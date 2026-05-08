@@ -5,10 +5,15 @@
 #include <cstring>
 #include <ctime>
 #include <cstdio>
+#include <cstddef>
+#include <cstdlib>
+#include <string>
 #include <string.h>
+#include <string_view>
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
+#include <array>
 #include <utility>
 #include <chrono>
 #include <thread>

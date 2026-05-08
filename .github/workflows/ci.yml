@@ -18,14 +18,23 @@ jobs:
   # and the full suite passes.
   # ----------------------------------------------------------------------
   build-linux-gcc:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # 4 vCPU, 16 GB RAM, 14 GB SSD
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      # ccache cuts warm-cache build time ~80% (per RocksDB / LLVM CI pattern).
+      # `create-symlink: true` intercepts gcc/g++ on PATH transparently — no
+      # Makefile edit needed. `max-size: 300M` covers ~5x our object set.
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ccache-linux-gcc
+          max-size: 300M
+          create-symlink: true
       - name: Build (gcc)
         run: make -j$(nproc)
-      - name: Test (full sweep)
+      - name: Test (all suites)
         run: ./test_runner
 
   # ----------------------------------------------------------------------
@@ -33,14 +42,20 @@ jobs:
   # codegen-driven UB that gcc misses.
   # ----------------------------------------------------------------------
   build-linux-clang:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # 4 vCPU, 16 GB RAM, 14 GB SSD
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev clang
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ccache-linux-clang
+          max-size: 300M
+          create-symlink: true
       - name: Build (clang)
         run: make -j$(nproc) CXX=clang++ CC=clang
-      - name: Test (full sweep)
+      - name: Test (all suites)
         run: ./test_runner
 
   # ----------------------------------------------------------------------
@@ -49,7 +64,7 @@ jobs:
   # runtime overhead.
   # ----------------------------------------------------------------------
   build-linux-asan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # 4 vCPU, 16 GB RAM, 14 GB SSD
     env:
       # detect_leaks=0: at-exit shared_ptr leaks from test-harness teardown
       # (not production code — tests do not always join every dispatcher
@@ -65,6 +80,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      # Sanitizer objects are ~2x larger; bump max-size accordingly.
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ccache-linux-asan
+          max-size: 500M
+          create-symlink: true
       - name: Build (asan + ubsan)
         run: |
           make -j$(nproc) \
@@ -72,22 +94,47 @@ jobs:
             CFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" \
             NGHTTP2_CFLAGS_EXTRA="-fsanitize=address,undefined -fno-omit-frame-pointer" \
             LDFLAGS_EXTRA="-fsanitize=address,undefined"
-      - name: Test (full sweep)
+      - name: Test (all suites)
         run: ./test_runner
 
   # ----------------------------------------------------------------------
-  # ThreadSanitizer. Catches data races, deadlocks, and lock-order
-  # inversions. The race / auth_race / circuit_breaker / dual_stack suites
-  # are the primary signal source. ~5-10x runtime overhead.
+  # ThreadSanitizer — sharded into two parallel buckets to cap PR wall-
+  # clock. TSAN amplifies runtime ~5-10x, so the previous single TSan job
+  # (which ran every suite in one shot) took ~15-25 min on shared runners;
+  # splitting the heaviest umbrellas (race, auth) into their own job lets
+  # the rest finish in parallel.
+  #
+  # Bucket assignment policy (must be re-balanced when adding a new heavy suite):
+  #   * `tsan-heavy`  — `race` + `auth` (auth umbrella covers
+  #                     auth_foundation / jwt / jwks / oidc / hrauth /
+  #                     auth_mgr / auth_fail / auth_reload / auth_multi /
+  #                     auth_ws / auth_race / router_async /
+  #                     introspection_cache / intro_client / auth_intro /
+  #                     auth_observability).
+  #   * `tsan-rest`   — every other suite enumerated explicitly. New
+  #                     suites added to RunAllTest() MUST be added here
+  #                     too — silent CI drift if missed.
+  #
+  # `stress` is NOT in either bucket — it lives in nightly-stress.yml.
   # ----------------------------------------------------------------------
-  build-linux-tsan:
-    runs-on: ubuntu-latest
+  build-linux-tsan-heavy:
+    runs-on: ubuntu-latest  # 4 vCPU, 16 GB RAM, 14 GB SSD
     env:
       TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:history_size=7
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      # Shared cache key with `build-linux-tsan-rest` — both jobs build
+      # an identical TSan binary with the same flags. Whichever finishes
+      # building first populates the cache for the other (cache write is
+      # deduplicated by exact key; second job reads via restore-keys).
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ccache-linux-tsan
+          max-size: 500M
+          create-symlink: true
       - name: Build (tsan)
         run: |
           make -j$(nproc) \
@@ -95,8 +142,72 @@ jobs:
             CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
             NGHTTP2_CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
             LDFLAGS_EXTRA="-fsanitize=thread"
-      - name: Test (full sweep)
-        run: ./test_runner
+      - name: Test - race (threading + I/O multiplexing)
+        run: ./test_runner race
+      - name: Test - auth (umbrella — every auth-related sub-suite)
+        run: ./test_runner auth
+
+  build-linux-tsan-rest:
+    runs-on: ubuntu-latest  # 4 vCPU, 16 GB RAM, 14 GB SSD
+    env:
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:history_size=7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ccache-linux-tsan  # shared with tsan-heavy
+          max-size: 500M
+          create-symlink: true
+      - name: Build (tsan)
+        run: |
+          make -j$(nproc) \
+            CXXFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+            CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+            NGHTTP2_CFLAGS_EXTRA="-fsanitize=thread -fno-omit-frame-pointer" \
+            LDFLAGS_EXTRA="-fsanitize=thread"
+      - name: Test (rest — every suite NOT in tsan-heavy, excluding stress)
+        run: |
+          set -e
+          # NOTE: When adding a suite to test/run_test.cc::RunAllTest(),
+          # add the matching flag here unless it belongs in tsan-heavy
+          # or nightly-stress.yml. See DEVELOPMENT_RULES.md.
+          for suite in \
+            basic \
+            timeout \
+            config \
+            http \
+            ws \
+            tls \
+            cli \
+            http2 \
+            route \
+            kqueue \
+            upstream \
+            proxy \
+            rate_limit \
+            circuit_breaker \
+            dns \
+            h2_upstream \
+            obs_foundation \
+            obs_tracer \
+            obs_metrics \
+            obs_mgr \
+            obs_propagator \
+            obs_export \
+            obs_prom \
+            obs_config \
+            obs_shutdown \
+            obs_linkkill \
+            obs_issue \
+            obs_stress \
+            obs_e2e ; do
+            echo "::group::test_runner $suite"
+            ./test_runner "$suite"
+            echo "::endgroup::"
+          done
 
   # ----------------------------------------------------------------------
   # macOS — only the suites whose behavior is influenced by the OS layer
@@ -109,11 +220,18 @@ jobs:
   # ordering, missing SOCK_CLOEXEC) still get caught.
   # ----------------------------------------------------------------------
   build-macos:
-    runs-on: macos-14
+    runs-on: macos-14  # 3 vCPU (Apple Silicon M1), 7 GB RAM, 14 GB SSD
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: brew install --quiet openssl@3 || true
+      # Native arm64 build; ccache same shape as Linux jobs.
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: ccache-macos-arm64
+          max-size: 300M
+          create-symlink: true
       - name: Build
         run: make -j$(sysctl -n hw.ncpu)
       - name: Test - basic (sanity)
@@ -143,8 +261,9 @@ jobs:
         # primitives suite (timing-sensitive deadline checks) is excluded
         # from this macOS subset by design — shared runners have variable
         # scheduling latency that breaks sub-100ms deadline assertions.
-        # Linux full-sweep ./test_runner runs both suites via the `dns`
-        # umbrella; macOS only carries the OS-sensitive integration half.
+        # The Linux gcc / clang / ASan jobs run both suites via the `dns`
+        # umbrella (all-suites runs); macOS only carries the OS-sensitive
+        # integration half.
         run: ./test_runner dual_stack
       - name: Test - h2_upstream (H2 codec + nghttp2 session via socketpair)
         # OS-sensitive: uses socketpair, threads, nghttp2 session framing,
@@ -152,3 +271,10 @@ jobs:
         # semantics and Apple-specific threading scheduling that can mask
         # races not caught by Linux alone.
         run: ./test_runner h2_upstream
+      - name: Test - obs_e2e (real-socket observability end-to-end)
+        # Boots a real HttpServer and verifies SERVER spans / finalize
+        # counters / 404 finalize. Socket-bound; the rest of the obs_*
+        # family (foundation/tracer/metrics/manager/propagator/export/
+        # prom/config/shutdown/linkkill/issue/stress) is pure logic and
+        # is exercised by the Linux gcc / clang / ASan all-suites runs above.
+        run: ./test_runner obs_e2e

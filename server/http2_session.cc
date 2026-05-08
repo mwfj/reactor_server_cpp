@@ -1,6 +1,7 @@
 #include "http2/http2_session.h"
 #include "http2/http2_connection_handler.h"
 #include "http/http_response.h"
+#include "http/http_server.h"  // HttpServer::FinalizeIfSnapshot
 #include "http/http_status.h"
 #include "log/logger.h"
 
@@ -1401,7 +1402,7 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     OnStreamNoLongerIncomplete();
     stream->MarkCounterDecremented();
 
-    const HttpRequest& req = stream->GetRequest();
+    HttpRequest& req = stream->GetRequest();
 
     // Propagate dispatcher index for upstream pool partition affinity
     if (conn_) {
@@ -1411,6 +1412,22 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
         req.client_ip = conn_->ip_addr();
         req.client_tls = conn_->HasTls();
         req.client_fd = conn_->fd();
+        // Observability fields needed by the inbound middleware.
+        // The :scheme pseudo-header is captured on Http2Stream::scheme_
+        // by the headers callback; copy it onto the HttpRequest first
+        // so a non-default :scheme (e.g. "https" over a non-TLS
+        // back-channel, or "http" over TLS for cleartext-via-HTTPS
+        // testing) is preserved. Fall back to the TLS-derived scheme
+        // only when :scheme was missing (defensive — nghttp2 normally
+        // rejects HEADERS without :scheme). H2 is always "2" on the
+        // wire.
+        if (stream->HasScheme() && !stream->Scheme().empty()) {
+            req.url_scheme = stream->Scheme();
+        } else if (req.url_scheme.empty()) {
+            req.url_scheme = conn_->HasTls() ? "https" : "http";
+        }
+        req.network_protocol_version = "2";
+        req.owning_dispatcher = conn_->GetDispatcher();
     }
 
     // RFC 9110 Section 8.6: If content-length is declared, the actual body
@@ -1438,11 +1455,18 @@ void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id)
     }
 
     HttpResponse response;
+    bool handler_threw = false;
     try {
         callbacks_.request_callback(Owner(), stream_id, req, response);
     } catch (const std::exception& e) {
         logging::Get()->error("Exception in HTTP/2 request handler: {}", e.what());
         response = HttpResponse::InternalError();
+        handler_threw = true;
+    }
+    // Mirror H1: a sync handler exception bypasses FinalizeIfSnapshot
+    // in the normal return paths, so the snapshot stays registered.
+    if (handler_threw) {
+        HttpServer::FinalizeIfSnapshot(req, response, "handler_threw");
     }
     // Async handler path: the framework has dispatched an async route and
     // will submit the real response on this stream later via

@@ -37,7 +37,7 @@ RateLimitManager::~RateLimitManager() {
 // Check
 // ---------------------------------------------------------------------------
 
-bool RateLimitManager::Check(const HttpRequest& request,
+bool RateLimitManager::Check(HttpRequest& request,
                              HttpResponse& response) {
     auto zones = LoadZones();
     if (!zones || zones->empty()) {

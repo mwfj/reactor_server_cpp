@@ -101,7 +101,7 @@ std::string LoadHmacKeyFromEnv(const std::string& env_var_name) {
     // contract. Any other decoded length means the env value wasn't a
     // base64url 32-byte key and we fall back to raw.
     //
-    // Exception containment (design spec §9 item 16): jwt::base::decode
+    // Exception containment: jwt::base::decode
     // throws std::runtime_error on invalid input (illegal chars, bad length).
     // Catch at this boundary and fall through to the raw-bytes interpretation
     // — a malformed env value must not propagate as an exception into

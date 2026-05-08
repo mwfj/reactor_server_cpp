@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// HeaderRewriter auth-overlay unit tests — Phase 2 test suite.
+// HeaderRewriter auth-overlay unit tests.
 //
 // Exercises the auth-overlay path in HeaderRewriter::RewriteRequest:
 //   - Strip inbound identity headers when strip_inbound_identity_headers=true

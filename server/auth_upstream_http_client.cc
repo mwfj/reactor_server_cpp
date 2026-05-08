@@ -1,4 +1,6 @@
 #include "auth/upstream_http_client.h"
+#include "observability/propagator.h"
+#include "observability/span_context.h"
 
 #include "upstream/upstream_manager.h"
 #include "upstream/upstream_http_codec.h"
@@ -11,6 +13,8 @@
 #include "connection_handler.h"
 #include "dispatcher.h"
 #include "log/logger.h"
+
+#include <string_view>
 // <functional>, <memory>, <atomic>, <chrono> via common.h
 
 namespace AUTH_NAMESPACE {
@@ -235,6 +239,52 @@ UpstreamHttpClient::UpstreamHttpClient(
 
 UpstreamHttpClient::~UpstreamHttpClient() = default;
 
+void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
+    // Strip first so an unsanitized inbound header can never leak
+    // across gateway-internal hops, then inject from issue_ctx when
+    // the caller has populated it with a valid local SpanContext.
+    //
+    // Header keys are documented as "lowercase preferred" — not
+    // required. A caller passing a mixed-case key like "TraceParent"
+    // would otherwise survive an exact-key erase and be serialized
+    // alongside the freshly injected lowercase header, leaking the
+    // caller's context. Walk the map and remove every key that
+    // case-insensitively matches "traceparent" or "tracestate".
+    auto ieq = [](const std::string& a, std::string_view b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < b.size(); ++i) {
+            unsigned char ca = static_cast<unsigned char>(a[i]);
+            unsigned char cb = static_cast<unsigned char>(b[i]);
+            if (std::tolower(ca) != std::tolower(cb)) return false;
+        }
+        return true;
+    };
+    for (auto it = req.headers.begin(); it != req.headers.end(); ) {
+        if (ieq(it->first, "traceparent") ||
+            ieq(it->first, "tracestate")) {
+            it = req.headers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Only inject when the caller has bound a Tracer in issue_ctx.
+    // The Tracer field is the contract signal that the caller is
+    // emitting (StartSpan + End) a CLIENT span with the SAME
+    // precomputed_context as `issue_ctx.local`. Injecting without
+    // that emission produces a downstream parent span_id the gateway
+    // never reports, leaving the upstream's parent reference dangling
+    // in the trace tree. Today no production caller populates
+    // issue_ctx — leaving this gate in place documents the contract
+    // for future wiring without leaking phantom span_ids in the
+    // meantime.
+    if (req.issue_ctx.has_value()
+        && req.issue_ctx->local.IsValid()
+        && req.issue_ctx->tracer != nullptr) {
+        OBSERVABILITY_NAMESPACE::W3CPropagator::Inject(
+            req.issue_ctx->local, req.headers);
+    }
+}
+
 void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
                                 size_t dispatcher_index,
                                 Request req,
@@ -266,6 +316,8 @@ void UpstreamHttpClient::Issue(const std::string& upstream_pool_name,
         deliver_error(cb, "dispatcher_out_of_range");
         return;
     }
+
+    ApplyOutboundTraceContext(req);
 
     auto txn = std::make_shared<Transaction>();
     txn->req = std::move(req);

@@ -43,8 +43,7 @@ Acceptor::Acceptor(std::shared_ptr<Dispatcher> _dispatcher, const std::string& _
             throw std::runtime_error(
                 "Unable to enforce IPV6_V6ONLY on IPv6 listener; startup "
                 "aborted because dual-mapped peer semantics would violate "
-                "the Phase 1 IP-based rate-limiting / ACL contract "
-                "documented in §1.3.");
+                "the IP-based rate-limiting / ACL contract.");
         }
     }
 

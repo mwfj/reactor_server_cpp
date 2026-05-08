@@ -635,7 +635,7 @@ std::unordered_set<std::string> AuthManager::LiveIssuerNames() const {
     return out;
 }
 
-bool AuthManager::InvokeMiddleware(const HttpRequest& req,
+bool AuthManager::InvokeMiddleware(HttpRequest& req,
                                      HttpResponse& resp) {
     // Master enforcement switch — `auth.enabled: false` passes through even
     // when the middleware is installed (installed unconditionally so
@@ -1146,7 +1146,7 @@ void AuthManager::ReconcilePerPolicyKeysLocked(
 }
 
 void AuthManager::InvokeAsyncMiddleware(
-        const HttpRequest& req, HttpResponse& resp,
+        HttpRequest& req, HttpResponse& resp,
         std::shared_ptr<HttpRouter::AsyncPendingState> state) {
     auto sync_pass = [&state]() {
         state->SetSyncResult(AsyncMiddlewareResult::PASS);

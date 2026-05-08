@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// Auth failure mode tests — Phase 2 test suite.
+// Auth failure-mode tests.
 //
 // These tests exercise the UNDETERMINED outcome path: IdP unavailable,
 // JWKS kid-miss with no cached keys, on_undetermined policy enforcement,

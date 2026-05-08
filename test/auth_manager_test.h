@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// AuthManager unit tests — Phase 2 test suite.
+// AuthManager unit tests.
 //
 // Tests the AuthManager in isolation without a real UpstreamManager or live
 // event loop. Key invariants:

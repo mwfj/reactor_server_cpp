@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// Auth multi-issuer tests — Phase 2 test suite.
+// Auth multi-issuer tests.
 //
 // These tests exercise AuthManager's issuer routing logic when multiple
 // issuers are configured: PeekIssuer-based routing, issuer allowlist

@@ -15,15 +15,14 @@ public:
     static constexpr int CONNECT_ERROR       = -1;  // SO_ERROR != 0 or getsockopt failure
 
 private:
-    // fd_ is read by fd() on the acceptor thread (e.g. HttpServer::HandleNewConnection's
-    // debug log) and written to -1 by ReleaseFd() on the worker dispatcher when a fast
-    // close races the new-connection handoff. Make it atomic to satisfy TSan; relaxed
-    // ordering is sufficient because cross-thread publication is established by the
-    // dispatcher's task queue.
-    std::atomic<int> fd_;
+    // Concurrently read by NetServer::HandleNewConnection (conn dispatcher,
+    // diagnostic logging) while ReleaseFd() on the owning dispatcher may
+    // write -1. Relaxed ordering is sufficient — a torn int read on a
+    // diagnostic path is harmless.
+    std::atomic<int> fd_{-1};
     std::string ip_addr_;
     int port_;
-    sa_family_t family_ = AF_UNSPEC;
+    sa_family_t family_ = AF_UNSPEC;   // dual-family — set by CreateSocket / accept-ctor
     static void SetNonBlocking(int fd);
 
 public:

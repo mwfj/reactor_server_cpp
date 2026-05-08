@@ -13,6 +13,7 @@
 #include "circuit_breaker/retry_budget.h" // RetryBudget::InFlightGuard (member-by-value)
 #include "http/http_callbacks.h"
 #include "http/http_response.h"
+#include "observability/observability_snapshot.h"  // UpstreamTransactionLink
 #include <optional>
 // <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono> provided by common.h
 
@@ -30,8 +31,10 @@ namespace AUTH_NAMESPACE {
 class AuthManager;
 }  // namespace AUTH_NAMESPACE
 
-class ProxyTransaction : public std::enable_shared_from_this<ProxyTransaction>,
-                         public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink {
+class ProxyTransaction
+    : public std::enable_shared_from_this<ProxyTransaction>,
+      public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink,
+      public OBSERVABILITY_NAMESPACE::UpstreamTransactionLink {
 public:
     // Result codes for internal state tracking
     static constexpr int RESULT_SUCCESS             = 0;
@@ -99,6 +102,33 @@ public:
     // Idempotent and dispatcher-thread-only (invoked via the connection
     // handler's abort hook, which always runs on the dispatcher).
     void Cancel();
+
+    // Hand the per-request snapshot to the transaction so Start() can
+    // publish the bidirectional link. Once linked, the shutdown kill
+    // loop can mark this transaction; terminal callbacks check the
+    // marker before emitting Span::End so shutdown wins every race
+    // against in-flight upstream I/O.
+    void AttachObservabilitySnapshot(
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap);
+
+    // Invoked under the snapshot's link_mtx by the shutdown kill loop.
+    // Two-part contract:
+    //   - kill_for_shutdown_ is the inline gate read by terminal
+    //     upstream callbacks (OnHeaders / OnBodyChunk / OnComplete /
+    //     OnError / OnUpstreamWriteComplete / OnUpstreamData /
+    //     OnStreamIdleTimeout / OnStreamBudgetTimeout / DeliverResponse)
+    //     so any callback firing on a still-live transport short-
+    //     circuits without writing to the client.
+    //   - the dispatcher EnQueue + Cancel() is the cleanup hop — it
+    //     releases the upstream lease, retry token, breaker admission,
+    //     and async hooks. Without it the proxy would keep using pool
+    //     resources after its snapshot was removed from drain counters.
+    // Out-of-line definition lets us depend on Dispatcher's full type
+    // in the .cc rather than dragging it into this header.
+    void MarkKilledForShutdown() noexcept override;
+    bool IsKilledForShutdown() const noexcept override {
+        return kill_for_shutdown_.load(std::memory_order_acquire);
+    }
 
     bool OnHeaders(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override;
@@ -178,16 +208,23 @@ private:
 
     // Completion callback
     HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete_cb_;
-    bool complete_cb_invoked_ = false;
+    // Atomic latch — writes happen on dispatcher-thread terminal
+    // callbacks (DeliverResponse / Cancel / various stream-error
+    // paths), but the destructor reads it on whatever thread releases
+    // the last shared_ptr (retry-timer lambda / upstream callback /
+    // shutdown kill sweep). Same TSan-flaggable cross-thread shape as
+    // kill_for_shutdown_ and inflight_counter_held_; use store(release)
+    // / load(acquire) so the dtor sees a published value.
+    std::atomic<bool> complete_cb_invoked_{false};
 
     // Upstream connection state (per attempt)
     UpstreamLease lease_;
     // Codec interface — H1 path always constructs UpstreamHttpCodec; H2
-    // path (Phase 1+ once UpstreamH2Codec lands) constructs the H2 codec.
-    // Single field through the abstract base lets ProxyTransaction
-    // dispatch parsing without protocol-specific downcasts. Protocol-
-    // specific extensions (e.g., UpstreamH2Codec::SubmitH2Request) reach
-    // through static_cast at the OnCheckoutReady branch that constructed
+    // path constructs UpstreamH2Codec. Single field through the abstract
+    // base lets ProxyTransaction dispatch parsing without protocol-
+    // specific downcasts. Protocol-specific extensions (e.g.,
+    // UpstreamH2Codec::SubmitH2Request) reach through static_cast at the
+    // OnCheckoutReady branch that constructed
     // the matching concrete type.
     std::unique_ptr<UpstreamCodec> codec_;
 
@@ -268,6 +305,23 @@ private:
     // and must promote to `std::atomic<uint64_t>` with relaxed ordering.
     uint64_t h2_response_timeout_generation_ = 0;
 
+    // Snapshot held for the link site in Start(). The shutdown kill
+    // loop sets kill_for_shutdown_ via MarkKilledForShutdown(); terminal
+    // callbacks read it before Span::End so shutdown wins every race
+    // against in-flight upstream I/O.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>
+        obs_snapshot_;
+    std::atomic<bool> kill_for_shutdown_{false};
+
+    // Latch — Start() bumps inflight_transactions_ exactly once and
+    // the destructor decrements iff this is set. Atomic because Start
+    // runs on the owning dispatcher thread while ~ProxyTransaction
+    // can run on whatever thread releases the last shared_ptr (a
+    // retry-timer lambda, an upstream `std::function` callback, or
+    // the shutdown kill sweep). Acq_rel exchange establishes a
+    // happens-before edge between the Start-thread bump and the
+    // dtor-thread decrement.
+    std::atomic<bool> inflight_counter_held_{false};
     enum class RelayMode {
         BUFFERED,
         STREAMING,
@@ -377,13 +431,13 @@ private:
     // plain 503 for those codes if called generically.
     static HttpResponse MakeErrorResponse(int result_code);
 
-    // Emit the circuit-open response (design §12.1):
+    // Emit the circuit-open response:
     //   503 + Retry-After (seconds until slice->OpenUntil())
     //       + X-Circuit-Breaker: open
     //       + X-Upstream-Host: service:host:port
     HttpResponse MakeCircuitOpenResponse() const;
 
-    // Emit the retry-budget-exhausted response (design §12.2):
+    // Emit the retry-budget-exhausted response:
     //   503 + X-Retry-Budget-Exhausted: 1
     static HttpResponse MakeRetryBudgetResponse();
 
@@ -397,8 +451,8 @@ private:
     bool ConsultBreaker();
 
     // ReportBreakerOutcome: classify a result_code into
-    // success/failure/neutral (per design §7) and call slice->Report*
-    // with admission_generation_. Clears admission_generation_ so a
+    // success/failure/neutral and call slice->Report* with
+    // admission_generation_. Clears admission_generation_ so a
     // double-report is impossible.
     //
     // failure_kind is ignored unless the outcome is a FailureKind-bearing

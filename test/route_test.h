@@ -6,7 +6,9 @@
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "http/http_server.h"
+#include "ws/websocket_connection.h"
 
+#include <functional>
 #include <string>
 #include <stdexcept>
 
@@ -1779,6 +1781,388 @@ void TestRouterProxyCompanionDisjointRegex() {
 }
 
 // ---------------------------------------------------------------------------
+// RouteKind / ResolveRouteMatch tests (r84 — first observability slice)
+// ---------------------------------------------------------------------------
+//
+// These tests exercise HttpRouter::ResolveRouteMatch — the single-source-
+// of-truth route resolver — directly. They DO NOT spin up a live server
+// (no port use); the resolver is a pure function over (request, router-
+// state), so we drive it by populating an HttpRequest and asserting the
+// resolved RouteMatch.
+
+namespace {
+// Tiny no-op handler factories used by RouteKind tests below.
+HttpRouter::Handler MakeNoopSync() {
+    return [](HttpRequest&, HttpResponse&) {};
+}
+HttpRouter::AsyncHandler MakeNoopAsync() {
+    return [](HttpRequest&,
+              HTTP_CALLBACKS_NAMESPACE::InterimResponseSender,
+              HTTP_CALLBACKS_NAMESPACE::ResourcePusher,
+              HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender,
+              HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback) {};
+}
+HttpRouter::WsUpgradeHandler MakeNoopWs() {
+    return [](WebSocketConnection&) {};
+}
+
+// Build a barebones HttpRequest for resolver tests.
+HttpRequest MakeRequest(const std::string& method,
+                         const std::string& path) {
+    HttpRequest r;
+    r.method = method;
+    r.path   = path;
+    r.url    = path;
+    return r;
+}
+
+// Build a request with a valid RFC 6455 upgrade-header set.
+HttpRequest MakeValidWsUpgrade(const std::string& path) {
+    HttpRequest r = MakeRequest("GET", path);
+    r.headers["host"]                  = "example.com";
+    r.headers["connection"]            = "Upgrade";
+    r.headers["upgrade"]               = "websocket";
+    r.headers["sec-websocket-version"] = "13";
+    // 16-byte key, base64-encoded → 24 chars (RFC 6455).
+    r.headers["sec-websocket-key"]     = "dGhlIHNhbXBsZSBub25jZQ==";
+    return r;
+}
+}  // namespace
+
+// Test: a registered WS handler hit by a valid upgrade resolves as
+// kind = WsUpgrade with is_websocket = true. A non-upgrade GET to the
+// same path NEVER classifies as WsUpgrade — the WS trie is consulted
+// ONLY when (0a) candidate detection trips.
+void TestResolveRouteMatchWsUpgradeKind() {
+    try {
+        HttpRouter router;
+        router.WebSocket("/ws", MakeNoopWs());
+
+        // (i) valid upgrade + path hit → WsUpgrade.
+        auto upgrade_req = MakeValidWsUpgrade("/ws");
+        router.ResolveRouteMatch(upgrade_req);
+        bool upgrade_ok =
+            upgrade_req.route_match.kind == RouteKind::WsUpgrade &&
+            upgrade_req.route_match.is_websocket &&
+            upgrade_req.route_match.pattern == "/ws" &&
+            upgrade_req.route_match.method_for_dispatch == "GET";
+
+        // (ii) non-upgrade GET to the same path: must NOT classify as
+        //      WsUpgrade. With no sync/async handler at /ws, kind stays
+        //      None.
+        auto plain_req = MakeRequest("GET", "/ws");
+        router.ResolveRouteMatch(plain_req);
+        bool plain_ok =
+            plain_req.route_match.kind == RouteKind::None &&
+            !plain_req.route_match.is_websocket;
+
+        bool pass = upgrade_ok && plain_ok;
+        std::string err;
+        if (!upgrade_ok) {
+            err = "valid upgrade did not resolve as WsUpgrade (kind=" +
+                  std::to_string(static_cast<int>(upgrade_req.route_match.kind)) +
+                  ", is_websocket=" +
+                  (upgrade_req.route_match.is_websocket ? "true" : "false") +
+                  ", pattern='" + upgrade_req.route_match.pattern + "')";
+        } else if (!plain_ok) {
+            err = "non-upgrade GET misclassified (kind=" +
+                  std::to_string(static_cast<int>(plain_req.route_match.kind)) +
+                  ", is_websocket=" +
+                  (plain_req.route_match.is_websocket ? "true" : "false") + ")";
+        }
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: WS upgrade resolves as WsUpgrade kind",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: WS upgrade resolves as WsUpgrade kind",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// Test: malformed WS-upgrade candidates (missing key, bad version,
+// non-base64 key, wrong key length) MUST short-circuit at step (0)
+// with kind = None + is_websocket = true — they MUST NOT fall through
+// to sync/async/proxy handlers that share the path. Catches an
+// implementer who gates step (0) on FULL validation instead of the
+// (0a) candidate-detection split.
+void TestResolveRouteMatchMalformedWsUpgradeForbidsFallthrough() {
+    try {
+        HttpRouter router;
+        // Stack the same path with sync + async + proxy candidates so a
+        // fallthrough WOULD pick one of them.
+        router.Get("/collide", MakeNoopSync());
+        router.RouteAsync("GET", "/collide", MakeNoopAsync());
+        router.RouteProxyAsync("POST", "/collide", MakeNoopAsync());
+
+        // Build the four malformed variants — each trips (0a) candidate
+        // detection but fails (0b) validation.
+        struct Variant {
+            const char* name;
+            std::function<HttpRequest()> build;
+        };
+        const Variant variants[] = {
+            { "missing Sec-WebSocket-Key", []{
+                auto r = MakeValidWsUpgrade("/collide");
+                r.headers.erase("sec-websocket-key");
+                return r;
+            } },
+            { "unsupported Sec-WebSocket-Version: 12", []{
+                auto r = MakeValidWsUpgrade("/collide");
+                r.headers["sec-websocket-version"] = "12";
+                return r;
+            } },
+            { "non-base64 Sec-WebSocket-Key", []{
+                auto r = MakeValidWsUpgrade("/collide");
+                // Contains characters outside the base64 alphabet.
+                r.headers["sec-websocket-key"] = "@@@not-base64@@@========";
+                return r;
+            } },
+            { "wrong-length Sec-WebSocket-Key (decodes to 8 bytes)", []{
+                auto r = MakeValidWsUpgrade("/collide");
+                // Valid base64, decodes to 9 bytes (not 16).
+                r.headers["sec-websocket-key"] = "QUJDREVGR0g=";
+                return r;
+            } },
+        };
+
+        bool all_pass = true;
+        std::string err;
+        for (const auto& v : variants) {
+            auto req = v.build();
+            router.ResolveRouteMatch(req);
+            const bool ok =
+                req.route_match.kind == RouteKind::None &&
+                req.route_match.is_websocket &&
+                !req.route_match.is_proxy;
+            if (!ok) {
+                all_pass = false;
+                err = std::string{v.name} + ": kind=" +
+                      std::to_string(static_cast<int>(req.route_match.kind)) +
+                      ", is_websocket=" +
+                      (req.route_match.is_websocket ? "true" : "false") +
+                      ", is_proxy=" +
+                      (req.route_match.is_proxy ? "true" : "false");
+                break;
+            }
+        }
+
+        // Positive control: a properly-formed upgrade with NO WS handler
+        // at this path also resolves as None+is_websocket=true (the
+        // documented valid-but-no-handler path-miss case).
+        if (all_pass) {
+            HttpRouter router_no_ws;
+            router_no_ws.Get("/collide", MakeNoopSync());
+            auto req = MakeValidWsUpgrade("/collide");
+            router_no_ws.ResolveRouteMatch(req);
+            const bool ok =
+                req.route_match.kind == RouteKind::None &&
+                req.route_match.is_websocket;
+            if (!ok) {
+                all_pass = false;
+                err = "valid upgrade with no WS handler did not stay at "
+                      "kind=None+is_websocket=true (kind=" +
+                      std::to_string(static_cast<int>(req.route_match.kind)) +
+                      ", is_websocket=" +
+                      (req.route_match.is_websocket ? "true" : "false") + ")";
+            }
+        }
+
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: malformed WS upgrade forbids fallthrough",
+            all_pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: malformed WS upgrade forbids fallthrough",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// Test: a proxy registered via RouteProxyAsync resolves as kind = Proxy
+// AND is_proxy = true. An operator async route via RouteAsync at a
+// separate prefix resolves as kind = Async AND is_proxy = false. The
+// bare-prefix companion runtime-yield case yields to sync.
+void TestResolveRouteMatchProxyKindIsProxy() {
+    try {
+        HttpRouter router;
+        // Proxy installs at /api/v1/*rest with a derived bare-prefix
+        // companion at /api/v1 that yields when sync registers there.
+        router.RouteProxyAsync("GET", "/api/v1/*rest", MakeNoopAsync());
+        router.RouteProxyAsync("GET", "/api/v1", MakeNoopAsync());
+        router.MarkProxyCompanion("GET", "/api/v1");
+        router.Get("/api/v1", MakeNoopSync());  // bare-prefix companion target.
+        // Sibling NON-proxy async route at a separate prefix.
+        router.RouteAsync("GET", "/api/v2/*rest", MakeNoopAsync());
+
+        // (a) proxy-only path → Proxy.
+        auto a = MakeRequest("GET", "/api/v1/users/123");
+        router.ResolveRouteMatch(a);
+        bool a_ok = a.route_match.kind == RouteKind::Proxy &&
+                    a.route_match.is_proxy &&
+                    a.route_match.pattern == "/api/v1/*rest";
+
+        // (b) bare-prefix companion → proxy yields, sync wins.
+        auto b = MakeRequest("GET", "/api/v1");
+        router.ResolveRouteMatch(b);
+        bool b_ok = b.route_match.kind == RouteKind::Sync &&
+                    !b.route_match.is_proxy;
+
+        // (c) sibling non-proxy async at separate prefix → Async, not Proxy.
+        auto c = MakeRequest("GET", "/api/v2/anything");
+        router.ResolveRouteMatch(c);
+        bool c_ok = c.route_match.kind == RouteKind::Async &&
+                    !c.route_match.is_proxy &&
+                    c.route_match.pattern == "/api/v2/*rest";
+
+        bool pass = a_ok && b_ok && c_ok;
+        std::string err;
+        if (!a_ok) {
+            err = "case (a) proxy-only: kind=" +
+                  std::to_string(static_cast<int>(a.route_match.kind)) +
+                  ", is_proxy=" + (a.route_match.is_proxy ? "true" : "false") +
+                  ", pattern='" + a.route_match.pattern + "'";
+        } else if (!b_ok) {
+            err = "case (b) bare-prefix companion: kind=" +
+                  std::to_string(static_cast<int>(b.route_match.kind)) +
+                  ", is_proxy=" + (b.route_match.is_proxy ? "true" : "false");
+        } else if (!c_ok) {
+            err = "case (c) sibling async: kind=" +
+                  std::to_string(static_cast<int>(c.route_match.kind)) +
+                  ", is_proxy=" + (c.route_match.is_proxy ? "true" : "false") +
+                  ", pattern='" + c.route_match.pattern + "'";
+        }
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: proxy resolves as Proxy kind",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: proxy resolves as Proxy kind",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// Test: a sync-only route resolves as kind = Sync. Verifies the kind=Sync
+// path of the resolver and its HEAD→GET fallback bookkeeping.
+void TestResolveRouteMatchSyncKindAndHeadFallback() {
+    try {
+        HttpRouter router;
+        router.Get("/users/:id", MakeNoopSync());
+
+        // (a) GET /users/42 → Sync, head_fallback=false.
+        auto get_req = MakeRequest("GET", "/users/42");
+        router.ResolveRouteMatch(get_req);
+        bool get_ok = get_req.route_match.kind == RouteKind::Sync &&
+                      !get_req.route_match.head_fallback &&
+                      get_req.route_match.method_for_dispatch == "GET";
+
+        // (b) HEAD /users/42 → Sync via HEAD→GET fallback,
+        //     head_fallback=true, method_for_dispatch="GET".
+        auto head_req = MakeRequest("HEAD", "/users/42");
+        router.ResolveRouteMatch(head_req);
+        bool head_ok = head_req.route_match.kind == RouteKind::Sync &&
+                       head_req.route_match.head_fallback &&
+                       head_req.route_match.method_for_dispatch == "GET";
+
+        // (c) DELETE /users/42 (no DELETE handler) → kind stays None.
+        auto del_req = MakeRequest("DELETE", "/users/42");
+        router.ResolveRouteMatch(del_req);
+        bool del_ok = del_req.route_match.kind == RouteKind::None;
+
+        bool pass = get_ok && head_ok && del_ok;
+        std::string err;
+        if (!get_ok) err = "GET case failed";
+        else if (!head_ok) err = "HEAD fallback case failed";
+        else if (!del_ok) err = "DELETE-no-match case failed (kind=" +
+                                std::to_string(static_cast<int>(
+                                    del_req.route_match.kind)) + ")";
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: sync route resolves as Sync kind, HEAD→GET fallback",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: sync route resolves as Sync kind, HEAD→GET fallback",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// Test: HEAD→GET fallback on a proxy route classifies as Proxy, not Async.
+// Regression guard for the IsProxyAsyncPattern lookup-by-method bug:
+// proxy ownership is keyed under "GET" but a HEAD request that falls
+// back to GET should still be tagged RouteKind::Proxy / is_proxy=true.
+void TestResolveRouteMatchHeadFallbackOnProxyRoute() {
+    try {
+        HttpRouter router;
+        router.RouteProxyAsync("GET", "/api/v1/*rest", MakeNoopAsync());
+        // No explicit HEAD registration — HEAD on /api/v1/foo must
+        // fall back to the GET handler (proxy).
+
+        auto head_req = MakeRequest("HEAD", "/api/v1/users/42");
+        router.ResolveRouteMatch(head_req);
+
+        bool pass = head_req.route_match.kind == RouteKind::Proxy &&
+                    head_req.route_match.is_proxy &&
+                    head_req.route_match.head_fallback &&
+                    head_req.route_match.method_for_dispatch == "GET" &&
+                    head_req.route_match.pattern == "/api/v1/*rest";
+        std::string err;
+        if (!pass) {
+            err = "kind=" + std::to_string(
+                      static_cast<int>(head_req.route_match.kind)) +
+                  ", is_proxy=" +
+                      (head_req.route_match.is_proxy ? "true" : "false") +
+                  ", head_fallback=" +
+                      (head_req.route_match.head_fallback ? "true" : "false") +
+                  ", method_for_dispatch='" +
+                      head_req.route_match.method_for_dispatch +
+                  "', pattern='" + head_req.route_match.pattern + "'";
+        }
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: HEAD→GET fallback on proxy route tagged Proxy",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: HEAD→GET fallback on proxy route tagged Proxy",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// Test: ResolveRouteMatch is idempotent. A second call must not clobber
+// or re-resolve. The H1/H2 dispatch frames may invoke the resolver
+// twice (pre-middleware AND at dispatch); the design contract is "first
+// call wins, subsequent calls no-op".
+void TestResolveRouteMatchIdempotency() {
+    try {
+        HttpRouter router;
+        router.Get("/health", MakeNoopSync());
+
+        auto req = MakeRequest("GET", "/health");
+        router.ResolveRouteMatch(req);
+        const RouteKind first_kind = req.route_match.kind;
+        const std::string first_pattern = req.route_match.pattern;
+
+        // Mutate the path to a non-existent route, then call again.
+        // The resolver MUST NOT overwrite — first call already
+        // populated kind, so the second call short-circuits.
+        req.path = "/does-not-exist";
+        router.ResolveRouteMatch(req);
+
+        bool pass = req.route_match.kind == first_kind &&
+                    req.route_match.pattern == first_pattern;
+        std::string err = pass ? "" :
+            "resolver re-resolved on second call (kind=" +
+            std::to_string(static_cast<int>(req.route_match.kind)) +
+            ", pattern='" + req.route_match.pattern + "')";
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: idempotent on second call",
+            pass, err, TestFramework::TestCategory::ROUTE);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ResolveRouteMatch: idempotent on second call",
+            false, e.what(), TestFramework::TestCategory::ROUTE);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RunAllTests
 // ---------------------------------------------------------------------------
 void RunAllTests() {
@@ -1843,6 +2227,14 @@ void RunAllTests() {
     TestRouterProxyCompanionYieldsForMarkedMethod();
     TestRouterProxyCompanionDisjointRegex();
     TestRouterProxyDefaultHeadPairingPerPattern();
+
+    // ResolveRouteMatch / RouteKind tests (r84 — first observability slice)
+    TestResolveRouteMatchWsUpgradeKind();
+    TestResolveRouteMatchMalformedWsUpgradeForbidsFallthrough();
+    TestResolveRouteMatchProxyKindIsProxy();
+    TestResolveRouteMatchSyncKindAndHeadFallback();
+    TestResolveRouteMatchHeadFallbackOnProxyRoute();
+    TestResolveRouteMatchIdempotency();
 }
 
 }  // namespace RouteTests

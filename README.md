@@ -488,7 +488,7 @@ make -C thread_pool
 | [docs/cli.md](docs/cli.md) | CLI usage, flags, signal handling, PID files, daemon mode |
 | [docs/architecture.md](docs/architecture.md) | Reactor pattern, layered design, data flow, memory management |
 | [docs/callback_architecture.md](docs/callback_architecture.md) | 3-layer callback chain, type definitions, weak_ptr design pattern |
-| [docs/testing.md](docs/testing.md) | Test suites, running tests, port configuration |
+| [docs/testing.md](docs/testing.md) | Test suites, running tests, port configuration, CI workflow cadence (per-PR / nightly stress / weekly valgrind) |
 | [docs/http.md](docs/http.md) | HTTP/1.1 layer — routing, middleware, request/response API |
 | [docs/http2.md](docs/http2.md) | HTTP/2 layer — streams, HPACK, flow control, ALPN |
 | [docs/websocket.md](docs/websocket.md) | WebSocket — upgrade flow, frames, message API, RFC 6455 compliance |

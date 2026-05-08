@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// OidcDiscovery unit tests — Phase 2 test suite.
+// OidcDiscovery unit tests.
 //
 // Because OidcDiscovery requires a live UpstreamHttpClient backed by a real
 // UpstreamManager (network I/O), pure unit tests focus on the parts that can

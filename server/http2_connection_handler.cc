@@ -206,7 +206,7 @@ public:
         int32_t stream_id,
         std::function<bool()> claim_response,
         std::function<void()> release_response_claim,
-        std::function<void()> finalize_request)
+        std::function<void(int, uint64_t, std::string)> finalize_request)
         : handler_(std::move(handler)),
           stream_id_(stream_id),
           claim_response_(std::move(claim_response)),
@@ -270,6 +270,67 @@ public:
             return -1;
         }
         headers_sent_ = true;
+        last_status_code_ = headers_only_response.GetStatusCode();
+        if (body_suppressed_) {
+            // Body-suppressed responses (HEAD / 204 / 205 / 304) are
+            // submitted as a headers-only frame with END_STREAM already
+            // set. The next flush (inline below, or OnRawData's tail
+            // flush when we're called from inside a receive callback)
+            // can drive nghttp2's on_stream_close synchronously — and
+            // if the peer batched RST_STREAM behind their request, the
+            // queued response is silently discarded. The dispatch site
+            // installs a per-stream abort hook AFTER the streaming
+            // handler returns; if we erase it AND record success
+            // unconditionally, observability locks a clean status onto
+            // a response that never reached the wire.
+            //
+            // Defer the finalize via the same outcome-checked closure
+            // used by End(): after the post-receive flush (or inline
+            // for non-InReceiveData callers) it consults
+            // WasStreamClosedSuccessfully and records success or
+            // client_disconnect accordingly.
+            terminal_ = true;
+            data_source_.reset();
+            self->EraseStreamAbortHook(stream_id_);
+
+            auto stream_id_copy = stream_id_;
+            auto status_copy    = last_status_code_;
+            auto bytes_copy     = bytes_sent_;
+            auto finalize_copy  = finalize_request_;
+            auto handler_weak   = handler_;
+            auto outcome_finalize =
+                [stream_id_copy, status_copy, bytes_copy,
+                 finalize_copy, handler_weak]() mutable {
+                if (!finalize_copy) return;
+                auto h = handler_weak.lock();
+                if (!h) {
+                    finalize_copy(/*status_code=*/0, /*bytes_sent=*/0,
+                                  /*error_type=*/"client_disconnect");
+                    return;
+                }
+                if (h->WasStreamClosedSuccessfully(stream_id_copy)) {
+                    finalize_copy(status_copy, bytes_copy,
+                                  std::string{});
+                } else {
+                    finalize_copy(/*status_code=*/0, /*bytes_sent=*/0,
+                                  /*error_type=*/"client_disconnect");
+                }
+            };
+
+            if (session->InReceiveData()) {
+                self->EnqueuePostReceiveTask(std::move(outcome_finalize));
+                // Don't call SendPendingFrames here — the post-receive
+                // tail flush in OnRawData handles it AND will drain the
+                // task we just enqueued.
+            } else {
+                session->SendPendingFrames();
+                self->RecheckShutdownDrainAfterFlush();
+                // Outside ReceiveData — close callback (if any) for
+                // this stream has fired; outcome map is current.
+                outcome_finalize();
+            }
+            return 0;
+        }
         if (!session->InReceiveData()) {
             session->SendPendingFrames();
             self->RecheckShutdownDrainAfterFlush();
@@ -280,12 +341,6 @@ public:
     SendResult SendData(const char* data, size_t len) override {
         if (!headers_sent_) {
             return HandleProgrammerError("SendData");
-        }
-        if (terminal_ || programmer_error_ || !data_source_) {
-            logging::Get()->debug(
-                "H2 streaming SendData rejected stream={} terminal={} programmer_error={} has_data_source={} len={}",
-                stream_id_, terminal_, programmer_error_, data_source_ != nullptr, len);
-            return SendResult::CLOSED;
         }
         auto self = handler_.lock();
         auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
@@ -302,8 +357,26 @@ public:
                 stream_id_);
             return SendResult::CLOSED;
         }
+        // Body-suppressed (HEAD / 204 / 205 / 304) silently drops body
+        // bytes — there is no body on the wire. Must run BEFORE the
+        // terminal_/data_source_ guard because SendHeaders for body-
+        // suppressed responses sets terminal_=true and resets
+        // data_source_, and a handler that follows SendHeaders with
+        // SendData (a benign no-op for body-suppressed status) must
+        // see ACCEPTED rather than CLOSED. Must run AFTER the
+        // dispatcher-thread guard so the documented H2 contract
+        // ("SendData is dispatcher-thread-only") is enforced for
+        // body-suppressed streams too — otherwise an off-thread caller
+        // would silently observe ACCEPTED while reading sender state
+        // off-loop.
         if (body_suppressed_) {
             return SendResult::ACCEPTED_BELOW_WATER;
+        }
+        if (terminal_ || programmer_error_ || !data_source_) {
+            logging::Get()->debug(
+                "H2 streaming SendData rejected stream={} terminal={} programmer_error={} has_data_source={} len={}",
+                stream_id_, terminal_, programmer_error_, data_source_ != nullptr, len);
+            return SendResult::CLOSED;
         }
         if (data_source_->Append(data, len) == SendResult::CLOSED) {
             logging::Get()->warn(
@@ -326,6 +399,11 @@ public:
             }
             session->SendPendingFrames();
         }
+        // Account bytes only after BOTH Append AND (when applicable)
+        // ResumeStreamData have succeeded. Either failure path tears
+        // the stream down before any bytes reach the wire, so they
+        // must not contribute to http.server.response.body.size.
+        bytes_sent_ += len;
         return EvaluateCombinedOccupancy();
     }
 
@@ -362,13 +440,73 @@ public:
             return SendResult::CLOSED;
         }
         terminal_ = true;
+        // Erase the abort hook BEFORE flushing EOF. data_source_->Finish()
+        // + SendPendingFrames may close the stream synchronously and fire
+        // the stream-close callback (which would otherwise call
+        // FireAndEraseStreamAbortHook → run a stale hook → record
+        // status=0/client_disconnect on a normal completion). Erasing
+        // makes the close-callback's hook lookup a no-op regardless of
+        // when the close actually lands.
+        self->EraseStreamAbortHook(stream_id_);
+
+        // The success/error finalize decision must be deferred until
+        // AFTER the post-receive flush. If the peer batched
+        // [END_STREAM headers] + [RST_STREAM] in the same recv buffer,
+        // nghttp2 may have already marked the stream as reset by the
+        // time our queued response frames flush — they get discarded
+        // silently, and observability must NOT record a clean status
+        // for a response that never reached the wire. The deferred
+        // closure reads `WasStreamClosedSuccessfully(stream_id)` (which
+        // consults FindStream + the stream_close_error_codes_ map) to
+        // pick the right finalize. Same shape for body-suppressed
+        // SendHeaders (no body, response is the headers frame).
+        auto stream_id_copy   = stream_id_;
+        auto status_copy      = last_status_code_;
+        auto bytes_copy       = bytes_sent_;
+        auto finalize_copy    = finalize_request_;
+        auto handler_weak     = handler_;
+        auto outcome_finalize = [stream_id_copy, status_copy, bytes_copy,
+                                  finalize_copy,
+                                  handler_weak]() mutable {
+            if (!finalize_copy) return;
+            auto h = handler_weak.lock();
+            if (!h) {
+                // Connection gone — record as client_disconnect.
+                finalize_copy(/*status_code=*/0, /*bytes_sent=*/0,
+                              /*error_type=*/"client_disconnect");
+                return;
+            }
+            if (h->WasStreamClosedSuccessfully(stream_id_copy)) {
+                finalize_copy(status_copy, bytes_copy, std::string{});
+            } else {
+                finalize_copy(/*status_code=*/0, /*bytes_sent=*/0,
+                              /*error_type=*/"client_disconnect");
+            }
+        };
+
         if (body_suppressed_) {
             data_source_.reset();
-            if (finalize_request_) {
-                finalize_request_();
+            if (session->InReceiveData()) {
+                self->EnqueuePostReceiveTask(std::move(outcome_finalize));
+            } else {
+                // Already outside ReceiveData. The previous flush in
+                // SendHeaders has run; on_stream_close (if any) has
+                // already recorded into stream_close_error_codes_.
+                // Fire the outcome check inline.
+                outcome_finalize();
             }
             return SendResult::ACCEPTED_BELOW_WATER;
         }
+
+        // For body-bearing streams the success finalize must NOT fire
+        // until ResumeStreamData succeeds. If Resume fails (stream no
+        // longer resumable / RST_STREAM observed / nghttp2 lost the
+        // stream), the response never emitted a successful END_STREAM
+        // and observability must record an error. Fire the error finalize
+        // explicitly on the Resume-failure branch (AbortInternal early-
+        // returns on `terminal_ && !from_programmer_error`, and the CAS
+        // gate inside finalize_request_ would silently drop a later
+        // override).
         data_source_->Finish();
         if (!session->InReceiveData()) {
             int rv = session->ResumeStreamData(stream_id_);
@@ -376,14 +514,22 @@ public:
                 logging::Get()->warn(
                     "H2 streaming End resume failed stream={} rv={}",
                     stream_id_, rv);
+                if (finalize_request_) {
+                    finalize_request_(/*status_code=*/0, /*bytes_sent=*/0,
+                                        /*error_type=*/"client_disconnect");
+                }
                 AbortInternal(false, AbortReason::CLIENT_DISCONNECT);
                 return SendResult::CLOSED;
             }
             session->SendPendingFrames();
             self->RecheckShutdownDrainAfterFlush();
-        }
-        if (finalize_request_) {
-            finalize_request_();
+            // Outside ReceiveData — the close callback (if any) for
+            // this stream has already fired during SendPendingFrames,
+            // so the outcome map is up to date.
+            outcome_finalize();
+        } else {
+            // Inside ReceiveData — defer until OnRawData's tail flush.
+            self->EnqueuePostReceiveTask(std::move(outcome_finalize));
         }
         return SendResult::ACCEPTED_BELOW_WATER;
     }
@@ -500,7 +646,8 @@ private:
                 stream_id_, HTTP2_CONSTANTS::ERROR_INTERNAL_ERROR);
         }
         if (finalize_request_) {
-            finalize_request_();
+            finalize_request_(last_status_code_, bytes_sent_,
+                                StreamingAbortReasonToString(reason));
         }
     }
 
@@ -565,7 +712,12 @@ private:
     int32_t stream_id_;
     std::function<bool()> claim_response_;
     std::function<void()> release_response_claim_;
-    std::function<void()> finalize_request_;
+    std::function<void(int, uint64_t, std::string)> finalize_request_;
+    // State observed by SendHeaders/SendData/Abort and replayed to
+    // finalize_request_ on End/Abort. Dispatcher-thread-only writes
+    // and reads — no synchronization needed.
+    int last_status_code_ = 0;
+    uint64_t bytes_sent_ = 0;
     std::shared_ptr<StreamingH2DataSource> data_source_;
     DrainListener drain_listener_;
     bool claimed_response_ = false;
@@ -603,10 +755,91 @@ Http2ConnectionHandler::WrapStreamCloseCallback(StreamCloseCallback callback) {
             return;
         }
         self->active_stream_sender_impls_.erase(stream_id);
+        // Record the close outcome BEFORE the user callback runs so
+        // any deferred finaliser pumped from the user callback (or from
+        // the upcoming post-receive task drain) can read the actual
+        // error_code rather than guessing from FindStream alone.
+        self->stream_close_error_codes_[stream_id] = error_code;
+        // Bound the map to prevent unbounded growth on long-lived H2
+        // connections where a stream closes without an outcome
+        // consumer reading back (e.g. sync H2 dispatch with
+        // observability disabled — neither the streaming-finalize
+        // path, the abort hook, nor the obs post-receive task is
+        // installed). Stream IDs are monotonic per RFC 9113 §5.1.1,
+        // so the smallest key is the oldest entry. The cap protects
+        // against a misconfigured max_concurrent_streams >= 256;
+        // default 100 never triggers it. If an operator pushes that
+        // ceiling above 256, post-receive consumers (which run after
+        // mem_recv2 returns) could lose entries and observability
+        // records `client_disconnect` instead of the actual outcome
+        // — graceful degradation, not data loss.
+        constexpr size_t kMaxStreamCloseEntries = 256;
+        if (self->stream_close_error_codes_.size() >
+            kMaxStreamCloseEntries) {
+            auto min_it = std::min_element(
+                self->stream_close_error_codes_.begin(),
+                self->stream_close_error_codes_.end(),
+                [](const auto& a, const auto& b) {
+                    return a.first < b.first;
+                });
+            if (min_it != self->stream_close_error_codes_.end()) {
+                self->stream_close_error_codes_.erase(min_it);
+            }
+        }
         if (callback) {
             callback(std::move(self), stream_id, error_code);
         }
     };
+}
+
+bool Http2ConnectionHandler::WasStreamClosedSuccessfully(int32_t stream_id) {
+    // Stream still in flight ⇒ response not yet finalized at the wire,
+    // but no observed error either ⇒ treat as success-bound. The deferred
+    // finaliser is run after the post-receive flush, so a stream that's
+    // still alive at that point either has its response queued behind
+    // backpressure (HALF_CLOSED_LOCAL waiting on peer END_STREAM) or
+    // genuinely in flight — neither is an error.
+    if (session_ && session_->FindStream(stream_id) != nullptr) {
+        return true;
+    }
+    auto it = stream_close_error_codes_.find(stream_id);
+    if (it == stream_close_error_codes_.end()) {
+        // Stream gone AND no close was recorded by the wrapped close
+        // callback. The most common reason is connection teardown:
+        // OnStreamCloseCallback bails out on a null Owner(), so the
+        // wrap (which records the error code) never runs. Treat as a
+        // failure rather than a success — the response did not reach a
+        // clean END_STREAM on the wire from the server's perspective.
+        return false;
+    }
+    const uint32_t error_code = it->second;
+    stream_close_error_codes_.erase(it);
+    return error_code == HTTP2_CONSTANTS::ERROR_NO_ERROR;
+}
+
+void Http2ConnectionHandler::EnqueuePostReceiveTask(
+        std::function<void()> task) {
+    if (task) {
+        pending_post_receive_tasks_.emplace_back(std::move(task));
+    }
+}
+
+void Http2ConnectionHandler::DrainPostReceiveTasks() {
+    if (pending_post_receive_tasks_.empty()) return;
+    auto tasks = std::move(pending_post_receive_tasks_);
+    pending_post_receive_tasks_.clear();
+    for (auto& task : tasks) {
+        if (!task) continue;
+        try {
+            task();
+        } catch (const std::exception& e) {
+            logging::Get()->error(
+                "H2 post-receive task threw: {}", e.what());
+        } catch (...) {
+            logging::Get()->error(
+                "H2 post-receive task threw an unknown exception");
+        }
+    }
 }
 
 void Http2ConnectionHandler::SetRequestCallback(RequestCallback callback) {
@@ -921,6 +1154,12 @@ void Http2ConnectionHandler::OnRawData(
     // Send pending frames (responses, WINDOW_UPDATEs, etc.)
     session_->SendPendingFrames();
 
+    // Drain post-receive tasks (e.g. streaming-sender finalisers
+    // deferred from inside ReceiveData). Runs AFTER the flush so
+    // FindStream / stream_close_error_codes_ reflect the final state
+    // for any stream the peer reset in this same recv batch.
+    DrainPostReceiveTasks();
+
     // Manage deadline based on the OLDEST incomplete stream's creation time.
     // The deadline = oldest_start + request_timeout_sec. New streams cannot
     // extend the deadline for older stalled streams, which closes the bypass
@@ -990,15 +1229,27 @@ void Http2ConnectionHandler::SetDrainCompleteCallback(DrainCompleteCallback cb) 
     drain_complete_cb_ = std::move(cb);
 }
 
-void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
+int Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
                                                   const HttpResponse& response) {
     if (!session_) {
         logging::Get()->warn(
             "SubmitStreamResponse called on destroyed H2 session (stream={})",
             stream_id);
-        return;
+        // Defensive: still fire the per-stream post-write notifier (if
+        // any) so a shutdown-route pump waiting on this stream's slot
+        // observes "framework gave up" rather than hanging. Match
+        // FireStreamPostWriteNotify's symmetric `if (slot)` null
+        // check so a stream registered with a null slot doesn't UB.
+        auto it = stream_post_write_notify_.find(stream_id);
+        if (it != stream_post_write_notify_.end()) {
+            if (it->second) {
+                it->second->store(true, std::memory_order_release);
+            }
+            stream_post_write_notify_.erase(it);
+        }
+        return -1;
     }
-    session_->SubmitResponse(stream_id, response);
+    const int submit_rv = session_->SubmitResponse(stream_id, response);
     // Flush nghttp2's outgoing frame queue onto the transport. The sync H2
     // path hits the SendPendingFrames call at the tail of OnRawData after
     // ReceiveData → OnRequest → SubmitResponse returns. Async completions
@@ -1008,6 +1259,28 @@ void Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     // any async H2 route.
     session_->SendPendingFrames();
     RecheckShutdownDrainAfterFlush();
+
+    // Fire the per-stream post-write notifier: response frames are
+    // committed to nghttp2's output buffer. Lookup-and-erase keeps
+    // the operation idempotent across stream-id reuse.
+    auto it = stream_post_write_notify_.find(stream_id);
+    if (it != stream_post_write_notify_.end()) {
+        if (it->second) {
+            it->second->store(true, std::memory_order_release);
+        }
+        stream_post_write_notify_.erase(it);
+    }
+    return submit_rv;
+}
+
+void Http2ConnectionHandler::SetPostWriteNotifyOnce(
+    int32_t stream_id,
+    std::shared_ptr<std::atomic<bool>> notify_sent) {
+    if (!notify_sent) {
+        stream_post_write_notify_.erase(stream_id);
+        return;
+    }
+    stream_post_write_notify_[stream_id] = std::move(notify_sent);
 }
 
 void Http2ConnectionHandler::RecheckShutdownDrainAfterFlush() {
@@ -1051,15 +1324,17 @@ Http2ConnectionHandler::CreateStreamingResponseSender(
     int32_t stream_id,
     std::function<bool()> claim_response,
     std::function<void()> release_response_claim,
-    std::function<void()> finalize_request) {
+    std::function<void(int, uint64_t, std::string)> finalize_request) {
     std::weak_ptr<Http2ConnectionHandler> weak_self = weak_from_this();
     auto finalize_with_unregister =
-        [weak_self, stream_id, finalize_request = std::move(finalize_request)]() {
+        [weak_self, stream_id, finalize_request = std::move(finalize_request)]
+            (int status_code, uint64_t bytes_sent, std::string error_type) {
             if (auto self = weak_self.lock()) {
                 self->active_stream_sender_impls_.erase(stream_id);
             }
             if (finalize_request) {
-                finalize_request();
+                finalize_request(status_code, bytes_sent,
+                                  std::move(error_type));
             }
         };
     auto impl = std::make_shared<H2StreamingResponseSenderImpl>(

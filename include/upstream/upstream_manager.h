@@ -68,10 +68,54 @@ public:
     // them (leases may still hold raw pointers). The manager must NOT be
     // destroyed until all dispatcher threads are joined — HttpServer::Stop()
     // ensures this by calling upstream_manager_.reset() after net_server_.Stop().
-    void WaitForDrain(std::chrono::seconds timeout);
+    // milliseconds resolution so HttpServer::Stop's single-deadline
+    // budget can pass sub-second residuals without rounding-up to the
+    // next full second (which would defeat the hard-cap contract).
+    // Callers passing chrono::seconds get implicit conversion (no API
+    // break for the test suites).
+    void WaitForDrain(std::chrono::milliseconds timeout);
 
     // Non-blocking check: true if outstanding_conns_ == 0.
     bool AllDrained() const;
+
+    // ---- Counters consumed by the shutdown drain predicate ----
+    //
+    // active_leases — UpstreamConnection leases currently held by
+    //   callers (not yet returned). Tracked separately from
+    //   outstanding_conns_ so the drain predicate doesn't wait on
+    //   IDLE keep-alive sockets sitting in the pool — those have no
+    //   in-flight request behind them and would block the
+    //   observability shutdown drain until the idle timeout fires.
+    //   Bumped by PoolPartition right before handing out a lease;
+    //   decremented by ReturnConnection when the lease is released.
+    //
+    // inflight_transactions — ProxyTransactions that entered Start()
+    //   but haven't reached terminal completion. Independent of
+    //   active_leases (a transaction can be queued or awaiting a
+    //   circuit-breaker decision before holding a lease) and bumped
+    //   by ProxyTransaction directly.
+    int64_t active_leases() const noexcept {
+        return inflight_leases_.load(std::memory_order_acquire);
+    }
+    int64_t inflight_transactions() const noexcept {
+        return inflight_transactions_.load(std::memory_order_acquire);
+    }
+    // Drain mutex/cv accessors for HttpServer::WaitForAllAsyncDrain.
+    // NOTE: drain_cv_ is signaled by PoolPartition::MaybeSignalDrain
+    // ONLY when shutting_down_ is set AND outstanding_conns_ has
+    // dropped to zero (the final transition). DecInflightTransactions
+    // is a silent atomic with no notify. Callers waiting on this cv
+    // MUST pair it with a periodic re-check timer; the cv alone is
+    // an opportunistic short-circuit for the final zero-crossing,
+    // not a per-event wake.
+    std::mutex& drain_mtx() noexcept { return drain_mtx_; }
+    std::condition_variable& drain_cv() noexcept { return drain_cv_; }
+    void IncInflightTransactions() noexcept {
+        inflight_transactions_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    void DecInflightTransactions() noexcept {
+        inflight_transactions_.fetch_sub(1, std::memory_order_acq_rel);
+    }
 
     // Force-close all remaining connections (enqueues to each dispatcher).
     void ForceCloseRemaining();
@@ -195,7 +239,23 @@ private:
     std::atomic<CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager*> breaker_manager_{nullptr};
 
     // Manager-owned atomic counter: total outstanding connections
+    // (active + idle keep-alive). Used by ~UpstreamManager's
+    // teardown wait — observability shutdown reads inflight_leases_
+    // instead so an idle pool doesn't stall the drain.
     std::atomic<int64_t> outstanding_conns_{0};
+
+    // Leases currently checked out by callers. Bumped by
+    // PoolPartition before invoking ready_cb with a fresh lease;
+    // decremented in PoolPartition::ReturnConnection when the
+    // lease's destructor returns the connection. Distinct from
+    // outstanding_conns_ which counts all live connections (idle
+    // keep-alive sockets included).
+    std::atomic<int64_t> inflight_leases_{0};
+
+    // Bumped from ProxyTransaction::Start, decremented at terminal
+    // completion. Read by HttpServer::WaitForAllAsyncDrain alongside
+    // active_leases.
+    std::atomic<int64_t> inflight_transactions_{0};
 
     std::mutex drain_mtx_;
     std::condition_variable drain_cv_;

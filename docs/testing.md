@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run the full sweep (1021 tests across 35+ suites at HEAD)
+make test               # Build and run all suites (1021 tests across 35+ suites at HEAD)
 ./test_runner                   # Run all tests directly (after building)
 ./test_runner help              # Print every supported flag
 
@@ -343,6 +343,54 @@ Success Rate: 100%
 - **Exception-safe recording**: Wrap test logic in try/catch, record failure on exception
 - **Atomic result tracking**: Use `std::atomic<int>` counters for multi-threaded test result aggregation
 - **Timeout on all sockets**: Prevents tests from hanging indefinitely on server failure
+
+## Continuous Integration
+
+CI workflows live in `.github/workflows/` and run in three cadences. Stress and valgrind never gate PRs — both run on cron and are independent of the per-PR matrix.
+
+Stress is also gated out of the per-PR no-arg `./test_runner` invocation: `RunAllTest()` checks `getenv("GITHUB_ACTIONS")` and skips `StressTests::RunStressTests()` when set. GitHub Actions sets `GITHUB_ACTIONS=true` automatically on its runners, so the per-PR matrix runs every other suite but never stress; `nightly-stress.yml` invokes `./test_runner stress` directly (the explicit-flag path bypasses `RunAllTest`). Local runs and Codespaces (which do NOT set `GITHUB_ACTIONS`) include stress so developers get full coverage from `make test`.
+
+Stress runs with `continue-on-error: true` because high-concurrency suites are legitimately flake-prone on shared runners. Valgrind does NOT use `continue-on-error`: a memory error caught by `valgrind --error-exitcode=1` should surface as a red scheduled run, otherwise the weekly job is just burning runner-minutes.
+
+### Per-PR (`.github/workflows/ci.yml`)
+
+Six parallel jobs gate every PR. Cheap dimensions run all suites; the slow dimension (TSan) is sharded by hand-curated buckets so the critical path stays under ~13 minutes.
+
+| Job | Runner | What it runs |
+|-----|--------|--------------|
+| `build-linux-gcc` | ubuntu-latest | All suites under gcc, no sanitizers — fastest signal that the build links and the suite passes. (Stress is skipped via the `GITHUB_ACTIONS` gate; see above.) |
+| `build-linux-clang` | ubuntu-latest | All suites under clang. Catches warnings / codegen-driven UB that gcc misses. (Stress is skipped via the `GITHUB_ACTIONS` gate.) |
+| `build-linux-asan` | ubuntu-latest | All suites under AddressSanitizer + UndefinedBehaviorSanitizer. Catches UAF, heap/stack overflows, signed overflow, alignment, null deref. `detect_leaks=0` to tolerate test-harness teardown. (Stress is skipped via the `GITHUB_ACTIONS` gate.) |
+| `build-linux-tsan-heavy` | ubuntu-latest | ThreadSanitizer on the two slowest umbrellas: `race` and `auth`. (TSan amplifies runtime ~5–10x; isolating these lets the rest finish in parallel.) |
+| `build-linux-tsan-rest` | ubuntu-latest | ThreadSanitizer on every other suite enumerated explicitly (basic, http, http2, ws, tls, cli, route, kqueue, upstream, proxy, rate_limit, circuit_breaker, dns, the obs_* family). |
+| `build-macos` | macos-14 | OS-sensitive subset only — kqueue, race, timeout, tls, cli, upstream, proxy, http, http2, ws, dual_stack, obs_e2e. Pure-logic suites are platform-deterministic and already covered by the Linux jobs. |
+
+The PR matrix uses GitHub Actions `concurrency: cancel-in-progress: true`, so a follow-up commit on the same branch automatically cancels the in-flight run.
+
+**Compile-time caching.** Every Linux job and the macOS job wraps the build step in [`hendrikmuhs/ccache-action`](https://github.com/hendrikmuhs/ccache-action). `create-symlink: true` puts ccache symlinks ahead of `gcc` / `g++` / `clang` / `clang++` on `PATH` so the Makefile picks them up transparently — no Makefile edit needed. Cache keys are per matrix dimension (`ccache-linux-gcc`, `ccache-linux-clang`, `ccache-linux-asan`, `ccache-linux-tsan`, `ccache-macos-arm64`); `tsan-heavy` and `tsan-rest` share `ccache-linux-tsan` since they compile identical TSan binaries. `max-size` is 300M for non-sanitizer dims and 500M for sanitizer dims (sanitizer instrumentation roughly doubles object size). Total per-PR cache footprint ~1.9 GB across 5 unique keys, well under GitHub's 10 GB per-repo cap. Expected warm-cache build wall-clock: ~30–60s vs ~7–13 min cold.
+
+### Nightly cron (`.github/workflows/nightly-stress.yml`)
+
+Runs at 07:00 UTC (= 00:00 PT). Stress suites are noisy on shared CI runners (200 concurrent clients with an 85% success-rate threshold under `CI=true`; 1000 clients with 95% threshold locally) — a failure here means "investigate flake," not "investigate code". The workflow uses `continue-on-error: true` and does not red-X the badge. Each job invokes `./test_runner stress` directly, which bypasses the `RunAllTest()` `GITHUB_ACTIONS` gate that excludes stress from the per-PR matrix.
+
+- `stress-linux` — ubuntu-latest, full stress sweep
+- `stress-macos` — macos-14, full stress sweep
+
+### Weekly cron (`.github/workflows/weekly-valgrind.yml`)
+
+Runs Sundays at 09:00 UTC. Valgrind catches reads-of-uninitialized-memory and pointer-validity bugs that AddressSanitizer cannot, but its 10–50x runtime overhead makes it unsuitable for PR-blocking CI. The workflow has a 6-hour timeout cap and runs against a curated subset (excludes `stress`, `timeout`, `race`, `obs_stress`, `obs_export` — interpreter slowdown collapses their timing assertions). Unlike `nightly-stress.yml`, this workflow does NOT set `continue-on-error: true`: a memory error from `valgrind --error-exitcode=1` must surface as a red scheduled run so the failure is actionable, not silently swallowed.
+
+### Adding a new test suite to CI
+
+When adding a suite to `test/run_test.cc::RunAllTest()`:
+
+1. The Linux gcc / clang / ASan jobs auto-pick it up (all suites).
+2. **Add the new flag to the loop in `build-linux-tsan-rest`** — TSan does not auto-pick-up. If the new suite is heavy (>30s base runtime) or is itself a multi-suite umbrella, add it to `build-linux-tsan-heavy` instead.
+3. If the suite touches OS-level primitives (sockets, signals, FDs, kqueue, TLS, DNS) add it to the macOS subset in `build-macos`.
+4. If it's stress-shaped, add it to `nightly-stress.yml` (invoked via an explicit `./test_runner <flag>` step). If the suite has heavy variants you also want to gate out of the per-PR no-arg invocation, mirror the existing stress pattern: gate the call site in `RunAllTest()` on `getenv("GITHUB_ACTIONS")` so local runs include it but the GitHub Actions PR matrix skips it.
+5. If it's memory-safety-flavored and not timing-sensitive, add it to the loop in `weekly-valgrind.yml`.
+
+Internal contributors: see `.claude/rules/DEVELOPMENT_RULES.md` "CI workflow maintenance" for the full pre-PR audit checklist.
 
 ## Thread Pool Tests
 

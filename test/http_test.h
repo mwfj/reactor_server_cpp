@@ -1875,6 +1875,182 @@ namespace HttpTests {
         }
     }
 
+    // Regression: an H1 streaming handler that sends a body-suppressed
+    // response (HEAD / 204 / 205 / 304) and returns WITHOUT calling
+    // End() must still finalise the request: clear
+    // deferred_response_pending_ so a subsequent pipelined request on
+    // the same keep-alive connection is parsed instead of being stashed
+    // in deferred_pending_buf_, and decrement active_requests_. The
+    // wire response was already complete after the head bytes; End()
+    // would be redundant. Pre-fix the connection would wedge — the
+    // first response went out fine, but the second request never got
+    // dispatched because the deferred state was never released.
+    void TestH1_StreamingBodyless204NoEndKeepsKeepalive() {
+        std::cout << "\n[TEST] H1 streaming: bodyless 204 without End() "
+                  << "keeps keep-alive parsing the next request..."
+                  << std::endl;
+        try {
+            HttpServer server("127.0.0.1", 0);
+            server.GetAsync(
+                "/no-end",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(204);
+                    (void)stream_sender.SendHeaders(head);
+                    // Intentionally NO End() — exercises the SendHeaders
+                    // body-suppressed finalize path.
+                });
+            server.Get("/after", [](const HttpRequest&, HttpResponse& res) {
+                res.Status(200).Text("AFTER-BODY");
+            });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+            int64_t before = server.GetStats().active_requests;
+
+            // Pipeline both requests in a single send. The second
+            // request reaches the dispatcher only when the first
+            // request's deferred async state is properly cleared.
+            std::string payload =
+                "GET /no-end HTTP/1.1\r\nHost: x\r\n\r\n"
+                "GET /after HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+            std::string resp = SendRawAndDrain(port, payload, 3000);
+
+            bool pass = true;
+            std::string err;
+            std::string lower = resp;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower.find("http/1.1 204") == std::string::npos) {
+                pass = false; err += "missing 204 response; ";
+            }
+            if (resp.find("AFTER-BODY") == std::string::npos) {
+                pass = false;
+                err += "second pipelined request never produced a response — "
+                       "deferred_response_pending_ leak; ";
+            }
+
+            // Bookkeeping must drop back to baseline before the
+            // connection closes. Pre-fix the decrement happened only at
+            // socket close, well after this poll window.
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(2);
+            int64_t after = server.GetStats().active_requests;
+            while (after != before &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                after = server.GetStats().active_requests;
+            }
+            if (after != before) {
+                pass = false;
+                err += "active_requests stuck at " + std::to_string(after) +
+                       " (expected " + std::to_string(before) + "); ";
+            }
+
+            TestFramework::RecordTest(
+                "H1 streaming: bodyless 204 without End() keeps keepalive",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: bodyless 204 without End() keeps keepalive",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
+    // Regression: after a bodyless streaming response, the request-
+    // timeout deadline (cleared by `finalize_response_`) must be re-
+    // armed if the client follows the response with the FIRST BYTES
+    // of the next pipelined request and then goes silent. Without the
+    // re-arm, slowloris protection only kicks in via the much longer
+    // idle timeout. Exercises the post-response cleanup path that the
+    // streaming-finalised-sync branch must fall through to.
+    void TestH1_StreamingBodylessRearmsRequestDeadlineForPartialNext() {
+        std::cout << "\n[TEST] H1 streaming: bodyless rearms request "
+                  << "timeout for partial next request..." << std::endl;
+        try {
+            ServerConfig config;
+            config.bind_host = "127.0.0.1";
+            config.bind_port = 0;
+            config.request_timeout_sec = 2;
+            config.idle_timeout_sec = 60;
+            config.worker_threads = 2;
+
+            HttpServer server(config);
+            server.GetAsync(
+                "/no-end",
+                [](const HttpRequest&,
+                   HttpRouter::InterimResponseSender /*send_interim*/,
+                   HttpRouter::ResourcePusher /*push_resource*/,
+                   HttpRouter::StreamingResponseSender stream_sender,
+                   HttpRouter::AsyncCompletionCallback /*complete*/) {
+                    HttpResponse head;
+                    head.Status(204);
+                    (void)stream_sender.SendHeaders(head);
+                });
+
+            TestServerRunner<HttpServer> runner(server);
+            int port = runner.GetPort();
+
+            int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(port);
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+            connect(sockfd, (struct sockaddr*)&addr, sizeof(addr));
+
+            // Complete first request + partial second request (no
+            // \r\n\r\n terminator) in one send, then go silent. The
+            // server must arm the 2s deadline for the partial second
+            // request and fire 408 / close.
+            std::string payload =
+                "GET /no-end HTTP/1.1\r\nHost: x\r\n\r\n"
+                "GET /partial HTTP/1.1\r\nHost: x\r\n";
+            send(sockfd, payload.data(), payload.size(), 0);
+
+            // Allow up to 5s for the 2s deadline + scan interval + 408.
+            struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0;
+            setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            char buf[4096] = {};
+            std::string response;
+            ssize_t n;
+            auto t0 = std::chrono::steady_clock::now();
+            while ((n = recv(sockfd, buf, sizeof(buf) - 1, 0)) > 0) {
+                response.append(buf, n);
+            }
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            close(sockfd);
+
+            bool got_204 = response.find("HTTP/1.1 204") != std::string::npos;
+            bool got_408 = response.find(" 408 ") != std::string::npos;
+            bool got_server_close = (n == 0);
+
+            bool pass = got_204 && (got_408 || got_server_close) && elapsed < 5;
+            std::string err;
+            if (!got_204) err += "missing 204 response; ";
+            if (!got_408 && !got_server_close)
+                err += "request timeout never enforced for partial next "
+                       "request (n=" + std::to_string(n) + ", elapsed=" +
+                       std::to_string(elapsed) + "s); ";
+            if (elapsed >= 5)
+                err += "took longer than request_timeout window; ";
+
+            TestFramework::RecordTest(
+                "H1 streaming: bodyless rearms request deadline for "
+                "partial next request",
+                pass, err, TestFramework::TestCategory::OTHER);
+        } catch (const std::exception& e) {
+            TestFramework::RecordTest(
+                "H1 streaming: bodyless rearms request deadline for "
+                "partial next request",
+                false, e.what(), TestFramework::TestCategory::OTHER);
+        }
+    }
+
     void TestH1_Streaming205CanonicalizesContentLength() {
         std::cout << "\n[TEST] H1 streaming: 205 canonicalizes Content-Length..." << std::endl;
         try {
@@ -2902,6 +3078,8 @@ namespace HttpTests {
         TestH1_StreamingTrailers_DeclarationFiltersForbiddenNames();
         TestH1_StreamingTrailers_SuppressedWhenNotChunked();
         TestH1_StreamingTrailers_DropsUndeclaredFields();
+        TestH1_StreamingBodyless204NoEndKeepsKeepalive();
+        TestH1_StreamingBodylessRearmsRequestDeadlineForPartialNext();
         TestH1_Streaming205CanonicalizesContentLength();
         TestH1_StreamingDeduplicatesContentLength();
         TestH1_StreamingHttp10UnknownLengthOmitsContentLength();

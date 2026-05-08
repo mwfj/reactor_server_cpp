@@ -3,11 +3,12 @@
 #include "http/push_helper.h"
 #include "config/config_loader.h"
 #include "net/dns_resolver.h"            // IsValidHostOrIpLiteral grammar
-#include "ws/websocket_frame.h"
-#include "http2/http2_constants.h"
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
 #include "auth/auth_manager.h"
+#include "observability/observability_manager.h"
+#include "observability/observability_middleware.h"
+#include "observability/observability_snapshot.h"
 #include "auth/auth_middleware.h"
 #include "circuit_breaker/circuit_breaker_manager.h"
 #include "circuit_breaker/circuit_breaker_host.h"
@@ -26,6 +27,45 @@
 // when the slot is null (called outside any sync dispatch).
 thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher*
     HttpServer::current_sync_pusher_ = nullptr;
+
+// Compute the wire body size for the given response under H1/H2
+// bodyless-status semantics. HEAD requests + 1xx / 204 / 304 statuses
+// always emit zero body; other statuses emit response.body.size()
+// bytes (modulo HEAD-strip, which is applied at the wire level inside
+// the connection handler). Mirrors the helper in
+// http_connection_handler.cc but exposed here for FinalizeIfSnapshot.
+static uint64_t ObsWireBodySize(const HttpResponse& response,
+                                  bool was_head_request) noexcept {
+    if (was_head_request) return 0;
+    const int status = response.GetStatusCode();
+    if (status >= 100 && status < 200) return 0;
+    // 204 No Content / 205 Reset Content / 304 Not Modified all
+    // forbid a body — HttpResponse::Serialize + the H2 submit path
+    // suppress the body bytes on the wire, so observability must
+    // record 0 even if a handler accidentally left a body on the
+    // response object.
+    if (status == HttpStatus::NO_CONTENT
+        || status == HttpStatus::RESET_CONTENT
+        || status == HttpStatus::NOT_MODIFIED) {
+        return 0;
+    }
+    return static_cast<uint64_t>(response.GetBody().size());
+}
+
+// static
+void HttpServer::FinalizeIfSnapshot(HttpRequest& request,
+                                      const HttpResponse& response,
+                                      std::string error_type) {
+    if (!request.obs_snapshot) return;
+    auto& snap = *request.obs_snapshot;
+    auto mgr = snap.manager.lock();
+    if (!mgr) return;  // manager torn down before finalize — kill loop ran.
+    const bool was_head = (request.method == "HEAD");
+    const uint64_t wire_body_size = ObsWireBodySize(response, was_head);
+    const int status = response.GetStatusCode();
+    mgr->FinalizeFromSnapshot(snap, status, wire_body_size,
+                               std::move(error_type));
+}
 
 // Factory for the H2 ResourcePusher closure. Both the async (bound on
 // the AsyncHandler signature) and sync (installed into
@@ -174,10 +214,22 @@ namespace {
 //     stamp Connection: close (H1) or no-op (H2) based on shutdown
 //     state and whether the user handler threw.
 //
-//   submit(handle, resp)
-//     Sends the final response.
-//       H1: ClearDeferred + CompleteAsyncResponse (close handled inside).
-//       H2: SubmitStreamResponse(stream_id, resp).
+//   submit(handle, req, resp, error_type)
+//     Sends the final response AND owns the FinalizeIfSnapshot call.
+//     Each protocol's submit decides the finalize ordering:
+//       H1: FinalizeIfSnapshot BEFORE CompleteAsyncResponse — that
+//           call replays deferred_pending_buf_ which can synchronously
+//           start the next pipelined request, so the finalize must
+//           land first to avoid racing with request B's snapshot.
+//       H2: FinalizeIfSnapshot AFTER SubmitStreamResponse — submit
+//           returns the nghttp2 result, and even on success the post-
+//           submit flush can discard frames if the peer batched
+//           RST_STREAM. The H2 submit checks the actual wire outcome
+//           via WasStreamClosedSuccessfully and finalizes accordingly.
+//     `error_type` is computed by MakeAsyncResumeCallback (handler_threw
+//     / rejected_by_async_middleware / "" on success-shaped) and passed
+//     through verbatim so each path can decide whether to override on
+//     wire-level failure.
 //
 // Lifetime: state, req, resp are shared_ptrs captured by value; HandlerT
 // is held weakly and re-locked at each invocation so a torn-down
@@ -242,11 +294,32 @@ MakeAsyncResumeCallback(
                 *resp = HttpResponse::InternalError();
             }
             tweak_response(*resp, threw);
+            // Compute error_type but DO NOT finalize here — each
+            // protocol's submit owns the finalize call (see the
+            // SubmitFn contract docstring above for why H1 wants
+            // finalize-before-submit and H2 wants finalize-after-
+            // submit).
+            std::string error_type;
+            if (threw) {
+                error_type = "handler_threw";
+            } else if (shared_payload->result ==
+                           HttpRouter::AsyncMiddlewareResult::DENY) {
+                error_type = "rejected_by_async_middleware";
+            }
             try {
-                submit(*handle, *resp);
+                submit(*handle, *req, *resp, std::move(error_type));
             } catch (const std::exception& e) {
                 logging::Get()->error(
                     "Exception sending resumed response: {}", e.what());
+                // submit() owns the FinalizeIfSnapshot call; pre_dispatch
+                // already erased the H2 abort hook, so a throw here
+                // would leave neither success-finalize nor
+                // client_disconnect-finalize landing — the snapshot
+                // would stay registered until the shutdown kill loop.
+                // Defensively finalize as "submit_failed"; the CAS gate
+                // makes this idempotent against any partial finalize
+                // submit may have done before the throw.
+                HttpServer::FinalizeIfSnapshot(*req, *resp, "submit_failed");
             }
             do_bookkeeping();
         });
@@ -403,9 +476,9 @@ struct TopLevelAuthPolicyMergeResult {
 
 // Preserve the LIVE top-level auth policy topology across SIGHUP. Top-level
 // policy fields (enabled / applies_to / issuers / required_scopes /
-// required_audience / on_undetermined / realm) are live-reloadable per
-// design §11.2 step 4 — BY IDENTITY, using stable `name` (required +
-// uniqueness enforced by the top-level-policy validator).
+// required_audience / on_undetermined / realm) are live-reloadable BY
+// IDENTITY, using stable `name` (required + uniqueness enforced by the
+// top-level-policy validator).
 //
 // The hazardous case is a policy edit whose staged `issuers[]` references
 // an issuer that isn't in the LIVE AuthManager::issuers_ map (issuer add
@@ -414,9 +487,9 @@ struct TopLevelAuthPolicyMergeResult {
 // `applies_to`, `enabled`) TO MATCH the new issuer in the same reload.
 // A partial-apply that took the staged peers while pinning issuers to
 // the live list would apply new-issuer-tuned rules to old-issuer traffic
-// → 401/403 on previously-working tokens. Design §11.2 step 4 / §18.5
-// mandate **whole-policy defer** for that case: preserve the ENTIRE
-// live policy for that identity, not just the issuers list.
+// → 401/403 on previously-working tokens. The fix is **whole-policy
+// defer** for that case: preserve the ENTIRE live policy for that
+// identity, not just the issuers list.
 //
 // Rules:
 //   - Edit (name matches live): if staged.issuers[] ⊆ live_issuer_names,
@@ -451,7 +524,7 @@ struct TopLevelAuthPolicyMergeResult {
 //
 // Live vector ORDER is preserved for matched identities; new live-safe
 // adds append at the end. Longest-prefix matching is the sole runtime
-// tie-breaker (design §3.2), so vector order only affects inert cases.
+// tie-breaker, so vector order only affects inert cases.
 static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopology(
         const std::vector<AUTH_NAMESPACE::AuthPolicy>& live_policies,
         const std::vector<AUTH_NAMESPACE::AuthPolicy>& staged_policies,
@@ -536,8 +609,8 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         auto it = staged_by_name.find(live.name);
         if (it == staged_by_name.end()) {
             // Staged removed or renamed this policy. Default: drop
-            // (live-reloadable removal per design §11.2 step 4). BUT if
-            // the SAME reload has a DEFERRED ADD covering SOME of this
+            // (live-reloadable removal). BUT if the SAME reload has a
+            // DEFERRED ADD covering SOME of this
             // policy's prefixes, treat those specific prefixes as a
             // migration-in-progress and preserve a TRIMMED copy of the
             // live policy that only covers the overlapping prefixes.
@@ -560,8 +633,8 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         if (!issuers_all_live(staged)) {
             // Issuer-refs point at non-live issuers. Two sub-cases:
             //
-            // A) staged.enabled=true — whole-policy defer (design §11.2
-            //    step 4 / §18.5). Applying staged peer fields
+            // A) staged.enabled=true — whole-policy defer. Applying
+            //    staged peer fields
             //    (required_audience, required_scopes, etc.) against
             //    traffic still flowing through the OLD live issuer
             //    would 401/403 previously-working tokens. Preserve the
@@ -838,7 +911,7 @@ void HttpServer::MarkServerReady() {
     {
         RateLimitManager* rl = rate_limit_manager_.get();
         router_.PrependMiddleware([rl](
-            const HttpRequest& request, HttpResponse& response) -> bool {
+            HttpRequest& request, HttpResponse& response) -> bool {
             if (!rl->enabled()) return true;
 
             if (!rl->Check(request, response)) {
@@ -1183,6 +1256,19 @@ void HttpServer::MarkServerReady() {
     // for the sizing logic and opt-out sentinel.
     RecomputeAsyncDeferredCap();
 
+    // Observability middleware — installed LAST so PrependMiddleware's
+    // "last prepend runs first" places it at the HEAD of the chain.
+    // It must run BEFORE auth + rate-limit so middleware-rejection
+    // paths can finalize through a populated snapshot. Skipped when
+    // observability is not configured.
+    if (observability_manager_) {
+        router_.PrependMiddleware(
+            OBSERVABILITY_NAMESPACE::MakeObservabilityMiddleware(
+                observability_manager_));
+        logging::Get()->info(
+            "ObservabilityManager middleware installed");
+    }
+
     start_time_ = std::chrono::steady_clock::now();
     server_ready_.store(true, std::memory_order_release);
 }
@@ -1403,9 +1489,9 @@ HttpServer::HttpServer(ServerConfig config)
                   config.worker_threads)
 {
     // Ctor body is pure configuration wiring — no listen socket, no
-    // DNS, no dispatchers. `Start()` owns Phase A (DNS batch), Phase B
-    // (StartListening on the resolved address), and Phase C (dispatcher
-    // bootstrap) per §5.4a. This lets a SIGTERM arriving between ctor
+    // DNS, no dispatchers. `Start()` owns the DNS batch, StartListening
+    // on the resolved address, and dispatcher bootstrap. This lets a
+    // SIGTERM arriving between ctor
     // completion and Start() produce a clean shutdown with no listener
     // open, and allows hostname bind to flow through the async
     // DnsResolver instead of synchronous getaddrinfo at ctor time.
@@ -1911,8 +1997,10 @@ void HttpServer::Proxy(const std::string& route_pattern,
             // Capture handler by shared_ptr so the lambda shares
             // ownership — later overwrites of proxy_handlers_[handler_key]
             // don't destroy this handler while this route is still live.
-            router_.RouteAsync(mr.method, pattern,
-                [handler](const HttpRequest& request,
+            // RouteProxyAsync (NOT RouteAsync) so ResolveRouteMatch can
+            // demux this entry as RouteKind::Proxy at step (2).
+            router_.RouteProxyAsync(mr.method, pattern,
+                [handler](HttpRequest& request,
                           HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
                           HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
                           HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
@@ -2320,8 +2408,10 @@ void HttpServer::RegisterProxyRoutes() {
             for (const auto& pattern : mr.patterns) {
                 // Capture handler by shared_ptr so the lambda shares
                 // ownership and survives any later overwrite.
-                router_.RouteAsync(mr.method, pattern,
-                    [handler](const HttpRequest& request,
+                // RouteProxyAsync (NOT RouteAsync) so ResolveRouteMatch
+                // can demux this entry as RouteKind::Proxy at step (2).
+                router_.RouteProxyAsync(mr.method, pattern,
+                    [handler](HttpRequest& request,
                               HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
                               HTTP_CALLBACKS_NAMESPACE::ResourcePusher        /*push_resource*/,
                               HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender stream_sender,
@@ -2391,10 +2481,10 @@ void HttpServer::Start() {
         return;
     }
 
-    // DNS resolution (off the reactor; no threads running) ──
-    // §5.4a. Batch contains one entry per configured upstream plus a
-    // `bind` entry for bind_host. For literal hosts (IP addresses)
-    // DnsResolver short-circuits without spawning worker threads, so
+    // DNS resolution (off the reactor; no threads running). Batch
+    // contains one entry per configured upstream plus a `bind` entry
+    // for bind_host. For literal hosts (IP addresses) DnsResolver
+    // short-circuits without spawning worker threads, so
     // literal-only deployments pay zero DNS cost here.
     //
     // The `tag` field distinguishes bind from upstream in the result
@@ -2829,30 +2919,59 @@ void HttpServer::Stop() {
                     WaitForH2Drain();
                 }
             }
-            // Upstream shutdown — deferred until AFTER H2/WS/H1 protocol
-            // drains so proxy handlers dispatched during the drain window
-            // can still call CheckoutAsync() successfully. Initiating here
-            // sets the reject-new-checkouts flag, then WaitForDrain waits
-            // for in-flight leases to complete.
+            const auto drain_budget = std::chrono::seconds(
+                shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
+            // Single shutdown deadline anchors steps 1/2/3 (observability
+            // flush, upstream drain, kill+shutdown) and the post-upstream
+            // H1 flush below. The earlier H1/H2/WS protocol drains have
+            // their own independent timeouts (H1_DRAIN_TIMEOUT_SEC, H2
+            // GOAWAY drain, WS close) and are NOT folded into this
+            // budget — operator-configured shutdown_drain_timeout_sec
+            // is the cap for this section, not for total Stop() wall.
+            const auto shutdown_deadline =
+                std::chrono::steady_clock::now() + drain_budget;
+            auto budget_left = [shutdown_deadline]() {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= shutdown_deadline) {
+                    return std::chrono::milliseconds{0};
+                }
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    shutdown_deadline - now);
+            };
+
+            // Step 1 — observability flush BEFORE upstream pool
+            // shutdown. The BatchSpanProcessor's final flush (when the
+            // OTLP push pipeline is wired) routes through
+            // UpstreamHttpClient against the same pools that
+            // InitiateShutdown is about to take down; running flush
+            // first keeps those checkouts valid. Today's
+            // NoopSpanProcessor wiring makes flush a no-op, but we wait
+            // for natural finalize drain so proxy in-flight that
+            // completes during the upcoming upstream drain doesn't
+            // race the kill loop.
+            const bool flushed = FlushObservabilityForShutdown(budget_left());
+            // Step 2 — upstream shutdown. Initiate AFTER protocol drain
+            // so proxy handlers dispatched during the drain can still
+            // check out. In-flight proxy requests that complete during
+            // this window finalize via the normal path against still-
+            // live snapshots.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
-                upstream_manager_->WaitForDrain(
-                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
-                        std::memory_order_relaxed)));
+                upstream_manager_->WaitForDrain(budget_left());
             }
-            // Post-upstream H1 flush window: an async (exempt) HTTP/1 handler
-            // whose completion fires during the upstream drain (or that takes
-            // longer than the first H1 drain loop) only starts writing its
-            // client response after the earlier H1 drain has finished. Use
-            // the operator-configured shutdown_drain_timeout_sec_ instead of
-            // the hard-coded H1_DRAIN_TIMEOUT_SEC: any async H1 route that
-            // doesn't go through UpstreamManager (or simply takes longer than
-            // 2s before it starts writing) would otherwise be cut off when
-            // StopEventLoop runs.
+            // Step 3 — kill survivors + BeginShutdown AFTER upstream
+            // drain so any proxy in-flight that finalized during step 2
+            // reached Span::End before the kill sweep.
+            KillAndShutdownObservability(budget_left(), flushed);
+            // Post-upstream H1 flush window: an async (exempt) HTTP/1
+            // handler whose completion fires during the upstream drain
+            // (or that takes longer than the first H1 drain loop) only
+            // starts writing its client response after the earlier H1
+            // drain has finished. Bounded by the same shutdown deadline
+            // as everything else.
             {
-                auto h1_deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
-                        std::memory_order_relaxed));
+                auto h1_deadline =
+                    std::chrono::steady_clock::now() + budget_left();
                 while (std::chrono::steady_clock::now() < h1_deadline) {
                     if (!HasPendingH1Output()) break;
                     std::this_thread::sleep_for(
@@ -2979,18 +3098,33 @@ void HttpServer::Stop() {
                     }
                 }
             }
-            // Upstream drain — initiate AFTER protocol drains so late
-            // proxy handlers can still check out. Then poll with task pump
-            // until leases are returned, and force-close stragglers.
-            // Followed by a second H1 flush window so async proxy
-            // responses that arrive DURING the upstream drain still have
-            // time to write their client bytes before the event loop stops.
+            const auto drain_budget_sec = std::chrono::seconds(
+                shutdown_drain_timeout_sec_.load(std::memory_order_relaxed));
+            // Single shutdown deadline — same hard-cap contract as the
+            // off-thread path above.
+            const auto dt_shutdown_deadline =
+                std::chrono::steady_clock::now() + drain_budget_sec;
+            auto dt_budget_left = [dt_shutdown_deadline]() {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= dt_shutdown_deadline) {
+                    return std::chrono::milliseconds{0};
+                }
+                return std::chrono::duration_cast<std::chrono::milliseconds>(
+                    dt_shutdown_deadline - now);
+            };
+            // Step 1 — observability flush BEFORE upstream pool
+            // shutdown — see the off-thread path above for rationale.
+            const bool flushed = FlushObservabilityForShutdown(
+                dt_budget_left());
+            // Step 2 — upstream drain — initiate AFTER protocol drains
+            // so late proxy handlers can still check out. Then poll
+            // with task pump until leases return, and force-close
+            // stragglers.
             if (upstream_manager_) {
                 upstream_manager_->InitiateShutdown();
                 static constexpr int UP_PUMP_MS = 200;
-                auto up_deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
-                        std::memory_order_relaxed));
+                auto up_deadline =
+                    std::chrono::steady_clock::now() + dt_budget_left();
                 while (std::chrono::steady_clock::now() < up_deadline) {
                     net_server_.ProcessSelfDispatcherTasks();
                     if (upstream_manager_->AllDrained()) break;
@@ -2999,12 +3133,15 @@ void HttpServer::Stop() {
                 }
                 upstream_manager_->ForceCloseRemaining();
             }
-            // Post-upstream H1 flush window: use the configured drain budget
-            // so async H1 routes that take longer than 2s aren't cut off.
+            // Step 3 — kill survivors + BeginShutdown AFTER upstream
+            // drain so any proxy in-flight that finalized during step 2
+            // reached Span::End before the kill sweep.
+            KillAndShutdownObservability(dt_budget_left(), flushed);
+            // Post-upstream H1 flush window — bounded by the same
+            // shutdown deadline as everything else.
             {
-                auto h1_deadline = std::chrono::steady_clock::now() +
-                    std::chrono::seconds(shutdown_drain_timeout_sec_.load(
-                        std::memory_order_relaxed));
+                auto h1_deadline =
+                    std::chrono::steady_clock::now() + dt_budget_left();
                 while (std::chrono::steady_clock::now() < h1_deadline) {
                     net_server_.ProcessSelfDispatcherTasks();
                     if (!HasPendingH1Output()) break;
@@ -3111,6 +3248,148 @@ void HttpServer::WaitForH2Drain() {
     }
 }
 
+bool HttpServer::WaitForAllAsyncDrain(
+        std::chrono::milliseconds timeout) {
+    const auto drain_started_at = std::chrono::steady_clock::now();
+    const auto budget_ms = timeout;
+    // Predicate gates each counter on its owning manager being non-
+    // null. Null managers contribute zero, so the predicate short-
+    // circuits true when nothing is in flight.
+    //
+    // The observability check covers THREE counters:
+    //   - inflight_finalizations_  : registered, not-yet-finalized.
+    //   - finalizers_in_progress_  : a finalize won the CAS and is
+    //                                still inside OnFinalizeWinner.
+    //                                Decremented AFTER inflight is
+    //                                decremented, so the window where
+    //                                inflight==0 but finalizer hasn't
+    //                                returned must also be drained.
+    //   - kill_marshals_in_flight_ : RESERVED for a future per-
+    //                                dispatcher kill-marshal step
+    //                                (today the kill loop runs inline
+    //                                from the stopper thread; no
+    //                                incrementer/decrementer exists).
+    //                                The clause is permanently zero
+    //                                today and is kept here so the
+    //                                predicate is forward-compatible
+    //                                with that wiring.
+    auto* upm = upstream_manager_.get();
+    auto* obs = observability_manager_.get();
+    auto predicate = [upm, obs]() {
+        return (upm == nullptr
+                || (upm->active_leases() == 0
+                    && upm->inflight_transactions() == 0))
+            && (obs == nullptr
+                || (obs->inflight_finalizations() == 0
+                    && obs->finalizers_in_progress() == 0
+                    && obs->kill_marshals_in_flight() == 0));
+    };
+
+    if (predicate()) return true;
+
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    if (obs) {
+        // The observability cv signals on every finalize-decrement.
+        // Re-check the upstream half on each wake — that side has no
+        // cv of its own.
+        std::unique_lock<std::mutex> lck(obs->finalizers_done_mtx());
+        while (!predicate()) {
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            obs->finalizers_done_cv().wait_for(
+                lck, std::chrono::milliseconds(50));
+        }
+    } else if (upm) {
+        // No observability manager — periodically re-check the
+        // predicate, with a wakeup hook on the upstream drain cv as
+        // an opportunistic short-circuit. PoolPartition's
+        // MaybeSignalDrain only fires on the LAST decrement to zero
+        // (gated on shutting_down_ && outstanding_conns <= 0), and
+        // DecInflightTransactions is a silent atomic — so the cv is
+        // not a reliable per-event wake. The 50 ms timer is what
+        // actually drives progress; the cv occasionally lets us
+        // short-circuit on the final zero-crossing.
+        std::unique_lock<std::mutex> lck(upm->drain_mtx());
+        while (!predicate()) {
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            upm->drain_cv().wait_for(lck, std::chrono::milliseconds(50));
+        }
+    }
+
+    bool drained = predicate();
+    if (!drained) {
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - drain_started_at);
+        logging::Get()->warn(
+            "WaitForAllAsyncDrain timeout — "
+            "budget_ms={} elapsed_ms={} active_leases={} "
+            "inflight_transactions={} inflight_finalizations={} "
+            "finalizers_in_progress={} kill_marshals_in_flight={}",
+            budget_ms.count(), elapsed_ms.count(),
+            upm ? upm->active_leases() : 0,
+            upm ? upm->inflight_transactions() : 0,
+            obs ? obs->inflight_finalizations() : 0,
+            obs ? obs->finalizers_in_progress() : 0,
+            obs ? obs->kill_marshals_in_flight() : 0);
+    }
+    return drained;
+}
+
+bool HttpServer::FlushObservabilityForShutdown(
+        std::chrono::milliseconds budget) {
+    bool drained = WaitForAllAsyncDrain(budget);
+    // TODO: when the OTLP push pipeline is wired, call
+    // BatchSpanProcessor::ForceFlush here. The pre-upstream-shutdown
+    // placement keeps those exporter checkouts against live pools.
+    // ForceFlush is not on the SpanProcessor base interface today —
+    // either dynamic_cast or expand the base when wiring lands.
+    return drained;
+}
+
+void HttpServer::KillAndShutdownObservability(
+        std::chrono::milliseconds budget,
+        bool drained_in_flush_phase) {
+    if (!observability_manager_) return;
+    // Anchor on a single deadline so the function's total wall <= budget.
+    // The original split passed `budget` to BOTH the finalizer-drain
+    // wait_until AND BeginShutdown's JoinWorkers, allowing 2x budget
+    // worst case. Compute remaining-after-each-step instead.
+    const auto deadline =
+        std::chrono::steady_clock::now() + budget;
+    auto remaining = [deadline]() {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return std::chrono::milliseconds{0};
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+    };
+    if (!drained_in_flush_phase) {
+        // KillOutstandingSnapshots is synchronous CAS work; the grace
+        // parameter is currently unused (see method docstring). Skip
+        // when step 1 already drained — the registry is empty.
+        observability_manager_->KillOutstandingSnapshots(remaining());
+    }
+    // Always wait for finalizers_in_progress_ to drain before
+    // BeginShutdown, even when step 1 returned drained=true. Step 2's
+    // upstream-pool drain runs between step 1 and here, and proxy
+    // transactions that complete during step 2 trigger fresh
+    // FinalizeFromSnapshot calls. Those finalizers may be mid-
+    // OnFinalizeWinner when this function is entered; if BeginShutdown
+    // signals the processor before they reach Span::End, OnEnd sees
+    // shutting_down_ and drops the completed span as post-shutdown
+    // overflow. Today's NoopSpanProcessor masks the loss; the moment
+    // BatchSpanProcessor wires in, this becomes user-visible data
+    // loss.
+    auto* obs = observability_manager_.get();
+    {
+        std::unique_lock<std::mutex> lck(obs->finalizers_done_mtx());
+        obs->finalizers_done_cv().wait_until(lck, deadline, [obs]() {
+            return obs->finalizers_in_progress() == 0;
+        });
+    }
+    observability_manager_->BeginShutdown(remaining());
+}
+
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {
     // Apply request size limits (snapshot from atomics — cached per-connection)
     http_conn->SetMaxBodySize(max_body_size_.load(std::memory_order_relaxed));
@@ -3129,7 +3408,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     // Set request handler: dispatch through router.
     http_conn->SetRequestCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
-               const HttpRequest& request,
+               HttpRequest& request,
                HttpResponse& response) {
             active_requests_->fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
@@ -3158,6 +3437,11 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     if (!server_ready_.load(std::memory_order_acquire)) {
                         response.Header("Connection", "close");
                     }
+                    // Finalize before returning to the auto-send path —
+                    // otherwise the snapshot's strong ref drops below
+                    // and inflight_finalizations_ stays elevated.
+                    FinalizeIfSnapshot(request, response,
+                                        /*error_type=*/"rejected_by_middleware");
                     return;  // Sync send path below runs auto-send
                 }
 
@@ -3196,7 +3480,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         // finalizer is a non-issue because the finalizer
                         // never runs.
                         response = HttpResponse();
-                        response.Status(503)
+                        response.Status(HttpStatus::SERVICE_UNAVAILABLE)
                                 .Header("Retry-After", "1")
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
@@ -3231,6 +3515,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         if (!server_ready_.load(std::memory_order_acquire)) {
                             response.Header("Connection", "close");
                         }
+                        FinalizeIfSnapshot(request, response,
+                                            /*error_type=*/"async_route_warmup_unavailable");
                         return;
                     }
                     if (mw_state &&
@@ -3241,6 +3527,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         if (!server_ready_.load(std::memory_order_acquire)) {
                             response.Header("Connection", "close");
                         }
+                        FinalizeIfSnapshot(request, response,
+                                            /*error_type=*/"rejected_by_async_middleware");
                         return;
                     }
                 }
@@ -3269,6 +3557,12 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 auto bookkeeping_done =
                     std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                // Capture observability snapshot + method by value so the
+                // async completion lambda can finalize even after the
+                // request slot has been Reset() for the next pipelined
+                // request. snap may be null when observability is disabled.
+                auto obs_snap_local = request.obs_snapshot;
+                const bool was_head_local = (request.method == "HEAD");
                 // Allocate a cancel slot for handler-installed cleanup
                 // (e.g., ProxyHandler registers tx->Cancel() here).
                 // Fired by the async abort hook below. Populated BEFORE
@@ -3280,7 +3574,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, active_counter,
                      mw_headers, response_claimed, bookkeeping_done,
-                     cancelled](HttpResponse final_resp) {
+                     cancelled, obs_snap_local, was_head_local](HttpResponse final_resp) {
                         if (response_claimed->exchange(
                                 true, std::memory_order_acq_rel)) {
                             return;
@@ -3309,8 +3603,29 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                             std::move(merged));
                         conn->RunOnDispatcher(
                             [s, shared_resp, active_counter,
-                             bookkeeping_done, cancelled]() {
+                             bookkeeping_done, cancelled,
+                             obs_snap_local, was_head_local]() {
                             if (cancelled->load(std::memory_order_acquire)) return;
+                            // Finalize the snapshot BEFORE handing the
+                            // response to CompleteAsyncResponse: that
+                            // call (a) move-consumes the response, so a
+                            // post-call read returns moved-from data
+                            // (body size 0, etc.), and (b) synchronously
+                            // replays deferred_pending_buf_, which can
+                            // start the next pipelined request before
+                            // the finalizer would otherwise run.
+                            if (obs_snap_local) {
+                                auto mgr = obs_snap_local->manager.lock();
+                                if (mgr) {
+                                    const uint64_t wire_size =
+                                        ObsWireBodySize(*shared_resp, was_head_local);
+                                    mgr->FinalizeFromSnapshot(
+                                        *obs_snap_local,
+                                        shared_resp->GetStatusCode(),
+                                        wire_size,
+                                        /*error_type=*/std::string{});
+                                }
+                            }
                             s->CompleteAsyncResponse(std::move(*shared_resp));
                             if (!bookkeeping_done->exchange(
                                     true, std::memory_order_acq_rel)) {
@@ -3321,7 +3636,25 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     };
 
                 auto finalize_request =
-                    [active_counter, bookkeeping_done]() {
+                    [active_counter, bookkeeping_done,
+                     obs_snap_local, was_head_local](
+                        int status_code, uint64_t bytes_sent,
+                        std::string error_type) {
+                    // Observability finalize for the H1 streaming path.
+                    // End() reports (status, total_bytes, "") and Abort()
+                    // reports (status_or_0, bytes_so_far, reason). HEAD
+                    // requests strip the body on the wire, so wire body
+                    // size is 0 regardless of bytes_sent.
+                    if (obs_snap_local) {
+                        auto mgr = obs_snap_local->manager.lock();
+                        if (mgr) {
+                            const uint64_t wire_body =
+                                was_head_local ? 0u : bytes_sent;
+                            mgr->FinalizeFromSnapshot(
+                                *obs_snap_local, status_code, wire_body,
+                                std::move(error_type));
+                        }
+                    }
                     if (!bookkeeping_done->exchange(
                             true, std::memory_order_acq_rel)) {
                         active_counter->fetch_sub(
@@ -3477,7 +3810,14 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                         }
                         stream_sender.Abort(
                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
-                        finalize_request();
+                        // Fallback finalize: Abort fires the inner
+                        // finalize_request_ in the normal case (claim
+                        // succeeded), but if claim_response was already
+                        // false the inner path early-returns without
+                        // finalizing. The CAS + bookkeeping_done guard
+                        // keep this path idempotent when Abort already
+                        // finalized.
+                        finalize_request(0, 0, "handler_threw");
                         guard.release();
                         return;
                     }
@@ -3522,7 +3862,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 // completion against a disconnected client.
                 self->SetAsyncAbortHook(
                     [bookkeeping_done, cancelled, active_counter,
-                     cancel_slot]() {
+                     cancel_slot, obs_snap_local]() {
                         if (!bookkeeping_done->exchange(
                                 true, std::memory_order_acq_rel)) {
                             cancelled->store(true, std::memory_order_release);
@@ -3540,6 +3880,24 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                                     logging::Get()->error(
                                         "Async cancel hook threw: {}",
                                         e.what());
+                                }
+                            }
+                            // Finalize the observability snapshot so
+                            // inflight_finalizations_ drains and the
+                            // SERVER span lands with error.type set.
+                            // No status code is on the wire (complete()
+                            // never fired); 0 indicates "no response".
+                            // The CAS gate inside FinalizeFromSnapshot
+                            // makes this safe even if a late complete()
+                            // path also tries to finalize.
+                            if (obs_snap_local) {
+                                if (auto mgr =
+                                        obs_snap_local->manager.lock()) {
+                                    mgr->FinalizeFromSnapshot(
+                                        *obs_snap_local,
+                                        /*status_code=*/0,
+                                        /*wire_body_size=*/0,
+                                        /*error_type=*/"client_disconnect");
                                 }
                             }
                         }
@@ -3561,6 +3919,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 if (!server_ready_.load(std::memory_order_acquire)) {
                     response.Header("Connection", "close");
                 }
+                FinalizeIfSnapshot(request, response,
+                                    /*error_type=*/"rejected_by_middleware");
                 return;
             }
 
@@ -3576,9 +3936,26 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 auto resp_copy = std::make_shared<HttpResponse>(std::move(response));
                 std::weak_ptr<HttpConnectionHandler> h1_weak = self;
                 auto active_counter_local = active_requests_;
+                // Snapshot from the request_copy so the abort hook can
+                // finalize the SERVER span if the suspend window is
+                // torn down before the resume callback runs (client
+                // disconnect, async safety cap, etc.). Without this,
+                // the registered snapshot leaks inflight_finalizations_
+                // until shutdown kill / timeout.
+                auto suspend_obs_snap = req_copy->obs_snapshot;
 
-                self->SetAsyncAbortHook([state]() {
+                self->SetAsyncAbortHook(
+                    [state, suspend_obs_snap]() {
                     state->TripCancel();
+                    if (suspend_obs_snap) {
+                        if (auto mgr = suspend_obs_snap->manager.lock()) {
+                            mgr->FinalizeFromSnapshot(
+                                *suspend_obs_snap,
+                                /*status_code=*/0,
+                                /*wire_body_size=*/0,
+                                /*error_type=*/"client_disconnect");
+                        }
+                    }
                 });
 
                 // Capture state by VALUE — RunOnDispatcher enqueues for
@@ -3602,7 +3979,17 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                     }
                 };
                 auto submit =
-                    [](HttpConnectionHandler& h, HttpResponse& r) {
+                    [](HttpConnectionHandler& h, HttpRequest& req,
+                       HttpResponse& r, std::string error_type) {
+                    // H1 ordering: FinalizeIfSnapshot BEFORE
+                    // CompleteAsyncResponse. CompleteAsyncResponse
+                    // move-consumes the response AND replays
+                    // deferred_pending_buf_, which can synchronously
+                    // start the next pipelined request — so request A's
+                    // finalize must land before request B's snapshot is
+                    // installed by BeginAsyncResponse.
+                    HttpServer::FinalizeIfSnapshot(req, r,
+                                                    std::move(error_type));
                     r.ClearDeferred();
                     h.CompleteAsyncResponse(std::move(r));
                 };
@@ -3625,6 +4012,8 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
                 if (!server_ready_.load(std::memory_order_acquire)) {
                     response.Header("Connection", "close");
                 }
+                FinalizeIfSnapshot(request, response,
+                                    /*error_type=*/"rejected_by_async_middleware");
                 return;
             }
 
@@ -3644,19 +4033,23 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             if (!server_ready_.load(std::memory_order_acquire)) {
                 response.Header("Connection", "close");
             }
+            // H1 sync-path observability finalize. The CAS gate on the
+            // snapshot ensures exactly-once dispatch even if a future
+            // error path also calls finalize.
+            FinalizeIfSnapshot(request, response, /*error_type=*/std::string{});
         }
     );
 
     // Middleware runner for WebSocket upgrades (auth, CORS, rate limiting)
     http_conn->SetMiddlewareCallback(
-        [this](const HttpRequest& request, HttpResponse& response) -> bool {
+        [this](HttpRequest& request, HttpResponse& response) -> bool {
             return router_.RunMiddleware(request, response);
         }
     );
 
     // Bridge WS-upgrade dispatch into the async chain.
     http_conn->SetAsyncMiddlewareCallback(
-        [this](const HttpRequest& request, HttpResponse& response,
+        [this](HttpRequest& request, HttpResponse& response,
                std::shared_ptr<AsyncPendingState>& out_state) -> bool {
             return router_.RunAsyncMiddleware(request, response, out_state);
         }
@@ -3669,7 +4062,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     // valid WS route. The shutdown_check_callback (after handshake validation,
     // before 101) handles shutdown rejection with a proper 503.
     http_conn->SetRouteCheckCallback(
-        [this](const HttpRequest& request) -> bool {
+        [this](HttpRequest& request) -> bool {
             auto handler = router_.GetWebSocketHandler(request);
             return handler != nullptr;
         }
@@ -3684,7 +4077,7 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     // Upgrade handler: wires WS callbacks (called exactly once, after ws_conn_ created)
     http_conn->SetUpgradeCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
-               const HttpRequest& request) {
+               HttpRequest& request) {
             // Connection is no longer HTTP/1 — it's now WebSocket.
             // Decrement here so /stats doesn't count WS as HTTP/1.
             // RemoveConnection checks IsUpgraded() to skip the double-decrement.
@@ -4227,7 +4620,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     h2_conn->SetRequestCallback(
         [this](std::shared_ptr<Http2ConnectionHandler> self,
                int32_t stream_id,
-               const HttpRequest& request,
+               HttpRequest& request,
                HttpResponse& response) {
             active_requests_->fetch_add(1, std::memory_order_relaxed);
             RequestGuard guard{active_requests_};
@@ -4247,6 +4640,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
             if (async_handler) {
                 if (!router_.RunMiddleware(request, response)) {
                     HttpRouter::FillDefaultRejectionResponse(response);
+                    FinalizeIfSnapshot(request, response,
+                                        /*error_type=*/"rejected_by_middleware");
                     return;
                 }
 
@@ -4266,7 +4661,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         request, response, mw_state);
                     if (!mw_sync_complete) {
                         response = HttpResponse();
-                        response.Status(503)
+                        response.Status(HttpStatus::SERVICE_UNAVAILABLE)
                                 .Header("Retry-After", "1")
                                 .Header("Cache-Control", "no-store")
                                 .Text("authentication unavailable on async route — retry");
@@ -4283,11 +4678,15 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                 /*policy=*/std::string{},
                                 AUTH_NAMESPACE::AuthCache::None);
                         }
+                        FinalizeIfSnapshot(request, response,
+                                            /*error_type=*/"async_route_warmup_unavailable");
                         return;
                     }
                     if (mw_state &&
                         mw_state->sync_result() ==
                             HttpRouter::AsyncMiddlewareResult::DENY) {
+                        FinalizeIfSnapshot(request, response,
+                                            /*error_type=*/"rejected_by_async_middleware");
                         return;
                     }
                 }
@@ -4304,6 +4703,11 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 auto bookkeeping_done =
                     std::make_shared<std::atomic<bool>>(false);
                 auto cancelled = std::make_shared<std::atomic<bool>>(false);
+                // Capture observability snapshot + method (for HEAD
+                // detection) by value — see H1 async path above for the
+                // full rationale; same pattern.
+                auto obs_snap_local = request.obs_snapshot;
+                const bool was_head_local = (request.method == "HEAD");
                 // Handler-installed cancel slot — mirrors HTTP/1.
                 // Populated before async_handler runs; fired by the
                 // per-stream abort hook on client-side abort (stream
@@ -4314,7 +4718,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 HttpRouter::AsyncCompletionCallback complete =
                     [weak_self, stream_id, active_counter,
                      mw_headers, response_claimed, bookkeeping_done,
-                     cancelled](HttpResponse final_resp) {
+                     cancelled, obs_snap_local, was_head_local](HttpResponse final_resp) {
                         if (response_claimed->exchange(
                                 true, std::memory_order_acq_rel)) {
                             return;
@@ -4343,9 +4747,58 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                             std::move(merged));
                         conn->RunOnDispatcher(
                             [s, stream_id, shared_resp, active_counter,
-                             bookkeeping_done, cancelled]() {
+                             bookkeeping_done, cancelled,
+                             obs_snap_local, was_head_local]() {
                             if (cancelled->load(std::memory_order_acquire)) return;
-                            s->SubmitStreamResponse(stream_id, *shared_resp);
+                            // Erase the per-stream abort hook BEFORE
+                            // SubmitStreamResponse: that call drives
+                            // SendPendingFrames(), and nghttp2 can
+                            // synchronously close the stream and fire
+                            // the close callback inline. Without this
+                            // erase, the close-callback path would run
+                            // a stale abort hook AFTER our finalize and
+                            // re-record bookkeeping/observability.
+                            s->EraseStreamAbortHook(stream_id);
+                            // Finalize AFTER submit + flush so we know
+                            // the response actually reached the wire.
+                            // SubmitStreamResponse returns -1 if
+                            // Http2Session rejected the call (stream
+                            // already closed / 1xx misuse), and even on
+                            // a 0 return the post-submit flush can
+                            // discard frames if the peer batched
+                            // RST_STREAM behind the request:
+                            //   * submit_rv != 0 ⇒ definitely failed
+                            //   * submit_rv == 0 + WasStreamClosedSuccessfully
+                            //     ⇒ delivered (in flight or clean close)
+                            //   * submit_rv == 0 + !WasStreamClosedSuccessfully
+                            //     ⇒ frames were discarded (peer-RST during
+                            //     same recv batch). Record client_disconnect.
+                            const int submit_rv =
+                                s->SubmitStreamResponse(stream_id, *shared_resp);
+                            const bool delivered =
+                                submit_rv == 0 &&
+                                s->WasStreamClosedSuccessfully(stream_id);
+                            if (obs_snap_local) {
+                                auto mgr = obs_snap_local->manager.lock();
+                                if (mgr) {
+                                    if (delivered) {
+                                        const uint64_t wire_size =
+                                            ObsWireBodySize(*shared_resp,
+                                                              was_head_local);
+                                        mgr->FinalizeFromSnapshot(
+                                            *obs_snap_local,
+                                            shared_resp->GetStatusCode(),
+                                            wire_size,
+                                            /*error_type=*/std::string{});
+                                    } else {
+                                        mgr->FinalizeFromSnapshot(
+                                            *obs_snap_local,
+                                            /*status_code=*/0,
+                                            /*wire_body_size=*/0,
+                                            /*error_type=*/"client_disconnect");
+                                    }
+                                }
+                            }
                             if (!bookkeeping_done->exchange(
                                     true, std::memory_order_acq_rel)) {
                                 active_counter->fetch_sub(
@@ -4355,7 +4808,22 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     };
 
                 auto finalize_request =
-                    [active_counter, bookkeeping_done]() {
+                    [active_counter, bookkeeping_done,
+                     obs_snap_local, was_head_local](
+                        int status_code, uint64_t bytes_sent,
+                        std::string error_type) {
+                    // Same observability finalize as the H1 streaming
+                    // path — see that lambda for the full contract.
+                    if (obs_snap_local) {
+                        auto mgr = obs_snap_local->manager.lock();
+                        if (mgr) {
+                            const uint64_t wire_body =
+                                was_head_local ? 0u : bytes_sent;
+                            mgr->FinalizeFromSnapshot(
+                                *obs_snap_local, status_code, wire_body,
+                                std::move(error_type));
+                        }
+                    }
                     if (!bookkeeping_done->exchange(
                             true, std::memory_order_acq_rel)) {
                         active_counter->fetch_sub(
@@ -4488,7 +4956,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                         }
                         stream_sender.Abort(
                             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
-                        finalize_request();
+                        // Fallback finalize — see H1 site for rationale.
+                        finalize_request(0, 0, "handler_threw");
                         guard.release();
                         return;
                     }
@@ -4530,7 +4999,7 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 self->SetStreamAbortHook(
                     stream_id,
                     [bookkeeping_done, cancelled, active_counter,
-                     cancel_slot]() {
+                     cancel_slot, obs_snap_local]() {
                         if (!bookkeeping_done->exchange(
                                 true, std::memory_order_acq_rel)) {
                             cancelled->store(true, std::memory_order_release);
@@ -4544,6 +5013,19 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                                     logging::Get()->error(
                                         "Async cancel hook threw: {}",
                                         e.what());
+                                }
+                            }
+                            // Mirror the H1 abort-hook fix — drain the
+                            // snapshot so inflight_finalizations_ stays
+                            // accurate and the SERVER span lands.
+                            if (obs_snap_local) {
+                                if (auto mgr =
+                                        obs_snap_local->manager.lock()) {
+                                    mgr->FinalizeFromSnapshot(
+                                        *obs_snap_local,
+                                        /*status_code=*/0,
+                                        /*wire_body_size=*/0,
+                                        /*error_type=*/"client_disconnect");
                                 }
                             }
                         }
@@ -4575,6 +5057,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
 
             if (!router_.RunMiddleware(request, response)) {
                 HttpRouter::FillDefaultRejectionResponse(response);
+                FinalizeIfSnapshot(request, response,
+                                    /*error_type=*/"rejected_by_middleware");
                 return;
             }
 
@@ -4590,8 +5074,22 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
                 auto active_counter_local = active_requests_;
 
-                self->SetStreamAbortHook(stream_id, [state]() {
+                // See H1 suspend hook above — finalize the snapshot
+                // on suspend-time aborts so it doesn't leak into the
+                // shutdown kill loop.
+                auto suspend_obs_snap = req_copy->obs_snapshot;
+                self->SetStreamAbortHook(stream_id,
+                    [state, suspend_obs_snap]() {
                     state->TripCancel();
+                    if (suspend_obs_snap) {
+                        if (auto mgr = suspend_obs_snap->manager.lock()) {
+                            mgr->FinalizeFromSnapshot(
+                                *suspend_obs_snap,
+                                /*status_code=*/0,
+                                /*wire_body_size=*/0,
+                                /*error_type=*/"client_disconnect");
+                        }
+                    }
                 });
 
                 // Protocol-specific bits go into the three callables below;
@@ -4612,8 +5110,36 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                     // handles GOAWAY/RST_STREAM separately.
                 };
                 auto submit =
-                    [stream_id](Http2ConnectionHandler& h, HttpResponse& r) {
-                    h.SubmitStreamResponse(stream_id, r);
+                    [stream_id](Http2ConnectionHandler& h, HttpRequest& req,
+                                HttpResponse& r, std::string error_type) {
+                    // H2 ordering: defer FinalizeIfSnapshot until AFTER
+                    // submit + flush so the recorded outcome reflects
+                    // whether nghttp2 actually accepted the response.
+                    // Mirrors the H2 async-completion fix: pre_dispatch
+                    // already erased the abort hook, so without this
+                    // outcome check a stream RST'd between the resume
+                    // hop and the post-submit flush would lock a clean
+                    // status onto a dropped response.
+                    if (!error_type.empty()) {
+                        // Handler-error path (handler_threw /
+                        // rejected_by_async_middleware) — record the
+                        // semantic error regardless of wire outcome and
+                        // still attempt to submit so the client gets a
+                        // 500 / 4xx response.
+                        HttpServer::FinalizeIfSnapshot(req, r,
+                                                        std::move(error_type));
+                        h.SubmitStreamResponse(stream_id, r);
+                        return;
+                    }
+                    const int submit_rv =
+                        h.SubmitStreamResponse(stream_id, r);
+                    const bool delivered =
+                        submit_rv == 0 &&
+                        h.WasStreamClosedSuccessfully(stream_id);
+                    HttpServer::FinalizeIfSnapshot(
+                        req, r,
+                        delivered ? std::string{}
+                                  : std::string{"client_disconnect"});
                 };
                 auto resume_cb = MakeAsyncResumeCallback(
                     router_, h2_weak, req_copy, resp_copy, state,
@@ -4629,6 +5155,8 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
             // `state` is null on empty-chain implicit PASS.
             if (state && state->sync_result() ==
                     HttpRouter::AsyncMiddlewareResult::DENY) {
+                FinalizeIfSnapshot(request, response,
+                                    /*error_type=*/"rejected_by_async_middleware");
                 return;
             }
 
@@ -4642,6 +5170,47 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
                 response.Status(HttpStatus::NOT_FOUND).Text("Not Found");
             }
             RestoreDebugAuthHeaders(response, auth_hdrs);
+            // H2 sync-path observability finalize MUST defer until
+            // AFTER OnRawData's post-receive flush. This callback runs
+            // INSIDE Http2Session::DispatchStreamRequest, BEFORE that
+            // function calls SubmitResponse and BEFORE the tail
+            // SendPendingFrames. If the peer batched
+            // [HEADERS+END_STREAM] [RST_STREAM] in the same recv buffer,
+            // nghttp2 processes the RST during the rest of ReceiveData
+            // and the post-receive flush silently discards the queued
+            // response — observability would otherwise lock a clean
+            // status onto a dropped response. Snapshot the values now,
+            // then queue an outcome-checked finalize on the H2 handler
+            // (drained by OnRawData after the tail flush; also drained
+            // by FireAllStreamAbortHooks on connection teardown). The
+            // snap.finalized CAS makes a future call idempotent if any
+            // error path also tries to finalize.
+            if (request.obs_snapshot) {
+                auto snap = request.obs_snapshot;
+                const bool was_head_local = (request.method == "HEAD");
+                const uint64_t wire_body_size =
+                    ObsWireBodySize(response, was_head_local);
+                const int status = response.GetStatusCode();
+                std::weak_ptr<Http2ConnectionHandler> h2_weak = self;
+                self->EnqueuePostReceiveTask(
+                    [h2_weak, stream_id, snap = std::move(snap),
+                     status, wire_body_size]() {
+                    auto mgr = snap->manager.lock();
+                    if (!mgr) return;
+                    auto h2 = h2_weak.lock();
+                    const bool delivered =
+                        h2 && h2->WasStreamClosedSuccessfully(stream_id);
+                    if (delivered) {
+                        mgr->FinalizeFromSnapshot(*snap, status,
+                                                    wire_body_size,
+                                                    std::string{});
+                    } else {
+                        mgr->FinalizeFromSnapshot(*snap, /*status=*/0,
+                                                    /*wire_body_size=*/0,
+                                                    "client_disconnect");
+                    }
+                });
+            }
         }
     );
 
@@ -4782,6 +5351,38 @@ bool HttpServer::Reload(ServerConfig new_config) {
         // immediately via rate_limit_manager_->Reload(), so bad values
         // (rate<=0, invalid key_type, duplicate zone names) must be caught.
         validation_copy.rate_limit = new_config.rate_limit;
+        // Substitute LIVE values for restart-only observability
+        // fields. Validate() applies the full schema (including
+        // restart-only cross-checks: otlp_http rejection, exporter
+        // allowlist, prometheus.path leading-`/`, histogram bucket
+        // layout). Without this substitution a direct in-process
+        // HttpServer::Reload that staged `traces.exporter="otlp_http"`
+        // or a smaller `traces.batch.max_queue_size` would reject the
+        // entire reload — even though those fields are later preserved
+        // from live_config_ in the merged commit, never actually
+        // applied to the running server. The SIGHUP path in
+        // main.cc::ReloadConfig already downgrades restart-only
+        // failures to warnings; the in-process path now mirrors that
+        // by validating against the live values for restart-only
+        // fields and the staged values for everything else.
+        validation_copy.observability.enabled =
+            live_config_.observability.enabled;
+        validation_copy.observability.resource =
+            live_config_.observability.resource;
+        validation_copy.observability.traces.exporter =
+            live_config_.observability.traces.exporter;
+        validation_copy.observability.traces.otlp.upstream =
+            live_config_.observability.traces.otlp.upstream;
+        validation_copy.observability.traces.batch.max_queue_size =
+            live_config_.observability.traces.batch.max_queue_size;
+        validation_copy.observability.metrics.exporter =
+            live_config_.observability.metrics.exporter;
+        validation_copy.observability.metrics.otlp.upstream =
+            live_config_.observability.metrics.otlp.upstream;
+        validation_copy.observability.metrics.prometheus.path =
+            live_config_.observability.metrics.prometheus.path;
+        validation_copy.observability.metrics.histogram_buckets =
+            live_config_.observability.metrics.histogram_buckets;
         try {
             // reload_copy=true — signals the validator that upstreams[]
             // has been deliberately stripped above, so topology cross-
@@ -4883,8 +5484,29 @@ bool HttpServer::Reload(ServerConfig new_config) {
             // ADDED/RENAMED issuer (rejected as restart-required anyway
             // by AuthManager::Reload) doesn't abort unrelated live-safe
             // edits.
+            //
+            // Substitute the LIVE max_queue_size before validating —
+            // the queue is restart-only, so the staged value would
+            // never take effect, and the validator's batch_size <=
+            // queue_size cross-check must reflect what the live worker
+            // actually runs against. Without this swap a reload that
+            // only stages a smaller queue would falsely reject an
+            // otherwise-valid batch_size edit. We restore the staged
+            // value afterwards so HttpServer::Reload's restart-required
+            // warn (which compares operator==) still fires on the
+            // operator's actual edit.
+            ServerConfig validation_target = new_config;
+            validation_target.observability.traces.batch.max_queue_size =
+                live_config_.observability.traces.batch.max_queue_size;
+            // observability_live=true iff the running server actually
+            // built an ObservabilityManager at construction. When
+            // observability was disabled at startup, no live runtime
+            // consumes the staged knobs — rejecting stale invalid live
+            // values here would block unrelated live-safe edits in the
+            // same SIGHUP.
             ConfigLoader::ValidateHotReloadable(
-                new_config, live_names, live_issuer_names);
+                validation_target, live_names, live_issuer_names,
+                /*observability_live=*/observability_manager_ != nullptr);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Reload() rejected invalid config: {}",
                                   e.what());
@@ -5154,11 +5776,11 @@ bool HttpServer::Reload(ServerConfig new_config) {
         }
         size_t final_cap = (ws > 0) ? (http_cap == 0 ? ws : std::min(http_cap, ws))
                                     : http_cap;
-        // Three-phase update ensures the cap is never larger than what the
+        // Three-step update ensures the cap is never larger than what the
         // limits enforce at any point during the transition:
-        //   Phase 1: set cap to min(old, new) — tightest constraint
-        //   Phase 2: update limit atomics (SetupHandlers reads these)
-        //   Phase 3: set final cap (may be larger if limits grew)
+        //   1. Set cap to min(old, new) — tightest constraint
+        //   2. Update limit atomics (SetupHandlers reads these)
+        //   3. Set final cap (may be larger if limits grew)
         // 0 means unlimited — never use it as the transitional cap.
         size_t old_cap = ComputeInputCap();  // from current atomics
         size_t transition_cap;
@@ -5403,8 +6025,8 @@ bool HttpServer::Reload(ServerConfig new_config) {
     // Why per-upstream rather than all-or-nothing: the prior behavior
     // rolled BACK reloadable edits on UNCHANGED upstreams whenever ANY
     // other upstream had a restart-only divergence. That silently lost
-    // unrelated live-safe proxy.auth edits (design §11.2 step 4 — per-
-    // upstream deferral, not blanket rollback).
+    // unrelated live-safe proxy.auth edits — per-upstream deferral, not
+    // blanket rollback, is the right granularity.
     bool any_diverged = false;
     std::vector<UpstreamConfig> merged;
     merged.reserve(upstream_configs_.size());
@@ -5474,6 +6096,62 @@ bool HttpServer::Reload(ServerConfig new_config) {
             new_config.auth.forward,
             new_config.auth.enabled,
             new_config.auth.debug_response_headers);
+    }
+
+    // Observability live-reloadable subset (sampler, batch sizing,
+    // export interval/timeout, traces.enabled / metrics.enabled,
+    // include_target_info). Master `enabled` and Resource (service.*)
+    // are restart-required and ignored by Manager::Reload — operators
+    // editing those see them surface as a warn here. The merged-commit
+    // block below preserves the live values silently, so without this
+    // diff/warn an operator could SIGHUP a new exporter, prometheus
+    // path, or `enabled=true` and see "reload OK" with no indication
+    // that the change was ignored.
+    //
+    // ObservabilityConfig::operator== covers exactly the restart-only
+    // fields (enabled, resource.*, exporters, otlp.upstream pair,
+    // max_queue_size, prometheus.path, histogram_buckets). Live-only
+    // edits never trigger this warn.
+    if (live_config_.observability != new_config.observability) {
+        logging::Get()->warn(
+            "Reload: observability restart-only fields changed "
+            "(enabled / resource.* / exporters / otlp.upstream / "
+            "max_queue_size / prometheus.path / histogram_buckets) — "
+            "restart required for those fields to take effect; "
+            "live-reloadable knobs (sampler, batch tuning, "
+            "include_target_info, traces.enabled, metrics.enabled) "
+            "applied normally");
+    }
+    if (observability_manager_) {
+        observability_manager_->Reload(new_config.observability);
+        // Preserve restart-only fields in the live snapshot so that
+        // /config and any subsequent in-process Reload read the values
+        // actually in use at runtime, not the staged-but-not-applied
+        // values. Restart-only fields (mirroring Manager::Reload's
+        // intentional skip set):
+        //   - master `enabled`
+        //   - service.{name,version,instance_id} (Resource)
+        //   - traces.exporter, metrics.exporter
+        //   - traces.otlp.upstream, metrics.otlp.upstream
+        //   - traces.batch.max_queue_size (queue allocated at ctor)
+        //   - metrics.prometheus.path
+        //   - metrics.histogram_buckets (instruments built at ctor;
+        //     bucket layout cannot change once Series are populated)
+        // Live-reloadable fields are taken from the staged config.
+        OBSERVABILITY_NAMESPACE::ObservabilityConfig merged =
+            new_config.observability;
+        merged.enabled                 = live_config_.observability.enabled;
+        merged.resource                = live_config_.observability.resource;
+        merged.traces.exporter         = live_config_.observability.traces.exporter;
+        merged.metrics.exporter        = live_config_.observability.metrics.exporter;
+        merged.traces.otlp.upstream    = live_config_.observability.traces.otlp.upstream;
+        merged.metrics.otlp.upstream   = live_config_.observability.metrics.otlp.upstream;
+        merged.traces.batch.max_queue_size =
+            live_config_.observability.traces.batch.max_queue_size;
+        merged.metrics.prometheus.path = live_config_.observability.metrics.prometheus.path;
+        merged.metrics.histogram_buckets =
+            live_config_.observability.metrics.histogram_buckets;
+        live_config_.observability = std::move(merged);
     }
 
     return true;

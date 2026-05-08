@@ -12,7 +12,7 @@ namespace CIRCUIT_BREAKER_NAMESPACE {
 // RateLimitManager: one instance lives on HttpServer, built once at
 // MarkServerReady, survives for the server's lifetime.
 //
-// Ownership (per design §3.1):
+// Ownership tree:
 //   HttpServer
 //     ├── upstream_manager_        (declared FIRST, destructs last)
 //     └── circuit_breaker_manager_ (declared SECOND, destructs first)

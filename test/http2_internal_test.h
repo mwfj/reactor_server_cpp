@@ -42,7 +42,7 @@ void TestStreamClosePrunesActiveSenderEntry() {
             1,
             []() { return true; },
             []() {},
-            []() {});
+            [](int /*status*/, uint64_t /*bytes*/, std::string /*err*/) {});
 
         bool pass = true;
         std::string err;

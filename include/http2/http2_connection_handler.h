@@ -68,18 +68,39 @@ public:
     // async operation completes. Safe to call with a stream_id that has
     // already closed (e.g. due to client RST_STREAM or connection drop) —
     // Http2Session handles the missing-stream case internally.
-    void SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
+    // Submits a response and flushes pending frames. Returns 0 on
+    // submit success, -1 if Http2Session::SubmitResponse rejected the
+    // call (stream not found / closed / 1xx misuse). The flush still
+    // runs on -1 so any prior queued frames drain. Callers that record
+    // observability on success must check the return value AND call
+    // WasStreamClosedSuccessfully(stream_id) after the flush, because
+    // submit-then-RST in the same recv batch will return 0 here but
+    // discard the response frames during the post-receive flush.
+    int SubmitStreamResponse(int32_t stream_id, const HttpResponse& response);
+
+    // Per-stream post-wire-write notification slot. H2 multiplexes
+    // streams, so the slot is keyed on stream_id. Used by
+    // ShutdownContext's H2 CASE B path: arms `notify_sent` BEFORE
+    // SubmitStreamResponse, observes the flip after nghttp2 commits
+    // the response frames.
+    void SetPostWriteNotifyOnce(int32_t stream_id,
+                                  std::shared_ptr<std::atomic<bool>> notify_sent);
 
     // Internal: after an explicit SendPendingFrames() flush, re-check whether
     // graceful shutdown can now complete or whether the normal deadline
     // tracking should be refreshed.
     void RecheckShutdownDrainAfterFlush();
 
+    // See HttpConnectionHandler::CreateStreamingResponseSender for the
+    // contract on `finalize_request`'s signature (status_code, bytes_sent,
+    // error_type).
     HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender CreateStreamingResponseSender(
         int32_t stream_id,
         std::function<bool()> claim_response,
         std::function<void()> release_response_claim,
-        std::function<void()> finalize_request);
+        std::function<void(int status_code,
+                            uint64_t bytes_sent,
+                            std::string error_type)> finalize_request);
 
     // Submit a non-final 1xx informational response (e.g. 103 Early Hints)
     // on a specific stream and flush nghttp2 output.
@@ -168,10 +189,18 @@ public:
     }
     void FireAndEraseStreamAbortHook(int32_t stream_id) {
         auto it = stream_abort_hooks_.find(stream_id);
-        if (it == stream_abort_hooks_.end()) return;
+        if (it == stream_abort_hooks_.end()) {
+            // Even when the abort hook is absent, fire the post-write
+            // notifier so a shutdown-route pump on this stream sees
+            // "framework gave up" — same semantics as H1's
+            // TripAsyncAbortHook.
+            FireStreamPostWriteNotify(stream_id);
+            return;
+        }
         auto hook = std::move(it->second);
         stream_abort_hooks_.erase(it);
         if (hook) hook();
+        FireStreamPostWriteNotify(stream_id);
     }
     // Fire ALL remaining stream-abort hooks. Called from
     // HttpServer::RemoveConnection when a connection is being torn
@@ -188,9 +217,38 @@ public:
         for (auto& [id, hook] : hooks) {
             if (hook) hook();
         }
+        // Fire every remaining per-stream post-write notifier — the
+        // observability/shutdown-route pumps observe "framework gave
+        // up on this submission" and can proceed to Stop().
+        for (auto& [id, slot] : stream_post_write_notify_) {
+            (void)id;
+            if (slot) slot->store(true, std::memory_order_release);
+        }
+        stream_post_write_notify_.clear();
+        // Drain any deferred post-receive finalisers. Streaming senders
+        // that fired SendHeaders/End from inside ReceiveData and
+        // queued their finalize through EnqueuePostReceiveTask would
+        // otherwise leak observability + active_requests bookkeeping
+        // when the connection is torn down before OnRawData's tail
+        // flush could run. The deferred closure's
+        // WasStreamClosedSuccessfully check correctly returns false for
+        // streams whose on_stream_close did not record (teardown skips
+        // OnStreamCloseCallback's user-callback path), so the
+        // finalisers record client_disconnect.
+        DrainPostReceiveTasks();
     }
 
 private:
+    // Fire-and-erase a single stream's post-write notifier. Idempotent.
+    void FireStreamPostWriteNotify(int32_t stream_id) {
+        auto it = stream_post_write_notify_.find(stream_id);
+        if (it == stream_post_write_notify_.end()) return;
+        if (it->second) {
+            it->second->store(true, std::memory_order_release);
+        }
+        stream_post_write_notify_.erase(it);
+    }
+
     StreamCloseCallback WrapStreamCloseCallback(StreamCloseCallback callback);
 
     // Dispatcher-thread-only weak refs to active per-stream streaming senders.
@@ -243,4 +301,50 @@ private:
 
     // Per-stream safety-cap abort hooks. See SetStreamAbortHook.
     std::unordered_map<int32_t, std::function<void()>> stream_abort_hooks_;
+
+    // Per-stream post-wire-write notifier slots. Flipped after the
+    // response frames commit to nghttp2's output buffer; cleared post-
+    // signal. Consumed by the shutdown-route pump.
+    std::unordered_map<int32_t, std::shared_ptr<std::atomic<bool>>>
+        stream_post_write_notify_;
+
+    // Per-stream nghttp2 close error code, recorded in
+    // WrapStreamCloseCallback before the user callback runs. Lets a
+    // deferred response finalize (the streaming sender or the async
+    // complete path) discriminate "stream cleanly closed" (NO_ERROR)
+    // from "stream reset by peer" (CANCEL / REFUSED_STREAM / ...) so
+    // observability records the actual outcome instead of overwriting
+    // a clean status onto a discarded response. Dispatcher-thread-only.
+    std::unordered_map<int32_t, uint32_t> stream_close_error_codes_;
+
+    // Tasks deferred from inside Http2Session::ReceiveData
+    // (e.g. streaming-sender finalisers) until AFTER OnRawData's
+    // post-receive SendPendingFrames flushes. By that point any
+    // late RST_STREAM the peer included in the same recv batch has
+    // closed the stream, so the deferred task can read the actual
+    // outcome via WasStreamClosedSuccessfully. Dispatcher-thread-only.
+    std::vector<std::function<void()>> pending_post_receive_tasks_;
+
+public:
+    // Outcome predicate for deferred finalisers. Returns true when the
+    // stream is still alive in nghttp2 (response in flight) OR closed
+    // with NGHTTP2_NO_ERROR (clean END_STREAM both directions). Returns
+    // false only when the stream closed with a non-zero error code
+    // (peer RST or local protocol abort) — which means the response
+    // never reached the wire as a clean END_STREAM. Erases the close-
+    // code entry on consume so the map stays bounded. Dispatcher-
+    // thread-only.
+    bool WasStreamClosedSuccessfully(int32_t stream_id);
+
+    // Enqueue a closure to run AFTER OnRawData's tail SendPendingFrames
+    // (and after any in-flight on_stream_close callbacks that flush
+    // would drive). Used by streaming senders that finalise observability
+    // from inside a receive callback — the success/error decision must
+    // wait until the rest of the recv batch has been processed.
+    void EnqueuePostReceiveTask(std::function<void()> task);
+
+private:
+    // Drain pending_post_receive_tasks_. Called from OnRawData after
+    // the post-receive flush; callers outside that path must not invoke.
+    void DrainPostReceiveTasks();
 };

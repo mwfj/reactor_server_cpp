@@ -120,12 +120,11 @@ bool IsStrictIpv4Literal(const std::string& s) {
 }
 
 // Accept an IPv6 literal. BSD `inet_pton(AF_INET6, ...)` accepts
-// `%<zone>` suffixes per RFC 4007 (fe80::1%eth0 / fe80::1%5) and stores
-// the scope_id in sin6_scope_id; glibc rejects them. Phase 1 of the
-// IPv6 design explicitly rejects scope-id forms (§1.2.7) because they
-// leak into `X-Forwarded-For` / ACL / rate-limit pipelines that cannot
-// parse zone-id. Pre-filter `%` out before inet_pton so macOS and
-// Linux agree.
+// `%<zone>` suffixes per RFC 4007 (fe80::1%eth0 / fe80::1%5) and
+// stores the scope_id in sin6_scope_id; glibc rejects them. Scope-id
+// forms are rejected here because they leak into `X-Forwarded-For` /
+// ACL / rate-limit pipelines that cannot parse zone-id. Pre-filter
+// `%` out before inet_pton so macOS and Linux agree.
 bool ParseIpv6Literal(const std::string& s) {
     if (s.empty()) return false;
     if (s.find('%') != std::string::npos) return false;   // §1.2.7

@@ -1,11 +1,7 @@
 #pragma once
 
-// Minimal test coverage for the auth-foundation pieces landed in this PR.
-// Full Phase 1 / Phase 2 test suites (jwt_verifier_test, jwks_cache_test,
-// auth_policy_matcher_test, etc.) are tracked in §13.1 of the design spec and
-// land in later PRs. The coverage here is deliberately narrow — it pins the
-// security-critical invariants introduced by the r3/r5 revisions so that a
-// regression is caught in CI:
+// Foundation tests for the auth subsystem. Pins the security-critical
+// invariants so a regression is caught in CI:
 //
 //   - TokenHasher::Hash returns std::optional — never "" on failure
 //     (r3 finding #2: cross-token cache-key collision risk).
@@ -394,11 +390,8 @@ void TestConfigLoaderAuthRoundTrip() {
             }
         }
 
-        // Validation behavior on this fixture (which has auth.enabled=true):
-        // Phase 1b lifted the master enforcement gate — a structurally
-        // well-formed config with enabled=true + issuers populated is
-        // now accepted. This block confirms the validator accepts the
-        // fixture cleanly (no structural or enabled-gate rejection).
+        // The validator accepts a structurally well-formed config with
+        // enabled=true + issuers populated.
         bool validation_ok = false;
         std::string validation_err;
         try {
@@ -407,8 +400,7 @@ void TestConfigLoaderAuthRoundTrip() {
         } catch (const std::invalid_argument& e) {
             validation_err =
                 std::string("Validate() rejected a valid "
-                            "auth.enabled=true+issuers config (master gate "
-                            "was lifted in Phase 1b): ") + e.what();
+                            "auth.enabled=true + issuers config: ") + e.what();
         } catch (const std::exception& e) {
             validation_err =
                 std::string("Validate() threw an unexpected exception type: ") +
@@ -703,28 +695,16 @@ void TestConfigLoaderClaimHeaderCollision() {
 }
 
 // -----------------------------------------------------------------------------
-// ConfigLoader::Validate — auth-enabled fail-closed gate (review P1 #1).
+// ConfigLoader::Validate — auth.enabled gating.
 //
-// Until AuthManager + middleware lands (design spec §14 Phase 2), a config
-// that toggles auth ON would silently behave as unauthenticated — i.e. the
-// gateway would accept the config but route requests to upstreams without
-// any token validation. To prevent that auth-bypass-by-misconfig scenario,
-// Validate() hard-rejects any config with auth.enabled=true OR
-// upstreams[].proxy.auth.enabled=true. Schema fields (issuers, policies,
-// forward) may still be populated for forward-compatibility — only the
-// master switches are gated.
-//
-// These tests pin the gate. When enforcement actually lands, both
-// throw-cases below are removed (the gate logic is deleted from
-// ConfigLoader::Validate) AND these test cases are flipped to assert
-// successful validation. Until then, the gate is the safety net.
+// A config with auth.enabled=true AND issuers populated is valid. A
+// config with auth.enabled=true AND empty issuers is rejected with a
+// clear message; the same gate applies to upstreams[].proxy.auth.
 // -----------------------------------------------------------------------------
 void TestConfigLoaderRejectsAuthEnabled() {
-    // Renamed behaviour per Phase 1b: the master gate was lifted — a
-    // config with auth.enabled=true AND issuers populated is now valid.
-    // This test asserts the POSITIVE case (accepted) plus the soft-check
-    // edge case (enabled=true + empty issuers is rejected with a clear
-    // message). Pre-Phase-1b the whole enabled=true path was rejected.
+    // Asserts the POSITIVE case (auth.enabled=true + issuers → accepted)
+    // plus the soft-check edge case (auth.enabled=true + empty issuers
+    // → rejected with a clear message).
     std::cout << "\n[TEST] ConfigLoader accepts auth.enabled=true with issuers (gateway-wide)..." << std::endl;
     try {
         // Case A — enabled=true + issuers populated: must PASS validation.
@@ -757,8 +737,8 @@ void TestConfigLoaderRejectsAuthEnabled() {
             TestFramework::RecordTest(
                 "AuthFoundation: ConfigLoader accepts gateway auth.enabled=true",
                 false,
-                "expected Validate() to accept auth.enabled=true with issuers "
-                "populated (master gate lifted in Phase 1b); got: " + err_msg,
+                "expected Validate() to accept auth.enabled=true with "
+                "issuers populated; got: " + err_msg,
                 TestFramework::TestCategory::OTHER);
             return;
         }
@@ -802,9 +782,9 @@ void TestConfigLoaderRejectsAuthEnabled() {
 }
 
 void TestConfigLoaderRejectsProxyAuthEnabled() {
-    // Phase 1b: the proxy.auth.enabled=true gate was lifted. This test
-    // now asserts the POSITIVE case (accepted with referenced issuers)
-    // plus the empty-issuers rejection (must name the offending upstream).
+    // Asserts the POSITIVE case (proxy.auth.enabled=true with
+    // referenced issuers → accepted) plus the empty-issuers rejection
+    // (must name the offending upstream).
     std::cout << "\n[TEST] ConfigLoader accepts proxy.auth.enabled=true..." << std::endl;
     try {
         // Case A — enabled=true with populated issuers: must PASS.
@@ -851,8 +831,8 @@ void TestConfigLoaderRejectsProxyAuthEnabled() {
             TestFramework::RecordTest(
                 "AuthFoundation: ConfigLoader accepts per-proxy auth.enabled=true",
                 false,
-                "expected Validate() to accept proxy.auth.enabled=true with "
-                "issuers populated (gate lifted in Phase 1b); got: " + err_msg,
+                "expected Validate() to accept proxy.auth.enabled=true "
+                "with issuers populated; got: " + err_msg,
                 TestFramework::TestCategory::OTHER);
             return;
         }
@@ -3385,12 +3365,10 @@ void TestValidateProxyAuthReloadGate() {
     };
 
     try {
-        // Case 1 (POST-Phase-1b flip): proxy.auth.enabled=true with a
-        // referenced issuer populated MUST be accepted. The earlier
-        // "enforcement not yet wired" gate was lifted in Phase 1b —
-        // inline auth activates request-time enforcement. Empty-issuers
-        // + enabled=true still rejects (tested separately in the
-        // TestConfigLoaderRejectsProxyAuthEnabled test above).
+        // Case 1: proxy.auth.enabled=true with a referenced issuer
+        // populated MUST be accepted — inline auth activates request-
+        // time enforcement. Empty-issuers + enabled=true still rejects
+        // (tested separately in TestConfigLoaderRejectsProxyAuthEnabled).
         std::string err = validate_expect_accepted(R"({
             "upstreams": [
                 {"name":"x","host":"127.0.0.1","port":80},
@@ -4230,7 +4208,7 @@ void TestConfigLoaderStrictUpstreamIntegers() {
     };
 
     try {
-        // Case 1: upstream.port as boolean (the reviewer's true→1 example).
+        // Case 1: upstream.port as boolean (the bool→1 coercion case).
         std::string err = load_expect_failure(R"({
             "upstreams": [{"name":"x","host":"127.0.0.1","port":true}]
         })", "must be an integer");
@@ -4242,7 +4220,7 @@ void TestConfigLoaderStrictUpstreamIntegers() {
         })", "must be an integer");
         if (!err.empty()) throw std::runtime_error("port as float: " + err);
 
-        // Case 3: pool.max_connections oversized (reviewer's 4294967297 → 1 example).
+        // Case 3: pool.max_connections oversized (the 4294967297 → 1 coercion case).
         err = load_expect_failure(R"({
             "upstreams": [{"name":"x","host":"127.0.0.1","port":80,
                            "pool":{"max_connections":4294967297}}]
@@ -4382,8 +4360,8 @@ void TestValidateProxyAuthLiveScoping() {
             ConfigLoader::ValidateProxyAuth(cfg, live_all);
         } catch (const std::exception& e) {
             throw std::runtime_error(
-                std::string("Case 2 (Phase 1b): staged proxy with "
-                            "enabled=true + populated issuers should be ")
+                std::string("Case 2: staged proxy with enabled=true + "
+                            "populated issuers should be ")
                 + "accepted but threw: " + e.what());
         }
 
@@ -4519,7 +4497,7 @@ void TestConfigLoaderStrictRateLimitMaxEntries() {
     };
 
     try {
-        // Case 1: oversized max_entries (the reviewer's 4294967312 → 16
+        // Case 1: oversized max_entries (the 4294967312 → 16
         // wrap example) rejected.
         std::string err = load_expect_failure(R"({
             "rate_limit": {
@@ -4713,11 +4691,12 @@ void TestConfigLoaderParseFreshDefaultsMatchStructDefaults() {
     }
 }
 
-// auth.forward.* must reject names owned by HeaderRewriter on the outbound
-// hop (Via, X-Forwarded-For, X-Forwarded-Proto). HeaderRewriter::RewriteRequest
-// appends to / overwrites those names per request — an auth.forward mapping
-// to one of them produces silently-mangled headers downstream once Phase 2
-// wiring lands. Reject at config load with a clear error.
+// auth.forward.* must reject names owned by HeaderRewriter on the
+// outbound hop (Via, X-Forwarded-For, X-Forwarded-Proto).
+// HeaderRewriter::RewriteRequest appends to / overwrites those names
+// per request — an auth.forward mapping to one of them would produce
+// silently-mangled headers downstream. Reject at config load with a
+// clear error.
 void TestConfigLoaderRejectsHeaderRewriterOwnedAuthForwardNames() {
     std::cout << "\n[TEST] ConfigLoader rejects HeaderRewriter-owned auth.forward names..." << std::endl;
     // The reserved-name check runs in Validate(), not LoadFromString().
@@ -4856,7 +4835,7 @@ void TestConfigLoaderStrictTopLevelIntegers() {
         }
     };
     try {
-        // The reviewer's exact example: {"bind_port": 4294967297} would
+        // For example: {"bind_port": 4294967297} would
         // wrap to port 1 with bare .get<int>(). Must be rejected.
         std::string err = load_expect(R"({"bind_port": 4294967297})",
                                        "out of int range");

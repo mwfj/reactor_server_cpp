@@ -110,14 +110,14 @@ private:
 // is never null. Drive the sync fast-path via SetSyncResult+MarkCompletedSync,
 // or hand off via Complete after kicking off async work.
 using AsyncMiddleware = std::function<void(
-    const HttpRequest& req, HttpResponse& resp,
+    HttpRequest& req, HttpResponse& resp,
     std::shared_ptr<AsyncPendingState> state)>;
 
 class HttpRouter {
 public:
     // Handler for HTTP requests
     using Handler = std::function<void(
-        const HttpRequest& request,
+        HttpRequest& request,
         HttpResponse& response
     )>;
 
@@ -131,7 +131,7 @@ public:
 
     // Middleware -- return true to continue, false to stop
     using Middleware = std::function<bool(
-        const HttpRequest& request,
+        HttpRequest& request,
         HttpResponse& response
     )>;
 
@@ -160,6 +160,29 @@ public:
     void RouteAsync(const std::string& method, const std::string& path,
                     AsyncHandler handler);
 
+    // Route registration (proxy async). Same per-method async-trie
+    // insertion path as RouteAsync, but tags the (method, pattern) pair
+    // as proxy-owned in `proxy_async_patterns_`. ResolveRouteMatch reads
+    // this tag at step (2) to demux: an async-trie hit whose entry is
+    // proxy-tagged classifies as RouteKind::Proxy (with the standing
+    // bare-prefix companion / HEAD-fallback rules) rather than
+    // RouteKind::Async. Without this tag, every proxy request — which
+    // installs through the async trie — would be classified as Async
+    // and the proxy-classification branch would never run.
+    //
+    // HttpServer::Proxy / RegisterProxyRoutes MUST call this method
+    // (not RouteAsync) so the proxy ownership marker is set. Operator
+    // async routes registered via HttpServer::RouteAsync stay on the
+    // unmarked path so existing user routes are unaffected.
+    void RouteProxyAsync(const std::string& method, const std::string& path,
+                          AsyncHandler handler);
+
+    // Returns true iff (method, pattern) was registered via
+    // RouteProxyAsync. ResolveRouteMatch consults this at step (2) to
+    // demux an async-trie hit between Async and Proxy classification.
+    bool IsProxyAsyncPattern(const std::string& method,
+                              const std::string& pattern) const;
+
     // WebSocket route
     void WebSocket(const std::string& path, WsUpgradeHandler handler);
 
@@ -183,18 +206,18 @@ public:
     // Returns true if every middleware completed synchronously; false if
     // any deferred — caller must call out_state->ArmResume(resume_cb,
     // active_counter) after wiring the transport cancel trampoline.
-    bool RunAsyncMiddleware(const HttpRequest& request, HttpResponse& response,
+    bool RunAsyncMiddleware(HttpRequest& request, HttpResponse& response,
                             std::shared_ptr<AsyncPendingState>& out_state);
 
     // Route lookup + handler invocation. Returns true if a matched handler
     // ran; false if no match (caller writes 404/405). Does NOT run
     // middleware — callers run RunMiddleware + RunAsyncMiddleware first.
-    bool DispatchHandler(const HttpRequest& request, HttpResponse& response);
+    bool DispatchHandler(HttpRequest& request, HttpResponse& response);
 
     // Compat shim for sync-only callers: RunMiddleware → DispatchHandler.
     // Logs a warn and skips the async chain if any async middleware is
     // registered (the caller cannot honor the suspend contract).
-    bool Dispatch(const HttpRequest& request, HttpResponse& response);
+    bool Dispatch(HttpRequest& request, HttpResponse& response);
 
     // Async-route lookup. Returns an empty function if no async route matches.
     // Populates request.params with extracted path parameters on match.
@@ -204,8 +227,16 @@ public:
     // Dispatch), otherwise the user's handler sees "HEAD" but the framework
     // applies GET-style response normalization + body stripping, which
     // diverges between sync and async routes.
-    AsyncHandler GetAsyncHandler(const HttpRequest& request,
-                                 bool* head_fallback_out = nullptr) const;
+    //
+    // When `matched_pattern_out` is non-null, on a successful match it is
+    // set to the trie pattern that produced the handler (e.g. "/api/v1/*rest"
+    // for a request hitting a proxy catch-all). Used by ResolveRouteMatch
+    // to label `request.route_match.pattern` AND to demux Async vs Proxy
+    // classification via `IsProxyAsyncPattern(method, matched_pattern_out)`.
+    // Untouched on miss.
+    AsyncHandler GetAsyncHandler(HttpRequest& request,
+                                 bool* head_fallback_out = nullptr,
+                                 std::string* matched_pattern_out = nullptr) const;
 
     // Populate request.params from the sync route trie BEFORE middleware
     // runs, so param-aware middleware (e.g. authorize on /users/:id) sees
@@ -214,11 +245,11 @@ public:
     // RunMiddleware; exposed for callers that want to seed params for
     // their own non-RunMiddleware paths (e.g. WS upgrades that consult
     // params before the handshake).
-    void PopulateRouteParams(const HttpRequest& request);
+    void PopulateRouteParams(HttpRequest& request);
 
     // Run middleware chain only (for WebSocket upgrades that need auth/CORS/etc.)
     // Returns true if all middleware passed, false if any short-circuited.
-    bool RunMiddleware(const HttpRequest& request, HttpResponse& response);
+    bool RunMiddleware(HttpRequest& request, HttpResponse& response);
 
     // Ensure a middleware-rejected response carries a meaningful payload:
     // if middleware returned false but left the response untouched, fill
@@ -230,8 +261,50 @@ public:
     // WebSocket route lookup
     bool HasWebSocketRoute(const std::string& path) const;
 
-    // WebSocket route lookup with param extraction (populates request.params)
-    WsUpgradeHandler GetWebSocketHandler(const HttpRequest& request) const;
+    // WebSocket route lookup with param extraction (populates request.params).
+    // When `matched_pattern_out` is non-null, on a successful match it is
+    // set to the trie pattern that produced the handler. Used by
+    // ResolveRouteMatch to label `request.route_match.pattern` for
+    // RouteKind::WsUpgrade matches. Untouched on miss.
+    WsUpgradeHandler GetWebSocketHandler(HttpRequest& request,
+                                          std::string* matched_pattern_out = nullptr) const;
+
+    // Single-source-of-truth route resolver. Walks the precedence chain
+    // and writes `request.route_match` with the resolved kind + pattern
+    // + legacy bool flags. Idempotent: a second call short-circuits when
+    // route_match.kind is already non-None.
+    //
+    // Precedence chain:
+    //   (0a) WS upgrade-candidate detection (cheap presence check).
+    //   (0b) Full RFC 6455 validation for upgrade candidates. On VALID
+    //        + WS-trie hit → kind=WsUpgrade. On VALID + miss OR INVALID
+    //        → kind=None + is_websocket=true (dispatch emits 404/426/400).
+    //        Forbid fallthrough: an upgrade candidate (even malformed)
+    //        MUST NOT reach steps (1)–(5).
+    //   (1) Shutdown route — DEFERRED; not yet wired (the ShutdownRoute
+    //        API doesn't exist on this branch yet).
+    //   (2) Async route via GetAsyncHandler. On hit, demux via
+    //        IsProxyAsyncPattern(method, matched_pattern):
+    //          false → kind=Async.
+    //          true  → kind=Proxy + is_proxy=true.
+    //   (3) Sync route via the sync trie (with HEAD→GET fallback).
+    //        sets kind=Sync.
+    //   (4) Proxy classification — folded into step (2) demux above.
+    //        GetAsyncHandler already encodes proxy-companion-yield
+    //        (which RETURNS NULL when the proxy companion should yield
+    //        to a sync route on this method/path), so a yielded
+    //        companion falls through to step (3) automatically.
+    //   (5) HEAD-fallback — GetAsyncHandler / sync-trie walk both
+    //        already handle HEAD→GET; this method sets head_fallback=true
+    //        on the resolved match when triggered.
+    //
+    // Called by PopulateRouteParams (which now delegates here) AND by
+    // dispatch sites that want to read route_match.kind early. The H1/H2
+    // dispatch frames may also invoke GetAsyncHandler / DispatchHandler
+    // independently to actually run the handler — those paths are
+    // unaffected by this resolver and remain authoritative for handler
+    // invocation.
+    void ResolveRouteMatch(HttpRequest& request) const;
 
     // Disable the async HEAD→GET fallback for a specific registered
     // pattern. Used by proxy routes that explicitly exclude HEAD from
@@ -372,6 +445,16 @@ private:
     // behavior. See MarkProxyCompanion for the full rationale.
     std::unordered_map<std::string, std::unordered_set<std::string>>
         proxy_companion_patterns_;
+
+    // Proxy ownership markers, keyed by method. Set by RouteProxyAsync;
+    // read by ResolveRouteMatch / IsProxyAsyncPattern to demux step-(2)
+    // async-trie hits between Async and Proxy classification. Distinct
+    // from proxy_companion_patterns_ (which marks DERIVED bare-prefix
+    // companions, a subset of proxy routes) — ALL proxy registrations
+    // (catch-alls AND companions) go in proxy_async_patterns_, only
+    // companions go in proxy_companion_patterns_.
+    std::unordered_map<std::string, std::unordered_set<std::string>>
+        proxy_async_patterns_;
 
     // Normalized-pattern keys for async routes, tracked per method.
     // Each registered pattern is reduced to a "semantic shape" key
