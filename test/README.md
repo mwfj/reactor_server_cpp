@@ -6,7 +6,7 @@ Comprehensive test coverage across the reactor core, HTTP/1.1, HTTP/2, WebSocket
 
 ```bash
 make clean && make -j4    # Build test_runner and server_runner
-./test_runner             # Run all tests (no-arg full sweep)
+./test_runner             # Run every suite (no-arg = all suites)
 ./test_runner <suite>     # Run a specific suite (see table below)
 ./test_runner help        # List every supported flag
 ```
@@ -34,7 +34,7 @@ All tests use ephemeral ports (port 0) to avoid conflicts. The test runner autom
 
 ### Feature-family umbrellas
 
-A single CLI flag runs every sub-suite in the family. Sub-suites stay accessible via the no-arg full sweep and (for auth) via individual flags.
+A single CLI flag runs every sub-suite in the family. Sub-suites stay accessible via the no-arg all-suites run and (for auth) via individual flags.
 
 | Family | Command | Short | Sub-suites covered |
 |--------|---------|-------|---------------------|
@@ -70,7 +70,7 @@ Every auth sub-suite has its own flag. Use these when you only want to exercise 
 ### Make Targets
 
 ```bash
-make test                    # Build and run the full sweep
+make test                    # Build and run all suites
 make test_basic              # Single-suite targets — one per CLI flag above
 make test_stress
 make test_race
@@ -205,7 +205,14 @@ Tests macOS kqueue-specific behaviors (skipped on Linux):
 
 ## CI
 
-Tests run on both Linux (`ubuntu-latest`) and macOS (`macos-14`) via GitHub Actions. The stress test adapts to CI environments automatically (`$CI` env var reduces client count from 1000 to 200). Kqueue tests only run on macOS.
+Tests run on both Linux (`ubuntu-latest`) and macOS (`macos-14`) via GitHub Actions in three cadences (per-PR `ci.yml`, nightly `nightly-stress.yml`, weekly `weekly-valgrind.yml`). See [docs/testing.md](../docs/testing.md#continuous-integration) for the full per-job breakdown.
+
+Stress test gating:
+- The no-arg `./test_runner` (and `make test`) invokes `RunAllTest()`, which calls `StressTests::RunStressTests()` only when `getenv("GITHUB_ACTIONS")` is unset. Local runs and Codespaces include stress; the per-PR matrix on GitHub Actions skips it.
+- The explicit `./test_runner stress` flag always runs stress (it goes through the `argc==2` path, not `RunAllTest`).
+- Inside `TestHighLoadConnections`, `getenv("CI")` separately dials load down to 200 clients (85% threshold) when set; locally it runs at 1000 clients (95% threshold). GitHub Actions sets both `CI` and `GITHUB_ACTIONS`, so `nightly-stress.yml` runs at the lighter CI-mode load via the explicit flag.
+
+Kqueue tests only run on macOS.
 
 ## Debugging Failed Tests
 
