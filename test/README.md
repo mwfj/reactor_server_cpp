@@ -205,7 +205,14 @@ Tests macOS kqueue-specific behaviors (skipped on Linux):
 
 ## CI
 
-Tests run on both Linux (`ubuntu-latest`) and macOS (`macos-14`) via GitHub Actions. The stress test adapts to CI environments automatically (`$CI` env var reduces client count from 1000 to 200). Kqueue tests only run on macOS.
+Tests run on both Linux (`ubuntu-latest`) and macOS (`macos-14`) via GitHub Actions in three cadences (per-PR `ci.yml`, nightly `nightly-stress.yml`, weekly `weekly-valgrind.yml`). See [docs/testing.md](../docs/testing.md#continuous-integration) for the full per-job breakdown.
+
+Stress test gating:
+- The no-arg `./test_runner` (and `make test`) invokes `RunAllTest()`, which calls `StressTests::RunStressTests()` only when `getenv("GITHUB_ACTIONS")` is unset. Local runs and Codespaces include stress; the per-PR matrix on GitHub Actions skips it.
+- The explicit `./test_runner stress` flag always runs stress (it goes through the `argc==2` path, not `RunAllTest`).
+- Inside `TestHighLoadConnections`, `getenv("CI")` separately dials load down to 200 clients (85% threshold) when set; locally it runs at 1000 clients (95% threshold). GitHub Actions sets both `CI` and `GITHUB_ACTIONS`, so `nightly-stress.yml` runs at the lighter CI-mode load via the explicit flag.
+
+Kqueue tests only run on macOS.
 
 ## Debugging Failed Tests
 

@@ -133,8 +133,13 @@ void RunAllTest(){
     // Run basic functional tests
     BasicTests::RunAllTests();
 
-    // Run stress tests
-    StressTests::RunStressTests();
+    // Skip stress in GitHub Actions PR-matrix runs — nightly-stress.yml
+    // invokes `./test_runner stress` directly (the explicit-flag path
+    // bypasses RunAllTest). Local runs and Codespaces (where
+    // GITHUB_ACTIONS is unset) include stress so devs get full coverage.
+    if (std::getenv("GITHUB_ACTIONS") == nullptr) {
+        StressTests::RunStressTests();
+    }
 
     // Run race condition tests
     RaceConditionTests::RunRaceConditionTests();
