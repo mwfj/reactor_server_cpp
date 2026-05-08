@@ -578,6 +578,23 @@ std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
                 ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                 "transport closed");
         });
+    // EPOLLERR / EVENT_ERR is routed through SetErrorCb only — the
+    // close callback is deliberately suppressed on the error path
+    // (`connection_handler.cc` comments "NOT close handler — avoid
+    // duplicate callbacks"). Without an error hook here, a pure
+    // EPOLLERR on an H2 transport would tear down the channel
+    // without notifying nghttp2: queued streams would hang until
+    // their per-transaction response timeout instead of failing
+    // immediately. Mirror SetCloseCb's MarkDead + FailAllStreams.
+    transport->SetErrorCb(
+        [wk](std::shared_ptr<ConnectionHandler>) {
+            auto h = wk.lock();
+            if (!h) return;
+            h->MarkDead();
+            h->FailAllStreams(
+                ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                "transport error");
+        });
 
     h2->AdoptLease(std::move(lease));
     h2_table_.Insert(upstream_name, h2);

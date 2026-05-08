@@ -603,26 +603,38 @@ int32_t UpstreamH2Connection::SubmitRequest(
 
     std::vector<nghttp2_nv> nva;
     nva.reserve(4 + headers.size());
-    auto push_nv = [&nva](const std::string& name, const std::string& value) {
+    // Pointer-and-length API only: passing pseudo-header NAMES as const
+    // std::string& would create per-call temporaries (the literal bytes
+    // copied into a stack-local string), and the pointers we store into
+    // `nva` would dangle after the statement ends. nghttp2_submit_request2
+    // memcpy's the bytes synchronously below — but ASan sees the read of
+    // freed-scope storage between push and submit (stack-use-after-scope).
+    // String literals have static storage duration; passing them directly
+    // sidesteps the issue, and value-side pointers come from caller-owned
+    // std::string refs (method/scheme/authority/path/headers) that outlive
+    // this function.
+    auto push_nv = [&nva](const char* name, size_t namelen,
+                          const char* value, size_t valuelen) {
         nghttp2_nv nv;
-        nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(name.data()));
-        nv.namelen = name.size();
-        nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(value.data()));
-        nv.valuelen = value.size();
+        nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(name));
+        nv.namelen = namelen;
+        nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(value));
+        nv.valuelen = valuelen;
         nv.flags = NGHTTP2_NV_FLAG_NONE;
         nva.push_back(nv);
     };
 
-    push_nv(":method", method);
-    push_nv(":scheme", scheme);
-    push_nv(":authority", authority);
-    push_nv(":path", path);
+    push_nv(":method", 7, method.data(), method.size());
+    push_nv(":scheme", 7, scheme.data(), scheme.size());
+    push_nv(":authority", 10, authority.data(), authority.size());
+    push_nv(":path", 5, path.data(), path.size());
 
     size_t i = 0;
     for (const auto& kv : headers) {
         const std::string& lower = lower_names[i++];
         if (IsForbiddenH2RequestHeader(lower)) continue;
-        push_nv(lower, kv.second);
+        push_nv(lower.data(), lower.size(),
+                kv.second.data(), kv.second.size());
     }
 
     auto stream = std::make_shared<UpstreamH2Stream>();

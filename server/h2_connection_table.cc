@@ -94,6 +94,15 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
                                                    : "h2 PING timeout");
                 it = conns.erase(it);
             } else if (c->goaway_seen() && c->active_stream_count() == 0) {
+                // Mark dead before erasing so any weak_ptr observer
+                // racing the destructor sees `IsDead() == true` instead
+                // of "alive but goaway-drained" — symmetric with the
+                // PING/GOAWAY-timeout branch above. The partition's
+                // strong-ref is the last one in practice, but the
+                // explicit MarkDead is cheap insurance against future
+                // observers that latch on a weak_ptr between erase and
+                // destruction.
+                c->MarkDead();
                 it = conns.erase(it);
             } else {
                 ++it;

@@ -691,22 +691,38 @@ void ProxyTransaction::DispatchH2(
     UpstreamH2Codec* raw_codec = h2_codec.get();
     codec_ = std::move(h2_codec);
 
-    // Build :authority mirroring HeaderRewriter's H1 Host derivation:
-    // TLS upstreams reached by IP with sni_hostname set must use the
-    // SNI name (cert CN/SAN match + virtual-host routing); IPv6
-    // literals must be bracketed via FormatAuthority; default ports
-    // for the active scheme are omitted.
-    const std::string& host_src =
-        (upstream_tls_ && !sni_hostname_.empty())
-            ? sni_hostname_
-            : upstream_host_;
-    const std::string host_value =
-        NET_DNS_NAMESPACE::DnsResolver::StripTrailingDot(host_src);
-    const bool omit_port = (!upstream_tls_ && upstream_port_ == 80) ||
-                           (upstream_tls_ && upstream_port_ == 443);
-    const std::string authority =
-        NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
+    // Build :authority by reusing the H1 Host header that
+    // HeaderRewriter::RewriteRequest already produced. RFC 9113 §8.3.1
+    // makes :authority the H2 equivalent of the H1 Host header; using
+    // the already-resolved value gives us H1/H2 byte-parity for free,
+    // including:
+    //   * `rewrite_host=false` passthrough (preserves client-supplied
+    //     Host, which the static derivation here would silently
+    //     overwrite, breaking backend vhost routing for routes that
+    //     opt out of rewriting);
+    //   * TLS-by-IP with `tls.sni_hostname` set (rewriter prefers SNI);
+    //   * IPv6 literal bracketing (via DnsResolver::FormatAuthority);
+    //   * default-port elision for the active scheme.
+    // Fallback to the static derivation only when the rewriter produced
+    // no host at all — defensively handles a rewriter contract change
+    // rather than emitting an empty :authority (which nghttp2 would
+    // reject).
+    std::string authority;
+    auto host_it = rewritten_headers_.find("host");
+    if (host_it != rewritten_headers_.end() && !host_it->second.empty()) {
+        authority = host_it->second;
+    } else {
+        const std::string& host_src =
+            (upstream_tls_ && !sni_hostname_.empty())
+                ? sni_hostname_
+                : upstream_host_;
+        const std::string host_value =
+            NET_DNS_NAMESPACE::DnsResolver::StripTrailingDot(host_src);
+        const bool omit_port = (!upstream_tls_ && upstream_port_ == 80) ||
+                               (upstream_tls_ && upstream_port_ == 443);
+        authority = NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
             host_value, upstream_port_, omit_port);
+    }
     const std::string scheme = upstream_tls_ ? "https" : "http";
 
     // Compose path with query, mirroring the H1 serializer.
@@ -1642,12 +1658,19 @@ void ProxyTransaction::Cleanup() {
         }
         h2_stream_id_ = -1;
         h2_conn_weak_.reset();
+        // ClearResponseTimeout MUST run while h2_path_ is still true:
+        // its H2 branch keys on h2_path_ to bump
+        // h2_response_timeout_generation_, which invalidates any queued
+        // EnQueueDelayed task. If we cleared h2_path_ first, the queued
+        // task would survive — fire later against this transaction (now
+        // possibly mid-retry on the H1 path or already destructed) and
+        // produce a spurious RESPONSE_TIMEOUT against the wrong attempt.
+        ClearResponseTimeout();
         // Reset h2_path_ so a subsequent retry attempt that lands on H1
         // (e.g. ALPN renegotiated, or the H2 connection died and prefer=auto's
         // next probe selects http/1.1) goes through the H1 lease-release
         // branch on its own Cleanup. Without this reset the H1 lease leaks.
         h2_path_ = false;
-        ClearResponseTimeout();
         // Cancelled mid-stream H2 requests are neutral from the breaker's
         // perspective — RST_STREAM is a client-initiated abort, not an
         // upstream failure. Release any held admission token so the slot

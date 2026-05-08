@@ -1713,6 +1713,196 @@ void TestB11HandleBytesRejectsInvalidStatus() {
     }
 }
 
+// B12 — Tick honors goaway_drain_timeout_sec when streams remain stuck
+// after a peer-initiated GOAWAY. With non-zero drain timeout AND elapsed
+// wall-clock past the deadline AND active streams, Tick returns false so
+// the table walker reaps the stuck connection. Without GOAWAY, the same
+// elapsed time leaves Tick returning true (drain timer never started).
+void TestB12TickGoawayDrainTimeout() {
+    std::cout << "\n[TEST] H2Upstream B12: Tick fires on stuck GOAWAY drain..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 2;
+
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B12: Tick fires on stuck GOAWAY drain",
+                false, "Init failed");
+            return;
+        }
+        UpstreamH2Codec codec;
+        RecordingSink sink;
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &codec, &sink);
+        if (sid != 1) {
+            TestFramework::RecordTest(
+                "H2Upstream B12: Tick fires on stuck GOAWAY drain",
+                false, "SubmitRequest failed");
+            return;
+        }
+
+        // No GOAWAY yet: Tick(now+drain_timeout) should still return true —
+        // drain timer is gated on goaway_seen_.
+        auto now = std::chrono::steady_clock::now();
+        bool tick_pre_goaway = conn.Tick(now + std::chrono::seconds(5),
+                                          /*ping_idle*/0, /*ping_timeout*/0,
+                                          /*goaway_drain*/2);
+
+        // Now mark GOAWAY as received. Stream is still in-flight.
+        conn.OnGoawayReceived(/*last_stream_id=*/0);
+
+        // Tick within the drain window — still alive.
+        bool tick_within_window = conn.Tick(
+            std::chrono::steady_clock::now() + std::chrono::seconds(1),
+            0, 0, 2);
+
+        // Tick past the drain window — should evict (return false).
+        bool tick_past_window = conn.Tick(
+            std::chrono::steady_clock::now() + std::chrono::seconds(5),
+            0, 0, 2);
+
+        bool pass = tick_pre_goaway && tick_within_window && !tick_past_window;
+        TestFramework::RecordTest(
+            "H2Upstream B12: Tick fires on stuck GOAWAY drain",
+            pass,
+            pass ? ""
+                 : "expected pre_goaway=true, within=true, past=false");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B12: Tick fires on stuck GOAWAY drain",
+            false, e.what());
+    }
+}
+
+// B13 — UpstreamManager advertises ALPN gated on per-upstream H2 prefer
+// mode. prefer="auto" (default) → ["h2", "http/1.1"]; prefer="never" →
+// ["http/1.1"] only. The wire format is length-prefixed concatenation.
+void TestB13AlpnGatedByPreferMode() {
+    std::cout << "\n[TEST] H2Upstream B13: ALPN list varies by prefer mode..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+
+        UpstreamConfig auto_cfg = MakeH2UpstreamConfig("svc_auto", "127.0.0.1", 9999);
+        auto_cfg.tls.enabled = true;
+        auto_cfg.tls.verify_peer = false;
+        auto_cfg.http2.prefer = "auto";
+
+        UpstreamConfig never_cfg = MakeH2UpstreamConfig("svc_never", "127.0.0.1", 9998);
+        never_cfg.tls.enabled = true;
+        never_cfg.tls.verify_peer = false;
+        never_cfg.http2.prefer = "never";
+
+        UpstreamConfig disabled_cfg = MakeH2UpstreamConfig("svc_disabled", "127.0.0.1", 9997);
+        disabled_cfg.tls.enabled = true;
+        disabled_cfg.tls.verify_peer = false;
+        disabled_cfg.http2.enabled = false;
+
+        UpstreamManager mgr({auto_cfg, never_cfg, disabled_cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        // Wire format: 1-byte length + bytes for each protocol.
+        // ["h2", "http/1.1"] = 0x02 'h' '2' 0x08 'h' 't' 't' 'p' '/' '1' '.' '1'
+        std::vector<unsigned char> expect_with_h2 = {
+            0x02, 'h', '2',
+            0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+        // ["http/1.1"] = 0x08 'h' 't' 't' 'p' '/' '1' '.' '1'
+        std::vector<unsigned char> expect_h1_only = {
+            0x08, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+
+        auto ctx_auto = mgr.GetTlsContextForUpstream("svc_auto");
+        auto ctx_never = mgr.GetTlsContextForUpstream("svc_never");
+        auto ctx_disabled = mgr.GetTlsContextForUpstream("svc_disabled");
+
+        bool pass = ctx_auto && ctx_never && ctx_disabled &&
+                    ctx_auto->GetAlpnWire() == expect_with_h2 &&
+                    ctx_never->GetAlpnWire() == expect_h1_only &&
+                    ctx_disabled->GetAlpnWire() == expect_h1_only;
+        TestFramework::RecordTest(
+            "H2Upstream B13: ALPN list varies by prefer mode",
+            pass,
+            pass ? ""
+                 : "auto must advertise [h2,http/1.1]; never/disabled must advertise [http/1.1] only");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B13: ALPN list varies by prefer mode",
+            false, e.what());
+    }
+}
+
+// B14 — :authority derivation through DispatchH2 mirrors H1's Host
+// header byte-for-byte. Exercised via HeaderRewriter's RewriteRequest
+// directly (the same source-of-truth DispatchH2 reads from). Covers the
+// cases the prior reviewer flagged: TLS-by-IP with sni_hostname,
+// IPv6-literal bracketing, and rewrite_host=false passthrough.
+void TestB14AuthorityDerivationCases() {
+    std::cout << "\n[TEST] H2Upstream B14: :authority derivation cases..." << std::endl;
+    try {
+        // Case 1: TLS by IP, sni_hostname set → SNI wins, default port omits.
+        {
+            HeaderRewriter::Config cfg;
+            HeaderRewriter rw(cfg);
+            auto out = rw.RewriteRequest({}, "203.0.113.5", false,
+                                         /*upstream_tls=*/true,
+                                         /*upstream_host=*/"192.0.2.1",
+                                         /*upstream_port=*/443,
+                                         /*sni_hostname=*/"api.example.com");
+            if (out["host"] != "api.example.com") {
+                TestFramework::RecordTest(
+                    "H2Upstream B14: :authority derivation cases",
+                    false, "Case 1 (SNI override): expected api.example.com, got " + out["host"]);
+                return;
+            }
+        }
+        // Case 2: IPv6 literal upstream → bracketed via FormatAuthority.
+        {
+            HeaderRewriter::Config cfg;
+            HeaderRewriter rw(cfg);
+            auto out = rw.RewriteRequest({}, "::1", false,
+                                         /*upstream_tls=*/false,
+                                         /*upstream_host=*/"2001:db8::1",
+                                         /*upstream_port=*/8080,
+                                         /*sni_hostname=*/"");
+            if (out["host"] != "[2001:db8::1]:8080") {
+                TestFramework::RecordTest(
+                    "H2Upstream B14: :authority derivation cases",
+                    false, "Case 2 (IPv6): expected [2001:db8::1]:8080, got " + out["host"]);
+                return;
+            }
+        }
+        // Case 3: rewrite_host=false → preserve client-supplied Host.
+        {
+            HeaderRewriter::Config cfg;
+            cfg.rewrite_host = false;
+            HeaderRewriter rw(cfg);
+            std::map<std::string, std::string> client = {
+                {"host", "client.example.com:9000"}};
+            auto out = rw.RewriteRequest(client, "203.0.113.5", false,
+                                         /*upstream_tls=*/false,
+                                         /*upstream_host=*/"upstream.internal",
+                                         /*upstream_port=*/80,
+                                         /*sni_hostname=*/"");
+            if (out["host"] != "client.example.com:9000") {
+                TestFramework::RecordTest(
+                    "H2Upstream B14: :authority derivation cases",
+                    false, "Case 3 (rewrite_host=false): expected client.example.com:9000, got " + out["host"]);
+                return;
+            }
+        }
+        TestFramework::RecordTest(
+            "H2Upstream B14: :authority derivation cases", true, "");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B14: :authority derivation cases",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tier C — Race / lifetime / memory
 // ---------------------------------------------------------------------------
@@ -2470,6 +2660,9 @@ void RunAllH2UpstreamTests() {
     TestB9HandleBytesConsumesSettings();
     TestB10HandleBytesDispatchesValidStatus();
     TestB11HandleBytesRejectsInvalidStatus();
+    TestB12TickGoawayDrainTimeout();
+    TestB13AlpnGatedByPreferMode();
+    TestB14AuthorityDerivationCases();
 
     // Tier C — race / lifetime / memory
     TestC1InReceiveDataGuard();

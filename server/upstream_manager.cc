@@ -465,6 +465,29 @@ void UpstreamManager::CommitHttp2Snapshots(
     for (const auto& live : LivePartitions()) {
         auto it = staged.find(live.upstream_name);
         if (it == staged.end()) continue;  // missing → keep live snapshot
+        // Restart-only-field guard: `enabled` and `prefer` drive the
+        // ALPN list that was baked into the TLS client context at
+        // construction time. Live-publishing a snapshot whose restart-
+        // only fields disagree with the live ALPN advertisement creates
+        // an inconsistent runtime: the dispatch decision in
+        // `OnCheckoutReady` honors the new `enabled`/`prefer`, but the
+        // wire still sends what ALPN negotiated at startup. Result for
+        // false→true: H2 framing on an H1-negotiated connection (peer
+        // rejects). Result for true→false: H1 framing on an
+        // H2-negotiated connection (peer rejects). Skip the commit and
+        // log a warn so the operator sees that a restart is required;
+        // live-reloadable fields (windows, PING, drain, frame-size)
+        // remain on the previous snapshot until restart, matching the
+        // "unchanged enable state" contract.
+        auto live_snap = live.partition->LoadHttp2ConfigSnapshot();
+        if (live_snap && !live_snap->LiveEqual(*it->second)) {
+            logging::Get()->warn(
+                "UpstreamManager::CommitHttp2Snapshots: upstream={} has "
+                "restart-only H2 field change (enabled or prefer); keeping "
+                "live snapshot — restart required",
+                live.upstream_name);
+            continue;
+        }
         live.partition->ApplyHttp2ConfigCommit(
             std::make_shared<const Http2UpstreamConfig>(*it->second));
     }

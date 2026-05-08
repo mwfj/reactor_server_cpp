@@ -144,6 +144,17 @@ public:
     void CommitHttp2Snapshots(
         const std::vector<UpstreamConfig>& upstreams);
 
+    // Read access to the per-upstream TLS client context. Returns null
+    // when the upstream is plaintext (no TLS) or when the name is
+    // unknown. Exposed for tests / diagnostics — production code uses
+    // PoolPartition's stored shared_ptr directly. Safe from any thread:
+    // tls_contexts_ is populated at construction and never mutated.
+    std::shared_ptr<TlsClientContext> GetTlsContextForUpstream(
+        const std::string& upstream_name) const {
+        auto it = tls_contexts_.find(upstream_name);
+        return it == tls_contexts_.end() ? nullptr : it->second;
+    }
+
     // Install a non-owning pointer to the server's CircuitBreakerManager.
     // Called once from HttpServer::MarkServerReady after both managers are
     // constructed (§3.1). Lifetime guarantee: the CircuitBreakerManager

@@ -259,6 +259,13 @@ private:
     // sibling streams when one stalls. The generation counter
     // invalidates a queued task when ClearResponseTimeout fires before
     // the task runs.
+    //
+    // dispatcher-thread-only: every reader and writer of this field
+    // (ArmResponseTimeout, ClearResponseTimeout, the EnQueueDelayed
+    // closure) runs on `dispatcher_`'s loop thread. Plain `uint64_t`
+    // is sufficient. If the H2 timeout path ever moves to a centralized
+    // timer pool or a different dispatcher, this field becomes a race
+    // and must promote to `std::atomic<uint64_t>` with relaxed ordering.
     uint64_t h2_response_timeout_generation_ = 0;
 
     enum class RelayMode {
