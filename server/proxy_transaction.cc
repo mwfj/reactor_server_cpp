@@ -334,9 +334,9 @@ void ProxyTransaction::Start() {
     ClearPendingRetryable5xxResponse();
 
     // Take a stack-local ForwardConfig() snapshot, but ONLY when
-    // enforcement is live. The IsEnforcing() gate is at the CALLER
-    // (design §4.7 / §6.1 / §14 step 21): `ForwardConfig()` returns
-    // the stored snapshot unconditionally even when IsEnforcing()=false
+    // enforcement is live. The IsEnforcing() gate is at the CALLER:
+    // `ForwardConfig()` returns the stored snapshot unconditionally
+    // even when IsEnforcing()=false
     // (AuthManager may exist in a "disabled but constructed" state so
     // SIGHUP can flip `auth.enabled: false → true` without a restart).
     // Unconditional snapshotting would let a staged
@@ -685,7 +685,7 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
     // Breaker reporting: connect failures (both timeout and refused) are
     // upstream-health signals → ReportFailure(CONNECT_FAILURE). Local
     // capacity (POOL_EXHAUSTED, QUEUE_TIMEOUT) and shutdown are NOT
-    // reported — they don't imply upstream unhealthiness (design §7).
+    // reported — they don't imply upstream unhealthiness.
     // CHECKOUT_CIRCUIT_OPEN is also not reported to the breaker (would
     // be a feedback loop — our own reject counting against the upstream).
     //

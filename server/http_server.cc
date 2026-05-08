@@ -509,9 +509,9 @@ struct TopLevelAuthPolicyMergeResult {
 
 // Preserve the LIVE top-level auth policy topology across SIGHUP. Top-level
 // policy fields (enabled / applies_to / issuers / required_scopes /
-// required_audience / on_undetermined / realm) are live-reloadable per
-// design §11.2 step 4 — BY IDENTITY, using stable `name` (required +
-// uniqueness enforced by the top-level-policy validator).
+// required_audience / on_undetermined / realm) are live-reloadable BY
+// IDENTITY, using stable `name` (required + uniqueness enforced by the
+// top-level-policy validator).
 //
 // The hazardous case is a policy edit whose staged `issuers[]` references
 // an issuer that isn't in the LIVE AuthManager::issuers_ map (issuer add
@@ -520,9 +520,9 @@ struct TopLevelAuthPolicyMergeResult {
 // `applies_to`, `enabled`) TO MATCH the new issuer in the same reload.
 // A partial-apply that took the staged peers while pinning issuers to
 // the live list would apply new-issuer-tuned rules to old-issuer traffic
-// → 401/403 on previously-working tokens. Design §11.2 step 4 / §18.5
-// mandate **whole-policy defer** for that case: preserve the ENTIRE
-// live policy for that identity, not just the issuers list.
+// → 401/403 on previously-working tokens. The fix is **whole-policy
+// defer** for that case: preserve the ENTIRE live policy for that
+// identity, not just the issuers list.
 //
 // Rules:
 //   - Edit (name matches live): if staged.issuers[] ⊆ live_issuer_names,
@@ -557,7 +557,7 @@ struct TopLevelAuthPolicyMergeResult {
 //
 // Live vector ORDER is preserved for matched identities; new live-safe
 // adds append at the end. Longest-prefix matching is the sole runtime
-// tie-breaker (design §3.2), so vector order only affects inert cases.
+// tie-breaker, so vector order only affects inert cases.
 static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopology(
         const std::vector<AUTH_NAMESPACE::AuthPolicy>& live_policies,
         const std::vector<AUTH_NAMESPACE::AuthPolicy>& staged_policies,
@@ -642,8 +642,8 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         auto it = staged_by_name.find(live.name);
         if (it == staged_by_name.end()) {
             // Staged removed or renamed this policy. Default: drop
-            // (live-reloadable removal per design §11.2 step 4). BUT if
-            // the SAME reload has a DEFERRED ADD covering SOME of this
+            // (live-reloadable removal). BUT if the SAME reload has a
+            // DEFERRED ADD covering SOME of this
             // policy's prefixes, treat those specific prefixes as a
             // migration-in-progress and preserve a TRIMMED copy of the
             // live policy that only covers the overlapping prefixes.
@@ -666,8 +666,8 @@ static TopLevelAuthPolicyMergeResult MergeTopLevelAuthPoliciesPreservingLiveTopo
         if (!issuers_all_live(staged)) {
             // Issuer-refs point at non-live issuers. Two sub-cases:
             //
-            // A) staged.enabled=true — whole-policy defer (design §11.2
-            //    step 4 / §18.5). Applying staged peer fields
+            // A) staged.enabled=true — whole-policy defer. Applying
+            //    staged peer fields
             //    (required_audience, required_scopes, etc.) against
             //    traffic still flowing through the OLD live issuer
             //    would 401/403 previously-working tokens. Preserve the
@@ -6070,8 +6070,8 @@ bool HttpServer::Reload(ServerConfig new_config) {
     // Why per-upstream rather than all-or-nothing: the prior behavior
     // rolled BACK reloadable edits on UNCHANGED upstreams whenever ANY
     // other upstream had a restart-only divergence. That silently lost
-    // unrelated live-safe proxy.auth edits (design §11.2 step 4 — per-
-    // upstream deferral, not blanket rollback).
+    // unrelated live-safe proxy.auth edits — per-upstream deferral, not
+    // blanket rollback, is the right granularity.
     bool any_diverged = false;
     std::vector<UpstreamConfig> merged;
     merged.reserve(upstream_configs_.size());

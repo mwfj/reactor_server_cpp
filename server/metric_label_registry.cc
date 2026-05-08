@@ -1,6 +1,7 @@
 #include "observability/metric_label_registry.h"
 
 #include "common.h"
+#include "log/logger.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 
@@ -9,11 +10,23 @@ MetricLabelRegistry::MetricLabelRegistry(Catalog catalog) {
     for (auto& k : catalog.allowed_keys) {
         allowed_keys_.insert(k);
         auto state = std::make_unique<PerKeyState>();
-        // Apply per-key cap; default to generic when unset.
+        // Apply per-key cap; default to generic when unset. A configured
+        // cap of 0 would silently route every observation to
+        // `__overflow__` (size<0 is false on the very first insert), so
+        // clamp to the default and warn — operators almost always want
+        // "unlimited" or a positive bound, not "drop everything".
         auto it = catalog.value_cardinality_caps.find(k);
-        state->cap = (it != catalog.value_cardinality_caps.end())
-                         ? it->second
-                         : kDefaultGenericCap;
+        if (it != catalog.value_cardinality_caps.end() && it->second > 0) {
+            state->cap = it->second;
+        } else {
+            if (it != catalog.value_cardinality_caps.end()) {
+                logging::Get()->warn(
+                    "MetricLabelRegistry: cap=0 for key '{}' clamped to "
+                    "default {} (cap=0 routes all observations to overflow)",
+                    k, kDefaultGenericCap);
+            }
+            state->cap = kDefaultGenericCap;
+        }
         per_key_.emplace(k, std::move(state));
     }
 }

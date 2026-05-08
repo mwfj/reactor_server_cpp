@@ -1527,28 +1527,58 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                             do_bookkeeping();
                             return;
                         }
-                        if (shared_payload->finalizer) {
-                            shared_payload->finalizer(*req_copy, *resp_copy);
-                        }
-                        if (shared_payload->result ==
-                                HttpRouter::AsyncMiddlewareResult::DENY) {
-                            resp_copy->Header("Connection", "close");
+                        // Mirror MakeAsyncResumeCallback's catch envelope:
+                        // a throwing user finalizer or any escape from
+                        // ContinueWsUpgradeAfterAuth must not bypass
+                        // do_bookkeeping(). Without this, active_requests_
+                        // / inflight_finalizations_ leak and the request
+                        // hangs. 101 has not yet hit the wire on the
+                        // async-resume path, so a generic 500 + Connection:
+                        // close is wire-legal and rollback of
+                        // upgraded_ / ws_conn_ is safe.
+                        try {
+                            if (shared_payload->finalizer) {
+                                shared_payload->finalizer(*req_copy, *resp_copy);
+                            }
+                            if (shared_payload->result ==
+                                    HttpRouter::AsyncMiddlewareResult::DENY) {
+                                resp_copy->Header("Connection", "close");
+                                HttpServer::FinalizeIfSnapshot(
+                                    *req_copy, *resp_copy,
+                                    "rejected_by_async_middleware");
+                                resp_copy->ClearDeferred();
+                                self->CompleteAsyncResponse(std::move(*resp_copy));
+                                self->CloseConnection();
+                            } else {
+                                // Trailing bytes were buffered during the
+                                // suspend window and are flushed by
+                                // CompleteAsyncResponse → OnRawData →
+                                // HandleUpgradedData once upgraded_ is set.
+                                self->ContinueWsUpgradeAfterAuth(
+                                    *req_copy, std::move(*resp_copy),
+                                    /*from_async_resume=*/true,
+                                    /*trailing_buf=*/nullptr,
+                                    /*trailing_len=*/0);
+                            }
+                        } catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Exception in resumed WS-upgrade handler: {}",
+                                e.what());
+                            self->upgraded_ = false;
+                            self->ws_conn_.reset();
+                            HttpResponse err = HttpResponse::InternalError();
+                            err.Header("Connection", "close");
                             HttpServer::FinalizeIfSnapshot(
-                                *req_copy, *resp_copy,
-                                "rejected_by_async_middleware");
-                            resp_copy->ClearDeferred();
-                            self->CompleteAsyncResponse(std::move(*resp_copy));
-                            self->CloseConnection();
-                        } else {
-                            // Trailing bytes were buffered during the
-                            // suspend window and are flushed by
-                            // CompleteAsyncResponse → OnRawData →
-                            // HandleUpgradedData once upgraded_ is set.
-                            self->ContinueWsUpgradeAfterAuth(
-                                *req_copy, std::move(*resp_copy),
-                                /*from_async_resume=*/true,
-                                /*trailing_buf=*/nullptr,
-                                /*trailing_len=*/0);
+                                *req_copy, err, "ws_upgrade_resume_threw");
+                            err.ClearDeferred();
+                            try {
+                                self->CompleteAsyncResponse(std::move(err));
+                                self->CloseConnection();
+                            } catch (const std::exception& e2) {
+                                logging::Get()->error(
+                                    "Failed to send 500 after WS-upgrade "
+                                    "resume throw: {}", e2.what());
+                            }
                         }
                         do_bookkeeping();
                     });
