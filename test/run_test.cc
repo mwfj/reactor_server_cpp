@@ -42,6 +42,19 @@
 #include "introspection_client_test.h"
 #include "auth_introspection_integration_test.h"
 #include "auth_observability_test.h"
+#include "observability_foundation_test.h"
+#include "observability_tracer_test.h"
+#include "observability_metrics_test.h"
+#include "observability_manager_test.h"
+#include "observability_propagator_test.h"
+#include "observability_export_pipeline_test.h"
+#include "observability_prometheus_test.h"
+#include "observability_config_test.h"
+#include "observability_shutdown_test.h"
+#include "observability_link_kill_test.h"
+#include "observability_issue_inject_test.h"
+#include "observability_stress_test.h"
+#include "observability_e2e_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -181,6 +194,63 @@ void RunAllTest(){
     // DNS / dual-stack feature family (transport layer, not inbound auth).
     RunAllDnsFamily();
 
+    // Observability foundation — pure value-type tests (TraceId / SpanId /
+    // TraceFlags / TraceState / SpanContext / LabelSet / AttrValue).
+    ObservabilityFoundationTests::RunAllTests();
+
+    // Observability tracer / sampler / span lifecycle tests — pure
+    // in-process (no I/O); uses InMemorySpanProcessor.
+    ObservabilityTracerTests::RunAllTests();
+
+    // Observability metrics tests — Counter / Histogram / Meter /
+    // MeterProvider + cardinality registry.
+    ObservabilityMetricsTests::RunAllTests();
+
+    // Observability manager + middleware tests — snapshot register-
+    // and-count, FinalizeFromSnapshot CAS gate, KillOutstandingSnapshots,
+    // Reload live-flag flipping, end-to-end middleware.
+    ObservabilityManagerTests::RunAllTests();
+
+    // W3C Trace Context propagator tests — pure value-type tests for
+    // traceparent / tracestate parse + serialize + Inject / Extract.
+    ObservabilityPropagatorTests::RunAllTests();
+
+    // Export pipeline tests — BatchSpanProcessor (worker thread + queue
+    // overflow + shutdown propagation), PeriodicMetricReader (interval
+    // worker), OtlpHttpExporter (OTLP/JSON serialization + lifecycle
+    // hooks + controlled-merge reload).
+    ObservabilityExportPipelineTests::RunAllTests();
+
+    // Prometheus exporter rendering — sanitization, content-type, format
+    // selection, counter / gauge / histogram exposition + OpenMetrics.
+    ObservabilityPrometheusTests::RunAllTests();
+
+    // Observability config schema — JSON load, Validate /
+    // ValidateHotReloadable splits, MakeMetricsHandler runtime gate.
+    ObservabilityConfigTests::RunAllTests();
+
+    // Shutdown drain — finalize CAS gate, KillOutstandingSnapshots
+    // counter drain, BeginShutdown idempotency.
+    ObservabilityShutdownTests::RunAllTests();
+
+    // Link/kill protocol — ProxyTransaction implements
+    // UpstreamTransactionLink; the kill loop reaches linked txs.
+    ObservabilityLinkKillTests::RunAllTests();
+
+    // IssueTraceContext outbound injection (JWKS / OIDC / introspection
+    // / OTLP) — strip-and-replace W3C contract.
+    ObservabilityIssueInjectTests::RunAllTests();
+
+    // Cross-cutting stress / lifecycle / race tests — concurrent
+    // finalize CAS, register/finalize churn, kill loop tolerance,
+    // concurrent counter add, reload + read race, manager cycle.
+    ObservabilityStressTests::RunAllTests();
+
+    // Observability end-to-end tests — boot a real HttpServer, install
+    // the observability manager + middleware, send TCP-level HTTP
+    // requests, assert spans are captured by the InMemorySpanProcessor.
+    ObservabilityE2ETests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -228,6 +298,36 @@ void PrintUsage(const char* program_name) {
     std::cout << "  intro_client, -y   Introspection client static-helper + AsyncPendingState tests" << std::endl;
     std::cout << "  auth_intro,  -Z    Introspection integration tests" << std::endl;
     std::cout << "  auth_observability, -o    Auth observability tests" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  obs_foundation     Observability foundation value-type tests" << std::endl;
+    std::cout << "                     (TraceId / SpanId / TraceFlags / TraceState /" << std::endl;
+    std::cout << "                      SpanContext / LabelSet / AttrValue)" << std::endl;
+    std::cout << "  obs_tracer         Observability tracer / sampler / span lifecycle" << std::endl;
+    std::cout << "                     tests (Tracer / TracerProvider / Span / Sampler)" << std::endl;
+    std::cout << "  obs_metrics        Observability metrics tests (Counter /" << std::endl;
+    std::cout << "                     Histogram / Meter / MeterProvider + cardinality" << std::endl;
+    std::cout << "                     registry)" << std::endl;
+    std::cout << "  obs_mgr            Observability manager + middleware tests" << std::endl;
+    std::cout << "                     (snapshot lifecycle, finalize CAS gate, kill" << std::endl;
+    std::cout << "                      loop, Reload, end-to-end middleware)" << std::endl;
+    std::cout << "  obs_e2e            Observability end-to-end tests (boot real" << std::endl;
+    std::cout << "                     HttpServer, send HTTP requests, verify spans)" << std::endl;
+    std::cout << "  obs_propagator     W3C Trace Context propagator tests" << std::endl;
+    std::cout << "                     (traceparent / tracestate parse + Inject)" << std::endl;
+    std::cout << "  obs_export         Export pipeline tests (BatchSpanProcessor /" << std::endl;
+    std::cout << "                     PeriodicMetricReader / OtlpHttpExporter)" << std::endl;
+    std::cout << "  obs_prom           PrometheusExporter rendering tests (sanitize," << std::endl;
+    std::cout << "                     counter / gauge / histogram exposition, OpenMetrics)" << std::endl;
+    std::cout << "  obs_config         Observability config schema tests (JSON load," << std::endl;
+    std::cout << "                     Validate, ValidateHotReloadable, MetricsHandler)" << std::endl;
+    std::cout << "  obs_shutdown       Shutdown drain tests (CAS gate," << std::endl;
+    std::cout << "                     KillOutstandingSnapshots drain, BeginShutdown idempotency)" << std::endl;
+    std::cout << "  obs_linkkill       Observability link/kill protocol tests" << std::endl;
+    std::cout << "                     (ProxyTransaction link, KillOutstandingSnapshots wiring)" << std::endl;
+    std::cout << "  obs_issue          IssueTraceContext outbound injection tests" << std::endl;
+    std::cout << "                     (JWKS / OIDC / introspection / OTLP traceparent strip+inject)" << std::endl;
+    std::cout << "  obs_stress         Cross-cutting stress / race / lifecycle tests" << std::endl;
+    std::cout << "                     (concurrent finalize CAS, churn drain, reload+read)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -327,7 +427,7 @@ int main(int argc, char* argv[]) {
         // Run AuthManager unit tests
         }else if(mode == "auth_mgr" || mode == "-M"){
             AuthManagerTests::RunAllTests();
-        // Run auth integration tests (Phase 2)
+        // Run auth integration tests
         }else if(mode == "auth2" || mode == "-V"){
             AuthIntegrationTests::RunAllTests();
         // Run auth failure mode tests
@@ -378,6 +478,54 @@ int main(int argc, char* argv[]) {
         // Run auth observability tests
         }else if(mode == "auth_observability" || mode == "-o"){
             AuthObservabilityTests::RunAllTests();
+        // Run observability foundation value-type tests (TraceId / SpanId /
+        // TraceFlags / TraceState / SpanContext / LabelSet / AttrValue).
+        }else if(mode == "obs_foundation"){
+            ObservabilityFoundationTests::RunAllTests();
+        // Run observability tracer / sampler / span lifecycle tests.
+        }else if(mode == "obs_tracer"){
+            ObservabilityTracerTests::RunAllTests();
+        // Run observability metrics tests (Counter / Histogram /
+        // Meter / MeterProvider + cardinality registry).
+        }else if(mode == "obs_metrics"){
+            ObservabilityMetricsTests::RunAllTests();
+        // Run observability manager + middleware tests (snapshot
+        // lifecycle, FinalizeFromSnapshot CAS gate, kill loop,
+        // Reload, middleware end-to-end).
+        }else if(mode == "obs_mgr"){
+            ObservabilityManagerTests::RunAllTests();
+        // Run observability end-to-end tests (boot real HttpServer,
+        // install observability manager + middleware, send real HTTP
+        // requests, assert spans captured).
+        }else if(mode == "obs_e2e"){
+            ObservabilityE2ETests::RunAllTests();
+        // Run W3C Trace Context propagator tests (traceparent /
+        // tracestate parse + serialize + Inject / Extract).
+        }else if(mode == "obs_propagator"){
+            ObservabilityPropagatorTests::RunAllTests();
+        // Run export pipeline tests (BatchSpanProcessor /
+        // PeriodicMetricReader / OtlpHttpExporter).
+        }else if(mode == "obs_export"){
+            ObservabilityExportPipelineTests::RunAllTests();
+        // Run PrometheusExporter rendering tests (sanitization,
+        // counter / gauge / histogram exposition + OpenMetrics).
+        }else if(mode == "obs_prom"){
+            ObservabilityPrometheusTests::RunAllTests();
+        // Run observability config schema + MakeMetricsHandler tests.
+        }else if(mode == "obs_config"){
+            ObservabilityConfigTests::RunAllTests();
+        // Run observability shutdown drain / kill loop tests.
+        }else if(mode == "obs_shutdown"){
+            ObservabilityShutdownTests::RunAllTests();
+        // Run observability link/kill protocol tests.
+        }else if(mode == "obs_linkkill"){
+            ObservabilityLinkKillTests::RunAllTests();
+        // Run IssueTraceContext outbound injection tests.
+        }else if(mode == "obs_issue"){
+            ObservabilityIssueInjectTests::RunAllTests();
+        // Run observability cross-cutting stress / race tests.
+        }else if(mode == "obs_stress"){
+            ObservabilityStressTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// Auth WebSocket upgrade tests — Phase 2 test suite.
+// Auth WebSocket upgrade tests.
 //
 // WebSocket upgrade requests pass through the HTTP middleware chain before
 // the 101 Switching Protocols response is sent. These tests verify that
@@ -245,7 +245,7 @@ static std::shared_ptr<AUTH_NAMESPACE::AuthManager> AttachAuth(
     mgr->Start();
 
     std::weak_ptr<AUTH_NAMESPACE::AuthManager> weak_mgr = mgr;
-    server.Use([weak_mgr](const HttpRequest& req, HttpResponse& resp) -> bool {
+    server.Use([weak_mgr](HttpRequest& req, HttpResponse& resp) -> bool {
         auto m = weak_mgr.lock();
         if (!m) return true;  // manager gone — pass through
         return m->InvokeMiddleware(req, resp);

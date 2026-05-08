@@ -10,6 +10,7 @@
 #include "tls/tls_context.h"
 #include "rate_limit/rate_limiter.h"
 #include "auth/auth_manager.h"
+#include "observability/common.h"  // forward decl of ObservabilityManager
 
 #include <atomic>
 #include <map>
@@ -64,6 +65,20 @@ public:
     explicit HttpServer(ServerConfig config);
 
     ~HttpServer();
+
+    // Install an ObservabilityManager. MUST be called BEFORE
+    // MarkServerReady runs (otherwise the middleware install in
+    // MarkServerReady will be a no-op for this server's lifetime).
+    // The middleware is installed automatically as the LAST prepend in
+    // MarkServerReady so it executes FIRST, before auth + rate-limit.
+    // Pass nullptr to disable observability (default).
+    void SetObservabilityManager(
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager> mgr) {
+        observability_manager_ = std::move(mgr);
+    }
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* GetObservabilityManager() const {
+        return observability_manager_.get();
+    }
 
     // Route registration (delegates to router) — synchronous handlers.
     // The framework serializes the response and closes out the request when
@@ -264,6 +279,21 @@ public:
     // class so it is namespaced under HttpServer:: rather than polluting
     // the global / http namespace with a free thread-local.
     static thread_local HTTP_CALLBACKS_NAMESPACE::ResourcePusher* current_sync_pusher_;
+
+    // Fire FinalizeFromSnapshot on the request's observability snapshot
+    // (if non-null). Computes the wire body size from the response's
+    // status + body — bodyless statuses (1xx / 204 / 304) and HEAD
+    // requests record 0. `error_type` is the OTel HTTP semconv
+    // `error.type` attribute value: empty string for success, or one
+    // of the categorical strings ("rejected_by_middleware",
+    // "handler_threw", "client_error", "server_error", etc.).
+    //
+    // Idempotent: multiple calls per request are CAS-gated by the
+    // snapshot itself; only the first call wins. Safe to call even
+    // when `request.obs_snapshot` is null (no-op).
+    static void FinalizeIfSnapshot(HttpRequest& request,
+                                     const HttpResponse& response,
+                                     std::string error_type);
 
 private:
     // `live_config_` is initialized first because every other member's
@@ -466,6 +496,29 @@ private:
     void OnWsDrainComplete(ConnectionHandler* conn_ptr);
     void WaitForH2Drain();
 
+    // Block until every async counter reaches zero or `timeout`
+    // expires. The predicate gates each counter on its owning manager
+    // being non-null — null managers contribute zero. Always called
+    // unconditionally so any future async counter added to the
+    // predicate is picked up automatically. Returns true on full drain.
+    bool WaitForAllAsyncDrain(std::chrono::milliseconds timeout);
+
+    // Two-phase split used by Stop()'s shutdown sequence so the
+    // natural-finalize wait + (future) BatchSpanProcessor ForceFlush
+    // can run BEFORE upstream pool shutdown — when the OTLP push
+    // pipeline is wired through UpstreamHttpClient, the final flush
+    // MUST go through pools that still accept checkouts. The kill +
+    // BeginShutdown phase runs AFTER upstream drain so proxy
+    // in-flight finalizes complete naturally during the upstream
+    // drain window without hitting CAS-killed snapshots.
+    //
+    // FlushObservability returns true when the natural wait observed
+    // a fully-drained state; the kill phase passes that hint so an
+    // already-drained pipeline skips the kill sweep entirely.
+    bool FlushObservabilityForShutdown(std::chrono::milliseconds budget);
+    void KillAndShutdownObservability(std::chrono::milliseconds budget,
+                                       bool drained_in_flush_phase);
+
     // Helper: set up request handler on an Http2ConnectionHandler
     void SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn);
 
@@ -502,6 +555,16 @@ private:
     // → circuit_breaker_manager_ → upstream_manager_.
     AUTH_NAMESPACE::AuthConfig auth_config_;
     std::unique_ptr<AUTH_NAMESPACE::AuthManager> auth_manager_;
+
+    // OpenTelemetry observability manager — null when observability
+    // is disabled (the default deployment). When non-null, the request
+    // callback invokes FinalizeIfSnapshot at completion. shared_ptr
+    // (not unique_ptr) so the observability-middleware closure can
+    // hold a co-owning reference for its lifetime; the manager
+    // inherits enable_shared_from_this so kill-loop closures can use
+    // weak_from_this().
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
+        observability_manager_;
 
     // Proxy handlers keyed by (upstream_service_name + normalized prefix).
     // shared_ptr (not unique_ptr) so that route lambdas capture shared

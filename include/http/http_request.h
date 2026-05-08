@@ -2,8 +2,16 @@
 
 #include "common.h"
 #include "auth/auth_context.h"
+#include "http/route_match.h"
+#include "observability/common.h"        // forward decls for Span / ObservabilitySnapshot
+#include "observability/trace_context.h" // RequestTraceContext (complete type for std::optional<>)
 #include <optional>
 // <unordered_map> provided by common.h
+
+// Forward declarations for observability types we hold as pointer /
+// shared_ptr (no header pull required at this point — full type only
+// needed at .cc construction sites).
+class Dispatcher;
 
 struct HttpRequest {
     std::string method;           // "GET", "POST", "PUT", "DELETE", etc.
@@ -21,8 +29,65 @@ struct HttpRequest {
     bool complete = false;        // True when full request has been parsed
 
     // Route parameters populated by HttpRouter during dispatch.
-    // Mutable because routing is an output of dispatch, not parser input.
-    mutable std::unordered_map<std::string, std::string> params;
+    std::unordered_map<std::string, std::string> params;
+
+    // Resolved route's identity, written by HttpRouter::ResolveRouteMatch /
+    // PopulateRouteParams BEFORE the middleware chain runs. Read by the
+    // observability middleware (per-route sampling, http.route metric
+    // label) and by the dispatch site (which switches on `kind` to pick
+    // the right handler shape). See include/http/route_match.h.
+    RouteMatch route_match;
+
+    // ============== OpenTelemetry observability fields ==============
+    //
+    // All six fields are populated by the observability middleware and/or
+    // the connection handler. When observability is disabled (the
+    // default deployment), the manager is null and these stay default-
+    // constructed — the disabled fast path costs one branch per request.
+
+    // W3C Trace Context state for this request — extracted from inbound
+    // `traceparent` (may be default-constructed when absent), plus a
+    // freshly-generated `current_local` SpanContext that identifies the
+    // gateway's INBOUND server hop. Always-set when observability is
+    // enabled (regardless of sampling decision); used for outbound
+    // propagation including DROP-sampled requests so downstream services
+    // attach to a synthetic per-attempt span_id.
+    std::optional<OBSERVABILITY_NAMESPACE::RequestTraceContext> trace_ctx;
+
+    // The inbound SERVER span allocated by the observability middleware,
+    // or null on DROP / when traces are disabled. The proxy and upstream
+    // child-span allocation paths use this as the StartSpanOptions parent
+    // so child CLIENT spans attach correctly under the SERVER span.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::Span> observability_span;
+
+    // url.scheme — populated by the connection handler at parse time.
+    // H1 derives "http" / "https" from `ConnectionHandler::HasTls()`;
+    // H2 copies the `:scheme` pseudo-header. Carries the OTel HTTP
+    // semconv `url.scheme` value for server spans + metric labels.
+    std::string url_scheme;
+
+    // network.protocol.version — populated by the connection handler at
+    // parse time. H1 formats as "1.0" / "1.1" (this server explicitly
+    // accepts HTTP/1.0; hardcoding "1.1" would mislabel HTTP/1.0 spans).
+    // H2 always emits "2". Carries the OTel HTTP semconv
+    // `network.protocol.version` value.
+    std::string network_protocol_version;
+
+    // The dispatcher (event loop) that owns this connection. The
+    // observability snapshot's kill-marshal target reads this field to
+    // choose between inline-on-self-dispatcher and cross-dispatcher
+    // EnQueue. Set by the connection handler at parse time (Dispatcher
+    // has no thread-local Current() accessor).
+    Dispatcher* owning_dispatcher = nullptr;
+
+    // Per-request observability bookkeeping snapshot — populated by the
+    // observability middleware AFTER Span allocation, BEFORE auth /
+    // rate-limit run (so middleware-rejection paths can finalize through
+    // the snapshot). Async wrappers + streaming senders capture this
+    // shared_ptr by value BEFORE any HttpRequest::Reset(), so the
+    // snapshot's lifetime is independent of the request slot.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> obs_snapshot;
+    // ===============================================================
 
     // Index of the dispatcher (event loop) handling this request's connection.
     // Set by the connection handler; used for upstream pool partition affinity.
@@ -128,6 +193,18 @@ struct HttpRequest {
         headers_complete = false;
         complete = false;
         params.clear();
+        route_match = {};
+        // Observability fields — cleared symmetrically with the other
+        // dispatch-time mutable state. Async wrappers + streaming
+        // senders capture obs_snapshot by value BEFORE Reset, so this
+        // reset is safe; it just tells the next pipelined request to
+        // allocate its own snapshot.
+        trace_ctx.reset();
+        observability_span.reset();
+        url_scheme.clear();
+        network_protocol_version.clear();
+        owning_dispatcher = nullptr;
+        obs_snapshot.reset();
         dispatcher_index = -1;
         client_ip.clear();
         client_tls = false;

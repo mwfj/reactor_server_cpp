@@ -42,7 +42,7 @@ bool ValidatePolicyList(const AppliedPolicyList& policies,
             err_out = "auth policy prefix `" + pref +
                       "` declared by both `" + it->second + "` and `" +
                       owner + "` — exact-prefix collisions must be resolved "
-                      "at config time (see design spec §3.2)";
+                      "at config time";
             return false;
         }
     }

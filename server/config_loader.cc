@@ -7,11 +7,13 @@
 #include "log/logger.h"
 #include "net/dns_resolver.h"        // IsValidHostOrIpLiteral grammar
 #include "rate_limit/rate_limit_zone.h"  // RateLimitZone::SHARD_COUNT
+#include "observability/observability_config.h"
 #include "nlohmann/json.hpp"
 
 #include <fstream>
 #include <sstream>
 #include <arpa/inet.h>
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 #include <algorithm>
@@ -222,7 +224,7 @@ static nlohmann::json SerializeAuthPolicy(const AUTH_NAMESPACE::AuthPolicy& p) {
 // `allow_applies_to` controls whether the `applies_to` field is permitted
 // in this JSON. Top-level policies set it to true (applies_to is the
 // REQUIRED prefix declaration). Inline proxy.auth blocks set it to false:
-// per design spec §3.2 / §5.2, the prefix for an inline policy is
+// the prefix for an inline policy is
 // derived from `proxy.route_prefix` at AuthManager::RegisterPolicy time,
 // and an inline `applies_to` would be silently ignored — the JSON would
 // then describe a different protected path than what the runtime uses,
@@ -254,7 +256,7 @@ static void ParseAuthPolicy(const nlohmann::json& j, AUTH_NAMESPACE::AuthPolicy&
             throw std::invalid_argument(
                 context + ".applies_to is not permitted on inline auth "
                 "(the prefix is derived from the surrounding proxy's "
-                "route_prefix, see design spec §3.2 / §5.2). Remove "
+                "route_prefix, ). Remove "
                 "applies_to here, or move this policy to top-level "
                 "auth.policies[] if it needs an explicit prefix list.");
         }
@@ -383,7 +385,7 @@ static void ParseIssuerConfig(const std::string& name, const nlohmann::json& j,
         }
         const auto& i = j["introspection"];
         // Reject inline client_secret — only env-var sourcing is allowed
-        // (design spec §9 item 8, §5.3).
+        //.
         if (i.contains("client_secret")) {
             throw std::invalid_argument(
                 ctx + ".introspection.client_secret must NOT be set inline; "
@@ -776,12 +778,11 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
 
                 // Inline per-proxy auth policy. `applies_to` is derived from
                 // `route_prefix` at AuthManager::RegisterPolicy time — the
-                // inline stanza never declares its own `applies_to`. See
-                // design spec §3.2 / §5.2. Pass `allow_applies_to=false`
-                // so the parser rejects misleading inline applies_to
-                // declarations at parse time, before they can mislead an
-                // operator into thinking that field governs runtime
-                // matching.
+                // inline stanza never declares its own `applies_to`. Pass
+                // `allow_applies_to=false` so the parser rejects misleading
+                // inline applies_to declarations at parse time, before they
+                // can mislead an operator into thinking that field governs
+                // runtime matching.
                 if (proxy.contains("auth")) {
                     ParseAuthPolicy(
                         proxy["auth"],
@@ -965,6 +966,338 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
         }
         config.dns.resolver_max_inflight = ParseStrictInt(
             dns, "resolver_max_inflight", config.dns.resolver_max_inflight, "dns");
+    }
+
+    // Observability section. The master switch is
+    // `observability.enabled` (RESTART). Sub-blocks override defaults
+    // when present; missing blocks keep struct defaults.
+    if (j.contains("observability")) {
+        if (!j["observability"].is_object()) {
+            throw std::runtime_error("observability must be an object");
+        }
+        auto& obs = j["observability"];
+        auto& oc = config.observability;
+        if (obs.contains("enabled")) {
+            if (!obs["enabled"].is_boolean())
+                throw std::runtime_error("observability.enabled must be boolean");
+            oc.enabled = obs["enabled"].get<bool>();
+        }
+        if (obs.contains("resource")) {
+            if (!obs["resource"].is_object())
+                throw std::runtime_error("observability.resource must be an object");
+            auto& r = obs["resource"];
+            if (r.contains("service_name")) {
+                if (!r["service_name"].is_string())
+                    throw std::runtime_error(
+                        "observability.resource.service_name must be a string");
+                oc.resource.service_name = r["service_name"].get<std::string>();
+            }
+            if (r.contains("service_version")) {
+                if (!r["service_version"].is_string())
+                    throw std::runtime_error(
+                        "observability.resource.service_version must be a string");
+                oc.resource.service_version = r["service_version"].get<std::string>();
+            }
+            if (r.contains("service_instance_id")) {
+                if (!r["service_instance_id"].is_string())
+                    throw std::runtime_error(
+                        "observability.resource.service_instance_id must be a string");
+                oc.resource.service_instance_id =
+                    r["service_instance_id"].get<std::string>();
+            }
+        }
+        if (obs.contains("traces")) {
+            if (!obs["traces"].is_object())
+                throw std::runtime_error("observability.traces must be an object");
+            auto& tj = obs["traces"];
+            if (tj.contains("enabled")) {
+                if (!tj["enabled"].is_boolean())
+                    throw std::runtime_error(
+                        "observability.traces.enabled must be boolean");
+                oc.traces.enabled = tj["enabled"].get<bool>();
+            }
+            if (tj.contains("exporter")) {
+                if (!tj["exporter"].is_string())
+                    throw std::runtime_error(
+                        "observability.traces.exporter must be a string");
+                oc.traces.exporter = tj["exporter"].get<std::string>();
+            }
+            if (tj.contains("sampler")) {
+                if (!tj["sampler"].is_object())
+                    throw std::runtime_error(
+                        "observability.traces.sampler must be an object");
+                auto& sj = tj["sampler"];
+                if (sj.contains("type")) {
+                    if (!sj["type"].is_string())
+                        throw std::runtime_error(
+                            "observability.traces.sampler.type must be a string");
+                    auto t = sj["type"].get<std::string>();
+                    if (t == "always_on")
+                        oc.traces.sampler.type =
+                            OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOn;
+                    else if (t == "always_off")
+                        oc.traces.sampler.type =
+                            OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOff;
+                    else if (t == "trace_id_ratio")
+                        oc.traces.sampler.type =
+                            OBSERVABILITY_NAMESPACE::SamplerType::TraceIdRatio;
+                    else if (t == "parent_based")
+                        oc.traces.sampler.type =
+                            OBSERVABILITY_NAMESPACE::SamplerType::ParentBased;
+                    else
+                        throw std::runtime_error(
+                            "observability.traces.sampler.type unknown: " + t);
+                }
+                if (sj.contains("ratio")) {
+                    if (!sj["ratio"].is_number())
+                        throw std::runtime_error(
+                            "observability.traces.sampler.ratio must be a number");
+                    oc.traces.sampler.ratio = sj["ratio"].get<double>();
+                }
+                if (sj.contains("routes")) {
+                    if (!sj["routes"].is_array())
+                        throw std::runtime_error(
+                            "observability.traces.sampler.routes must be an array");
+                    oc.traces.sampler.routes.clear();
+                    for (const auto& it : sj["routes"]) {
+                        if (!it.is_object()) {
+                            // Silently dropping non-object entries
+                            // (`routes: ["/health"]`, `routes: [null]`)
+                            // would let an operator typo disable
+                            // per-route sampling without any error.
+                            // Treat the whole reload as malformed.
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[] "
+                                "entries must be objects with "
+                                "{path, sampler, ratio?}");
+                        }
+                        OBSERVABILITY_NAMESPACE::SamplerRouteOverride o;
+                        if (it.contains("path") && !it["path"].is_string())
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[].path "
+                                "must be a string");
+                        o.path = it.value("path", std::string{});
+                        if (it.contains("sampler") && !it["sampler"].is_string())
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[].sampler "
+                                "must be a string");
+                        auto t = it.value("sampler", std::string("always_off"));
+                        if (t == "always_on")
+                            o.sampler = OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOn;
+                        else if (t == "always_off")
+                            o.sampler = OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOff;
+                        else if (t == "trace_id_ratio")
+                            o.sampler =
+                                OBSERVABILITY_NAMESPACE::SamplerType::TraceIdRatio;
+                        else if (t == "parent_based")
+                            o.sampler =
+                                OBSERVABILITY_NAMESPACE::SamplerType::ParentBased;
+                        else
+                            // Match the top-level sampler parser: a typo
+                            // (e.g. "always-of") must fail config load
+                            // rather than silently coerce to AlwaysOff
+                            // and disable telemetry for the prefix.
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[].sampler "
+                                "must be one of: always_on, always_off, "
+                                "trace_id_ratio, parent_based (got '" +
+                                t + "')");
+                        if (it.contains("ratio") && !it["ratio"].is_number())
+                            throw std::runtime_error(
+                                "observability.traces.sampler.routes[].ratio "
+                                "must be a number");
+                        o.ratio = it.value("ratio", 1.0);
+                        oc.traces.sampler.routes.push_back(std::move(o));
+                    }
+                }
+            }
+            if (tj.contains("otlp")) {
+                if (!tj["otlp"].is_object())
+                    throw std::runtime_error(
+                        "observability.traces.otlp must be an object");
+                auto& oj = tj["otlp"];
+                if (oj.contains("upstream")) {
+                    if (!oj["upstream"].is_string())
+                        throw std::runtime_error(
+                            "observability.traces.otlp.upstream must be a string");
+                    oc.traces.otlp.upstream = oj["upstream"].get<std::string>();
+                }
+                if (oj.contains("timeout_ms"))
+                    oc.traces.otlp.timeout_ms = std::chrono::milliseconds{
+                        ParseStrictInt(oj, "timeout_ms",
+                            static_cast<int>(oc.traces.otlp.timeout_ms.count()),
+                            "observability.traces.otlp")};
+                if (oj.contains("headers")) {
+                    if (!oj["headers"].is_object())
+                        throw std::runtime_error(
+                            "observability.traces.otlp.headers must be object");
+                    oc.traces.otlp.headers.clear();
+                    for (auto it = oj["headers"].begin();
+                         it != oj["headers"].end(); ++it) {
+                        if (!it.value().is_string())
+                            throw std::runtime_error(
+                                "observability.traces.otlp.headers[" +
+                                it.key() + "] must be a string");
+                        oc.traces.otlp.headers[it.key()] =
+                            it.value().get<std::string>();
+                    }
+                }
+            }
+            if (tj.contains("batch")) {
+                if (!tj["batch"].is_object())
+                    throw std::runtime_error(
+                        "observability.traces.batch must be an object");
+                auto& bj = tj["batch"];
+                oc.traces.batch.max_queue_size = ParseStrictInt(
+                    bj, "max_queue_size", oc.traces.batch.max_queue_size,
+                    "observability.traces.batch");
+                oc.traces.batch.max_export_batch_size = ParseStrictInt(
+                    bj, "max_export_batch_size",
+                    oc.traces.batch.max_export_batch_size,
+                    "observability.traces.batch");
+                if (bj.contains("schedule_delay_ms"))
+                    oc.traces.batch.schedule_delay = std::chrono::milliseconds{
+                        ParseStrictInt(bj, "schedule_delay_ms",
+                            static_cast<int>(
+                                oc.traces.batch.schedule_delay.count()),
+                            "observability.traces.batch")};
+                if (bj.contains("retries")) {
+                    if (!bj["retries"].is_object()) {
+                        // `retries: []` or `retries: "off"` previously
+                        // fell through this gate and silently kept
+                        // defaults — the operator's intent was lost.
+                        // Reject malformed values explicitly.
+                        throw std::runtime_error(
+                            "observability.traces.batch.retries must be "
+                            "an object with {max_attempts, "
+                            "initial_backoff_ms, max_backoff_ms}");
+                    }
+                    auto& rj = bj["retries"];
+                    oc.traces.batch.retries.max_attempts = ParseStrictInt(
+                        rj, "max_attempts",
+                        oc.traces.batch.retries.max_attempts,
+                        "observability.traces.batch.retries");
+                    if (rj.contains("initial_backoff_ms"))
+                        oc.traces.batch.retries.initial_backoff =
+                            std::chrono::milliseconds{ParseStrictInt(
+                                rj, "initial_backoff_ms",
+                                static_cast<int>(
+                                    oc.traces.batch.retries.initial_backoff.count()),
+                                "observability.traces.batch.retries")};
+                    if (rj.contains("max_backoff_ms"))
+                        oc.traces.batch.retries.max_backoff =
+                            std::chrono::milliseconds{ParseStrictInt(
+                                rj, "max_backoff_ms",
+                                static_cast<int>(
+                                    oc.traces.batch.retries.max_backoff.count()),
+                                "observability.traces.batch.retries")};
+                }
+            }
+        }
+        if (obs.contains("metrics")) {
+            if (!obs["metrics"].is_object())
+                throw std::runtime_error(
+                    "observability.metrics must be an object");
+            auto& mj = obs["metrics"];
+            if (mj.contains("enabled")) {
+                if (!mj["enabled"].is_boolean())
+                    throw std::runtime_error(
+                        "observability.metrics.enabled must be boolean");
+                oc.metrics.enabled = mj["enabled"].get<bool>();
+            }
+            if (mj.contains("exporter")) {
+                if (!mj["exporter"].is_string())
+                    throw std::runtime_error(
+                        "observability.metrics.exporter must be a string");
+                oc.metrics.exporter = mj["exporter"].get<std::string>();
+            }
+            if (mj.contains("otlp")) {
+                if (!mj["otlp"].is_object())
+                    throw std::runtime_error(
+                        "observability.metrics.otlp must be an object");
+                auto& oj = mj["otlp"];
+                if (oj.contains("upstream")) {
+                    if (!oj["upstream"].is_string())
+                        throw std::runtime_error(
+                            "observability.metrics.otlp.upstream must be a string");
+                    oc.metrics.otlp.upstream = oj["upstream"].get<std::string>();
+                }
+                if (oj.contains("timeout_ms"))
+                    oc.metrics.otlp.timeout_ms = std::chrono::milliseconds{
+                        ParseStrictInt(oj, "timeout_ms",
+                            static_cast<int>(oc.metrics.otlp.timeout_ms.count()),
+                            "observability.metrics.otlp")};
+                if (oj.contains("headers")) {
+                    if (!oj["headers"].is_object())
+                        throw std::runtime_error(
+                            "observability.metrics.otlp.headers must be object");
+                    oc.metrics.otlp.headers.clear();
+                    for (auto it = oj["headers"].begin();
+                         it != oj["headers"].end(); ++it) {
+                        if (!it.value().is_string())
+                            throw std::runtime_error(
+                                "observability.metrics.otlp.headers[" +
+                                it.key() + "] must be a string");
+                        oc.metrics.otlp.headers[it.key()] =
+                            it.value().get<std::string>();
+                    }
+                }
+            }
+            if (mj.contains("export_interval_ms"))
+                oc.metrics.reader.export_interval = std::chrono::milliseconds{
+                    ParseStrictInt(mj, "export_interval_ms",
+                        static_cast<int>(
+                            oc.metrics.reader.export_interval.count()),
+                        "observability.metrics")};
+            if (mj.contains("export_timeout_ms"))
+                oc.metrics.reader.export_timeout = std::chrono::milliseconds{
+                    ParseStrictInt(mj, "export_timeout_ms",
+                        static_cast<int>(
+                            oc.metrics.reader.export_timeout.count()),
+                        "observability.metrics")};
+            if (mj.contains("prometheus")) {
+                if (!mj["prometheus"].is_object())
+                    throw std::runtime_error(
+                        "observability.metrics.prometheus must be an object");
+                auto& pj = mj["prometheus"];
+                if (pj.contains("path")) {
+                    if (!pj["path"].is_string())
+                        throw std::runtime_error(
+                            "observability.metrics.prometheus.path must be a string");
+                    oc.metrics.prometheus.path = pj["path"].get<std::string>();
+                }
+                if (pj.contains("include_target_info")) {
+                    if (!pj["include_target_info"].is_boolean())
+                        throw std::runtime_error(
+                            "observability.metrics.prometheus.include_target_info "
+                            "must be boolean");
+                    oc.metrics.prometheus.include_target_info =
+                        pj["include_target_info"].get<bool>();
+                }
+            }
+            if (mj.contains("histogram_buckets")) {
+                if (!mj["histogram_buckets"].is_object())
+                    throw std::runtime_error(
+                        "observability.metrics.histogram_buckets must be object");
+                oc.metrics.histogram_buckets.clear();
+                for (auto it = mj["histogram_buckets"].begin();
+                     it != mj["histogram_buckets"].end(); ++it) {
+                    if (!it.value().is_array())
+                        throw std::runtime_error(
+                            "observability.metrics.histogram_buckets[" +
+                            it.key() + "] must be an array of numbers");
+                    std::vector<double> bs;
+                    for (const auto& b : it.value()) {
+                        if (!b.is_number())
+                            throw std::runtime_error(
+                                "observability.metrics.histogram_buckets[" +
+                                it.key() + "] entries must be numbers");
+                        bs.push_back(b.get<double>());
+                    }
+                    oc.metrics.histogram_buckets[it.key()] = std::move(bs);
+                }
+            }
+        }
     }
 
     return config;
@@ -1242,6 +1575,14 @@ void ConfigLoader::Normalize(ServerConfig& config) {
 //   - each zone's name / rate / capacity / key_type / max_entries
 //   - duplicate zone name detection
 //
+// Forward decls for the observability validators (defined further
+// below). Surfaced here so ValidateHotReloadable / Validate can call
+// them regardless of source ordering.
+static void ValidateObservabilityLive(const ServerConfig& config,
+                                        bool force_validate);
+static void ValidateObservabilityRestart(const ServerConfig& config,
+                                           bool reload_copy);
+
 // Throws std::invalid_argument with a field-named message on failure.
 // Called from both `Validate` (startup) and `ValidateHotReloadable`
 // (reload) so both paths see identical rejection behavior.
@@ -1485,7 +1826,8 @@ static void ValidateIntrospectionFields(
 void ConfigLoader::ValidateHotReloadable(
         const ServerConfig& config,
         const std::unordered_set<std::string>& live_upstream_names,
-        const std::unordered_set<std::string>& live_issuer_names) {
+        const std::unordered_set<std::string>& live_issuer_names,
+        bool observability_live) {
     // Mirrors the circuit_breaker validation block in Validate().
     // Kept in lock-step with that block — any rule added there for a
     // hot-reloadable field must be added here too, or the SIGHUP
@@ -1635,7 +1977,7 @@ void ConfigLoader::ValidateHotReloadable(
                 throw std::invalid_argument(
                     ctx + ".algorithms contains unsupported value '" + a +
                     "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
-                    "HS*/none/PS*/auto are deferred per design spec §15)");
+                    "HS*/none/PS*/auto are deferred)");
             }
         }
         // Introspection-block input validation runs for ALL staged issuers
@@ -1703,6 +2045,243 @@ void ConfigLoader::ValidateHotReloadable(
     // RateLimitManager::Reload applies every edit live, so bad values
     // must be rejected before the reload path commits them.
     ValidateRateLimitHotReloadable(config);
+
+    // Observability hot-reloadable subset. Restart-required fields
+    // (exporter selection, otlp.upstream cross-refs, prometheus path,
+    // histogram bucket layout) are deliberately NOT validated here —
+    // SIGHUP edits to those fields are surfaced as the outer "restart
+    // required" warn by HttpServer::Reload.
+    //
+    // force_validate is set ONLY when a live ObservabilityManager
+    // actually consumes the staged live knobs. When the server started
+    // with observability.enabled=false, no manager exists and stale
+    // invalid live values in the file (e.g. schedule_delay_ms=0
+    // carried over from a prior config) would never be applied —
+    // rejecting them here would block unrelated live-safe edits in
+    // the same SIGHUP. When the manager IS live, force_validate=true
+    // because disabling observability is itself restart-only and the
+    // live pipeline keeps consuming the live subset (rejecting the
+    // stale value protects the running exporter / batch processor).
+    // Same scoping rationale as `live_upstream_names` /
+    // `live_issuer_names`: validate only what the apply path will
+    // actually touch.
+    ValidateObservabilityLive(config, /*force_validate=*/observability_live);
+}
+
+// Validate the observability schema. Splits into a "live-reloadable"
+// subset (called from ValidateHotReloadable) and a "restart-required"
+// subset (called only from Validate at startup). The split mirrors
+// the field classification in `ObservabilityConfig`.
+static void ValidateObservabilityLive(const ServerConfig& config,
+                                        bool force_validate) {
+    const auto& oc = config.observability;
+    // Skip the live-field range checks when the master switch is OFF
+    // and the caller hasn't asked us to force validation. Startup with
+    // `enabled=false` is the canonical "no observability" deployment
+    // and we don't want to reject configs that happen to carry stale
+    // (possibly invalid) reader / batch values they never apply.
+    //
+    // ValidateHotReloadable passes force_validate=true because in a
+    // SIGHUP reload the LIVE manager may be enabled even when the
+    // staged config sets enabled=false (which is restart-only —
+    // disabling never takes effect mid-process). HttpServer::Reload
+    // hands the staged config straight to ObservabilityManager::Reload
+    // and applies the live subfields, so invalid live knobs in the
+    // staged file would otherwise reach a running manager unchecked.
+    if (!oc.enabled && !force_validate) return;
+
+    if (oc.metrics.reader.export_interval.count() < 1)
+        throw std::invalid_argument(
+            "observability.metrics.export_interval_ms must be >= 1");
+    if (oc.metrics.reader.export_timeout.count() < 1)
+        throw std::invalid_argument(
+            "observability.metrics.export_timeout_ms must be >= 1");
+    if (oc.metrics.reader.export_timeout > oc.metrics.reader.export_interval)
+        throw std::invalid_argument(
+            "observability.metrics.export_timeout_ms must not exceed "
+            "export_interval_ms");
+
+    if (oc.traces.batch.max_queue_size < 1)
+        throw std::invalid_argument(
+            "observability.traces.batch.max_queue_size must be >= 1");
+    if (oc.traces.batch.max_export_batch_size < 1)
+        throw std::invalid_argument(
+            "observability.traces.batch.max_export_batch_size must be >= 1");
+    // batch_size must not exceed queue_size. max_queue_size is
+    // restart-only — for the SIGHUP reload path, HttpServer::Reload
+    // overwrites the staged max_queue_size with the live value
+    // BEFORE calling ValidateHotReloadable, so this comparison sees
+    // the live queue capacity that staged batch_size will actually
+    // run against. At startup both values are the operator's
+    // construction-time choices.
+    if (oc.traces.batch.max_export_batch_size > oc.traces.batch.max_queue_size) {
+        throw std::invalid_argument(
+            "observability.traces.batch.max_export_batch_size must not "
+            "exceed max_queue_size");
+    }
+    if (oc.traces.batch.schedule_delay.count() < 1)
+        throw std::invalid_argument(
+            "observability.traces.batch.schedule_delay_ms must be >= 1");
+    if (oc.traces.batch.retries.max_attempts < 0)
+        throw std::invalid_argument(
+            "observability.traces.batch.retries.max_attempts must be >= 0");
+    // Non-positive backoffs would collapse exponential retry into
+    // immediate retries (cv::wait_for with a non-positive duration
+    // returns instantly per the spec), hammering a struggling
+    // exporter. Both knobs are live-reloadable, so reject before
+    // they reach the running BatchSpanProcessor.
+    if (oc.traces.batch.retries.initial_backoff.count() < 1)
+        throw std::invalid_argument(
+            "observability.traces.batch.retries.initial_backoff_ms "
+            "must be >= 1");
+    if (oc.traces.batch.retries.max_backoff.count() < 1)
+        throw std::invalid_argument(
+            "observability.traces.batch.retries.max_backoff_ms "
+            "must be >= 1");
+    if (oc.traces.batch.retries.max_backoff
+            < oc.traces.batch.retries.initial_backoff)
+        throw std::invalid_argument(
+            "observability.traces.batch.retries.max_backoff_ms must "
+            "not be less than initial_backoff_ms");
+
+    if (oc.traces.sampler.ratio < 0.0 || oc.traces.sampler.ratio > 1.0)
+        throw std::invalid_argument(
+            "observability.traces.sampler.ratio must be in [0.0, 1.0]");
+    for (const auto& r : oc.traces.sampler.routes) {
+        if (r.path.empty())
+            throw std::invalid_argument(
+                "observability.traces.sampler.routes[].path must be non-empty");
+        if (r.ratio < 0.0 || r.ratio > 1.0)
+            throw std::invalid_argument(
+                "observability.traces.sampler.routes[].ratio must be in "
+                "[0.0, 1.0]");
+    }
+
+    if (oc.metrics.otlp.timeout_ms.count() < 1)
+        throw std::invalid_argument(
+            "observability.metrics.otlp.timeout_ms must be >= 1");
+    if (oc.traces.otlp.timeout_ms.count() < 1)
+        throw std::invalid_argument(
+            "observability.traces.otlp.timeout_ms must be >= 1");
+}
+
+// Restart-required subset — exporter selection, prometheus path,
+// OTLP upstream cross-references. Skipped on `reload_copy=true` (the
+// reload path's stripped-upstreams view).
+static void ValidateObservabilityRestart(const ServerConfig& config,
+                                           bool reload_copy) {
+    const auto& oc = config.observability;
+    if (!oc.enabled) return;
+
+    if (!oc.traces.exporter.empty() && oc.traces.exporter != "otlp_http")
+        throw std::invalid_argument(
+            "observability.traces.exporter must be empty or 'otlp_http'");
+    if (!oc.metrics.exporter.empty()
+        && oc.metrics.exporter != "otlp_http"
+        && oc.metrics.exporter != "prometheus_pull")
+        throw std::invalid_argument(
+            "observability.metrics.exporter must be empty, 'otlp_http' or "
+            "'prometheus_pull'");
+
+    // OTLP push pipeline acceptance is gated on the bootstrap path
+    // in main.cc actually wiring an OtlpHttpExporter through
+    // UpstreamHttpClient. That wiring is non-trivial because the
+    // UpstreamHttpClient needs HttpServer's live dispatchers (built
+    // during Start()) while the ObservabilityManager must be
+    // attached BEFORE Start() so the middleware fires — i.e. the
+    // processor swap has to go through a post-Start re-bind, which
+    // is a focused follow-up not yet in this PR. Until that lands,
+    // reject `otlp_http` here at validate time so `validate` /
+    // `config` / `start` give consistent answers (the alternative —
+    // accept at validate, install NoopSpanProcessor at start —
+    // silently drops every span/metric the operator configured for
+    // export).
+    if (oc.traces.exporter == "otlp_http") {
+        throw std::invalid_argument(
+            "observability.traces.exporter='otlp_http' is not yet wired "
+            "in this build; remove the exporter or wait for the OTLP "
+            "push pipeline bootstrap to land");
+    }
+    if (oc.metrics.exporter == "otlp_http") {
+        throw std::invalid_argument(
+            "observability.metrics.exporter='otlp_http' is not yet wired "
+            "in this build; use 'prometheus_pull' or remove the exporter");
+    }
+
+    if (oc.metrics.exporter == "prometheus_pull"
+        && oc.metrics.prometheus.path.empty()) {
+        throw std::invalid_argument(
+            "observability.metrics.prometheus.path must be non-empty when "
+            "metrics.exporter='prometheus_pull'");
+    }
+    if (oc.metrics.exporter == "prometheus_pull"
+        && (oc.metrics.prometheus.path.empty()
+            || oc.metrics.prometheus.path[0] != '/')) {
+        throw std::invalid_argument(
+            "observability.metrics.prometheus.path must start with '/'");
+    }
+
+    // Cross-references into upstreams[] — only at startup (reload_copy
+    // strips upstreams to skip topology checks; the reload path warns
+    // separately on staged otlp.upstream renames). An empty `upstream`
+    // when the exporter is otlp_http is a configuration error: the
+    // pipeline has no collector to route to, so requests would be
+    // silently discarded post-startup.
+    if (!reload_copy) {
+        auto cross_ref = [&](const std::string& name, const char* field) {
+            if (name.empty()) {
+                throw std::invalid_argument(
+                    std::string(field) +
+                    " must reference an upstreams[].name when the "
+                    "matching exporter is set to 'otlp_http'");
+            }
+            for (const auto& u : config.upstreams) {
+                if (u.name == name) return;
+            }
+            throw std::invalid_argument(
+                std::string(field) + " references unknown upstream '" +
+                name + "' — must match one of the upstreams[].name");
+        };
+        if (oc.traces.exporter == "otlp_http")
+            cross_ref(oc.traces.otlp.upstream,
+                      "observability.traces.otlp.upstream");
+        if (oc.metrics.exporter == "otlp_http")
+            cross_ref(oc.metrics.otlp.upstream,
+                      "observability.metrics.otlp.upstream");
+    }
+
+    // Histogram bucket layout — every boundary must be finite (NaN
+    // and ±Inf are rejected so the Prometheus formatter and OTLP
+    // serialiser never see them) AND strictly increasing. The cap
+    // lives on MetricsConfig so non-config histogram constructors
+    // can share it.
+    for (const auto& kv : oc.metrics.histogram_buckets) {
+        if (kv.second.empty())
+            throw std::invalid_argument(
+                "observability.metrics.histogram_buckets[" + kv.first +
+                "] must be non-empty");
+        if (kv.second.size() >
+            OBSERVABILITY_NAMESPACE::MetricsConfig::kMaxBucketsPerInstrument)
+            throw std::invalid_argument(
+                "observability.metrics.histogram_buckets[" + kv.first +
+                "] exceeds the per-instrument boundary cap (" +
+                std::to_string(OBSERVABILITY_NAMESPACE::MetricsConfig::
+                                 kMaxBucketsPerInstrument) +
+                ")");
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            if (!std::isfinite(kv.second[i])) {
+                throw std::invalid_argument(
+                    "observability.metrics.histogram_buckets[" + kv.first +
+                    "] contains a non-finite boundary (NaN/Inf forbidden)");
+            }
+        }
+        for (size_t i = 1; i < kv.second.size(); ++i) {
+            if (!(kv.second[i] > kv.second[i-1]))
+                throw std::invalid_argument(
+                    "observability.metrics.histogram_buckets[" + kv.first +
+                    "] must be strictly increasing");
+        }
+    }
 }
 
 void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
@@ -2245,7 +2824,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
     ValidateRateLimitHotReloadable(config);
 
     // -------------------------------------------------------------------
-    // Auth validation (design spec §5.3).
+    // Auth validation.
     //
     // Scope: defensive input validation on the parsed auth config. Hard-
     // reject conditions that cannot safely be live-applied later by
@@ -2271,7 +2850,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             if (ic.issuer_url.empty()) {
                 throw std::invalid_argument(ctx + ".issuer_url is required");
             }
-            // TLS-mandatory to IdP (design spec §9 item 4). Plaintext rejected.
+            // TLS-mandatory to IdP. Plaintext rejected.
             // Case-insensitive scheme per RFC 3986 §3.1.
             if (!AUTH_NAMESPACE::HasHttpsScheme(ic.issuer_url)) {
                 throw std::invalid_argument(
@@ -2291,7 +2870,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     throw std::invalid_argument(
                         ctx + ".algorithms contains unsupported value '" + a +
                         "' (v1 supports only RS256/RS384/RS512/ES256/ES384; "
-                        "HS*/none/PS*/auto are deferred per design spec §15)");
+                        "HS*/none/PS*/auto are deferred)");
                 }
             }
             // Referenced upstream is mandatory — JWKS refresh, OIDC
@@ -2352,7 +2931,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 throw std::invalid_argument(ctx + ".jwks_cache_sec must be > 0");
             }
 
-            // Mode-specific required fields (design spec §5.3).
+            // Mode-specific required fields.
             // jwt mode requires at least one algorithm and a key source —
             // either OIDC discovery OR a static jwks_uri.
             // introspection mode requires the endpoint (the POST target).
@@ -2374,7 +2953,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
 
             // TLS-mandatory on actual outbound IdP endpoints, not just on
-            // issuer_url (design spec §9 item 4 hardening). The issuer_url
+            // issuer_url. The issuer_url
             // check above protects discovery; these checks protect the two
             // other URLs that carry security-sensitive data:
             //
@@ -2398,14 +2977,14 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 throw std::invalid_argument(
                     ctx + ".jwks_uri must start with https:// — plaintext "
                     "JWKS allows MITM key substitution and would compromise "
-                    "token verification (design spec §9 item 4)");
+                    "token verification");
             }
             if (!ic.introspection.endpoint.empty() &&
                 !AUTH_NAMESPACE::HasHttpsScheme(ic.introspection.endpoint)) {
                 throw std::invalid_argument(
                     ctx + ".introspection.endpoint must start with https:// "
                     "— plaintext introspection would leak bearer tokens and "
-                    "client credentials over the wire (design spec §9 item 4)");
+                    "client credentials over the wire");
             }
 
             // TLS-on-upstream check for introspection-mode issuers.
@@ -2476,10 +3055,10 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 }
             }
 
-            // Mode/endpoint mismatch — warn per design spec §5.3. Not a
-            // hard-reject because operators sometimes template both blocks
-            // and select mode dynamically; emitting a warn ensures the
-            // unused field is noticed without blocking deployment.
+            // Mode/endpoint mismatch — warn, not a hard-reject because
+            // operators sometimes template both blocks and select mode
+            // dynamically; emitting a warn ensures the unused field is
+            // noticed without blocking deployment.
             if (ic.mode == "jwt" &&
                 !ic.introspection.endpoint.empty()) {
                 logging::Get()->warn(
@@ -2549,7 +3128,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
 
             // ---- Structural validation: runs regardless of `enabled` ----
             //
-            // Per the rollout plan (design spec §14), operators are EXPECTED
+            // Per the rollout plan, operators are EXPECTED
             // to pre-stage inline auth blocks with `enabled=false` while
             // request-time enforcement is being wired in follow-up PRs.
             // If we only validated when enabled=true, typos in the staged
@@ -2599,7 +3178,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
 
             // route_prefix must be a LITERAL byte prefix when inline auth
             // is populated. AUTH_NAMESPACE::FindPolicyForPath does literal-prefix
-            // matching (design spec §3.2) — it has no understanding of the
+            // matching — it has no understanding of the
             // route_trie's :param / *splat syntax. A proxy with
             // `/api/:version/users/*path` routes real requests like
             // `/api/v1/users/123` via the trie just fine, but the AUTH
@@ -2637,7 +3216,7 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                                 ? "':" + s.param_name + "' param"
                                 : "'*" + s.param_name + "' catch-all") +
                             " segment). The auth matcher does byte-prefix "
-                            "matching only (design spec §3.2). If you need "
+                            "matching only. If you need "
                             "to protect a patterned route, use top-level "
                             "auth.policies[] with applies_to listing the "
                             "literal prefix(es) the pattern expands through "
@@ -2689,6 +3268,15 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             }
         }
     }
+
+    // Observability schema. Both live + restart subsets run at startup;
+    // the reload path runs only the live subset (ValidateObservabilityLive).
+    // Startup honours `enabled=false` and skips the live-field range
+    // checks (force_validate=false); the reload caller above forces
+    // them on so a SIGHUP can't smuggle invalid live values through
+    // staged enabled=false.
+    ValidateObservabilityLive(config, /*force_validate=*/false);
+    ValidateObservabilityRestart(config, reload_copy);
 }
 
 void ConfigLoader::ValidateAuthForward(const ServerConfig& config) {
@@ -2841,7 +3429,7 @@ void ConfigLoader::ValidateAuthPrefixCollisions(
                 "auth policy prefix '" + u.proxy.route_prefix +
                 "' declared by both " + ins.first->second + " and " +
                 owner + " — exact-prefix collisions must be resolved at "
-                "config time (design spec §3.2)");
+                "config time");
         }
     }
     for (size_t i = 0; i < config.auth.policies.size(); ++i) {
@@ -2858,7 +3446,7 @@ void ConfigLoader::ValidateAuthPrefixCollisions(
                     "auth policy prefix '" + pref + "' declared by both " +
                     ins.first->second + " and " + policy_owner +
                     " — exact-prefix collisions must be resolved at "
-                    "config time (design spec §3.2)");
+                    "config time");
             }
         }
     }
@@ -2996,7 +3584,7 @@ void ConfigLoader::ValidateProxyAuth(
                             ? "':" + s.param_name + "' param"
                             : "'*" + s.param_name + "' catch-all") +
                         " segment). The auth matcher does byte-prefix "
-                        "matching only (design spec §3.2). If you need "
+                        "matching only. If you need "
                         "to protect a patterned route, use top-level "
                         "auth.policies[] with applies_to listing the "
                         "literal prefix(es) the pattern expands through "
@@ -3261,6 +3849,120 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             aj["forward"] = fj;
         }
         j["auth"] = aj;
+    }
+
+    // Observability — round-trip support. Without this block,
+    // ConfigLoader::ToJson(LoadFromString(...)) would silently strip
+    // every operator-set observability field (exporters, sampler
+    // routes, /metrics path, OTLP upstream, batch sizing, etc.).
+    {
+        auto sampler_name = [](OBSERVABILITY_NAMESPACE::SamplerType t) {
+            switch (t) {
+                case OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOn:
+                    return "always_on";
+                case OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOff:
+                    return "always_off";
+                case OBSERVABILITY_NAMESPACE::SamplerType::TraceIdRatio:
+                    return "trace_id_ratio";
+                case OBSERVABILITY_NAMESPACE::SamplerType::ParentBased:
+                default:
+                    return "parent_based";
+            }
+        };
+        const auto& oc = config.observability;
+        nlohmann::json oj;
+        oj["enabled"] = oc.enabled;
+
+        nlohmann::json rj;
+        rj["service_name"] = oc.resource.service_name;
+        if (!oc.resource.service_version.empty())
+            rj["service_version"] = oc.resource.service_version;
+        if (!oc.resource.service_instance_id.empty())
+            rj["service_instance_id"] = oc.resource.service_instance_id;
+        oj["resource"] = rj;
+
+        nlohmann::json tj;
+        tj["enabled"]  = oc.traces.enabled;
+        if (!oc.traces.exporter.empty())
+            tj["exporter"] = oc.traces.exporter;
+
+        nlohmann::json sj;
+        sj["type"]  = sampler_name(oc.traces.sampler.type);
+        sj["ratio"] = oc.traces.sampler.ratio;
+        if (!oc.traces.sampler.routes.empty()) {
+            nlohmann::json routes = nlohmann::json::array();
+            for (const auto& r : oc.traces.sampler.routes) {
+                nlohmann::json rj2;
+                rj2["path"]    = r.path;
+                rj2["sampler"] = sampler_name(r.sampler);
+                rj2["ratio"]   = r.ratio;
+                routes.push_back(std::move(rj2));
+            }
+            sj["routes"] = std::move(routes);
+        }
+        tj["sampler"] = sj;
+
+        nlohmann::json otj;
+        if (!oc.traces.otlp.upstream.empty())
+            otj["upstream"] = oc.traces.otlp.upstream;
+        if (!oc.traces.otlp.headers.empty())
+            otj["headers"] = oc.traces.otlp.headers;
+        otj["timeout_ms"] =
+            static_cast<int64_t>(oc.traces.otlp.timeout_ms.count());
+        tj["otlp"] = otj;
+
+        nlohmann::json bj;
+        bj["max_queue_size"]        = oc.traces.batch.max_queue_size;
+        bj["max_export_batch_size"] = oc.traces.batch.max_export_batch_size;
+        bj["schedule_delay_ms"]     =
+            static_cast<int64_t>(oc.traces.batch.schedule_delay.count());
+        nlohmann::json brj;
+        brj["max_attempts"]    = oc.traces.batch.retries.max_attempts;
+        brj["initial_backoff_ms"] =
+            static_cast<int64_t>(oc.traces.batch.retries.initial_backoff.count());
+        brj["max_backoff_ms"]  =
+            static_cast<int64_t>(oc.traces.batch.retries.max_backoff.count());
+        bj["retries"] = brj;
+        tj["batch"] = bj;
+        oj["traces"] = tj;
+
+        nlohmann::json mj;
+        mj["enabled"] = oc.metrics.enabled;
+        if (!oc.metrics.exporter.empty())
+            mj["exporter"] = oc.metrics.exporter;
+        nlohmann::json mojo;
+        if (!oc.metrics.otlp.upstream.empty())
+            mojo["upstream"] = oc.metrics.otlp.upstream;
+        if (!oc.metrics.otlp.headers.empty())
+            mojo["headers"] = oc.metrics.otlp.headers;
+        mojo["timeout_ms"] =
+            static_cast<int64_t>(oc.metrics.otlp.timeout_ms.count());
+        mj["otlp"] = mojo;
+
+        // Reader knobs sit at metrics-level in the parser (not under
+        // a "reader" sub-object). Serialize at the same path so a
+        // Load → ToJson → Load round-trip preserves the operator's
+        // export cadence.
+        mj["export_interval_ms"] =
+            static_cast<int64_t>(oc.metrics.reader.export_interval.count());
+        mj["export_timeout_ms"]  =
+            static_cast<int64_t>(oc.metrics.reader.export_timeout.count());
+
+        nlohmann::json pj;
+        pj["path"]                = oc.metrics.prometheus.path;
+        pj["include_target_info"] = oc.metrics.prometheus.include_target_info;
+        mj["prometheus"] = pj;
+
+        if (!oc.metrics.histogram_buckets.empty()) {
+            nlohmann::json hj = nlohmann::json::object();
+            for (const auto& [name, buckets] : oc.metrics.histogram_buckets) {
+                hj[name] = buckets;
+            }
+            mj["histogram_buckets"] = hj;
+        }
+        oj["metrics"] = mj;
+
+        j["observability"] = oj;
     }
 
     return j.dump(4);

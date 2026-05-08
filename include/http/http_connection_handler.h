@@ -35,12 +35,45 @@ public:
     // Send an HTTP response
     void SendResponse(const HttpResponse& response);
 
+    // ============================================================
+    // Observability finalize hooks
+    // ============================================================
+    // Per-request post-wire-write notification slot. The shutdown-route
+    // pump arms this when no observability snapshot exists so it knows
+    // when the response has been buffered.
+    //
+    // The framework signals it by calling `notify_sent->store(true,
+    // std::memory_order_release);` immediately AFTER the post-wire-
+    // write step (the same instant a WithFinalize hook would fire).
+    // Cleared after signal so subsequent pipelined requests see a
+    // fresh state.
+    //
+    // On transport teardown before write completion, the framework
+    // still flips the flag — the helper observes "framework gave up
+    // on this submission" which is the correct shutdown signal.
+    void SetPostWriteNotifyOnce(std::shared_ptr<std::atomic<bool>> notify_sent);
+    // ============================================================
+
     // Create a streaming final-response sender for the current deferred async
     // request. Used by the proxy relay path to stream bytes without going
     // through CompleteAsyncResponse(HttpResponse).
+    //
+    // `finalize_request` fires exactly once on End() OR Abort() with the
+    // observed final state of the stream:
+    //   status_code     — the status passed to SendHeaders, or 0 if Abort
+    //                     fired before SendHeaders.
+    //   bytes_sent      — cumulative bytes accepted by SendData (the
+    //                     wire body size, modulo HEAD-strip).
+    //   error_type      — empty for End(); a stable label
+    //                     ("upstream_truncated", "client_disconnect", etc.)
+    //                     mapped from AbortReason on Abort. The OTel
+    //                     observability finalize uses this verbatim as
+    //                     the `error.type` attribute on the SERVER span.
     HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender CreateStreamingResponseSender(
         std::function<bool()> claim_response,
-        std::function<void()> finalize_request);
+        std::function<void(int status_code,
+                            uint64_t bytes_sent,
+                            std::string error_type)> finalize_request);
 
     // Send a non-final 1xx response (103 Early Hints, 102 Processing, etc.).
     // Thread-safe: off-dispatcher callers are internally hopped to the
@@ -125,6 +158,16 @@ public:
     // any pipelined bytes that arrived during the deferred window.
     void CompleteAsyncResponse(HttpResponse response);
 
+    // Variant that fires `before_replay` AFTER the wire bytes have been
+    // queued via SendRaw and AFTER the deferred state has been cleared,
+    // but BEFORE the deferred-pipeline replay loop resumes parsing.
+    // Lets a caller land observability or pipeline-ordered work
+    // between the request-A response and any synchronous request-B
+    // middleware/registration triggered by replay.
+    void CompleteAsyncResponseBeforeReplay(
+        HttpResponse response,
+        std::function<void()> before_replay);
+
     // Cancel a deferred async-response cycle that was started by
     // BeginAsyncResponse but whose handler threw before handing off the
     // completion callback. Resets deferred state + shutdown exemption so
@@ -149,9 +192,20 @@ public:
     // drops the socket while a request is still deferred — without
     // this, the heartbeat timer dies with the connection and a stuck
     // handler would leak active_requests_ permanently.
+    //
+    // Also fires the post_write_notify_ flag so any shutdown-route
+    // pump waiting on this slot observes "framework gave up on this
+    // submission" — the correct shutdown signal.
+    // The helper does not need to distinguish wrote-OK vs gave-up:
+    // either way the queued submit work has run and Stop() can
+    // proceed.
     void TripAsyncAbortHook() {
         auto hook = std::move(async_abort_hook_);
         if (hook) hook();
+        if (post_write_notify_) {
+            post_write_notify_->store(true, std::memory_order_release);
+            post_write_notify_.reset();
+        }
     }
 
     // Append bytes that arrived while an async response was pending.
@@ -227,7 +281,7 @@ private:
     // sync path uses SendResponse directly; the async resume path uses
     // CompleteAsyncResponse so deferred-response state unwinds correctly.
     // Trailing bytes after the request are flushed by the caller.
-    bool ContinueWsUpgradeAfterAuth(const HttpRequest& req,
+    bool ContinueWsUpgradeAfterAuth(HttpRequest& req,
                                     HttpResponse mw_response,
                                     bool from_async_resume,
                                     const char* trailing_buf,
@@ -272,6 +326,22 @@ private:
     bool deferred_was_head_ = false;
     bool deferred_keep_alive_ = true;
     std::string deferred_pending_buf_;
+    // Snapshot of `req.obs_snapshot` captured at BeginAsyncResponse time.
+    // The parser request slot is Reset() after the handler returns (the
+    // sync send path at HandleCompleteRequest's tail clears it before
+    // returning false), so the cap-fire safety-cap path running later
+    // can no longer read obs_snapshot from parser_.GetRequest(). The
+    // captured shared_ptr keeps the snapshot alive for the deferred
+    // window — cleared by Complete/CancelAsyncResponse along with the
+    // other deferred fields.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>
+        deferred_obs_snapshot_;
+    // Mirror of req.method == "HEAD" for the deferred snapshot's
+    // wire-body-size accounting in the cap-fire path. Already
+    // captured as deferred_was_head_ above; the cap-fire path passes
+    // a synthetic req copy so the FinalizeIfSnapshot static helper
+    // can compute wire size correctly without needing the
+    // (now-reset) parser request.
 
     // Tracks whether the final (>=200) response has been written for the
     // CURRENT request. Set by SendResponse (status >= 200) and
@@ -296,6 +366,11 @@ private:
 
     // Safety-cap abort hook. See SetAsyncAbortHook.
     std::function<void()> async_abort_hook_;
+
+    // Per-request orthogonal post-wire-write notifier slot. Set by
+    // SetPostWriteNotifyOnce; flipped after the wire-bytes are buffered;
+    // cleared post-signal so the next pipelined request starts clean.
+    std::shared_ptr<std::atomic<bool>> post_write_notify_;
 
     // Active streaming sender for the current deferred async request.
     // Weak to avoid creating a handler↔sender ownership cycle.

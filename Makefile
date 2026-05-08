@@ -84,14 +84,34 @@ CIRCUIT_BREAKER_SRCS = $(SERVER_DIR)/circuit_breaker_window.cc $(SERVER_DIR)/cir
 
 # Auth layer sources (OAuth 2.0 token validation — Layer 7 middleware)
 # Note: JWT decode + signature verification is delegated to vendored jwt-cpp
-# (third_party/jwt-cpp/, header-only). See design spec §12.1 and r4/r5 revision
-# history for the library-adoption rationale.
+# (third_party/jwt-cpp/, header-only).
 AUTH_SRCS = $(SERVER_DIR)/token_hasher.cc $(SERVER_DIR)/auth_policy_matcher.cc $(SERVER_DIR)/auth_claims.cc \
             $(SERVER_DIR)/jwks_cache.cc $(SERVER_DIR)/auth_upstream_http_client.cc $(SERVER_DIR)/issuer.cc \
             $(SERVER_DIR)/jwks_fetcher.cc $(SERVER_DIR)/oidc_discovery.cc $(SERVER_DIR)/jwt_verifier.cc \
             $(SERVER_DIR)/auth_error_responses.cc $(SERVER_DIR)/auth_manager.cc $(SERVER_DIR)/auth_middleware.cc \
             $(SERVER_DIR)/auth_url_util.cc $(SERVER_DIR)/introspection_cache.cc \
             $(SERVER_DIR)/introspection_client.cc
+
+# Observability layer sources (OpenTelemetry — Layer 7 middleware)
+# Foundational value types only at this stage; Span / Tracer / Meter
+# / OtlpHttpExporter / PrometheusExporter / ObservabilityManager land
+# in subsequent slices.
+OBSERVABILITY_SRCS = $(SERVER_DIR)/trace_id.cc $(SERVER_DIR)/trace_state.cc \
+                     $(SERVER_DIR)/attr_value.cc $(SERVER_DIR)/sampler.cc \
+                     $(SERVER_DIR)/span.cc $(SERVER_DIR)/tracer.cc \
+                     $(SERVER_DIR)/tracer_provider.cc \
+                     $(SERVER_DIR)/metric_label_registry.cc \
+                     $(SERVER_DIR)/metric_writer_context.cc \
+                     $(SERVER_DIR)/counter.cc $(SERVER_DIR)/histogram.cc \
+                     $(SERVER_DIR)/meter.cc $(SERVER_DIR)/meter_provider.cc \
+                     $(SERVER_DIR)/observability_manager.cc \
+                     $(SERVER_DIR)/observability_middleware.cc \
+                     $(SERVER_DIR)/propagator.cc \
+                     $(SERVER_DIR)/batch_span_processor.cc \
+                     $(SERVER_DIR)/periodic_metric_reader.cc \
+                     $(SERVER_DIR)/otlp_http_exporter.cc \
+                     $(SERVER_DIR)/prometheus_exporter.cc \
+                     $(SERVER_DIR)/metrics_handler.cc
 
 # CLI layer sources
 CLI_SRCS = $(SERVER_DIR)/cli_parser.cc $(SERVER_DIR)/signal_handler.cc $(SERVER_DIR)/pid_file.cc $(SERVER_DIR)/daemonizer.cc
@@ -139,7 +159,7 @@ NGHTTP2_SRC = $(THIRD_PARTY_DIR)/nghttp2/nghttp2_alpn.c \
 NGHTTP2_OBJ = $(NGHTTP2_SRC:.c=.o)
 
 # Server library sources (shared between test and production binaries)
-LIB_SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(HTTP2_SRCS) $(WS_SRCS) $(TLS_SRCS) $(UPSTREAM_SRCS) $(RATE_LIMIT_SRCS) $(CIRCUIT_BREAKER_SRCS) $(AUTH_SRCS) $(CLI_SRCS) $(UTIL_SRCS)
+LIB_SRCS = $(REACTOR_SRCS) $(NETWORK_SRCS) $(SERVER_SRCS) $(THREAD_POOL_SRCS) $(FOUNDATION_SRCS) $(HTTP_SRCS) $(HTTP2_SRCS) $(WS_SRCS) $(TLS_SRCS) $(UPSTREAM_SRCS) $(RATE_LIMIT_SRCS) $(CIRCUIT_BREAKER_SRCS) $(AUTH_SRCS) $(OBSERVABILITY_SRCS) $(CLI_SRCS) $(UTIL_SRCS)
 
 # Test binary sources
 TEST_SRCS = $(LIB_SRCS) $(TEST_DIR)/test_framework.cc $(TEST_DIR)/run_test.cc
@@ -154,7 +174,8 @@ SERVER_HEADERS = $(LIB_DIR)/net_server.h $(LIB_DIR)/buffer.h
 THREAD_POOL_HEADERS = $(THREAD_POOL_DIR)/include/threadpool.h $(THREAD_POOL_DIR)/include/threadtask.h
 UTIL_HEADERS = $(UTIL_DIR)/timestamp.h $(UTIL_DIR)/base64.h
 FOUNDATION_HEADERS = $(LIB_DIR)/log/logger.h $(LIB_DIR)/log/log_utils.h $(LIB_DIR)/config/server_config.h $(LIB_DIR)/config/config_loader.h
-HTTP_HEADERS = $(LIB_DIR)/http/http_callbacks.h $(LIB_DIR)/http/http_connection_handler.h $(LIB_DIR)/http/http_parser.h $(LIB_DIR)/http/http_request.h $(LIB_DIR)/http/http_response.h $(LIB_DIR)/http/http_router.h $(LIB_DIR)/http/http_server.h $(LIB_DIR)/http/route_trie.h $(LIB_DIR)/http/route_trie_impl.h
+HTTP_HEADERS = $(LIB_DIR)/http/http_callbacks.h $(LIB_DIR)/http/http_connection_handler.h $(LIB_DIR)/http/http_parser.h $(LIB_DIR)/http/http_request.h $(LIB_DIR)/http/http_response.h $(LIB_DIR)/http/http_router.h $(LIB_DIR)/http/http_server.h $(LIB_DIR)/http/http_status.h $(LIB_DIR)/http/route_match.h $(LIB_DIR)/http/route_trie.h $(LIB_DIR)/http/route_trie_impl.h $(LIB_DIR)/http/streaming_response_sender.h $(LIB_DIR)/http/streaming_response_sender_utils.h $(LIB_DIR)/http/trailer_policy.h
+OBSERVABILITY_HEADERS = $(LIB_DIR)/observability/common.h $(LIB_DIR)/observability/attr_value.h $(LIB_DIR)/observability/batch_span_processor.h $(LIB_DIR)/observability/counter.h $(LIB_DIR)/observability/histogram.h $(LIB_DIR)/observability/instrumentation_scope.h $(LIB_DIR)/observability/meter.h $(LIB_DIR)/observability/meter_provider.h $(LIB_DIR)/observability/metric_exporter.h $(LIB_DIR)/observability/metric_label_registry.h $(LIB_DIR)/observability/metric_writer_context.h $(LIB_DIR)/observability/metrics_handler.h $(LIB_DIR)/observability/metrics_snapshot.h $(LIB_DIR)/observability/observability_config.h $(LIB_DIR)/observability/observability_manager.h $(LIB_DIR)/observability/observability_middleware.h $(LIB_DIR)/observability/observability_snapshot.h $(LIB_DIR)/observability/otlp_http_exporter.h $(LIB_DIR)/observability/periodic_metric_reader.h $(LIB_DIR)/observability/prometheus_exporter.h $(LIB_DIR)/observability/propagator.h $(LIB_DIR)/observability/resource.h $(LIB_DIR)/observability/sampler.h $(LIB_DIR)/observability/semantic_conventions.h $(LIB_DIR)/observability/span.h $(LIB_DIR)/observability/span_context.h $(LIB_DIR)/observability/span_data.h $(LIB_DIR)/observability/span_exporter.h $(LIB_DIR)/observability/span_kind.h $(LIB_DIR)/observability/span_processor.h $(LIB_DIR)/observability/span_status.h $(LIB_DIR)/observability/trace_context.h $(LIB_DIR)/observability/trace_id.h $(LIB_DIR)/observability/trace_state.h $(LIB_DIR)/observability/tracer.h $(LIB_DIR)/observability/tracer_provider.h
 HTTP2_HEADERS = $(LIB_DIR)/http2/http2_callbacks.h $(LIB_DIR)/http2/http2_connection_handler.h $(LIB_DIR)/http2/http2_constants.h $(LIB_DIR)/http2/http2_session.h $(LIB_DIR)/http2/http2_stream.h $(LIB_DIR)/http2/protocol_detector.h
 WS_HEADERS = $(LIB_DIR)/ws/websocket_connection.h $(LIB_DIR)/ws/websocket_frame.h $(LIB_DIR)/ws/websocket_handshake.h $(LIB_DIR)/ws/websocket_parser.h $(LIB_DIR)/ws/utf8_validate.h
 TLS_HEADERS = $(LIB_DIR)/tls/tls_context.h $(LIB_DIR)/tls/tls_connection.h $(LIB_DIR)/tls/tls_client_context.h
@@ -166,10 +187,10 @@ CIRCUIT_BREAKER_HEADERS = $(LIB_DIR)/circuit_breaker/circuit_breaker_state.h $(L
 JWT_CPP_DIR = $(THIRD_PARTY_DIR)/jwt-cpp/include/jwt-cpp
 AUTH_HEADERS = $(LIB_DIR)/auth/auth_context.h $(LIB_DIR)/auth/auth_config.h $(LIB_DIR)/auth/token_hasher.h $(LIB_DIR)/auth/auth_policy_matcher.h $(LIB_DIR)/auth/auth_claims.h $(LIB_DIR)/auth/auth_result.h $(LIB_DIR)/auth/auth_url_util.h $(LIB_DIR)/auth/jwks_cache.h $(LIB_DIR)/auth/upstream_http_client.h $(LIB_DIR)/auth/issuer.h $(LIB_DIR)/auth/jwks_fetcher.h $(LIB_DIR)/auth/oidc_discovery.h $(LIB_DIR)/auth/jwt_verifier.h $(LIB_DIR)/auth/auth_error_responses.h $(LIB_DIR)/auth/auth_manager.h $(LIB_DIR)/auth/auth_middleware.h $(LIB_DIR)/auth/introspection_cache.h $(LIB_DIR)/auth/introspection_client.h $(JWT_CPP_DIR)/jwt.h $(JWT_CPP_DIR)/base.h $(JWT_CPP_DIR)/traits/nlohmann-json/defaults.h $(JWT_CPP_DIR)/traits/nlohmann-json/traits.h
 CLI_HEADERS = $(LIB_DIR)/cli/cli_parser.h $(LIB_DIR)/cli/signal_handler.h $(LIB_DIR)/cli/pid_file.h $(LIB_DIR)/cli/version.h $(LIB_DIR)/cli/daemonizer.h
-TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h $(TEST_DIR)/auth_foundation_test.h $(TEST_DIR)/jwt_verifier_test.h $(TEST_DIR)/jwks_cache_test.h $(TEST_DIR)/oidc_discovery_test.h $(TEST_DIR)/header_rewriter_auth_test.h $(TEST_DIR)/auth_manager_test.h $(TEST_DIR)/auth_integration_test.h $(TEST_DIR)/auth_failure_mode_test.h $(TEST_DIR)/auth_reload_test.h $(TEST_DIR)/auth_multi_issuer_test.h $(TEST_DIR)/auth_websocket_upgrade_test.h $(TEST_DIR)/auth_race_test.h $(TEST_DIR)/dns_resolver_test.h $(TEST_DIR)/dual_stack_test.h $(TEST_DIR)/router_async_middleware_test.h $(TEST_DIR)/introspection_cache_test.h $(TEST_DIR)/introspection_client_test.h $(TEST_DIR)/mock_introspection_server.h $(TEST_DIR)/auth_introspection_integration_test.h $(TEST_DIR)/auth_observability_test.h
+TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h $(TEST_DIR)/auth_foundation_test.h $(TEST_DIR)/jwt_verifier_test.h $(TEST_DIR)/jwks_cache_test.h $(TEST_DIR)/oidc_discovery_test.h $(TEST_DIR)/header_rewriter_auth_test.h $(TEST_DIR)/auth_manager_test.h $(TEST_DIR)/auth_integration_test.h $(TEST_DIR)/auth_failure_mode_test.h $(TEST_DIR)/auth_reload_test.h $(TEST_DIR)/auth_multi_issuer_test.h $(TEST_DIR)/auth_websocket_upgrade_test.h $(TEST_DIR)/auth_race_test.h $(TEST_DIR)/dns_resolver_test.h $(TEST_DIR)/dual_stack_test.h $(TEST_DIR)/router_async_middleware_test.h $(TEST_DIR)/introspection_cache_test.h $(TEST_DIR)/introspection_client_test.h $(TEST_DIR)/mock_introspection_server.h $(TEST_DIR)/auth_introspection_integration_test.h $(TEST_DIR)/auth_observability_test.h $(TEST_DIR)/observability_test_helpers.h $(TEST_DIR)/observability_foundation_test.h $(TEST_DIR)/observability_tracer_test.h $(TEST_DIR)/observability_metrics_test.h $(TEST_DIR)/observability_manager_test.h $(TEST_DIR)/observability_propagator_test.h $(TEST_DIR)/observability_export_pipeline_test.h $(TEST_DIR)/observability_prometheus_test.h $(TEST_DIR)/observability_config_test.h $(TEST_DIR)/observability_shutdown_test.h $(TEST_DIR)/observability_link_kill_test.h $(TEST_DIR)/observability_issue_inject_test.h $(TEST_DIR)/observability_stress_test.h $(TEST_DIR)/observability_e2e_test.h
 
 # All headers combined
-HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(DNS_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(HTTP_HEADERS) $(HTTP2_HEADERS) $(WS_HEADERS) $(TLS_HEADERS) $(UPSTREAM_HEADERS) $(RATE_LIMIT_HEADERS) $(CIRCUIT_BREAKER_HEADERS) $(AUTH_HEADERS) $(CLI_HEADERS) $(TEST_HEADERS)
+HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(DNS_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(HTTP_HEADERS) $(HTTP2_HEADERS) $(WS_HEADERS) $(TLS_HEADERS) $(UPSTREAM_HEADERS) $(RATE_LIMIT_HEADERS) $(CIRCUIT_BREAKER_HEADERS) $(AUTH_HEADERS) $(CLI_HEADERS) $(OBSERVABILITY_HEADERS) $(TEST_HEADERS)
 
 # Default target
 .DEFAULT_GOAL := all
@@ -221,17 +242,17 @@ test_config: $(TARGET)
 	@echo "Running config tests only..."
 	./$(TARGET) config
 
-# Run only HTTP tests (placeholder for Phase 2)
+# Run only HTTP tests
 test_http: $(TARGET)
 	@echo "Running HTTP tests only..."
 	./$(TARGET) http
 
-# Run only WebSocket tests (placeholder for Phase 3)
+# Run only WebSocket tests
 test_ws: $(TARGET)
 	@echo "Running WebSocket tests only..."
 	./$(TARGET) ws
 
-# Run only TLS tests (placeholder for Phase 4)
+# Run only TLS tests
 test_tls: $(TARGET)
 	@echo "Running TLS tests only..."
 	./$(TARGET) tls
@@ -297,7 +318,7 @@ test_auth_mgr: $(TARGET)
 	./$(TARGET) auth_mgr
 
 test_auth2: $(TARGET)
-	@echo "Running auth integration tests (Phase 2) only..."
+	@echo "Running auth integration tests only..."
 	./$(TARGET) auth2
 
 test_auth_fail: $(TARGET)
@@ -362,6 +383,68 @@ test_auth_observability: $(TARGET)
 	@echo "Running auth observability tests only..."
 	./$(TARGET) auth_observability
 
+# Per-suite OTel observability targets — each maps onto a flag the
+# test runner already understands. `test_obs` chains every per-suite
+# target (the runner doesn't ship an umbrella flag — unknown flags
+# exit through the unknown-option path).
+test_obs: test_obs_foundation test_obs_tracer test_obs_metrics \
+          test_obs_mgr test_obs_propagator test_obs_export \
+          test_obs_prom test_obs_config test_obs_shutdown \
+          test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e
+	@echo "All observability suites passed."
+
+test_obs_foundation: $(TARGET)
+	@echo "Running observability foundation tests..."
+	./$(TARGET) obs_foundation
+
+test_obs_tracer: $(TARGET)
+	@echo "Running observability tracer tests..."
+	./$(TARGET) obs_tracer
+
+test_obs_metrics: $(TARGET)
+	@echo "Running observability metrics tests..."
+	./$(TARGET) obs_metrics
+
+test_obs_mgr: $(TARGET)
+	@echo "Running observability manager tests..."
+	./$(TARGET) obs_mgr
+
+test_obs_propagator: $(TARGET)
+	@echo "Running W3C propagator tests..."
+	./$(TARGET) obs_propagator
+
+test_obs_export: $(TARGET)
+	@echo "Running observability export pipeline tests..."
+	./$(TARGET) obs_export
+
+test_obs_prom: $(TARGET)
+	@echo "Running Prometheus exporter tests..."
+	./$(TARGET) obs_prom
+
+test_obs_config: $(TARGET)
+	@echo "Running observability config tests..."
+	./$(TARGET) obs_config
+
+test_obs_shutdown: $(TARGET)
+	@echo "Running observability shutdown tests..."
+	./$(TARGET) obs_shutdown
+
+test_obs_linkkill: $(TARGET)
+	@echo "Running observability link/kill tests..."
+	./$(TARGET) obs_linkkill
+
+test_obs_issue: $(TARGET)
+	@echo "Running observability issue context tests..."
+	./$(TARGET) obs_issue
+
+test_obs_stress: $(TARGET)
+	@echo "Running observability stress tests..."
+	./$(TARGET) obs_stress
+
+test_obs_e2e: $(TARGET)
+	@echo "Running observability end-to-end tests..."
+	./$(TARGET) obs_e2e
+
 # Thread-Sanitizer build for dual-stack stop/reload/destruction race tests.
 # Builds a separate binary (test_runner_tsan) with -fsanitize=thread and
 # runs the dual_stack TSAN subset (stop-vs-reload, teardown barrier,
@@ -411,11 +494,11 @@ help:
 	@echo "  make test_config - Build and run only config tests"
 	@echo "                     Runs configuration loading/validation tests"
 	@echo ""
-	@echo "  make test_http   - Build and run only HTTP tests (Phase 2)"
+	@echo "  make test_http   - Build and run only HTTP tests"
 	@echo ""
-	@echo "  make test_ws     - Build and run only WebSocket tests (Phase 3)"
+	@echo "  make test_ws     - Build and run only WebSocket tests"
 	@echo ""
-	@echo "  make test_tls    - Build and run only TLS tests (Phase 4)"
+	@echo "  make test_tls    - Build and run only TLS tests"
 	@echo ""
 	@echo "  make clean       - Remove build artifacts"
 	@echo "                     Deletes './test_runner' executable and llhttp object files"

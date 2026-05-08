@@ -125,14 +125,14 @@ class AuthManager {
     // populates `req.auth` on ALLOW. Returns true when the request
     // should continue (ALLOW or no policy match), false when a 401 /
     // 403 / 503 has been written to `resp`.
-    bool InvokeMiddleware(const HttpRequest& req, HttpResponse& resp);
+    bool InvokeMiddleware(HttpRequest& req, HttpResponse& resp);
 
     // Async middleware entry point. Drives the introspection-mode dispatch
     // path. Sync fast-paths (cache hit / negative-hit / stale-serve / no
     // policy / JWT-mode pass-through / DENY for missing/oversized bearer)
     // call SetSyncResult+MarkCompletedSync inline. The deferred path fires
     // a POST through IntrospectionClient and resolves via state->Complete.
-    void InvokeAsyncMiddleware(const HttpRequest& req, HttpResponse& resp,
+    void InvokeAsyncMiddleware(HttpRequest& req, HttpResponse& resp,
                                 std::shared_ptr<HttpRouter::AsyncPendingState> state);
 
     // Read-only accessor for tests + the async dispatch path.

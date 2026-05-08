@@ -14,6 +14,7 @@
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
 #include "log/logger.h"
+#include "observability/observability_snapshot.h"
 #include <unordered_set>
 
 namespace {
@@ -253,7 +254,17 @@ ProxyTransaction::~ProxyTransaction() {
     // (e.g., transaction was abandoned due to client disconnect).
     Cleanup();
 
-    if (!complete_cb_invoked_ && complete_cb_) {
+    // Pair the Start()-time IncInflightTransactions; the latch covers
+    // the case where the transaction was constructed but never Start()ed.
+    // Atomic exchange handles the cross-thread case (dtor may run on a
+    // retry-timer / upstream-callback / shutdown-sweep thread) and
+    // returns the previous value so we Dec exactly once.
+    if (upstream_manager_ &&
+        inflight_counter_held_.exchange(false, std::memory_order_acq_rel)) {
+        upstream_manager_->DecInflightTransactions();
+    }
+
+    if (!complete_cb_invoked_.load(std::memory_order_acquire) && complete_cb_) {
         logging::Get()->warn("ProxyTransaction destroyed without delivering "
                              "response client_fd={} service={} state={}",
                              client_fd_, service_name_,
@@ -261,7 +272,50 @@ ProxyTransaction::~ProxyTransaction() {
     }
 }
 
+void ProxyTransaction::AttachObservabilitySnapshot(
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap) {
+    obs_snapshot_ = std::move(snap);
+}
+
 void ProxyTransaction::Start() {
+    // Bump exactly once per transaction; the destructor's matching
+    // decrement is gated on the same latch. exchange returns the
+    // PREVIOUS value, so the !old-value branch fires exactly once
+    // even under repeat Start() calls.
+    if (upstream_manager_ &&
+        !inflight_counter_held_.exchange(true, std::memory_order_acq_rel)) {
+        upstream_manager_->IncInflightTransactions();
+    }
+
+    // Publish ourselves to the snapshot so the shutdown kill loop can
+    // mark us via MarkKilledForShutdown on its terminal sweep.
+    //
+    // Delegate to ObservabilitySnapshot::AttachTransaction — it owns
+    // the canonical link/kill protocol: lock link_mtx, read finalized
+    // under the lock, capture the strong ptr if already finalized,
+    // publish tx_weak, release the lock, then call
+    // MarkKilledForShutdown OUTSIDE the lock.
+    //
+    // Returns true when the snapshot had already been finalized (kill
+    // sweep ran first). In that case the helper has already called
+    // MarkKilledForShutdown — which Cancelled us inline because
+    // Start() runs on the owning dispatcher — so the rest of Start()
+    // would only allocate header-rewrite / request-serialize / slice
+    // resolution work that AttemptCheckout's cancelled_ check would
+    // immediately discard. Returning here makes the kill barrier
+    // explicit so future code added between attach and checkout
+    // doesn't silently bypass it. The IncInflightTransactions above
+    // is paired by the destructor's gated decrement on
+    // inflight_counter_held_, so the early return preserves the
+    // counter contract.
+    if (obs_snapshot_) {
+        if (obs_snapshot_->AttachTransaction(
+                std::weak_ptr<OBSERVABILITY_NAMESPACE::UpstreamTransactionLink>(
+                    shared_from_this()))) {
+            return;
+        }
+    }
+
     // Tell the codec the request method so it handles HEAD correctly
     // (no body despite Content-Length/Transfer-Encoding in response).
     codec_.SetRequestMethod(method_);
@@ -280,9 +334,9 @@ void ProxyTransaction::Start() {
     ClearPendingRetryable5xxResponse();
 
     // Take a stack-local ForwardConfig() snapshot, but ONLY when
-    // enforcement is live. The IsEnforcing() gate is at the CALLER
-    // (design §4.7 / §6.1 / §14 step 21): `ForwardConfig()` returns
-    // the stored snapshot unconditionally even when IsEnforcing()=false
+    // enforcement is live. The IsEnforcing() gate is at the CALLER:
+    // `ForwardConfig()` returns the stored snapshot unconditionally
+    // even when IsEnforcing()=false
     // (AuthManager may exist in a "disabled but constructed" state so
     // SIGHUP can flip `auth.enabled: false → true` without a restart).
     // Unconditional snapshotting would let a staged
@@ -305,6 +359,35 @@ void ProxyTransaction::Start() {
         upstream_host_, upstream_port_, sni_hostname_,
         fwd_snap ? fwd_snap.get() : nullptr,
         &auth_ctx_);
+
+    // Outbound trace context: PRESERVE the client's traceparent /
+    // tracestate verbatim — the standard reverse-proxy behaviour
+    // that keeps the client's trace tree intact across the gateway
+    // hop. Stripping without replacement would break transparent
+    // W3C propagation; injecting a fresh context without emitting
+    // a CLIENT span would leave downstream services with a parent
+    // span_id the gateway never reports.
+    //
+    // TODO: once the per-attempt CLIENT span lands (deferred), switch
+    // to strip-and-replace here so SERVER and upstream see the SAME
+    // trace_id (the SERVER span's trace_id, with the CLIENT span as
+    // parent) instead of the diverging tree the verbatim forward
+    // produces. Until then, propagator_test.h's outbound-strip cases
+    // exercise the auth path; the proxy path stays verbatim by design.
+    //
+    // Threat note for operators: a malicious client can populate
+    // arbitrary trace_id / span_id / trace-flags in traceparent and
+    // arbitrary key=value entries in tracestate, and this proxy hop
+    // forwards them verbatim to every upstream behind the gateway.
+    // Operators MUST NOT trust upstream trace_ids for log
+    // correlation across a security boundary — a same-trace_id
+    // observation only proves the client claimed it, not that the
+    // request originated from a peer in the same trust domain.
+    // Auth-path requests bound for an IdP go through
+    // UpstreamHttpClient::ApplyOutboundTraceContext, which strips
+    // the inbound headers and only re-injects when the auth caller
+    // populates issue_ctx (today: never). That path is the secure
+    // default; the proxy hop is the operator-visible exception.
 
     // Compute upstream path with strip_prefix support.
     // Prefer upstream_path_override_ (extracted from catch-all route param by
@@ -602,7 +685,7 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
     // Breaker reporting: connect failures (both timeout and refused) are
     // upstream-health signals → ReportFailure(CONNECT_FAILURE). Local
     // capacity (POOL_EXHAUSTED, QUEUE_TIMEOUT) and shutdown are NOT
-    // reported — they don't imply upstream unhealthiness (design §7).
+    // reported — they don't imply upstream unhealthiness.
     // CHECKOUT_CIRCUIT_OPEN is also not reported to the breaker (would
     // be a feedback loop — our own reject counting against the upstream).
     //
@@ -765,7 +848,7 @@ void ProxyTransaction::SendUpstreamRequest() {
 void ProxyTransaction::OnUpstreamData(
     std::shared_ptr<ConnectionHandler> conn, std::string& data) {
     // Guard against callbacks after completion/failure
-    if (cancelled_) return;
+    if (cancelled_ || IsKilledForShutdown()) return;
     if (state_ == State::COMPLETE || state_ == State::FAILED) {
         return;
     }
@@ -881,7 +964,7 @@ void ProxyTransaction::OnUpstreamData(
 
 bool ProxyTransaction::OnHeaders(
     const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) {
-    if (cancelled_) return false;
+    if (cancelled_ || IsKilledForShutdown()) return false;
 
     response_headers_seen_ = true;
     response_head_ = head;
@@ -947,7 +1030,7 @@ bool ProxyTransaction::OnHeaders(
             state_ = State::FAILED;
             stream_sender_.Abort(
                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
-            complete_cb_invoked_ = true;
+            complete_cb_invoked_.store(true, std::memory_order_release);
             complete_cb_ = nullptr;
             Cleanup();
             return false;
@@ -958,7 +1041,7 @@ bool ProxyTransaction::OnHeaders(
 }
 
 bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
-    if (cancelled_) return false;
+    if (cancelled_ || IsKilledForShutdown()) return false;
     last_body_progress_at_ = std::chrono::steady_clock::now();
     if (state_ == State::AWAITING_RESPONSE) {
         state_ = State::RECEIVING_BODY;
@@ -985,7 +1068,7 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
         stream_sender_.Abort(
             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::CLIENT_DISCONNECT);
         state_ = State::FAILED;
-        complete_cb_invoked_ = true;
+        complete_cb_invoked_.store(true, std::memory_order_release);
         complete_cb_ = nullptr;
         Cleanup();
         return false;
@@ -995,6 +1078,7 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
 
 void ProxyTransaction::OnTrailers(
     const std::vector<std::pair<std::string, std::string>>& trailers) {
+    if (cancelled_ || IsKilledForShutdown()) return;
     if (config_.forward_trailers) {
         auto allowed = CollectDeclaredTrailerNames(response_head_.headers);
         response_trailers_.clear();
@@ -1012,12 +1096,13 @@ void ProxyTransaction::OnTrailers(
 }
 
 void ProxyTransaction::OnComplete() {
+    if (cancelled_ || IsKilledForShutdown()) return;
     body_complete_ = true;
 }
 
 void ProxyTransaction::OnUpstreamWriteComplete(
     std::shared_ptr<ConnectionHandler> conn) {
-    if (cancelled_) return;
+    if (cancelled_ || IsKilledForShutdown()) return;
     // Clear the send-phase write-progress callback installed in
     // SendUpstreamRequest. The response-wait phase uses a hard
     // (unrefreshed) deadline. Done regardless of state so an early
@@ -1057,6 +1142,7 @@ void ProxyTransaction::OnUpstreamWriteComplete(
 }
 
 void ProxyTransaction::OnResponseComplete() {
+    if (cancelled_ || IsKilledForShutdown()) return;
     ClearResponseTimeout();
     InvalidateStreamTimers();
 
@@ -1091,7 +1177,7 @@ void ProxyTransaction::OnResponseComplete() {
             stream_sender_.Abort(
                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::CLIENT_DISCONNECT);
         }
-        complete_cb_invoked_ = true;
+        complete_cb_invoked_.store(true, std::memory_order_release);
         complete_cb_ = nullptr;
         Cleanup();
         return;
@@ -1103,6 +1189,7 @@ void ProxyTransaction::OnResponseComplete() {
 
 void ProxyTransaction::OnError(int result_code,
                                 const std::string& log_message) {
+    if (cancelled_ || IsKilledForShutdown()) return;
     InvalidateStreamTimers();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time_);
@@ -1131,7 +1218,7 @@ void ProxyTransaction::OnError(int result_code,
             reason = AbortReason::UPSTREAM_TIMEOUT;
         }
         stream_sender_.Abort(reason);
-        complete_cb_invoked_ = true;
+        complete_cb_invoked_.store(true, std::memory_order_release);
         complete_cb_ = nullptr;
         Cleanup();
         return;
@@ -1311,18 +1398,31 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
 }
 
 void ProxyTransaction::DeliverResponse(HttpResponse response) {
-    if (complete_cb_invoked_) {
+    if (complete_cb_invoked_.load(std::memory_order_acquire)) {
         logging::Get()->warn("ProxyTransaction double-deliver prevented "
                              "client_fd={} service={}",
                              client_fd_, service_name_);
         return;
     }
-    complete_cb_invoked_ = true;
+    complete_cb_invoked_.store(true, std::memory_order_release);
     ClearPendingRetryable5xxResponse();
 
     // Cleanup BEFORE invoking the completion callback to ensure transport
-    // callbacks are cleared and lease is released.
+    // callbacks are cleared and lease is released. This MUST run even
+    // when killed — otherwise the lease leaks past shutdown.
     Cleanup();
+
+    // Skip the client delivery when the shutdown kill sweep reached us
+    // with complete_cb_ still bound (Cancel's EnQueue may not have
+    // run yet, or this site bypassed the upstream-callback gate).
+    // The framework abort hook is what closes the request from the
+    // client side; firing complete_cb_ now would race the kill sweep's
+    // terminal accounting and could deliver to an already-finalized
+    // observability snapshot.
+    if (IsKilledForShutdown()) {
+        complete_cb_ = nullptr;
+        return;
+    }
 
     if (complete_cb_) {
         auto cb = std::move(complete_cb_);
@@ -1331,8 +1431,72 @@ void ProxyTransaction::DeliverResponse(HttpResponse response) {
     }
 }
 
+void ProxyTransaction::MarkKilledForShutdown() noexcept {
+    // Set the flag first so a subsequent dispatcher-thread caller
+    // observing it (any future site that gates on IsKilledForShutdown)
+    // sees the shutdown intent. The flag is also load-bearing for
+    // Start()'s "snapshot already finalized" branch, which calls this
+    // BEFORE publishing tx_weak (i.e., we're not yet wired up to the
+    // kill loop) — that path is a noop on Cancel because dispatcher_
+    // operations are still safe.
+    kill_for_shutdown_.store(true, std::memory_order_release);
+    // Cancel() touches dispatcher-thread-only state (cancelled_,
+    // complete_cb_, retry timers, lease release). The kill loop runs
+    // from the stopper thread, so we must hop. dispatcher_ is non-
+    // owning and outlives the transaction (per the field comment), so
+    // the EnQueue is safe even though MarkKilledForShutdown can fire
+    // very late in shutdown.
+    if (!dispatcher_) return;
+    // If we're already on the owning dispatcher (e.g. Start() called
+    // us synchronously after observing snap.finalized), Cancel inline:
+    // letting Start go on to AttemptCheckout / write the upstream
+    // request just to undo it on the next event-loop tick wastes pool
+    // capacity and IO. Off-thread (the common kill-loop path) we hop.
+    if (dispatcher_->is_on_loop_thread()) {
+        try {
+            Cancel();
+        } catch (...) {
+            // Cancel is noexcept-shaped in practice but defend against
+            // future changes — dropping here keeps MarkKilledForShutdown
+            // noexcept-safe.
+        }
+        return;
+    }
+    std::weak_ptr<ProxyTransaction> weak = weak_from_this();
+    try {
+        dispatcher_->EnQueue([weak]() {
+            if (auto self = weak.lock()) {
+                self->Cancel();
+            }
+        });
+    } catch (const std::exception& e) {
+        // Dispatcher loop already stopped — Cancel() will not run.
+        // kill_for_shutdown_ stays observable to the terminal-callback
+        // gates (OnHeaders / OnBodyChunk / OnError / DeliverResponse
+        // etc.) so any callbacks that fire on a still-live transport
+        // short-circuit. The transaction is destroyed with its
+        // connection; the lease, retry token, and breaker admission
+        // are released by the destructor's tear-down. Demoted to
+        // debug so a drain-timed-out shutdown doesn't spam the log
+        // with one warn per surviving transaction.
+        try {
+            logging::Get()->debug(
+                "ProxyTransaction kill EnQueue skipped (dispatcher stopped) "
+                "client_fd={} service={}: {}",
+                client_fd_, service_name_, e.what());
+        } catch (...) {}
+    } catch (...) {
+        try {
+            logging::Get()->debug(
+                "ProxyTransaction kill EnQueue skipped (unknown exception) "
+                "client_fd={} service={}",
+                client_fd_, service_name_);
+        } catch (...) {}
+    }
+}
+
 void ProxyTransaction::Cancel() {
-    if (cancelled_ || complete_cb_invoked_) {
+    if (cancelled_ || complete_cb_invoked_.load(std::memory_order_acquire)) {
         return;
     }
     logging::Get()->debug("ProxyTransaction::Cancel client_fd={} service={} "
@@ -1354,7 +1518,7 @@ void ProxyTransaction::Cancel() {
     // the client-side bookkeeping; delivering a response to a
     // disconnected client would be pointless and confuses the complete-
     // closure's one-shot completed/cancelled contract.
-    complete_cb_invoked_ = true;
+    complete_cb_invoked_.store(true, std::memory_order_release);
     complete_cb_ = nullptr;
     // POISON the upstream connection before releasing the lease IF we
     // have already started (or finished) writing the upstream request.
@@ -1585,7 +1749,7 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
             state_ = State::FAILED;
             stream_sender_.Abort(
                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::UPSTREAM_ERROR);
-            complete_cb_invoked_ = true;
+            complete_cb_invoked_.store(true, std::memory_order_release);
             complete_cb_ = nullptr;
             Cleanup();
             return true;
@@ -1943,6 +2107,7 @@ void ProxyTransaction::InvalidateStreamTimers() {
 
 void ProxyTransaction::OnStreamIdleTimeout(uint64_t generation) {
     if (generation != stream_idle_timer_generation_ || cancelled_ ||
+        IsKilledForShutdown() ||
         body_complete_ || !response_headers_seen_ ||
         state_ == State::COMPLETE || state_ == State::FAILED) {
         if (generation == stream_idle_timer_generation_) {
@@ -1972,6 +2137,7 @@ void ProxyTransaction::OnStreamIdleTimeout(uint64_t generation) {
 
 void ProxyTransaction::OnStreamBudgetTimeout(uint64_t generation) {
     if (generation != stream_budget_timer_generation_ || cancelled_ ||
+        IsKilledForShutdown() ||
         body_complete_ || !response_headers_seen_ ||
         state_ == State::COMPLETE || state_ == State::FAILED) {
         return;

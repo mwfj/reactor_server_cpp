@@ -67,7 +67,8 @@ void TestH1StreamingRejectsInterimStatusInFinalApi() {
                 claim_calls.fetch_add(1, std::memory_order_relaxed);
                 return true;
             },
-            [&finalize_calls]() {
+            [&finalize_calls](int /*status*/, uint64_t /*bytes*/,
+                                std::string /*err*/) {
                 finalize_calls.fetch_add(1, std::memory_order_relaxed);
             });
 

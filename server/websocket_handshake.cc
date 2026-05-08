@@ -1,6 +1,7 @@
 #include "ws/websocket_handshake.h"
 
 #include "base64.h"
+#include "http/http_status.h"
 
 #include <openssl/sha.h>
 
@@ -136,7 +137,7 @@ HttpResponse WebSocketHandshake::Accept(const HttpRequest& request) {
     std::string accept_key = ComputeAcceptKey(key);
 
     HttpResponse response;
-    response.Status(101, "Switching Protocols")
+    response.Status(HttpStatus::SWITCHING_PROTOCOLS, "Switching Protocols")
             .Header("Upgrade", "websocket")
             .Header("Connection", "Upgrade")
             .Header("Sec-WebSocket-Accept", accept_key);

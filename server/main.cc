@@ -12,6 +12,11 @@
 #include "http/http_response.h"
 #include "http/http_status.h"
 #include "log/logger.h"
+#include "observability/metrics_handler.h"
+#include "observability/observability_manager.h"
+#include "observability/resource.h"
+#include "observability/span_processor.h"
+#include "observability/trace_id.h"
 #include "nlohmann/json.hpp"
 
 // <cstdio> provided by common.h (via http_server.h)
@@ -175,9 +180,9 @@ static int HandleReload(const CliOptions& options) {
 }
 
 // ── Health endpoint handler ──────────────────────────────────────
-static std::function<void(const HttpRequest&, HttpResponse&)>
+static std::function<void(HttpRequest&, HttpResponse&)>
 MakeHealthHandler(HttpServer* server) {
-    return [server](const HttpRequest& /*req*/, HttpResponse& res) {
+    return [server](HttpRequest& /*req*/, HttpResponse& res) {
         auto stats = server->GetStats();
         char buf[HEALTH_BUF_SIZE];
         std::snprintf(buf, sizeof(buf),
@@ -395,13 +400,13 @@ nlohmann::json BuildDnsObject(HttpServer* server) {
 
 }  // namespace
 
-static std::function<void(const HttpRequest&, HttpResponse&)>
+static std::function<void(HttpRequest&, HttpResponse&)>
 MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
     // Capture config by value so /stats always reflects the startup-time
     // configuration for restart-required fields (bind_host, bind_port, etc.).
     // This avoids a data race: ReloadConfig() mutates the caller's ServerConfig
     // on the main thread while dispatcher threads serve /stats requests.
-    return [server, config](const HttpRequest& /*req*/, HttpResponse& res) {
+    return [server, config](HttpRequest& /*req*/, HttpResponse& res) {
         auto stats = server->GetStats();
 
         // Build legacy fields via snprintf for zero-overhead on the hot keys.
@@ -662,8 +667,28 @@ static bool ReloadConfig(const std::string& config_path,
         std::unordered_set<std::string> live_issuer_names =
             server.LiveAuthIssuerNames();
         try {
+            // Substitute the LIVE max_queue_size into the validation
+            // copy. The traces.batch.max_queue_size field is restart-
+            // only (BatchSpanProcessor allocates its bounded queue at
+            // ctor time and Reload() never resizes), so the validator's
+            // batch_size <= queue_size cross-check must measure
+            // staged batch_size against the LIVE queue capacity, not
+            // the staged one. Without this substitution, a SIGHUP
+            // that lowers max_queue_size below the live batch_size
+            // (e.g. live queue 2048, staged queue 100, batch 512)
+            // falsely rejects an otherwise-safe reload — the running
+            // processor keeps using the live capacity until restart.
+            ServerConfig validation_copy = new_config;
+            validation_copy.observability.traces.batch.max_queue_size =
+                current_config.observability.traces.batch.max_queue_size;
+            // observability_live mirrors the startup decision: the
+            // master `enabled` field is restart-only and preserved
+            // across reloads (saved_obs_enabled below), so the live
+            // value here is the boot-time setting that determined
+            // whether HttpServer instantiated an ObservabilityManager.
             ConfigLoader::ValidateHotReloadable(
-                new_config, live_names, live_issuer_names);
+                validation_copy, live_names, live_issuer_names,
+                /*observability_live=*/current_config.observability.enabled);
         } catch (const std::invalid_argument& e) {
             logging::Get()->error("Config reload rejected: {}", e.what());
             reopen_existing_logs();
@@ -787,6 +812,32 @@ static bool ReloadConfig(const std::string& config_path,
     // becomes hot-reloadable); at that point this save becomes a
     // partial-field save excluding circuit_breaker.
     auto saved_upstreams = current_config.upstreams;
+    // Same rationale for observability — `enabled`, `resource.*`,
+    // `traces.exporter`, `metrics.exporter`, the `otlp.upstream`
+    // pair, and `metrics.prometheus.path` are all restart-required
+    // (see ObservabilityConfig::operator==). Without preserving
+    // them, a SIGHUP that stages new restart-only obs values would
+    // record them in current_config as if live, and subsequent
+    // reloads / `--config` dumps would compare against phantom
+    // state. ObservabilityManager::Reload only applies the live-
+    // reloadable subset; the others stay at their startup values
+    // until restart.
+    auto saved_obs_enabled  = current_config.observability.enabled;
+    auto saved_obs_resource = current_config.observability.resource;
+    auto saved_obs_traces_exporter =
+        current_config.observability.traces.exporter;
+    auto saved_obs_traces_otlp_upstream =
+        current_config.observability.traces.otlp.upstream;
+    auto saved_obs_traces_max_queue =
+        current_config.observability.traces.batch.max_queue_size;
+    auto saved_obs_metrics_exporter =
+        current_config.observability.metrics.exporter;
+    auto saved_obs_metrics_otlp_upstream =
+        current_config.observability.metrics.otlp.upstream;
+    auto saved_obs_metrics_prom_path =
+        current_config.observability.metrics.prometheus.path;
+    auto saved_obs_histogram_buckets =
+        current_config.observability.metrics.histogram_buckets;
 
     current_config = new_config;
 
@@ -796,6 +847,23 @@ static bool ReloadConfig(const std::string& config_path,
     current_config.worker_threads = saved_workers;
     current_config.http2.enabled = saved_h2_enabled;
     current_config.upstreams = std::move(saved_upstreams);
+
+    current_config.observability.enabled = saved_obs_enabled;
+    current_config.observability.resource = std::move(saved_obs_resource);
+    current_config.observability.traces.exporter =
+        std::move(saved_obs_traces_exporter);
+    current_config.observability.traces.otlp.upstream =
+        std::move(saved_obs_traces_otlp_upstream);
+    current_config.observability.traces.batch.max_queue_size =
+        saved_obs_traces_max_queue;
+    current_config.observability.metrics.exporter =
+        std::move(saved_obs_metrics_exporter);
+    current_config.observability.metrics.otlp.upstream =
+        std::move(saved_obs_metrics_otlp_upstream);
+    current_config.observability.metrics.prometheus.path =
+        std::move(saved_obs_metrics_prom_path);
+    current_config.observability.metrics.histogram_buckets =
+        std::move(saved_obs_histogram_buckets);
 
     // Commit file-backed state only after full success — a failed reload
     // must not flip this flag or future reloads lose the defaults+env fallback.
@@ -994,12 +1062,112 @@ static int HandleStart(const CliOptions& options) {
         server->Get("/health", MakeHealthHandler(server.get()));
         logging::Get()->info("  Health:  /health");
     }
-    // /stats requires health_endpoint for backwards compatibility:
-    // --no-health-endpoint disables both endpoints.
-    // --no-stats-endpoint independently disables only /stats.
-    if (options.stats_endpoint && options.health_endpoint) {
+    // /health, /stats, and /metrics are independent. Disabling /health
+    // must not silently disable /stats or /metrics — operators who
+    // want all three off should pass --no-health-endpoint
+    // --no-stats-endpoint --no-metrics-endpoint.
+    if (options.stats_endpoint) {
         server->Get("/stats", MakeStatsHandler(server.get(), config));
         logging::Get()->info("  Stats:   /stats");
+    }
+
+    // Observability bootstrap — only when the master switch is on.
+    // Resource carries service.name/version/instance.id.
+    //
+    // Refuse otlp_http exporters until the production push pipeline is
+    // wired through this bootstrap. Defense-in-depth — ConfigLoader::
+    // Validate already rejects otlp_http via ValidateObservabilityRestart
+    // for the normal startup path, but a code path that bypasses
+    // Validate (test fixtures, future programmatic config) would
+    // otherwise silently build the manager with a NoopSpanProcessor and
+    // lose all traces. Fail closed at startup so misconfigurations
+    // surface immediately regardless of how config arrived here.
+    if (config.observability.enabled) {
+        if (config.observability.traces.exporter == "otlp_http") {
+            throw std::runtime_error(
+                "observability.traces.exporter='otlp_http' is not yet "
+                "wired in this bootstrap; remove the exporter or rebuild "
+                "after the OTLP push pipeline lands");
+        }
+        if (config.observability.metrics.exporter == "otlp_http") {
+            throw std::runtime_error(
+                "observability.metrics.exporter='otlp_http' is not yet "
+                "wired in this bootstrap; use 'prometheus_pull' or remove "
+                "the exporter until the OTLP push pipeline lands");
+        }
+    }
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
+        observability_manager;
+    if (config.observability.enabled) {
+        std::vector<OBSERVABILITY_NAMESPACE::Attribute> resource_attrs;
+        resource_attrs.emplace_back(
+            "service.name",
+            OBSERVABILITY_NAMESPACE::AttrValue(
+                config.observability.resource.service_name));
+        if (!config.observability.resource.service_version.empty()) {
+            resource_attrs.emplace_back(
+                "service.version",
+                OBSERVABILITY_NAMESPACE::AttrValue(
+                    config.observability.resource.service_version));
+        }
+        if (!config.observability.resource.service_instance_id.empty()) {
+            resource_attrs.emplace_back(
+                "service.instance.id",
+                OBSERVABILITY_NAMESPACE::AttrValue(
+                    config.observability.resource.service_instance_id));
+        }
+        auto resource = std::make_shared<OBSERVABILITY_NAMESPACE::Resource>(
+            std::move(resource_attrs));
+        // Install a span processor whenever a traces exporter is
+        // configured — independent of traces.enabled. This keeps
+        // traces.enabled truly live-reloadable: an operator can boot
+        // with traces.enabled=false, then SIGHUP to true and have
+        // spans flow without restart. Without this, gating on
+        // traces.enabled at boot would make the false→true flip a
+        // permanent no-op (the warn in PublishLiveFlags would fire).
+        // A Prometheus-only deployment (traces.exporter empty) still
+        // gets no processor, so Tracer::StartSpan returns non-
+        // recording spans and the propagator doesn't inject sampled
+        // trace_flags. The traces.enabled live flag governs whether
+        // PublishLiveFlags lets spans record once a processor exists.
+        //
+        // FIXME (Phase 2): NoopSpanProcessor is free, but the same
+        // allocation site will pick up BatchSpanProcessor when the OTLP
+        // push pipeline lands — at which point `traces.enabled=false
+        // exporter="otlp_http"` will spin up a worker thread + bounded
+        // queue at boot. Either gate this on a separate
+        // `traces.reload_ready` knob or accept the worker cost as the
+        // price of live-reloadable traces.enabled.
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor> processor;
+        if (!config.observability.traces.exporter.empty()) {
+            processor =
+                std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>();
+        }
+        auto random = std::make_shared<OBSERVABILITY_NAMESPACE::RandomSource>();
+        observability_manager =
+            OBSERVABILITY_NAMESPACE::ObservabilityManager::Create(
+                config.observability, resource, processor, std::move(random));
+        server->SetObservabilityManager(observability_manager);
+        logging::Get()->info("  Observability: enabled (service={})",
+                              config.observability.resource.service_name);
+    }
+
+    // Register /metrics only when the master switch is on, the
+    // exporter is prometheus_pull, and the /metrics CLI flag is
+    // enabled. /health and /metrics are independent — disabling
+    // health must not silently disable metrics scrape. Runtime
+    // metrics.enabled toggles are handled by the handler (404 when
+    // off) so the route stays registered across reloads.
+    if (config.observability.enabled
+        && config.observability.metrics.exporter == "prometheus_pull"
+        && options.metrics_endpoint
+        && observability_manager) {
+        const std::string& mp = config.observability.metrics.prometheus.path;
+        server->Get(mp,
+            OBSERVABILITY_NAMESPACE::MakeMetricsHandler(
+                std::weak_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>(
+                    observability_manager)));
+        logging::Get()->info("  Metrics: {}", mp);
     }
 
     // ── Wire readiness callback — fires after bind/listen, before event loop ──

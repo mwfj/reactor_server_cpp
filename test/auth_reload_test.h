@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// Auth reload tests — Phase 2 test suite.
+// Auth reload tests.
 //
 // These tests exercise the AuthManager::Reload() path without starting a live
 // server: forward config field updates, leeway_sec changes, algorithm list

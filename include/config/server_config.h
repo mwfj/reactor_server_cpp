@@ -7,6 +7,7 @@
 
 #include "auth/auth_config.h"
 #include "net/dns_resolver.h"
+#include "observability/observability_config.h"
 
 struct TlsConfig {
     bool enabled = false;
@@ -311,10 +312,34 @@ struct ServerConfig {
     size_t max_body_size = 1048576;      // 1 MB
     size_t max_ws_message_size = 16777216; // 16 MB
     int request_timeout_sec = 30;
-    int shutdown_drain_timeout_sec = 30; // Max seconds to wait for in-flight H2 streams during shutdown. 0 = immediate.
+    // Drain budget (in seconds) used by HttpServer::Stop. Reused as a
+    // deadline at multiple points in the shutdown sequence — sizing
+    // pod terminationGracePeriodSeconds against this knob requires
+    // accounting for every reuse, not just one application.
+    //
+    // Wall-clock worst case across the off-thread Stop() path:
+    //   1. WaitForH2Drain                    — up to T  (H2 GOAWAY drain)
+    //   2. WS close handshake                — up to 6s (fixed)
+    //   3. HTTP/1 output flush               — up to 2s (H1_DRAIN_TIMEOUT_SEC)
+    //   4. Late-H2 re-check (WaitForH2Drain) — up to T  (slow h2c classify)
+    //   5. Post-protocol drain section       — up to T  (single deadline:
+    //                                                    obs-flush +
+    //                                                    upstream-drain +
+    //                                                    kill+obs-stop +
+    //                                                    post-upstream H1)
+    // Sum: 3 × T + 8s. Step 5 itself is a single shutdown_deadline =
+    // now + T anchor (steps 5a-5d each consume from the same budget
+    // via budget_left()), but T is also the per-call deadline for
+    // steps 1 and 4.
+    //
+    // Pod terminationGracePeriodSeconds: size as 3 × T + 8s + margin.
+    //
+    // 0 = immediate (skip waits, force-close); negative rejected by Validate.
+    int shutdown_drain_timeout_sec = 30;
     Http2Config http2;
     std::vector<UpstreamConfig> upstreams;
     RateLimitConfig rate_limit;
     AUTH_NAMESPACE::AuthConfig auth;
     NET_DNS_NAMESPACE::DnsConfig dns;
+    OBSERVABILITY_NAMESPACE::ObservabilityConfig observability;
 };

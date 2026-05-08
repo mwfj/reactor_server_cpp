@@ -1,10 +1,13 @@
 #include "http/http_connection_handler.h"
 #include "http/http_router.h"   // AsyncPendingState / AsyncMiddlewarePayload
+#include "http/http_server.h"   // HttpServer::FinalizeIfSnapshot
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
 #include "http/streaming_response_sender_utils.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include "observability/observability_manager.h"  // ->FinalizeFromSnapshot mgr-method calls
+#include "observability/observability_snapshot.h"
 #include <cstdio>
 #include <sstream>
 #include <unordered_set>
@@ -238,7 +241,7 @@ public:
     H1StreamingResponseSenderImpl(
         std::shared_ptr<ConnectionHandler> conn,
         std::function<bool()> claim_response,
-        std::function<void()> finalize_request,
+        std::function<void(int, uint64_t, std::string)> finalize_request,
         PrepareHeadCallback prepare_head,
         FinalizeResponseCallback finalize_response,
         AbortResponseCallback abort_response,
@@ -305,10 +308,37 @@ public:
         declared_trailer_names_ =
             CollectAllowedTrailerNames(headers_only_response.GetHeaders());
         headers_sent_ = true;
+        last_status_code_ = headers_only_response.GetStatusCode();
         if (mark_response_committed_) {
             mark_response_committed_();
         }
         conn_->SendRaw(prepared->wire.data(), prepared->wire.size());
+        if (body_suppressed_) {
+            // Mirrors the H2 SendHeaders fix: body-suppressed responses
+            // (HEAD / 204 / 205 / 304 / 1xx) are fully on the wire after
+            // the head bytes are flushed — there's no body, no chunked
+            // terminator, and no trailers (PrepareHead disables chunked
+            // for these). If the handler returns without End(), the
+            // async-dispatch finalizers never run: active_requests_
+            // stays elevated, observability records never close, and
+            // crucially `finalize_response_` never clears
+            // `deferred_response_pending_`, so on a keep-alive socket
+            // the next pipelined bytes are stashed in
+            // deferred_pending_buf_ and never parsed — the connection
+            // wedges until the client gives up. End()'s body-suppressed
+            // path runs the SAME two finalisers in the SAME order; we
+            // run them here so handlers that omit End() still complete
+            // cleanly. End() called afterward early-returns on
+            // `terminal_` (no-op) so it remains safe to call.
+            terminal_ = true;
+            if (finalize_request_) {
+                finalize_request_(last_status_code_, bytes_sent_,
+                                    std::string{});
+            }
+            if (finalize_response_) {
+                finalize_response_(should_close_);
+            }
+        }
         return 0;
     }
 
@@ -328,14 +358,21 @@ public:
         if (!headers_sent_) {
             return HandleProgrammerError("SendData");
         }
+        // Body-suppressed (HEAD / 1xx / 204 / 205 / 304) silently drops
+        // body bytes — there's no body on the wire. Must run BEFORE the
+        // terminal_ guard because SendHeaders for body-suppressed
+        // responses now sets terminal_=true (see SendHeaders body-
+        // suppressed finalize path); a handler that follows SendHeaders
+        // with SendData would otherwise observe CLOSED instead of the
+        // ACCEPTED contract this branch documents.
+        if (body_suppressed_) {
+            return SendResult::ACCEPTED_BELOW_WATER;
+        }
         if (terminal_ || programmer_error_) {
             logging::Get()->debug(
                 "H1 streaming SendData rejected fd={} terminal={} programmer_error={} len={}",
                 conn_->fd(), terminal_, programmer_error_, len);
             return SendResult::CLOSED;
-        }
-        if (body_suppressed_) {
-            return SendResult::ACCEPTED_BELOW_WATER;
         }
         if (use_chunked_) {
             if (len == 0) {
@@ -361,6 +398,11 @@ public:
         } else {
             conn_->SendRaw(data, len);
         }
+        // Account bytes only after the SendRaw calls succeeded — the
+        // chunk-encode-failure branch above aborts the stream BEFORE
+        // any bytes hit the wire and must not contribute to
+        // http.server.response.body.size.
+        bytes_sent_ += len;
         return EvaluateOccupancy();
     }
 
@@ -399,11 +441,19 @@ public:
                 trailers, declared_trailer_names_);
             conn_->SendRaw(final_chunk.data(), final_chunk.size());
         }
+        // finalize_request_ MUST run before finalize_response_:
+        // finalize_response_ clears the deferred state and can
+        // synchronously replay deferred_pending_buf_ back through
+        // OnRawData, which begins parsing the next pipelined request
+        // and (for keep-alive) starts request B's snapshot. Reversing
+        // the order means request A's metric / span finalize lands
+        // AFTER request B's middleware has registered, briefly
+        // overlapping the two snapshots.
+        if (finalize_request_) {
+            finalize_request_(last_status_code_, bytes_sent_, std::string{});
+        }
         if (finalize_response_) {
             finalize_response_(should_close_);
-        }
-        if (finalize_request_) {
-            finalize_request_();
         }
         return SendResult::ACCEPTED_BELOW_WATER;
     }
@@ -505,7 +555,13 @@ private:
             abort_response_();
         }
         if (finalize_request_) {
-            finalize_request_();
+            // last_status_code_ may be 0 if Abort fired before
+            // SendHeaders — that's deliberately propagated so the
+            // observability finalize knows the wire never carried a
+            // status. bytes_sent_ is whatever was accepted before
+            // the abort.
+            finalize_request_(last_status_code_, bytes_sent_,
+                                StreamingAbortReasonToString(reason));
         }
     }
 
@@ -547,11 +603,16 @@ private:
 
     std::shared_ptr<ConnectionHandler> conn_;
     std::function<bool()> claim_response_;
-    std::function<void()> finalize_request_;
+    std::function<void(int, uint64_t, std::string)> finalize_request_;
     PrepareHeadCallback prepare_head_;
     FinalizeResponseCallback finalize_response_;
     AbortResponseCallback abort_response_;
     std::function<void()> mark_response_committed_;
+    // State observed by SendHeaders/SendData/Abort and replayed to
+    // finalize_request_ on End/Abort. Dispatcher-thread-only writes
+    // and reads — no synchronization needed.
+    int last_status_code_ = 0;
+    uint64_t bytes_sent_ = 0;
     DrainListener drain_listener_;
     bool claimed_response_ = false;
     bool headers_sent_ = false;
@@ -597,7 +658,7 @@ void HttpConnectionHandler::SetUpgradeCallback(UpgradeCallback callback) {
 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender
 HttpConnectionHandler::CreateStreamingResponseSender(
     std::function<bool()> claim_response,
-    std::function<void()> finalize_request) {
+    std::function<void(int, uint64_t, std::string)> finalize_request) {
     auto weak_self = weak_from_this();
     auto prepare_head =
         [weak_self](const HttpResponse& input)
@@ -666,6 +727,7 @@ HttpConnectionHandler::CreateStreamingResponseSender(
         self->deferred_was_head_ = false;
         self->deferred_keep_alive_ = true;
         self->deferred_start_ = std::chrono::steady_clock::time_point{};
+        self->deferred_obs_snapshot_.reset();
         self->async_abort_hook_ = nullptr;
 
         if (self->conn_->IsClosing()) {
@@ -701,6 +763,7 @@ HttpConnectionHandler::CreateStreamingResponseSender(
         self->deferred_keep_alive_ = true;
         self->deferred_pending_buf_.clear();
         self->deferred_start_ = std::chrono::steady_clock::time_point{};
+        self->deferred_obs_snapshot_.reset();
         self->async_abort_hook_ = nullptr;
         self->conn_->SetShutdownExempt(false);
         self->conn_->ClearDeadline();
@@ -797,6 +860,17 @@ void HttpConnectionHandler::SetRequestTimeout(int seconds) {
                 if (auto self = weak_self.lock()) {
                     HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                     timeout_resp.Header("Connection", "close");
+                    // Finalize any observability snapshot middleware
+                    // attached to the in-flight request before the 408
+                    // hits the wire — otherwise inflight_finalizations_
+                    // leaks and the shutdown drain stalls.
+                    // parser_.GetRequest() is the live request slot on
+                    // the dispatcher thread that owns this callback;
+                    // FinalizeIfSnapshot no-ops
+                    // when no snapshot is attached (early-arrival case).
+                    HttpServer::FinalizeIfSnapshot(
+                        self->parser_.GetRequest(), timeout_resp,
+                        "request_timeout");
                     self->SendResponse(timeout_resp);
                 }
                 return false;
@@ -859,6 +933,11 @@ void HttpConnectionHandler::BeginAsyncResponse(const HttpRequest& req) {
     deferred_response_committed_ = false;
     deferred_was_head_ = (req.method == "HEAD");
     deferred_keep_alive_ = req.keep_alive;
+    // Capture obs_snapshot before the parser request slot gets Reset()
+    // so the cap-fire safety-cap path can finalize against the
+    // ORIGINAL deferred request, not whatever (empty) request slot
+    // the parser owns by the time the deadline callback runs.
+    deferred_obs_snapshot_ = req.obs_snapshot;
     // Reset so interim responses can be emitted before the final response
     // on this new async cycle. Without this, back-to-back requests on a
     // keep-alive connection would inherit the previous request's
@@ -880,6 +959,7 @@ void HttpConnectionHandler::CancelAsyncResponse() {
     deferred_keep_alive_ = true;
     deferred_pending_buf_.clear();
     deferred_start_ = std::chrono::steady_clock::time_point{};
+    deferred_obs_snapshot_.reset();
     // Release the abort hook's captured shared_ptrs so the request's
     // atomic flags and active_counter handle can be freed. The throw
     // path that calls CancelAsyncResponse already has its own
@@ -934,10 +1014,16 @@ void HttpConnectionHandler::StashDeferredBytes(const std::string& data) {
 }
 
 void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
+    CompleteAsyncResponseBeforeReplay(std::move(response), nullptr);
+}
+
+void HttpConnectionHandler::CompleteAsyncResponseBeforeReplay(
+        HttpResponse response, std::function<void()> before_replay) {
     if (!deferred_response_pending_) {
         logging::Get()->warn(
             "CompleteAsyncResponse called without a pending deferred response "
             "(fd={})", conn_ ? conn_->fd() : -1);
+        if (before_replay) before_replay();
         return;
     }
 
@@ -965,6 +1051,14 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     if (was_head) StripResponseBodyForHead(wire);
     conn_->SendRaw(wire.data(), wire.size());
 
+    // Fire the per-request post-wire notifier: the wire bytes are now
+    // buffered for send. Fired AFTER SendRaw so the ordering is
+    // "bytes buffered → notifier flipped".
+    if (post_write_notify_) {
+        post_write_notify_->store(true, std::memory_order_release);
+        post_write_notify_.reset();
+    }
+
     // Clear deferred state BEFORE resuming parsing/closing — subsequent
     // OnRawData or CloseConnection calls must see the connection as idle.
     // BUT: delay clearing shutdown_exempt_ until AFTER CloseConnection
@@ -978,6 +1072,7 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     deferred_was_head_ = false;
     deferred_keep_alive_ = true;
     deferred_start_ = std::chrono::steady_clock::time_point{};
+    deferred_obs_snapshot_.reset();
     // Release the abort hook's captures — by the time CompleteAsyncResponse
     // runs on the normal path, the complete closure already owns the
     // bookkeeping and the safety cap no longer needs to fire.
@@ -986,6 +1081,11 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     if (conn_->IsClosing()) {
         if (conn_) conn_->SetShutdownExempt(false);
         deferred_pending_buf_.clear();
+        // Fire before_replay (no replay will happen on this branch);
+        // the hook documents itself as "after wire bytes queued and
+        // deferred state cleared, before parsing resumes" — both
+        // hold here.
+        if (before_replay) before_replay();
         return;
     }
     if (should_close) {
@@ -994,6 +1094,7 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
         // so HasPendingH1Output always sees at least one flag true.
         CloseConnection();
         if (conn_) conn_->SetShutdownExempt(false);
+        if (before_replay) before_replay();
         return;
     }
 
@@ -1010,6 +1111,14 @@ void HttpConnectionHandler::CompleteAsyncResponse(HttpResponse response) {
     // when the response was marked deferred).
     conn_->ClearDeadline();
     conn_->SetDeadlineTimeoutCb(nullptr);
+
+    // Fire `before_replay` AFTER state-clear / deadline-clear but
+    // BEFORE the deferred-pipeline replay loop. The replay calls
+    // OnRawData() which can synchronously parse the next pipelined
+    // request and register its observability snapshot — firing the
+    // request-A finalize hook here keeps the "A finalize before B
+    // register" ordering the wrapper contract requires.
+    if (before_replay) before_replay();
 
     // Resume parsing any pipelined bytes that arrived during the deferred
     // window. Move out of the member first so a nested BeginAsyncResponse
@@ -1038,6 +1147,37 @@ void HttpConnectionHandler::SendResponse(const HttpResponse& response) {
     versioned.Version(1, current_http_minor_.load(std::memory_order_acquire));
     std::string wire = versioned.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
+    // Fire the per-request post-wire notifier: the wire bytes are now
+    // buffered for send; downstream pumps key on this.
+    if (post_write_notify_) {
+        post_write_notify_->store(true, std::memory_order_release);
+        post_write_notify_.reset();
+    }
+}
+
+namespace {
+
+// Compute the body size that ACTUALLY landed on the wire after
+// normalization. HEAD-stripped responses + 1xx / 204 / 304 produce
+// 0 (no body emitted); everything else returns the response body's
+// post-normalization byte count. The result is the
+// `http.server.response.body.size` semconv value.
+inline uint64_t ComputeWireBodySize(const HttpResponse& response,
+                                      bool was_head_request) noexcept {
+    if (was_head_request) return 0;
+    const int status = response.GetStatusCode();
+    // 1xx / 204 / 205 / 304 — bodyless per HTTP semantics.
+    // The wire serialiser strips the body for these statuses.
+    if (status >= 100 && status < 200) return 0;
+    if (status == 204 || status == 205 || status == 304) return 0;
+    return static_cast<uint64_t>(response.GetBody().size());
+}
+
+}  // namespace
+
+void HttpConnectionHandler::SetPostWriteNotifyOnce(
+    std::shared_ptr<std::atomic<bool>> notify_sent) {
+    post_write_notify_ = std::move(notify_sent);
 }
 
 bool HttpConnectionHandler::SendInterimResponse(
@@ -1212,7 +1352,7 @@ void HttpConnectionHandler::HandleParseError() {
 }
 
 bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed) {
-    const HttpRequest& req = parser_.GetRequest();
+    HttpRequest& req = parser_.GetRequest();
 
     // Propagate dispatcher index for upstream pool partition affinity
     req.dispatcher_index = conn_->dispatcher_index();
@@ -1222,6 +1362,19 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     req.client_ip = conn_->ip_addr();
     req.client_tls = conn_->HasTls();
     req.client_fd = conn_->fd();
+
+    // Populate observability fields BEFORE dispatch / middleware so the
+    // observability middleware sees non-empty url.scheme,
+    // network.protocol.version, and the owning dispatcher pointer
+    // needed by the kill-marshal target.
+    req.url_scheme = conn_->HasTls() ? "https" : "http";
+    {
+        char ver[8];
+        std::snprintf(ver, sizeof(ver), "%d.%d",
+                      req.http_major, req.http_minor);
+        req.network_protocol_version = ver;
+    }
+    req.owning_dispatcher = conn_->GetDispatcher();
 
     // Count every completed request parse — dispatched, rejected, or upgraded.
     if (callbacks_.request_count_callback) {
@@ -1270,7 +1423,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         if (expect != "100-continue") {
             logging::Get()->debug("Unsupported Expect value fd={}", conn_->fd());
             HttpResponse err;
-            err.Status(417, "Expectation Failed");
+            err.Status(HttpStatus::EXPECTATION_FAILED, "Expectation Failed");
             err.Header("Connection", "close");
             SendResponse(err);
             CloseConnection();
@@ -1306,6 +1459,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                 logging::Get()->debug("WebSocket upgrade rejected by middleware fd={} path={}",
                                       conn_->fd(), req.path);
                 mw_response.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(req, mw_response,
+                                                "rejected_by_middleware");
                 SendResponse(mw_response);
                 CloseConnection();
                 return false;
@@ -1333,8 +1488,23 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 
                 self->BeginAsyncResponse(*req_copy);
 
-                self->SetAsyncAbortHook([state]() {
+                // Same finalize-on-abort contract as the H1/H2 sync-route
+                // suspends — without this, a WS upgrade whose async
+                // middleware is mid-IdP-introspection when the client
+                // disconnects leaves the snapshot registered until the
+                // shutdown kill loop runs.
+                auto suspend_obs_snap = req_copy->obs_snapshot;
+                self->SetAsyncAbortHook([state, suspend_obs_snap]() {
                     state->TripCancel();
+                    if (suspend_obs_snap) {
+                        if (auto mgr = suspend_obs_snap->manager.lock()) {
+                            mgr->FinalizeFromSnapshot(
+                                *suspend_obs_snap,
+                                /*status_code=*/0,
+                                /*wire_body_size=*/0,
+                                /*error_type=*/"client_disconnect");
+                        }
+                    }
                 });
 
                 auto resume_cb =
@@ -1357,25 +1527,58 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                             do_bookkeeping();
                             return;
                         }
-                        if (shared_payload->finalizer) {
-                            shared_payload->finalizer(*req_copy, *resp_copy);
-                        }
-                        if (shared_payload->result ==
-                                HttpRouter::AsyncMiddlewareResult::DENY) {
-                            resp_copy->Header("Connection", "close");
-                            resp_copy->ClearDeferred();
-                            self->CompleteAsyncResponse(std::move(*resp_copy));
-                            self->CloseConnection();
-                        } else {
-                            // Trailing bytes were buffered during the
-                            // suspend window and are flushed by
-                            // CompleteAsyncResponse → OnRawData →
-                            // HandleUpgradedData once upgraded_ is set.
-                            self->ContinueWsUpgradeAfterAuth(
-                                *req_copy, std::move(*resp_copy),
-                                /*from_async_resume=*/true,
-                                /*trailing_buf=*/nullptr,
-                                /*trailing_len=*/0);
+                        // Mirror MakeAsyncResumeCallback's catch envelope:
+                        // a throwing user finalizer or any escape from
+                        // ContinueWsUpgradeAfterAuth must not bypass
+                        // do_bookkeeping(). Without this, active_requests_
+                        // / inflight_finalizations_ leak and the request
+                        // hangs. 101 has not yet hit the wire on the
+                        // async-resume path, so a generic 500 + Connection:
+                        // close is wire-legal and rollback of
+                        // upgraded_ / ws_conn_ is safe.
+                        try {
+                            if (shared_payload->finalizer) {
+                                shared_payload->finalizer(*req_copy, *resp_copy);
+                            }
+                            if (shared_payload->result ==
+                                    HttpRouter::AsyncMiddlewareResult::DENY) {
+                                resp_copy->Header("Connection", "close");
+                                HttpServer::FinalizeIfSnapshot(
+                                    *req_copy, *resp_copy,
+                                    "rejected_by_async_middleware");
+                                resp_copy->ClearDeferred();
+                                self->CompleteAsyncResponse(std::move(*resp_copy));
+                                self->CloseConnection();
+                            } else {
+                                // Trailing bytes were buffered during the
+                                // suspend window and are flushed by
+                                // CompleteAsyncResponse → OnRawData →
+                                // HandleUpgradedData once upgraded_ is set.
+                                self->ContinueWsUpgradeAfterAuth(
+                                    *req_copy, std::move(*resp_copy),
+                                    /*from_async_resume=*/true,
+                                    /*trailing_buf=*/nullptr,
+                                    /*trailing_len=*/0);
+                            }
+                        } catch (const std::exception& e) {
+                            logging::Get()->error(
+                                "Exception in resumed WS-upgrade handler: {}",
+                                e.what());
+                            self->upgraded_ = false;
+                            self->ws_conn_.reset();
+                            HttpResponse err = HttpResponse::InternalError();
+                            err.Header("Connection", "close");
+                            HttpServer::FinalizeIfSnapshot(
+                                *req_copy, err, "ws_upgrade_resume_threw");
+                            err.ClearDeferred();
+                            try {
+                                self->CompleteAsyncResponse(std::move(err));
+                                self->CloseConnection();
+                            } catch (const std::exception& e2) {
+                                logging::Get()->error(
+                                    "Failed to send 500 after WS-upgrade "
+                                    "resume throw: {}", e2.what());
+                            }
                         }
                         do_bookkeeping();
                     });
@@ -1415,6 +1618,8 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                     "WebSocket upgrade rejected by async middleware fd={} path={}",
                     conn_->fd(), req.path);
                 mw_response.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(req, mw_response,
+                                                "rejected_by_async_middleware");
                 SendResponse(mw_response);
                 CloseConnection();
                 return false;
@@ -1442,11 +1647,13 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                 // Pre-101: send HTTP 500, close via HTTP path
                 HttpResponse err = HttpResponse::InternalError();
                 err.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(req, err, "ws_upgrade_handler_threw");
                 SendResponse(err);
                 CloseConnection();
             } else if (ws_conn_) {
                 // Post-101 with WS connection: send close 1011.
                 // SendClose now includes CloseAfterWrite for proper drain.
+                // Snapshot was already finalized at 101 success.
                 ws_conn_->SendClose(1011, "Internal error");
             } else {
                 // Post-101 but ws_conn_ is null — make_unique threw (OOM).
@@ -1469,8 +1676,38 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             logging::Get()->error("Exception in request handler: {}", e.what());
             response = HttpResponse::InternalError();
             response.Header("Connection", "close");
+            // Finalize the snapshot here too: the sync-handler exception
+            // path bypasses the FinalizeIfSnapshot calls in
+            // request_callback's normal return paths, leaving
+            // inflight_finalizations_ elevated and the SERVER span open.
+            HttpServer::FinalizeIfSnapshot(req, response, "handler_threw");
             SendResponse(response);
             CloseConnection();
+            return false;
+        }
+
+        // Streaming sender that finalised synchronously inside the
+        // handler (e.g. SendHeaders for HEAD/204/205/304, or
+        // SendHeaders+End on the dispatcher) has already called
+        // `finalize_response_`, which clears `deferred_response_pending_`,
+        // delivers any earlier-stashed pipelined bytes, and — when the
+        // response asked to close — calls CloseConnection. We must
+        // NOT take the deferred-stash branch below (bytes after
+        // `consumed` belong to the next pipelined request and must be
+        // parsed normally, not re-stashed into a buffer nothing will
+        // ever replay) and we must NOT call SendResponse(response) (it
+        // would write a stale empty response on top of the wire bytes
+        // already flushed by the streaming sender). We DO want to fall
+        // through to the post-response cleanup at the bottom of this
+        // function so the request-timeout deadline is re-armed when
+        // `remaining > 0` — finalize_response_ already cleared the
+        // previous deadline, so without that re-arm a partial pipelined
+        // request following a body-suppressed streaming response has
+        // no slowloris protection until the (much longer) idle timeout
+        // fires.
+        const bool streaming_finalised_sync =
+            response.IsDeferred() && !deferred_response_pending_;
+        if (streaming_finalised_sync && conn_->IsClosing()) {
             return false;
         }
 
@@ -1482,7 +1719,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
         // Route them through StashDeferredBytes so the same size cap and
         // force-close-on-overflow logic as OnRawData's top-level stash
         // applies.
-        if (response.IsDeferred()) {
+        if (response.IsDeferred() && !streaming_finalised_sync) {
             request_in_progress_ = false;
             // Arm a ROLLING heartbeat deadline that re-arms itself on
             // fire to suppress idle_timeout while the async handler
@@ -1572,15 +1809,52 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                             "aborting and sending 504",
                             cap_sec,
                             self->conn_ ? self->conn_->fd() : -1);
-                        // Fire the abort hook FIRST. It short-circuits
-                        // the stored complete() closure (flipping its
-                        // one-shot completed/cancelled atomics) and
-                        // decrements active_requests exactly once,
-                        // regardless of whether the real handler
-                        // eventually calls complete(). Without this
-                        // the /stats.requests.active counter stays
-                        // permanently elevated after a stuck handler.
+                        // Build the synthetic 504 response.
+                        // Forcing Connection: close ensures
+                        // NormalizeOutgoingResponse returns should_close=true
+                        // so the socket is torn down (the handler may
+                        // still be running in the background and must not
+                        // see a reusable connection).
+                        HttpResponse timeout_resp =
+                            HttpResponse::GatewayTimeout();
+                        timeout_resp.Header("Connection", "close");
+                        // Pre-finalize the snapshot with the actual 504
+                        // BEFORE firing the abort hook. The hook also
+                        // calls FinalizeFromSnapshot (with a synthetic
+                        // client_disconnect placeholder), but the CAS
+                        // gate inside FinalizeFromSnapshot makes this
+                        // first call the winner — the hook's later
+                        // attempt becomes a no-op. Without this
+                        // pre-finalize, the abort hook would record
+                        // server-side timeouts as client_disconnect.
                         //
+                        // Use the snapshot captured at BeginAsyncResponse
+                        // time, NOT parser_.GetRequest() — the parser
+                        // request slot was Reset() right after the
+                        // handler returned, so a parser-based finalize
+                        // would no-op (obs_snapshot is null) and the
+                        // abort hook's client_disconnect placeholder
+                        // would land instead.
+                        if (self->deferred_obs_snapshot_) {
+                            auto mgr =
+                                self->deferred_obs_snapshot_->manager.lock();
+                            if (mgr) {
+                                const uint64_t wire_size =
+                                    self->deferred_was_head_
+                                        ? 0u
+                                        : ComputeWireBodySize(
+                                              timeout_resp,
+                                              self->deferred_was_head_);
+                                mgr->FinalizeFromSnapshot(
+                                    *self->deferred_obs_snapshot_,
+                                    timeout_resp.GetStatusCode(),
+                                    wire_size,
+                                    "server_timeout");
+                            }
+                        }
+                        // Fire the abort hook for its bookkeeping
+                        // (active_requests--, cancel_slot, etc.). Its
+                        // FinalizeFromSnapshot is now a CAS no-op.
                         // Move to a local first so CompleteAsyncResponse
                         // (which clears async_abort_hook_) cannot
                         // destroy the std::function while we're
@@ -1594,15 +1868,6 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
                         // call CancelAsyncResponse first — that wipes
                         // deferred_was_head_, which CompleteAsyncResponse
                         // needs to know whether to strip the body.
-                        // Forcing Connection: close on the synthetic 504
-                        // ensures NormalizeOutgoingResponse returns
-                        // should_close=true so the socket is torn down
-                        // (the handler may still be running in the
-                        // background and must not see a reusable
-                        // connection).
-                        HttpResponse timeout_resp =
-                            HttpResponse::GatewayTimeout();
-                        timeout_resp.Header("Connection", "close");
                         self->CompleteAsyncResponse(std::move(timeout_resp));
                         return false;
                     }
@@ -1639,31 +1904,36 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             return false;
         }
 
-        const bool should_close = NormalizeOutgoingResponse(
-            response, req.keep_alive, req.http_minor);
+        // Sync-response path. Skipped when the streaming sender already
+        // finalised inline (the response is on the wire and CloseConnection
+        // / keep-alive accounting were handled by `finalize_response_`).
+        if (!streaming_finalised_sync) {
+            const bool should_close = NormalizeOutgoingResponse(
+                response, req.keep_alive, req.http_minor);
 
-        // RFC 7231 §4.3.2: HEAD responses carry the GET headers (including
-        // Content-Length) but MUST NOT include a body. Serialize first so
-        // the framework's auto-computed Content-Length is preserved, then
-        // strip the body from the wire.
-        if (req.method == "HEAD") {
-            response.Version(1, current_http_minor_.load(std::memory_order_acquire));
-            std::string wire = response.Serialize();
-            StripResponseBodyForHead(wire);
-            conn_->SendRaw(wire.data(), wire.size());
-        } else {
-            SendResponse(response);
-        }
+            // RFC 7231 §4.3.2: HEAD responses carry the GET headers (including
+            // Content-Length) but MUST NOT include a body. Serialize first so
+            // the framework's auto-computed Content-Length is preserved, then
+            // strip the body from the wire.
+            if (req.method == "HEAD") {
+                response.Version(1, current_http_minor_.load(std::memory_order_acquire));
+                std::string wire = response.Serialize();
+                StripResponseBodyForHead(wire);
+                conn_->SendRaw(wire.data(), wire.size());
+            } else {
+                SendResponse(response);
+            }
 
-        // If SendResponse triggered a connection close (e.g., EPIPE),
-        // stop processing pipelined requests.
-        if (conn_->IsClosing()) {
-            return false;
-        }
+            // If SendResponse triggered a connection close (e.g., EPIPE),
+            // stop processing pipelined requests.
+            if (conn_->IsClosing()) {
+                return false;
+            }
 
-        if (should_close) {
-            CloseConnection();
-            return false;
+            if (should_close) {
+                CloseConnection();
+                return false;
+            }
         }
     }
 
@@ -1691,6 +1961,9 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             if (auto self = weak_self.lock()) {
                 HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                 timeout_resp.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(
+                    self->parser_.GetRequest(), timeout_resp,
+                    "request_timeout");
                 self->SendResponse(timeout_resp);
             }
             return false;  // Proceed with connection close
@@ -1721,7 +1994,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
 // return value: the WS upgrade decision is final and the parser is
 // either in WS mode or the connection is closing.
 bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
-    const HttpRequest& req,
+    HttpRequest& req,
     HttpResponse mw_response,
     bool from_async_resume,
     const char* trailing_buf,
@@ -1747,6 +2020,11 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
             reject.Header("Sec-WebSocket-Version", "13");
         }
         reject.Header("Connection", "close");
+        // Finalize BEFORE the response leaves: CompleteAsyncResponse
+        // can synchronously start the next pipelined request, and
+        // SendResponse may also trigger pipeline replay on keep-alive.
+        // FinalizeIfSnapshot is a no-op when obs is disabled.
+        HttpServer::FinalizeIfSnapshot(req, reject, "ws_handshake_invalid");
         if (from_async_resume) {
             reject.ClearDeferred();
             CompleteAsyncResponse(std::move(reject));
@@ -1768,6 +2046,7 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
                               conn_->fd(), logging::SanitizePath(req.path));
         auto not_found = HttpResponse::NotFound();
         not_found.Header("Connection", "close");
+        HttpServer::FinalizeIfSnapshot(req, not_found, "ws_route_not_found");
         if (from_async_resume) {
             not_found.ClearDeferred();
             CompleteAsyncResponse(std::move(not_found));
@@ -1816,6 +2095,7 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
         HttpResponse shutdown_resp;
         shutdown_resp.Status(HttpStatus::SERVICE_UNAVAILABLE).Text("Service Unavailable");
         shutdown_resp.Header("Connection", "close");
+        HttpServer::FinalizeIfSnapshot(req, shutdown_resp, "shutting_down");
         if (from_async_resume) {
             shutdown_resp.ClearDeferred();
             CompleteAsyncResponse(std::move(shutdown_resp));
@@ -1872,10 +2152,15 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
             ws_conn_.reset();
             HttpResponse err = HttpResponse::InternalError();
             err.Header("Connection", "close");
+            HttpServer::FinalizeIfSnapshot(req, err, "ws_upgrade_handler_threw");
             err.ClearDeferred();
             CompleteAsyncResponse(std::move(err));
             return false;
         }
+        // 101 success — finalize the SERVER span. The HTTP request is
+        // terminal at the upgrade; subsequent WS frames are out of
+        // scope for this span.
+        HttpServer::FinalizeIfSnapshot(req, upgrade_resp, std::string{});
         upgrade_resp.ClearDeferred();
         CompleteAsyncResponse(std::move(upgrade_resp));
         if (conn_->IsClosing()) {
@@ -1896,6 +2181,9 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
     }
 
     // ---- Sync path ----
+    // Finalize BEFORE the 101 leaves the wire so the SERVER span is
+    // closed in lock-step with the upgrade completion.
+    HttpServer::FinalizeIfSnapshot(req, upgrade_resp, std::string{});
     SendResponse(upgrade_resp);
 
     if (conn_->IsClosing()) {
@@ -2018,7 +2306,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
                     return;
                 }
                 HttpResponse cont;
-                cont.Status(100, "Continue");
+                cont.Status(HttpStatus::CONTINUE, "Continue");
                 SendResponse(cont);
                 sent_100_continue_ = true;
                 logging::Get()->debug("Sent 100 Continue fd={}", conn_->fd());
@@ -2027,7 +2315,7 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
                 logging::Get()->debug("Early reject: unsupported Expect fd={}", conn_->fd());
                 count_request();
                 HttpResponse err;
-                err.Status(417, "Expectation Failed");
+                err.Status(HttpStatus::EXPECTATION_FAILED, "Expectation Failed");
                 err.Header("Connection", "close");
                 SendResponse(err);
                 CloseConnection();
@@ -2094,6 +2382,9 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 if (auto self = weak_self.lock()) {
                     HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                     timeout_resp.Header("Connection", "close");
+                    HttpServer::FinalizeIfSnapshot(
+                        self->parser_.GetRequest(), timeout_resp,
+                        "request_timeout");
                     self->SendResponse(timeout_resp);
                 }
                 return false;  // Proceed with connection close
@@ -2105,6 +2396,8 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
                 logging::Get()->warn("Request timeout fd={}", conn_->fd());
                 HttpResponse timeout_resp = HttpResponse::RequestTimeout();
                 timeout_resp.Header("Connection", "close");
+                HttpServer::FinalizeIfSnapshot(
+                    parser_.GetRequest(), timeout_resp, "request_timeout");
                 SendResponse(timeout_resp);
                 CloseConnection();
                 return;

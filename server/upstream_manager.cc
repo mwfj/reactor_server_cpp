@@ -181,7 +181,8 @@ UpstreamManager::UpstreamManager(
             effective_sni,
             resolved_endpoint,
             upstream.pool, dispatchers, tls_ctx,
-            outstanding_conns_, shutting_down_, drain_mtx_, drain_cv_);
+            outstanding_conns_, inflight_leases_,
+            shutting_down_, drain_mtx_, drain_cv_);
     }
 
     // Adjust dispatcher timer intervals for upstream timeout enforcement.
@@ -336,7 +337,7 @@ void UpstreamManager::InitiateShutdown() {
     }
 }
 
-void UpstreamManager::WaitForDrain(std::chrono::seconds timeout) {
+void UpstreamManager::WaitForDrain(std::chrono::milliseconds timeout) {
     auto deadline = std::chrono::steady_clock::now() + timeout;
     std::unique_lock<std::mutex> lck(drain_mtx_);
     drain_cv_.wait_until(lck, deadline, [this]() {

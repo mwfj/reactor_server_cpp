@@ -1,7 +1,7 @@
 #pragma once
 
 // ============================================================================
-// JwtVerifier unit tests — Phase 2 test suite.
+// JwtVerifier unit tests.
 //
 // Exercises JwtVerifier::Verify and ::PeekIssuer. Signs real JWTs using
 // jwt-cpp and OpenSSL-generated test keys; no pre-baked tokens.

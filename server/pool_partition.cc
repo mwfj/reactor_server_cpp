@@ -42,6 +42,7 @@ PoolPartition::PoolPartition(
     const UpstreamPoolConfig& config,
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
+    std::atomic<int64_t>& inflight_leases,
     std::atomic<bool>& manager_shutting_down,
     std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
@@ -53,6 +54,7 @@ PoolPartition::PoolPartition(
     , tls_ctx_(std::move(tls_ctx))
     , resolved_endpoint_(std::move(resolved_endpoint))
     , outstanding_conns_(outstanding_conns)
+    , inflight_leases_(inflight_leases)
     , manager_shutting_down_(manager_shutting_down)
     , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
@@ -246,6 +248,9 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
             std::chrono::steady_clock::now() + FAR_FUTURE_CHECKOUT);
         UpstreamConnection* raw = conn.get();
         active_conns_.push_back(std::move(conn));
+        // Bump inflight_leases_ BEFORE handing the lease to the caller.
+        // ReturnConnection (called from ~UpstreamLease) decrements.
+        inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
         ready_cb(UpstreamLease(raw, this, alive_));
         return;
     }
@@ -312,6 +317,12 @@ size_t PoolPartition::PurgeCancelledWaitEntries() {
 
 void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     if (!conn) return;
+
+    // The lease that owned `conn` is being released — decrement
+    // inflight_leases_ once per call regardless of where the connection
+    // ends up (idle pool / destroyed / zombie cleanup). Pairs with the
+    // increment at every ready_cb(UpstreamLease(...)) site above.
+    inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
 
     // Hoist alive_ onto the stack — the waiter retry loops below call
     // CreateNewConnection, which can synchronously invoke a user error_cb
@@ -420,6 +431,15 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
             active_conns_.push_back(std::move(owned));
             auto entry = std::move(wait_queue_.front());
             wait_queue_.pop_front();
+            // Bump inflight_leases_ BEFORE the handoff. The fetch_sub
+            // at the top of ReturnConnection paired with the released
+            // lease; this is a brand-new lease handed to a waiter and
+            // needs its own increment so the waiter's eventual return
+            // brings the counter back to balance. Without this the
+            // counter goes negative on every queued-reuse handoff and
+            // the observability shutdown drain never observes
+            // active_leases() == 0.
+            inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
             entry.ready_callback(UpstreamLease(raw, this, alive_));
             // No member access follows (function returns), but keep the
             // check for defense-in-depth against future refactors.
@@ -1036,6 +1056,8 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
     logging::Get()->debug("Upstream connection ready fd={} {}:{}",
                           raw->fd(), upstream_host_, upstream_port_);
 
+    // See the matching site above — bump before handing the lease out.
+    inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
     ready_cb(UpstreamLease(raw, this, alive_));
 }
 
@@ -1175,6 +1197,12 @@ void PoolPartition::ServiceWaitQueue() {
 
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();
+        // Bump inflight_leases_ before the ready_callback runs — see
+        // the matching site in ReturnConnection's direct-handoff
+        // branch. Idle-pool handoffs must increment too; otherwise
+        // the eventual lease release drives active_leases() negative
+        // and stalls graceful shutdown's drain wait.
+        inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
         entry.ready_callback(UpstreamLease(raw, this, alive_));
         if (!alive->load(std::memory_order_acquire)) return;
         // ready_callback can synchronously start server shutdown

@@ -146,3 +146,10 @@ jobs:
         # Linux full-sweep ./test_runner runs both suites via the `dns`
         # umbrella; macOS only carries the OS-sensitive integration half.
         run: ./test_runner dual_stack
+      - name: Test - obs_e2e (real-socket observability end-to-end)
+        # Boots a real HttpServer and verifies SERVER spans / finalize
+        # counters / 404 finalize. Socket-bound; the rest of the obs_*
+        # family (foundation/tracer/metrics/manager/propagator/export/
+        # prom/config/shutdown/linkkill/issue/stress) is pure logic and
+        # is exercised by the Linux full-sweep ./test_runner runs above.
+        run: ./test_runner obs_e2e

@@ -39,6 +39,7 @@ struct CliOptions {
     // Health/stats endpoints
     bool health_endpoint = true;
     bool stats_endpoint = true;
+    bool metrics_endpoint = true;
 
     // Daemon mode
     bool daemonize = false;

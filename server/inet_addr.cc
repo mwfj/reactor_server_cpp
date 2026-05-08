@@ -81,14 +81,12 @@ std::string InetAddr::Ip() const {
     // appended here. `Ip()` is read transitively by HeaderRewriter into
     // `X-Forwarded-For`; zone-qualified literals like `fe80::1%5` are
     // widely rejected by downstream XFF parsers, ACL engines, and log
-    // pipelines. An earlier review-round fix tried to append `%scope_id`
-    // to preserve link-local peer identity across interfaces, but that
-    // regressed header correctness on exactly the traffic the fix
-    // targeted (reviewer P2). The proper fix — separate peer-identity
-    // API + `InetAddr`-carrying `SocketHandler` — is deferred out of
-    // step-1 scope; link-local peer identity collapse on multi-interface
-    // hosts is an acknowledged P3 gap that will be addressed in a later
-    // phase alongside the observability work (§10 / §14).
+    // pipelines. Appending `%scope_id` to preserve link-local peer
+    // identity across interfaces breaks header correctness on exactly
+    // the traffic that fix targets, so we drop the scope unconditionally.
+    // Link-local peer identity collapse on multi-interface hosts is an
+    // acknowledged gap; the proper fix is a separate peer-identity API
+    // plus an `InetAddr`-carrying `SocketHandler`.
     char buf[INET6_ADDRSTRLEN] = {0};
     if (family_ == Family::kIPv4) {
         if (::inet_ntop(AF_INET, &AsV4(&addr_)->sin_addr, buf,
