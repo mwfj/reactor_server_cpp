@@ -13,8 +13,7 @@
 // passes one RandomSource through the manager to all Tracers).
 
 #include "../common.h"
-#include <array>
-// <cstdint>, <memory>, <mutex>, <string> via common.h
+// <array>, <cstdint>, <memory>, <mutex>, <string> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

@@ -376,7 +376,7 @@ std::unordered_set<std::string>& CollisionWarnedSet() {
     static std::unordered_set<std::string> s;
     return s;
 }
-void WarnCollisionOnce(const std::string& key,
+void WarnCollisionOnce(const std::string&  key,
                         const std::string& a_name,
                         const std::string& b_name,
                         const std::string& emit_name) {

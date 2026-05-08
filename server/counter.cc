@@ -111,7 +111,7 @@ std::vector<CounterPoint> Counter::SnapshotPoints() const {
     for (const auto& shard : shards_) {
         std::shared_lock<std::shared_mutex> g(shard.mtx);
         for (const auto& [hash, bucket] : shard.by_hash) {
-            (void)hash;
+            (void)hash; // unused except for making compiler happy
             for (const auto& s : bucket) {
                 CounterPoint p;
                 p.labels = s->labels;

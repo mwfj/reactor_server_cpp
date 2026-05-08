@@ -253,11 +253,11 @@ private:
     std::atomic<int64_t> kill_marshals_in_flight_{0};
     std::atomic<int64_t> finalizers_in_progress_{0};
 
-    std::mutex                                  finalizers_done_mtx_;
-    std::condition_variable                     finalizers_done_cv_;
+    std::mutex              finalizers_done_mtx_;
+    std::condition_variable finalizers_done_cv_;
 
     // Idempotent BeginShutdown latch.
-    std::atomic<bool>                           shutdown_started_{false};
+    std::atomic<bool>    shutdown_started_{false};
 
     // Diagnostic — bumped on every kill-loop CAS-win.
     std::atomic<int64_t> snapshots_killed_on_timeout_{0};

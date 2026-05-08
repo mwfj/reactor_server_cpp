@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
+#include <array>
 #include <utility>
 #include <chrono>
 #include <thread>

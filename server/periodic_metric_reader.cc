@@ -6,9 +6,9 @@
 namespace OBSERVABILITY_NAMESPACE {
 
 PeriodicMetricReader::PeriodicMetricReader(
-    MeterProvider*                 provider,
+    MeterProvider*                  provider,
     std::shared_ptr<MetricExporter> exporter,
-    MeterReaderOptions             options)
+    MeterReaderOptions              options)
     : provider_(provider),
       exporter_(std::move(exporter)),
       interval_ns_(options.export_interval.count() * 1'000'000),

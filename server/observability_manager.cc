@@ -11,7 +11,7 @@
 namespace OBSERVABILITY_NAMESPACE {
 
 std::shared_ptr<ObservabilityManager> ObservabilityManager::Create(
-    ObservabilityConfig config,
+    ObservabilityConfig             config,
     std::shared_ptr<const Resource> resource,
     std::shared_ptr<SpanProcessor>  span_processor,
     std::shared_ptr<RandomSource>   random) {
@@ -20,15 +20,15 @@ std::shared_ptr<ObservabilityManager> ObservabilityManager::Create(
     // shared_ptr's deleter will call ~ObservabilityManager normally.
     auto mgr = std::shared_ptr<ObservabilityManager>(
         new ObservabilityManager(std::move(config),
-                                  std::move(resource),
-                                  std::move(span_processor),
-                                  std::move(random)));
+                                 std::move(resource),
+                                 std::move(span_processor),
+                                 std::move(random)));
     mgr->Init();
     return mgr;
 }
 
 ObservabilityManager::ObservabilityManager(
-    ObservabilityConfig config,
+    ObservabilityConfig             config,
     std::shared_ptr<const Resource> resource,
     std::shared_ptr<SpanProcessor>  span_processor,
     std::shared_ptr<RandomSource>   random)
@@ -45,8 +45,7 @@ ObservabilityManager::ObservabilityManager(
 // work. The dtor budget covers tests / abnormal teardown only — long
 // enough to drain a typical processor flush, short enough that an
 // unwinding test doesn't hang.
-static constexpr auto kDtorShutdownBudget =
-    std::chrono::milliseconds{1000};
+static constexpr auto kDtorShutdownBudget = std::chrono::milliseconds{1000};
 
 ObservabilityManager::~ObservabilityManager() {
     // Idempotent safety net for tests / abnormal teardown paths.
@@ -80,8 +79,7 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
     // traces_enabled_ stays cached against the stale processor and
     // either overcommits work to a now-null pipeline or silently
     // disables tracing on a pipeline that just came online.
-    const bool traces_pipeline_present =
-        c.traces.enabled && span_processor_ != nullptr;
+    const bool traces_pipeline_present = c.traces.enabled && span_processor_ != nullptr;
     traces_enabled_.store(traces_pipeline_present,
                             std::memory_order_release);
     metrics_enabled_.store(c.metrics.enabled, std::memory_order_release);
@@ -126,8 +124,7 @@ void ObservabilityManager::Init() {
     // get-or-create cost. Buckets: configured `metrics.histogram_buckets`
     // for "http.server.request.duration" if present, otherwise the
     // OTel-recommended default exponential-ish ladder (seconds).
-    Meter* http_server_meter =
-        meter_provider_->GetMeter("reactor.http.server");
+    Meter* http_server_meter = meter_provider_->GetMeter("reactor.http.server");
     std::vector<double> duration_buckets;
     auto bucket_it = config_.metrics.histogram_buckets.find(
         "http.server.request.duration");
@@ -178,8 +175,8 @@ ObservabilityManager::BuildRouteOverridesFromConfig() const {
     auto out = std::make_shared<std::vector<RouteOverride>>();
     out->reserve(config_.traces.sampler.routes.size() + 1);
     bool metrics_path_overridden = false;
-    const std::string& metrics_path =
-        config_.metrics.prometheus.path;
+    const std::string& metrics_path = config_.metrics.prometheus.path;
+
     for (const auto& r : config_.traces.sampler.routes) {
         if (r.path.empty()) continue;
         RouteOverride ov;
@@ -229,11 +226,18 @@ std::shared_ptr<const Sampler>
 ObservabilityManager::EffectiveSamplerForPath(
         const std::string& path) const noexcept {
     auto snap = std::atomic_load_explicit(&route_overrides_snapshot_,
-                                            std::memory_order_acquire);
+                                          std::memory_order_acquire);
+
     if (!snap || snap->empty() || path.empty()) return nullptr;
+
     for (const auto& r : *snap) {
         if (r.path_prefix.empty()) continue;
         if (path.size() < r.path_prefix.size()) continue;
+
+        // FIXME: Is this has the potential memory leak or performance issue? 
+        // We are doing memcmp for every request, and the path_prefix can be of arbitrary length. 
+        // We should consider using a more efficient data structure for route overrides, 
+        // such as a trie or prefix tree, to optimize the lookup process?
         if (std::memcmp(path.data(), r.path_prefix.data(),
                          r.path_prefix.size()) != 0) {
             continue;
@@ -260,6 +264,7 @@ ObservabilitySnapshot::~ObservabilitySnapshot() {
     if (finalized.load(std::memory_order_acquire)) return;
     auto mgr = manager.lock();
     if (!mgr) return;  // manager torn down — kill loop ran or test path.
+
     // Exception-safe: FinalizeFromSnapshot wraps OnFinalizeWinner in
     // try/catch and never throws. The mgr shared_ptr keeps the
     // manager alive for the duration of the call. The counter bump
@@ -269,8 +274,8 @@ ObservabilitySnapshot::~ObservabilitySnapshot() {
     // FinalizeFromSnapshot for this snapshot. The CAS below is
     // therefore guaranteed to win, so every counter increment
     // corresponds to a real backstop fire.
-    mgr->snapshots_finalized_via_dtor_.fetch_add(
-        1, std::memory_order_relaxed);
+    mgr->snapshots_finalized_via_dtor_.fetch_add(1, std::memory_order_relaxed);
+
     mgr->FinalizeFromSnapshot(*this, /*status=*/0, /*wire_body=*/0,
                                 /*error_type=*/"unfinalized_drop");
 }
@@ -318,9 +323,26 @@ bool ObservabilityManager::FinalizeFromSnapshot(
 
     // Idempotent CAS gate — exactly one caller wins.
     bool expected = false;
-    if (!snap.finalized.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel)) {
+    if (!snap.finalized.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         finalizers_in_progress_.fetch_sub(1, std::memory_order_acq_rel);
+        // Surface losers that carried an abnormal observation. The
+        // winner's payload — whatever it is — is what gets exported,
+        // so a non-empty loser error_type means a real terminal-event
+        // signal was discarded (e.g. client_disconnect lost to a
+        // success finalize). Empty-error_type losers are routine race
+        // outcomes (a success record losing to a shutdown/abort
+        // record where the recorded outcome is the more important
+        // one) — silent. The trace_id + snap address let operators
+        // correlate with the exported span.
+        if (!error_type.empty()) {
+            logging::Get()->warn(
+                "FinalizeFromSnapshot CAS lost: trace_id={} snap=0x{:x} "
+                "discarded_error_type={} discarded_status={} "
+                "discarded_wire_body_size={}",
+                snap.trace_context.trace_id().ToHex(),
+                reinterpret_cast<uintptr_t>(&snap),
+                error_type, status_code, wire_body_size);
+        }
         // Notify so a drain wait that latched on this loser-bump
         // wakes once the counter returns to its real value.
         std::lock_guard<std::mutex> g(finalizers_done_mtx_);

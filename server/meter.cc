@@ -4,17 +4,17 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
-Meter::Meter(std::shared_ptr<const InstrumentationScope> scope,
-              std::shared_ptr<const Resource>             resource,
+Meter::Meter(std::shared_ptr<const InstrumentationScope>   scope,
+              std::shared_ptr<const Resource>              resource,
               size_t                                       shard_count)
     : scope_(std::move(scope)),
       resource_(std::move(resource)),
       shard_count_(shard_count > 0 ? shard_count : 1) {}
 
 Counter* Meter::GetCounter(const std::string& name,
-                             const std::string& description,
-                             const std::string& unit,
-                             MetricLabelRegistry::Catalog catalog) {
+                           const std::string& description,
+                           const std::string& unit,
+                           MetricLabelRegistry::Catalog catalog) {
     std::lock_guard<std::mutex> g(inst_mtx_);
     auto it = counters_.find(name);
     if (it != counters_.end()) return it->second.get();
@@ -27,9 +27,9 @@ Counter* Meter::GetCounter(const std::string& name,
 }
 
 UpDownCounter* Meter::GetUpDownCounter(const std::string& name,
-                                          const std::string& description,
-                                          const std::string& unit,
-                                          MetricLabelRegistry::Catalog catalog) {
+                                       const std::string& description,
+                                       const std::string& unit,
+                                       MetricLabelRegistry::Catalog catalog) {
     std::lock_guard<std::mutex> g(inst_mtx_);
     auto it = updowns_.find(name);
     if (it != updowns_.end()) return it->second.get();
@@ -42,10 +42,10 @@ UpDownCounter* Meter::GetUpDownCounter(const std::string& name,
 }
 
 Histogram* Meter::GetHistogram(const std::string& name,
-                                 const std::string& description,
-                                 const std::string& unit,
-                                 std::vector<double> bucket_boundaries,
-                                 MetricLabelRegistry::Catalog catalog) {
+                               const std::string& description,
+                               const std::string& unit,
+                               std::vector<double> bucket_boundaries,
+                               MetricLabelRegistry::Catalog catalog) {
     std::lock_guard<std::mutex> g(inst_mtx_);
     auto it = histograms_.find(name);
     if (it != histograms_.end()) return it->second.get();

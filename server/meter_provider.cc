@@ -10,7 +10,7 @@ MeterProvider::MeterProvider(std::shared_ptr<const Resource> resource,
       shard_count_(shard_count > 0 ? shard_count : 1) {}
 
 Meter* MeterProvider::GetMeter(const std::string& name,
-                                 const std::string& version) {
+                               const std::string& version) {
     std::string key = name;
     key.push_back('\0');
     key.append(version);
@@ -19,8 +19,7 @@ Meter* MeterProvider::GetMeter(const std::string& name,
     auto it = meters_.find(key);
     if (it != meters_.end()) return it->second.get();
     auto scope = std::make_shared<InstrumentationScope>(name, version);
-    auto meter = std::make_unique<Meter>(
-        std::move(scope), resource_, shard_count_);
+    auto meter = std::make_unique<Meter>(std::move(scope), resource_, shard_count_);
     Meter* raw = meter.get();
     meters_.emplace(std::move(key), std::move(meter));
     return raw;

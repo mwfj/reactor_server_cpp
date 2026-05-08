@@ -122,11 +122,11 @@ struct MetricsConfig {
     // construction-time validators.
     static constexpr size_t kMaxBucketsPerInstrument = 256;
 
-    bool        enabled  = true;       // live-reloadable
-    std::string exporter;              // "otlp_http" | "prometheus_pull" | "". RESTART
-    OtlpTransportConfig otlp;          // upstream RESTART; headers/timeout/interval live
-    PeriodicReaderConfig reader;       // live-reloadable
-    PrometheusConfig prometheus;       // path RESTART; include_target_info live
+    bool                 enabled  = true;       // live-reloadable
+    std::string          exporter;              // "otlp_http" | "prometheus_pull" | "". RESTART
+    OtlpTransportConfig  otlp;                  // upstream RESTART; headers/timeout/interval live
+    PeriodicReaderConfig reader;                // live-reloadable
+    PrometheusConfig     prometheus;            // path RESTART; include_target_info live
     // Per-instrument bucket overrides (instrument-name -> boundaries).
     // RESTART-only — bucket layout cannot change once Series are
     // populated without losing histogram coherency.

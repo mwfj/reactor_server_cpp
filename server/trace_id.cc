@@ -1,8 +1,5 @@
 #include "observability/trace_id.h"
 
-#include <chrono>
-#include <thread>
-
 namespace OBSERVABILITY_NAMESPACE {
 
 namespace {

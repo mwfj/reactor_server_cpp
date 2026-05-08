@@ -9,11 +9,11 @@ Span::Span(SpanContext context,
            bool        has_parent,
            std::string name,
            SpanKind    kind,
-           std::chrono::system_clock::time_point start_system,
+           std::chrono::system_clock::time_point       start_system,
            std::shared_ptr<const Resource>             resource,
            std::shared_ptr<const InstrumentationScope> scope,
            std::shared_ptr<SpanProcessor>              processor,
-           bool                                         record_locally)
+           bool                                        record_locally)
     : context_(std::move(context)),
       parent_context_(std::move(parent)),
       has_parent_(has_parent),
