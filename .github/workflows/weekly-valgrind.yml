@@ -7,8 +7,16 @@ name: Weekly Valgrind
 # PR-blocking CI. We run it weekly on cron, mirroring the pattern used
 # by RocksDB (`build-linux-valgrind` weekly).
 #
-# A failure here is signal worth investigating but does NOT red-X a PR
-# (the workflow is independent of ci.yml). The high-value outputs are:
+# A failure here does NOT red-X a PR — the workflow is independent of
+# ci.yml — but it IS allowed to red-X this scheduled run. We do NOT set
+# `continue-on-error: true` on the job: valgrind's --error-exitcode=1
+# would otherwise be silently swallowed and the scheduled run would go
+# green even when valgrind detected a real memory error. The whole
+# point of running valgrind is to surface those errors. The hard
+# `timeout-minutes: 360` cap below still protects against a hung
+# suite eating the runner.
+#
+# The high-value outputs are:
 #   1. Conditional-jump-on-uninitialized — bug class invisible to ASan.
 #   2. Pointer-validity violations on edge-case allocators.
 #   3. Definite leaks confirmed across multiple runs (ASan disables
@@ -33,9 +41,11 @@ jobs:
   valgrind-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 360  # 6h cap — refuse to consume runner-minutes
-                          # past this even if a suite hangs under valgrind
-    continue-on-error: true  # flake or interpreter-amplified timing
-                             # should not red-X the workflow
+                          # past this even if a suite hangs under valgrind.
+                          # NOTE: deliberately NO `continue-on-error: true`
+                          # — valgrind --error-exitcode=1 must surface as a
+                          # red scheduled run; suppressing it would defeat
+                          # the purpose of running this workflow at all.
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies

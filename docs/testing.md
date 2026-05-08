@@ -346,7 +346,7 @@ Success Rate: 100%
 
 ## Continuous Integration
 
-CI workflows live in `.github/workflows/` and run in three cadences. Stress and valgrind never gate PRs — their machine-time cost on shared GitHub runners is high and a flaky red badge trains contributors to ignore CI.
+CI workflows live in `.github/workflows/` and run in three cadences. Stress and valgrind never gate PRs — both run on cron and are independent of the per-PR matrix. Stress runs with `continue-on-error: true` because high-concurrency suites are legitimately flake-prone on shared runners. Valgrind does NOT use `continue-on-error`: a memory error caught by `valgrind --error-exitcode=1` should surface as a red scheduled run, otherwise the weekly job is just burning runner-minutes.
 
 ### Per-PR (`.github/workflows/ci.yml`)
 
@@ -372,7 +372,7 @@ Runs at 07:00 UTC (= 00:00 PT). Stress suites (100–1000 concurrent clients) ar
 
 ### Weekly cron (`.github/workflows/weekly-valgrind.yml`)
 
-Runs Sundays at 09:00 UTC. Valgrind catches reads-of-uninitialized-memory and pointer-validity bugs that AddressSanitizer cannot, but its 10–50x runtime overhead makes it unsuitable for PR-blocking CI. The workflow has a 6-hour timeout, `continue-on-error: true`, and runs against a curated subset (excludes `stress`, `timeout`, `race`, `obs_stress`, `obs_export` — interpreter slowdown collapses their timing assertions).
+Runs Sundays at 09:00 UTC. Valgrind catches reads-of-uninitialized-memory and pointer-validity bugs that AddressSanitizer cannot, but its 10–50x runtime overhead makes it unsuitable for PR-blocking CI. The workflow has a 6-hour timeout cap and runs against a curated subset (excludes `stress`, `timeout`, `race`, `obs_stress`, `obs_export` — interpreter slowdown collapses their timing assertions). Unlike `nightly-stress.yml`, this workflow does NOT set `continue-on-error: true`: a memory error from `valgrind --error-exitcode=1` must surface as a red scheduled run so the failure is actionable, not silently swallowed.
 
 ### Adding a new test suite to CI
 
