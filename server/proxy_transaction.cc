@@ -691,16 +691,22 @@ void ProxyTransaction::DispatchH2(
     UpstreamH2Codec* raw_codec = h2_codec.get();
     codec_ = std::move(h2_codec);
 
-    // Build :authority from upstream_host + port. Omit default port
-    // for the active scheme so the wire matches the canonical form
-    // expected by H2 servers.
-    std::string authority = upstream_host_;
-    bool default_port = (upstream_tls_  && upstream_port_ == 443) ||
-                        (!upstream_tls_ && upstream_port_ == 80);
-    if (!default_port && upstream_port_ > 0) {
-        authority.push_back(':');
-        authority.append(std::to_string(upstream_port_));
-    }
+    // Build :authority mirroring HeaderRewriter's H1 Host derivation:
+    // TLS upstreams reached by IP with sni_hostname set must use the
+    // SNI name (cert CN/SAN match + virtual-host routing); IPv6
+    // literals must be bracketed via FormatAuthority; default ports
+    // for the active scheme are omitted.
+    const std::string& host_src =
+        (upstream_tls_ && !sni_hostname_.empty())
+            ? sni_hostname_
+            : upstream_host_;
+    const std::string host_value =
+        NET_DNS_NAMESPACE::DnsResolver::StripTrailingDot(host_src);
+    const bool omit_port = (!upstream_tls_ && upstream_port_ == 80) ||
+                           (upstream_tls_ && upstream_port_ == 443);
+    const std::string authority =
+        NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
+            host_value, upstream_port_, omit_port);
     const std::string scheme = upstream_tls_ ? "https" : "http";
 
     // Compose path with query, mirroring the H1 serializer.
@@ -1084,9 +1090,10 @@ bool ProxyTransaction::OnHeaders(
             // transport without stalling sibling streams. Make the retry
             // decision synchronously so subsequent body chunks land on a
             // detached sink (Cleanup nulls stream->sink via ResetStream)
-            // and never reach the client. Empty-body fallback if the
-            // retry is rejected — H1's body-replay logic doesn't carry
-            // over because nothing has been buffered yet on this path.
+            // and never reach the client. Snapshot-as-complete fallback
+            // if the retry is rejected — whatever H2 DATA arrived before
+            // the headers triggered the decision is treated as the full
+            // body for replay.
             if (h2_path_) {
                 ProcessHeadersRetryDecision();
             }
@@ -2072,6 +2079,18 @@ void ProxyTransaction::HandleStreamSendResult(
         return;
     }
 
+    // H2 path: the transport is shared across every multiplexed stream,
+    // so transport-level IncReadDisable would pause sibling streams when
+    // this stream's downstream is slow. The peer's stream-level window
+    // (cfg_->initial_window_size, default 1 MB) bounds how much the
+    // upstream can buffer for this stream without WINDOW_UPDATE, which
+    // is sufficient minimal-viable backpressure. Per-stream
+    // flow-control pause via nghttp2_session_consume_stream is a future
+    // refinement.
+    if (h2_path_) {
+        return;
+    }
+
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn || upstream_conn->IsReadDisabled()) {
         return;
@@ -2210,6 +2229,43 @@ void ProxyTransaction::ArmResponseTimeout(int explicit_budget_ms) {
         return;
     }
 
+    // H2 path: schedule a per-transaction dispatcher task. The transport
+    // is shared across every multiplexed stream — installing a transport
+    // deadline here would tear down sibling streams when one stalls.
+    if (h2_path_) {
+        if (!dispatcher_) return;
+        const uint64_t generation = ++h2_response_timeout_generation_;
+        std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+        dispatcher_->EnQueueDelayed(
+            [weak_self, generation]() {
+                auto self = weak_self.lock();
+                if (!self) return;
+                if (self->cancelled_) return;
+                if (generation != self->h2_response_timeout_generation_) return;
+                logging::Get()->warn(
+                    "ProxyTransaction H2 response timeout client_fd={} "
+                    "service={} attempt={} stream={}",
+                    self->client_fd_, self->service_name_, self->attempt_,
+                    self->h2_stream_id_);
+                if (self->state_ == State::SENDING_REQUEST ||
+                    self->state_ == State::AWAITING_RESPONSE ||
+                    self->state_ == State::RECEIVING_BODY) {
+                    self->ReportBreakerOutcome(RESULT_RESPONSE_TIMEOUT);
+                    self->MaybeRetry(
+                        RetryPolicy::RetryCondition::RESPONSE_TIMEOUT);
+                } else {
+                    self->OnError(RESULT_RESPONSE_TIMEOUT,
+                                  "Response timeout");
+                }
+            },
+            std::chrono::milliseconds(budget_ms));
+        logging::Get()->debug("ProxyTransaction armed H2 response timeout "
+                              "{}ms client_fd={} service={} stream={}",
+                              budget_ms, client_fd_, service_name_,
+                              h2_stream_id_);
+        return;
+    }
+
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn) return;
 
@@ -2270,6 +2326,14 @@ void ProxyTransaction::ArmResponseTimeout(int explicit_budget_ms) {
 }
 
 void ProxyTransaction::ClearResponseTimeout() {
+    // H2 path: invalidate any queued response-timeout task by bumping
+    // the generation. The closure compares against the current value
+    // before firing.
+    if (h2_path_) {
+        ++h2_response_timeout_generation_;
+        return;
+    }
+
     if (!lease_) return;
 
     auto* upstream_conn = lease_.Get();

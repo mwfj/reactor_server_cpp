@@ -1420,7 +1420,7 @@ void TestB5TickReturnsFalseWithNullSession() {
         // and Tick() returns false at the null-session early-out.
         UpstreamH2Connection conn(nullptr, cfg);
         auto now = std::chrono::steady_clock::now();
-        bool tick_result = conn.Tick(now, 1, 1);
+        bool tick_result = conn.Tick(now, 1, 1, 0);
         bool pass = !tick_result;
         TestFramework::RecordTest("H2Upstream B5: Tick returns false when session is null",
                                    pass,
@@ -1499,6 +1499,217 @@ void TestB8RecordingSinkTrailers() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest("H2Upstream B8: RecordingSink.OnTrailers tracks payload",
                                    false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier B (wire-level via real UpstreamH2Connection::HandleBytes)
+// ---------------------------------------------------------------------------
+// These tests construct a REAL UpstreamH2Connection (with a null transport,
+// so FlushSend silently drains nghttp2's buffer) and feed hand-crafted server
+// bytes through the production HandleBytes → mem_recv2 → callback chain.
+// Coverage gap closed (vs. TestB1 which drives nghttp2 manually):
+//   B9  — empty SETTINGS frame is consumed and accounted for
+//   B10 — :status=200 HEADERS dispatches OnHeaders to the sink
+//   B11 — :status="abc" triggers TEMPORAL_CALLBACK_FAILURE → RST_STREAM
+//         → OnStreamClose → sink->OnError (no OnHeaders)
+
+namespace H2WireTest {
+
+// Build a SETTINGS frame with an empty payload. nghttp2 server preface is
+// just an immediate SETTINGS frame; clients accept it without an explicit
+// connection preface.
+inline std::vector<uint8_t> BuildEmptySettings() {
+    return {0,0,0, NGHTTP2_SETTINGS, 0, 0,0,0,0};
+}
+
+// HPACK-encode a single (name, value) header block and frame it as a HEADERS
+// frame on `stream_id`. Always sets END_HEADERS; END_STREAM is operator
+// controlled. Returns the wire bytes ready to feed to HandleBytes.
+inline std::vector<uint8_t> BuildHeadersFrame(
+    int32_t stream_id,
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    bool end_stream)
+{
+    nghttp2_hd_deflater* defl = nullptr;
+    if (nghttp2_hd_deflate_new(&defl, 4096) != 0) return {};
+
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(headers.size());
+    for (const auto& kv : headers) {
+        nghttp2_nv nv;
+        nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(kv.first.data()));
+        nv.namelen = kv.first.size();
+        nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(kv.second.data()));
+        nv.valuelen = kv.second.size();
+        nv.flags = NGHTTP2_NV_FLAG_NO_INDEX;
+        nva.push_back(nv);
+    }
+    size_t bound = nghttp2_hd_deflate_bound(defl, nva.data(), nva.size());
+    std::vector<uint8_t> hpack(bound);
+    ssize_t pl = nghttp2_hd_deflate_hd2(defl, hpack.data(), hpack.size(),
+                                         nva.data(), nva.size());
+    nghttp2_hd_deflate_del(defl);
+    if (pl < 0) return {};
+
+    std::vector<uint8_t> frame;
+    frame.reserve(9 + pl);
+    frame.push_back(static_cast<uint8_t>((pl >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((pl >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(pl & 0xff));
+    frame.push_back(NGHTTP2_HEADERS);
+    uint8_t flags = NGHTTP2_FLAG_END_HEADERS;
+    if (end_stream) flags |= NGHTTP2_FLAG_END_STREAM;
+    frame.push_back(flags);
+    frame.push_back(static_cast<uint8_t>((stream_id >> 24) & 0x7f));
+    frame.push_back(static_cast<uint8_t>((stream_id >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((stream_id >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(stream_id & 0xff));
+    frame.insert(frame.end(), hpack.begin(), hpack.begin() + pl);
+    return frame;
+}
+
+}  // namespace H2WireTest
+
+// B9 — Empty SETTINGS frame is consumed by the real HandleBytes path
+void TestB9HandleBytesConsumesSettings() {
+    std::cout << "\n[TEST] H2Upstream B9: HandleBytes accepts server SETTINGS..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 0;
+
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B9: HandleBytes accepts server SETTINGS",
+                false, "Init failed");
+            return;
+        }
+        auto bytes = H2WireTest::BuildEmptySettings();
+        ssize_t consumed = conn.HandleBytes(
+            reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        bool pass = (consumed == static_cast<ssize_t>(bytes.size())) &&
+                    !conn.IsDead();
+        TestFramework::RecordTest(
+            "H2Upstream B9: HandleBytes accepts server SETTINGS",
+            pass, pass ? "" : "consumed mismatch or session marked dead");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B9: HandleBytes accepts server SETTINGS",
+            false, e.what());
+    }
+}
+
+// B10 — A valid HEADERS frame for an outstanding request dispatches
+// OnHeaders to the sink with the parsed status.
+void TestB10HandleBytesDispatchesValidStatus() {
+    std::cout << "\n[TEST] H2Upstream B10: HandleBytes dispatches OnHeaders for :status=200..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 0;
+
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B10: HandleBytes dispatches OnHeaders for :status=200",
+                false, "Init failed");
+            return;
+        }
+        // Submit a request so stream 1 is registered; the outbound HEADERS
+        // are silently drained by FlushSend (null transport).
+        UpstreamH2Codec codec;
+        RecordingSink sink;
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &codec, &sink);
+        if (sid != 1) {
+            TestFramework::RecordTest(
+                "H2Upstream B10: HandleBytes dispatches OnHeaders for :status=200",
+                false, "expected stream id 1 from first SubmitRequest");
+            return;
+        }
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-length", "0"}},
+            /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+
+        ssize_t consumed = conn.HandleBytes(
+            reinterpret_cast<const char*>(wire.data()), wire.size());
+        bool pass = (consumed > 0) &&
+                    (sink.headers_calls == 1) &&
+                    (sink.last_status == 200);
+        TestFramework::RecordTest(
+            "H2Upstream B10: HandleBytes dispatches OnHeaders for :status=200",
+            pass,
+            pass ? "" : "expected single OnHeaders with status=200");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B10: HandleBytes dispatches OnHeaders for :status=200",
+            false, e.what());
+    }
+}
+
+// B11 — Malformed :status="abc" rejects via NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE.
+// nghttp2 issues RST_STREAM, OnStreamClose fires with non-NO_ERROR, sink gets
+// OnError. The sink must NOT see OnHeaders.
+void TestB11HandleBytesRejectsInvalidStatus() {
+    std::cout << "\n[TEST] H2Upstream B11: HandleBytes rejects :status='abc'..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 0;
+
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B11: HandleBytes rejects :status='abc'",
+                false, "Init failed");
+            return;
+        }
+        UpstreamH2Codec codec;
+        RecordingSink sink;
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &codec, &sink);
+        if (sid != 1) {
+            TestFramework::RecordTest(
+                "H2Upstream B11: HandleBytes rejects :status='abc'",
+                false, "expected stream id 1");
+            return;
+        }
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "abc"}}, /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+
+        ssize_t consumed = conn.HandleBytes(
+            reinterpret_cast<const char*>(wire.data()), wire.size());
+        // sink->OnError fires from OnStreamClose after nghttp2 RSTs the
+        // stream in response to TEMPORAL_CALLBACK_FAILURE.
+        bool pass = (consumed > 0) &&
+                    (sink.headers_calls == 0) &&
+                    (sink.error_calls == 1);
+        TestFramework::RecordTest(
+            "H2Upstream B11: HandleBytes rejects :status='abc'",
+            pass,
+            pass ? ""
+                 : "expected zero OnHeaders and one OnError after RST_STREAM");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B11: HandleBytes rejects :status='abc'",
+            false, e.what());
     }
 }
 
@@ -2254,6 +2465,11 @@ void RunAllH2UpstreamTests() {
     TestB7OnTrailersCompleteNoStream();
     TestB8RecordingSinkTrailers();
     TestB1SingleRequestCompletes();
+
+    // Tier B (wire-level via real UpstreamH2Connection::HandleBytes)
+    TestB9HandleBytesConsumesSettings();
+    TestB10HandleBytesDispatchesValidStatus();
+    TestB11HandleBytesRejectsInvalidStatus();
 
     // Tier C — race / lifetime / memory
     TestC1InReceiveDataGuard();

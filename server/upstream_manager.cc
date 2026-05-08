@@ -111,8 +111,20 @@ UpstreamManager::UpstreamManager(
                 }
                 // Default 1.2 is already set in TlsClientContext constructor
 
-                // Set ALPN for HTTP/1.1 (HTTP/2 upstream deferred)
-                tls_ctx->SetAlpnProtocols({"http/1.1"});
+                // ALPN advertisement matches the upstream's H2 prefer mode.
+                // When http2.enabled and prefer != "never" we offer "h2"
+                // first so peers that support both protocols pick H2;
+                // "http/1.1" stays in the list so the auto path can fall
+                // back when the peer is H1-only. With prefer=never (or
+                // http2.enabled=false) we keep the H1-only advertisement
+                // — sending "h2" but rejecting H2 framing would mislead
+                // the peer.
+                std::vector<std::string> alpn;
+                if (upstream.http2.enabled && upstream.http2.prefer != "never") {
+                    alpn.push_back("h2");
+                }
+                alpn.push_back("http/1.1");
+                tls_ctx->SetAlpnProtocols(alpn);
 
                 tls_contexts_[upstream.name] = tls_ctx;
                 logging::Get()->info("TLS client context created for upstream '{}'",

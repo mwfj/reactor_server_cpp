@@ -253,6 +253,14 @@ private:
     int32_t h2_stream_id_ = -1;
     bool h2_path_ = false;
 
+    // H2 response timeout uses a dispatcher-scheduled task instead of a
+    // transport-level deadline: the transport is shared across every
+    // stream on the multiplexed session, so SetDeadline would tear down
+    // sibling streams when one stalls. The generation counter
+    // invalidates a queued task when ClearResponseTimeout fires before
+    // the task runs.
+    uint64_t h2_response_timeout_generation_ = 0;
+
     enum class RelayMode {
         BUFFERED,
         STREAMING,

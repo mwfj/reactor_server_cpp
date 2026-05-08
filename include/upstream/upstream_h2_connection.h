@@ -53,11 +53,14 @@ public:
 
     // Periodic liveness check. Emits a PING when idle for >=
     // ping_idle_sec; closes the connection (returns false) if a PING
-    // sent earlier hasn't ACKed within ping_timeout_sec. Caller must
-    // pass the live snapshot's timer values; INT_MAX-or-zero values
-    // disable the corresponding check.
+    // sent earlier hasn't ACKed within ping_timeout_sec, or if a
+    // peer-initiated GOAWAY has been observed for >=
+    // goaway_drain_timeout_sec without all in-flight streams completing.
+    // Caller must pass the live snapshot's timer values; INT_MAX-or-zero
+    // values disable the corresponding check.
     bool Tick(std::chrono::steady_clock::time_point now,
-              int ping_idle_sec, int ping_timeout_sec);
+              int ping_idle_sec, int ping_timeout_sec,
+              int goaway_drain_timeout_sec);
 
     // Transport accessor (non-owning). Used by the connection table on
     // reap to verify the underlying transport is still alive.
@@ -163,6 +166,12 @@ private:
 
     bool goaway_seen_ = false;
     int32_t goaway_last_stream_id_ = -1;
+    // Timestamp at which goaway_seen_ flipped true. Tick uses this with
+    // cfg_->goaway_drain_timeout_sec to evict a connection whose peer
+    // has signaled close but where in-flight streams never finished —
+    // without this bound, a stuck stream would pin the partition slot
+    // forever.
+    std::chrono::steady_clock::time_point goaway_seen_at_{};
     std::chrono::steady_clock::time_point last_activity_at_{};
     std::optional<std::chrono::steady_clock::time_point> pending_ping_at_;
 

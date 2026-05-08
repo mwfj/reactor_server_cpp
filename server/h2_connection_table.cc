@@ -78,7 +78,8 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
             const auto& cfg = c->config_snapshot();
             int idle = cfg ? cfg->ping_idle_sec : 0;
             int timeout = cfg ? cfg->ping_timeout_sec : 0;
-            if (!c->Tick(now, idle, timeout)) {
+            int goaway_drain = cfg ? cfg->goaway_drain_timeout_sec : 0;
+            if (!c->Tick(now, idle, timeout, goaway_drain)) {
                 // MarkDead BEFORE FailAllStreams: between the failure
                 // fan-out and the table erase below, FindUsable could be
                 // called from another path and would return this conn
@@ -88,7 +89,9 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
                 // "After any FailAllStreams call site, the connection
                 // MUST be marked dead".
                 c->MarkDead();
-                c->FailAllStreams(-1, "h2 PING timeout");
+                c->FailAllStreams(-1,
+                                  c->goaway_seen() ? "h2 GOAWAY drain timeout"
+                                                   : "h2 PING timeout");
                 it = conns.erase(it);
             } else if (c->goaway_seen() && c->active_stream_count() == 0) {
                 it = conns.erase(it);

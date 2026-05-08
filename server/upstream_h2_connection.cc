@@ -349,7 +349,8 @@ bool UpstreamH2Connection::SendPing(
 }
 
 bool UpstreamH2Connection::Tick(std::chrono::steady_clock::time_point now,
-                                 int ping_idle_sec, int ping_timeout_sec)
+                                 int ping_idle_sec, int ping_timeout_sec,
+                                 int goaway_drain_timeout_sec)
 {
     if (!session_) return false;
 
@@ -361,6 +362,25 @@ bool UpstreamH2Connection::Tick(std::chrono::steady_clock::time_point now,
             logging::Get()->warn(
                 "UpstreamH2Connection: PING timeout after {}s — closing",
                 elapsed);
+            return false;
+        }
+    }
+
+    // GOAWAY drain bound. Once the peer has signaled GOAWAY and the
+    // configured drain window has elapsed without every in-flight stream
+    // completing, retire the connection so the partition slot can be
+    // reclaimed. The reap walker still removes a fully-drained
+    // (active_stream_count() == 0) GOAWAY'd session inline; this branch
+    // catches the stuck case the walker can never observe.
+    if (goaway_seen_ && goaway_drain_timeout_sec > 0 && !streams_.empty()) {
+        auto elapsed =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                now - goaway_seen_at_).count();
+        if (elapsed >= goaway_drain_timeout_sec) {
+            logging::Get()->warn(
+                "UpstreamH2Connection: GOAWAY drain timeout after {}s with "
+                "{} stream(s) still active — closing",
+                elapsed, streams_.size());
             return false;
         }
     }
@@ -382,9 +402,11 @@ void UpstreamH2Connection::OnPingAck() {
 }
 
 void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
+    auto now = std::chrono::steady_clock::now();
     goaway_seen_ = true;
     goaway_last_stream_id_ = last_stream_id;
-    last_activity_at_ = std::chrono::steady_clock::now();
+    goaway_seen_at_ = now;
+    last_activity_at_ = now;
 }
 
 void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
@@ -478,6 +500,10 @@ void UpstreamH2Connection::OnTrailersComplete(int32_t stream_id) {
     if (it == streams_.end()) return;
     auto& stream = it->second;
     if (!stream || !stream->sink) return;
+    // Elide an empty trailers HEADERS block (legal per RFC 9113 §8.1):
+    // sinks observe stream completion via OnComplete (driven by
+    // OnStreamClose), so dispatching a zero-pair OnTrailers here would
+    // be a no-op for every existing sink.
     if (stream->trailers.empty()) return;
     stream->sink->OnTrailers(stream->trailers);
 }
