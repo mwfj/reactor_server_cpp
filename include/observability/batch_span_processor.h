@@ -133,6 +133,13 @@ private:
     std::atomic<bool>              flush_requested_{false};
     std::atomic<int64_t>           dropped_on_overflow_{0};
     std::atomic<int64_t>           exported_batches_{0};
+    // Set to N>0 while the worker is mid-export-cycle (a single batch's
+    // entire retry sequence increments once and decrements once on
+    // exit). ForceFlush polls until queue=0 AND in_flight=0 — without
+    // this, a poll could see queue=0 while an in-flight POST is still
+    // alive, which lets the four-phase shutdown tear down the upstream
+    // pool mid-batch and lose the final spans.
+    std::atomic<int>               exports_in_flight_{0};
 
     std::thread                    worker_;
     std::atomic<bool>              worker_started_{false};

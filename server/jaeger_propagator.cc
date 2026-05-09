@@ -47,19 +47,21 @@ std::optional<SpanContext> JaegerPropagator::Parse(std::string_view value) {
         const auto end = (next == std::string_view::npos) ? value.size() : next;
         parts[idx++] = value.substr(cur, end - cur);
         if (next == std::string_view::npos) break;
+        // A 5th colon means trailing data after parts[3] — reject.
+        // (The previous post-loop length check used the wrong base and
+        // accidentally accepted "a:b:c:d:e" whenever len(e)==len(d).)
+        if (idx == 4) return std::nullopt;
         cur = next + 1;
     }
-    // Reject if fewer than 4 parts or any trailing data after the 4th.
-    if (idx != 4 || cur + parts[3].size() != value.size()) {
-        return std::nullopt;
-    }
+    if (idx != 4) return std::nullopt;
     if (!IsHexLowercase(parts[0]) || !IsHexLowercase(parts[1])
         || !IsHexLowercase(parts[3])) {
         return std::nullopt;
     }
-    // parent-span-id is informational only; it must be hex but a literal
-    // "0" (root span) is permitted.
-    if (!parts[2].empty() && !IsHexLowercase(parts[2])) {
+    // parent-span-id is informational; the 4-part contract requires it
+    // to be present and hex. A literal "0" (root span) is permitted by
+    // jaeger-client-go's serializer; empty is not.
+    if (!IsHexLowercase(parts[2])) {
         return std::nullopt;
     }
 
@@ -110,6 +112,15 @@ bool JaegerPropagator::Inject(const SpanContext& ctx,
 
 void JaegerPropagator::StripOwnedHeaders(HeadersMap& headers) const {
     headers.erase(kHeader);
+    // Mixed-case duplicates (e.g. "Uber-Trace-Id") would otherwise leak
+    // through to the upstream — match W3C's case-insensitive sweep.
+    for (auto it = headers.begin(); it != headers.end(); ) {
+        if (EqualsLowerAscii(it->first, kHeader)) {
+            it = headers.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 }  // namespace OBSERVABILITY_NAMESPACE

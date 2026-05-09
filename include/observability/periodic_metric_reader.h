@@ -58,6 +58,19 @@ public:
         exporter_shutdown_disabled_.store(true, std::memory_order_release);
     }
 
+    // Live emission gate — when false the worker still ticks and bumps
+    // flush_completed_count_ (preserving ForceFlush handshake) but
+    // skips the Snapshot+Export pair so no metrics traffic is pushed.
+    // Backs the documented `metrics.enabled=false` SIGHUP semantic:
+    // emission stops, allocation stays so a `false → true` flip works
+    // without restart. Counters keep accumulating in MeterProvider.
+    void SetEnabled(bool on) noexcept {
+        enabled_.store(on, std::memory_order_release);
+    }
+    bool enabled() const noexcept {
+        return enabled_.load(std::memory_order_acquire);
+    }
+
     // Phase 2 — exposed so ObservabilityManager::BeginShutdown can detect
     // a MetricExporter shared with the BatchSpanProcessor and coordinate
     // the single SignalShutdown call after both workers have joined.
@@ -99,6 +112,12 @@ private:
     std::condition_variable         join_cv_;
     bool                            worker_done_ = false;
     std::atomic<bool>               exporter_shutdown_disabled_{false};
+
+    // Live emission gate (defaults to true so the boot path doesn't have
+    // to call SetEnabled before the first cycle). ObservabilityManager
+    // pushes the metrics.enabled config into this on registration and on
+    // every Reload — see SetEnabled().
+    std::atomic<bool>               enabled_{true};
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

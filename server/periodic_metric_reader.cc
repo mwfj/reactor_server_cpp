@@ -44,21 +44,30 @@ void PeriodicMetricReader::WorkerLoop() {
             continue;
         }
 
-        // Snapshot the provider's current series state and hand to
-        // exporter. The snapshot is a consistent point-in-time view
-        // produced under the provider's series-map lock.
-        try {
-            MetricsSnapshot snap = provider_->Snapshot();
-            const auto deadline = std::chrono::steady_clock::now() +
-                std::chrono::nanoseconds(timeout_ns_.load(std::memory_order_acquire));
-            exporter_->Export(std::move(snap), deadline);
-            exported_cycles_.fetch_add(1, std::memory_order_relaxed);
-        } catch (const std::exception& e) {
-            logging::Get()->error(
-                "PeriodicMetricReader::Export threw: {}", e.what());
-        } catch (...) {
-            logging::Get()->error(
-                "PeriodicMetricReader::Export threw unknown exception");
+        // Live emission gate. metrics.enabled=false (boot or SIGHUP)
+        // means: keep the worker ticking so flush_completed_count_
+        // continues to advance for ForceFlush waiters AND so a
+        // false→true flip resumes immediately, but skip the actual
+        // Snapshot+Export pair. MeterProvider's writers keep
+        // accumulating regardless — only the push side is gated.
+        if (enabled_.load(std::memory_order_acquire)) {
+            // Snapshot the provider's current series state and hand to
+            // exporter. The snapshot is a consistent point-in-time view
+            // produced under the provider's series-map lock.
+            try {
+                MetricsSnapshot snap = provider_->Snapshot();
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::nanoseconds(
+                        timeout_ns_.load(std::memory_order_acquire));
+                exporter_->Export(std::move(snap), deadline);
+                exported_cycles_.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::exception& e) {
+                logging::Get()->error(
+                    "PeriodicMetricReader::Export threw: {}", e.what());
+            } catch (...) {
+                logging::Get()->error(
+                    "PeriodicMetricReader::Export threw unknown exception");
+            }
         }
 
         // Any ForceFlush waiter that captured its target before this

@@ -6271,6 +6271,18 @@ bool HttpServer::Reload(ServerConfig new_config) {
     }
     if (observability_manager_) {
         observability_manager_->Reload(new_config.observability);
+        // ObservabilityManager::Reload propagates sampler/batch/reader
+        // settings, but the OtlpHttpExporter is owned by HttpServer and
+        // does not see SIGHUP otherwise. Push the (live-reloadable)
+        // headers + timeouts into it so rotated auth tokens / changed
+        // export deadlines take effect without a restart.
+        if (otlp_exporter_) {
+            otlp_exporter_->ReloadHeaders(
+                new_config.observability.traces.otlp.headers,
+                new_config.observability.metrics.otlp.headers,
+                new_config.observability.traces.otlp.timeout_ms,
+                new_config.observability.metrics.otlp.timeout_ms);
+        }
         // Preserve restart-only fields in the live snapshot so that
         // /config and any subsequent in-process Reload read the values
         // actually in use at runtime, not the staged-but-not-applied

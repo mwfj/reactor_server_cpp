@@ -129,6 +129,19 @@ void TestParseRejectsMalformed() {
              "1234567890abcdef1234567890abcdef:001122:0:1"},
             {"upper_hex_trace",
              "1234567890ABCDEF1234567890abcdef:0011223344556677:0:1"},
+            // Trailing 5th colon must be rejected. The previous post-loop
+            // length check used the wrong base and accidentally accepted
+            // "a:b:c:d:e" whenever len(e) happened to equal len(d).
+            {"five_parts_equal_lengths",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1:2"},
+            {"five_parts_long_extra",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1:extra"},
+            {"trailing_colon_no_extra",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1:"},
+            // Empty parent-span-id contradicts the documented 4-part
+            // contract — must reject (was silently accepted before).
+            {"empty_parent_span_id",
+             "1234567890abcdef1234567890abcdef:0011223344556677::1"},
         };
         bool pass = true;
         std::string err;
@@ -183,6 +196,33 @@ void TestStripOwnedHeaders() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "ObsJaeger: StripOwnedHeaders removes uber-trace-id only",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Mixed-case duplicates ("Uber-Trace-Id") would otherwise leak through
+// to the upstream — Strip must match case-insensitively, like W3C.
+void TestStripOwnedHeadersCaseInsensitive() {
+    try {
+        JaegerPropagator p;
+        Propagator::HeadersMap h = {
+            {"Uber-Trace-Id",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1"},
+            {"UBER-TRACE-ID",
+             "0000000000000000aaaaaaaaaaaaaaaa:0011223344556677:0:0"},
+            {"content-type", "application/json"}};
+        p.StripOwnedHeaders(h);
+        bool pass = h.count("Uber-Trace-Id") == 0
+                  && h.count("UBER-TRACE-ID") == 0
+                  && h.count("uber-trace-id") == 0
+                  && h.count("content-type") == 1;
+        TestFramework::RecordTest(
+            "ObsJaeger: StripOwnedHeaders is case-insensitive",
+            pass, pass ? "" : "case-variant uber-trace-id leaked through",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsJaeger: StripOwnedHeaders is case-insensitive",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -418,6 +458,7 @@ void RunAllTests() {
     TestParseRejectsMalformed();
     TestParseHeaderAbsent();
     TestStripOwnedHeaders();
+    TestStripOwnedHeadersCaseInsensitive();
     TestNameIsJaeger();
     TestInjectAlways128Bit();
     TestInjectUnsampledFlagsZero();

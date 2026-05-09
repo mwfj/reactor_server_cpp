@@ -293,10 +293,16 @@ class CountingMetricExporter : public MetricExporter {
 public:
     ExportResult Export(MetricsSnapshot,
                          std::chrono::steady_clock::time_point) override {
+        export_calls_.fetch_add(1, std::memory_order_relaxed);
         return ExportResult::kSuccess;
     }
     void SignalShutdown() override {}
     void CancelAllActiveExports() override {}
+    int export_calls() const noexcept {
+        return export_calls_.load(std::memory_order_relaxed);
+    }
+private:
+    std::atomic<int> export_calls_{0};
 };
 }  // namespace
 
@@ -340,6 +346,129 @@ void TestRegisterMetricReaderDrainedOnBeginShutdown() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "ObsMgr: RegisterMetricReader drained on BeginShutdown",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Manager.Reload must propagate the new export_interval into the live
+// PMR worker — without this, MeterProvider holds the new knob but the
+// running worker keeps using its construction-time atomic snapshot.
+//
+// Note: a single in-flight cv_.wait_for(old_interval) cannot be
+// shortened mid-wait, so this test compares per-window tick RATES
+// across a long-interval phase and a short-interval phase rather than
+// asserting an instant change.
+void TestManagerReloadPropagatesIntervalToReader() {
+    try {
+        auto mgr = MakeManager();
+        auto exporter = std::make_shared<CountingMetricExporter>();
+        // Phase 1: 200ms interval — slow enough that a 500ms window
+        // sees only ~2 ticks.
+        MeterReaderOptions opts;
+        opts.export_interval = std::chrono::milliseconds(200);
+        opts.export_timeout  = std::chrono::milliseconds(100);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(), exporter, opts);
+        mgr->RegisterMetricReader(reader);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const int64_t baseline = reader->worker_loop_iterations();
+
+        // Phase 2: Reload to 25ms — well below the pre-reload rate.
+        auto cfg = DefaultConfig();
+        cfg.metrics.reader.export_interval = std::chrono::milliseconds(25);
+        cfg.metrics.reader.export_timeout  = std::chrono::milliseconds(50);
+        mgr->Reload(cfg);
+
+        // Wait through the worst-case stale wait_for tail (200ms) plus
+        // a full 500ms of post-reload activity. With 25ms ticks, the
+        // post-reload window alone should produce >>10 ticks.
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        const int64_t after = reader->worker_loop_iterations();
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        // Pre-reload rate: ~2.5 ticks per 500ms.
+        // Post-reload rate (at 25ms): >>10 over the trailing 500ms.
+        // Assert delta-after-reload is at least 4x the baseline rate.
+        const int64_t delta = after - baseline;
+        const bool propagated = delta >= 10;
+        TestFramework::RecordTest(
+            "ObsMgr: Reload propagates export_interval to live PMR worker",
+            propagated,
+            propagated ? "" : "delta=" + std::to_string(delta)
+                                + " over ~700ms (expected >=10 at 25ms cadence)",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: Reload propagates export_interval to live PMR worker",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// metrics.enabled=false must STOP exporter pushes without joining the
+// PMR worker. The worker keeps ticking (so flush_completed_count_
+// advances for ForceFlush), but Snapshot+Export is skipped so no
+// telemetry leaves the process. Re-enable resumes pushing.
+void TestManagerReloadGatesPmrEmission() {
+    try {
+        auto mgr = MakeManager();
+        auto exporter = std::make_shared<CountingMetricExporter>();
+        MeterReaderOptions opts;
+        opts.export_interval = std::chrono::milliseconds(30);
+        opts.export_timeout  = std::chrono::milliseconds(50);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(), exporter, opts);
+        mgr->RegisterMetricReader(reader);
+
+        // Phase 1: enabled, watch Export() get called.
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const int exports_while_enabled = exporter->export_calls();
+
+        // Phase 2: disable, Export() must stop being called even though
+        // the worker keeps ticking.
+        auto cfg = DefaultConfig();
+        cfg.metrics.enabled = false;
+        cfg.metrics.reader.export_interval = std::chrono::milliseconds(30);
+        cfg.metrics.reader.export_timeout  = std::chrono::milliseconds(50);
+        mgr->Reload(cfg);
+        const int64_t iter_at_disable = reader->worker_loop_iterations();
+        const int exports_at_disable = exporter->export_calls();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const int64_t iter_after_disable = reader->worker_loop_iterations();
+        const int exports_after_disable = exporter->export_calls();
+
+        // Phase 3: re-enable, Export() resumes.
+        cfg.metrics.enabled = true;
+        mgr->Reload(cfg);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const int exports_after_reenable = exporter->export_calls();
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        const bool exported_initially = exports_while_enabled >= 2;
+        const bool worker_kept_ticking =
+            (iter_after_disable - iter_at_disable) >= 2;
+        const bool no_exports_while_disabled =
+            exports_after_disable == exports_at_disable;
+        const bool resumed_after_reenable =
+            exports_after_reenable > exports_after_disable;
+
+        const bool pass = exported_initially
+                       && worker_kept_ticking
+                       && no_exports_while_disabled
+                       && resumed_after_reenable;
+        std::string err;
+        if (!exported_initially) err = "no exports during enabled phase";
+        else if (!worker_kept_ticking) err = "worker stopped ticking when disabled";
+        else if (!no_exports_while_disabled) err = "exporter called while disabled";
+        else if (!resumed_after_reenable) err = "exporter did not resume after re-enable";
+        TestFramework::RecordTest(
+            "ObsMgr: metrics.enabled=false halts PMR Export, true resumes",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: metrics.enabled=false halts PMR Export, true resumes",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -873,6 +1002,8 @@ void RunAllTests() {
     TestReloadFlipsMetricsEnabled();
     TestBeginShutdownIdempotent();
     TestRegisterMetricReaderDrainedOnBeginShutdown();
+    TestManagerReloadPropagatesIntervalToReader();
+    TestManagerReloadGatesPmrEmission();
     TestSharedExporterSignalledOnceOnShutdown();
     TestSeparateExportersEachSignalledOnce();
     TestSwapToBatchSpanProcessorReplacesNoop();

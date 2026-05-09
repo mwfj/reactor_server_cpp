@@ -1,41 +1,26 @@
 #include "observability/propagator.h"
 
 #include <algorithm>
-#include <cctype>
 #include <set>
+#include <string_view>
 
 namespace OBSERVABILITY_NAMESPACE {
 
 namespace {
 
-inline std::string ToLower(std::string_view s) {
-    std::string out(s);
-    std::transform(out.begin(), out.end(), out.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return out;
-}
-
+// Case-insensitive lookup over std::map<string,string>. Hot path on the
+// inbound traceparent + tracestate read — the fast path is the
+// case-sensitive find(); the linear scan only fires when the caller
+// built the map with non-canonical casing.
 const std::string* FindHeader(
     const std::map<std::string, std::string>& headers,
-    const std::string& lower_key) {
-    auto it = headers.find(lower_key);
+    std::string_view lower_key) {
+    auto it = headers.find(std::string(lower_key));
     if (it != headers.end()) return &it->second;
     for (const auto& [k, v] : headers) {
-        if (k.size() == lower_key.size() && ToLower(k) == lower_key) {
-            return &v;
-        }
+        if (EqualsLowerAscii(k, lower_key)) return &v;
     }
     return nullptr;
-}
-
-inline bool EqualsLowerAscii(std::string_view name, std::string_view lower) {
-    if (name.size() != lower.size()) return false;
-    for (size_t i = 0; i < lower.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(name[i])) != lower[i]) {
-            return false;
-        }
-    }
-    return true;
 }
 
 inline void EraseVecHeader(
@@ -47,6 +32,36 @@ inline void EraseVecHeader(
                 return EqualsLowerAscii(kv.first, lower_key);
             }),
         headers.end());
+}
+
+// Single-pass map erase that drops every entry whose lowercased key
+// matches any of the supplied references. Avoids the per-iteration
+// std::string allocation that ToLower() would incur.
+inline void EraseMapHeadersIfLowerMatches(
+    std::map<std::string, std::string>& headers,
+    std::initializer_list<std::string_view> lower_keys) {
+    for (auto it = headers.begin(); it != headers.end(); ) {
+        bool match = false;
+        for (auto lk : lower_keys) {
+            if (EqualsLowerAscii(it->first, lk)) { match = true; break; }
+        }
+        it = match ? headers.erase(it) : std::next(it);
+    }
+}
+
+// Lowercase a string_view into the receiver. Used only by the
+// post-strip survivor-set bookkeeping in the vector overload, which
+// is a one-shot cost per Inject(HeadersVec&) call rather than a
+// per-header hot-path operation.
+inline std::string ToLower(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        out.push_back((c >= 'A' && c <= 'Z')
+                          ? static_cast<char>(c + 32)
+                          : static_cast<char>(c));
+    }
+    return out;
 }
 
 inline void AppendFlagsHex(uint8_t flags, std::string& out) {
@@ -187,14 +202,8 @@ void W3CPropagator::StripOwnedHeaders(HeadersMap& headers) const {
     headers.erase("traceparent");
     headers.erase("tracestate");
     // Tolerate any non-lower-case duplicates a caller might have built.
-    for (auto it = headers.begin(); it != headers.end(); ) {
-        const std::string lower = ToLower(it->first);
-        if (lower == "traceparent" || lower == "tracestate") {
-            it = headers.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    // Single linear pass with EqualsLowerAscii — no per-header allocation.
+    EraseMapHeadersIfLowerMatches(headers, {"traceparent", "tracestate"});
 }
 
 void W3CPropagator::StripOwnedHeaders(HeadersVec& headers) const {

@@ -49,6 +49,22 @@ inline bool IsHexCharLower(char c) noexcept {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
 }
 
+// Case-insensitive ASCII equality against a precomputed all-lowercase
+// reference. Hot path: every inbound + outbound proxy request runs
+// StripOwnedHeaders across every header — `tolower` per char dodges
+// the per-iteration std::string allocation that ToLower() would incur.
+inline bool EqualsLowerAscii(std::string_view name,
+                             std::string_view lower) noexcept {
+    if (name.size() != lower.size()) return false;
+    for (size_t i = 0; i < lower.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        const char l = (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32)
+                                              : static_cast<char>(c);
+        if (l != lower[i]) return false;
+    }
+    return true;
+}
+
 class Propagator {
 public:
     using HeadersMap = std::map<std::string, std::string>;
@@ -167,8 +183,9 @@ public:
 // 64-bit value is left-padded with zeros to the canonical 128-bit
 // TraceId. span-id is 16-hex. parent-span-id is informational only
 // (gateway does not reconstruct the parent chain) but the field MUST
-// be present and hex. flags is 1-2 hex chars; only the sampled bit
-// (0x01) is honored — debug/firehose bits are dropped.
+// be present and hex (a literal "0" is the documented root-span
+// sentinel; empty is rejected). flags is 1-2 hex chars; only the
+// sampled bit (0x01) is honored — debug/firehose bits are dropped.
 class JaegerPropagator final : public Propagator {
 public:
     static constexpr const char* kHeader = "uber-trace-id";

@@ -131,6 +131,20 @@ void BatchSpanProcessor::WorkerLoop() {
                 retries_max_backoff_ns_.load(
                     std::memory_order_acquire) / 1'000'000);
             int attempt = 0;
+            // RAII bracket: ForceFlush waits for queue=0 AND in_flight=0
+            // so the upstream pool isn't torn down mid-POST during the
+            // four-phase shutdown drain. The counter wraps the entire
+            // retry sequence (not each individual Export call) so a
+            // ForceFlush poll can't slip through between attempts.
+            struct InFlightGuard {
+                std::atomic<int>& c;
+                InFlightGuard(std::atomic<int>& counter) : c(counter) {
+                    c.fetch_add(1, std::memory_order_acq_rel);
+                }
+                ~InFlightGuard() {
+                    c.fetch_sub(1, std::memory_order_acq_rel);
+                }
+            } guard{exports_in_flight_};
             for (; attempt < max_attempts; ++attempt) {
                 const auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::nanoseconds(export_timeout_ns_.load(
@@ -305,12 +319,21 @@ void BatchSpanProcessor::ReloadRetries(int new_max_attempts,
 void BatchSpanProcessor::ForceFlush(std::chrono::milliseconds deadline) {
     flush_requested_.store(true, std::memory_order_release);
     cv_.notify_all();
-    // Poll until queue empties or deadline expires. We do NOT block the
-    // calling thread on a cv-wait because the worker thread holds the
-    // mtx during Export() — a cv-wait here would just spin on the cv.
+    // Poll until queue empties AND no Export is in flight, or deadline
+    // expires. We do NOT block the calling thread on a cv-wait because
+    // the worker thread holds the mtx during Export() — a cv-wait here
+    // would just spin on the cv.
+    //
+    // Both conditions matter: queue=0 alone is insufficient because the
+    // worker may have just dequeued the last batch and be inside the
+    // exporter's HTTP POST. Returning then would let the shutdown
+    // proceed to pool teardown, killing the in-flight POST.
     const auto t_end = std::chrono::steady_clock::now() + deadline;
     while (std::chrono::steady_clock::now() < t_end) {
-        if (queue_depth() == 0) return;
+        const bool queue_empty = (queue_depth() == 0);
+        const bool no_export = exports_in_flight_.load(
+            std::memory_order_acquire) == 0;
+        if (queue_empty && no_export) return;
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     }
 }

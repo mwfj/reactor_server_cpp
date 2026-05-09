@@ -11,6 +11,7 @@
 #include "observability/meter_provider.h"
 #include "observability/metric_label_registry.h"
 #include "observability/otlp_http_exporter.h"
+#include "observability/otlp_transport.h"
 #include "observability/periodic_metric_reader.h"
 #include "observability/resource.h"
 #include "observability/sampler.h"
@@ -680,6 +681,59 @@ void TestPeriodicMetricReaderForceFlushBlocks() {
     }
 }
 
+// Sub-second OTLP timeouts must NOT truncate to zero. timeout_sec=0
+// disables UpstreamHttpClient::SetDeadline; fut.get() then blocks
+// indefinitely on a stalled upstream and wedges the BSP/PMR worker.
+// Round-up-to-1s is the contract OtlpTimeoutCeilSeconds enforces.
+void TestOtlpTimeoutCeilSeconds() {
+    try {
+        using ms = std::chrono::milliseconds;
+        struct Case {
+            const char* name;
+            int64_t input_ms;
+            int     expected_secs;
+        };
+        const Case cases[] = {
+            {"zero",                0,        1},
+            {"one_ms",              1,        1},
+            {"sub_second_500",    500,        1},
+            {"sub_second_999",    999,        1},
+            {"exact_1s",         1000,        1},
+            {"1001ms_rounds_up", 1001,        2},
+            {"5500ms_rounds_up", 5500,        6},
+            {"60s",             60000,       60},
+            {"negative_clamped",   -5,        1},
+        };
+        bool pass = true;
+        std::string err;
+        for (const auto& c : cases) {
+            const int got = OBSERVABILITY_NAMESPACE::OtlpTimeoutCeilSeconds(
+                ms{c.input_ms});
+            if (got != c.expected_secs) {
+                pass = false;
+                err = std::string{c.name} + ": expected "
+                    + std::to_string(c.expected_secs)
+                    + ", got " + std::to_string(got);
+                break;
+            }
+            // Critical invariant: never zero — that disables SetDeadline.
+            if (got <= 0) {
+                pass = false;
+                err = std::string{c.name} + ": timeout_sec <= 0 "
+                                            "(would disable deadline)";
+                break;
+            }
+        }
+        TestFramework::RecordTest(
+            "ObsExport: OtlpTimeoutCeilSeconds rounds up sub-second to >=1",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: OtlpTimeoutCeilSeconds rounds up sub-second to >=1",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "OBSERVABILITY EXPORT PIPELINE TESTS" << std::endl;
@@ -699,6 +753,7 @@ void RunAllTests() {
     TestInMemoryProcessorForceFlushIsNoop();
     TestBatchSpanProcessorOverridesForceFlush();
     TestPeriodicMetricReaderForceFlushBlocks();
+    TestOtlpTimeoutCeilSeconds();
 }
 
 }  // namespace ObservabilityExportPipelineTests

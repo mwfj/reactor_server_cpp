@@ -13,6 +13,7 @@
 
 #include "observability/otlp_http_exporter.h"
 
+#include <chrono>
 #include <memory>
 
 namespace AUTH_NAMESPACE {
@@ -20,6 +21,14 @@ class UpstreamHttpClient;
 }
 
 namespace OBSERVABILITY_NAMESPACE {
+
+// Round a millisecond timeout up to whole seconds, clamped to a minimum
+// of 1. UpstreamHttpClient::Request::timeout_sec is whole seconds and
+// only arms SetDeadline when timeout_sec > 0; a naive truncation of
+// any sub-second OTLP timeout would silently disable the deadline and
+// let fut.get() block indefinitely on a stalled upstream. Exposed for
+// direct testing — the lambda captured by MakeOtlpTransport calls this.
+int OtlpTimeoutCeilSeconds(std::chrono::milliseconds ms) noexcept;
 
 OtlpHttpExporter::TransportFn MakeOtlpTransport(
     std::weak_ptr<AUTH_NAMESPACE::UpstreamHttpClient> client_weak);

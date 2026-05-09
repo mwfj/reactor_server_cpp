@@ -365,6 +365,35 @@ void TestW3CPropagatorImplementsInterface() {
     }
 }
 
+// Mixed-case duplicates ("Traceparent", "TRACESTATE") must be scrubbed
+// by the strip sweep — the EqualsLowerAscii hot-path replacement
+// (no per-iteration std::string allocation) must remain functionally
+// equivalent to the prior ToLower-based loop.
+void TestW3CStripCaseInsensitive() {
+    try {
+        W3CPropagator p;
+        std::map<std::string, std::string> h = {
+            {"Traceparent", "00-0af7651916cd43dd8448eb211c80319c"
+                            "-b7ad6b7169203331-01"},
+            {"TRACESTATE",  "vendor=value"},
+            {"content-type", "application/json"}};
+        p.StripOwnedHeaders(h);
+        bool pass = h.count("Traceparent") == 0
+                  && h.count("TRACESTATE")  == 0
+                  && h.count("traceparent") == 0
+                  && h.count("tracestate")  == 0
+                  && h.count("content-type") == 1;
+        TestFramework::RecordTest(
+            "ObsProp: StripOwnedHeaders is case-insensitive",
+            pass, pass ? "" : "case-variant traceparent/tracestate leaked",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsProp: StripOwnedHeaders is case-insensitive",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "OBSERVABILITY PROPAGATOR TESTS" << std::endl;
@@ -381,6 +410,7 @@ void RunAllTests() {
     TestInjectStripsTracestateOnEmptyState();
     TestInjectInvalidContextNoOp();
     TestW3CPropagatorImplementsInterface();
+    TestW3CStripCaseInsensitive();
 }
 
 }  // namespace ObservabilityPropagatorTests

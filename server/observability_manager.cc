@@ -488,6 +488,10 @@ void ObservabilityManager::RegisterMetricReader(
         return;
     }
     metric_reader_ = std::move(reader);
+    // Sync the live emission gate into the reader. The PMR's enabled_
+    // defaults to true; if metrics.enabled started false at boot the
+    // worker would otherwise push one cycle before our first Reload.
+    metric_reader_->SetEnabled(MetricsEnabled());
 }
 
 std::shared_ptr<const Propagator> ObservabilityManager::propagator() const noexcept {
@@ -742,6 +746,20 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
         ro.export_interval = new_config.metrics.reader.export_interval;
         ro.export_timeout  = new_config.metrics.reader.export_timeout;
         meter_provider_->Reload(ro);
+        // The MeterProvider holds the reload knobs but the PMR worker
+        // reads its own atomic snapshot — propagate explicitly so the
+        // running worker picks up the new interval/timeout on its next
+        // iteration. Without this the documented live reload is a
+        // no-op until restart.
+        //
+        // Also push the live `metrics.enabled` flag — when an operator
+        // toggles it via SIGHUP the PMR worker must stop / resume
+        // export without reallocating. PublishLiveFlags has already
+        // updated metrics_enabled_ above.
+        if (metric_reader_) {
+            metric_reader_->Reload(ro);
+            metric_reader_->SetEnabled(MetricsEnabled());
+        }
     }
 }
 
