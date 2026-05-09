@@ -241,6 +241,7 @@ ProxyTransaction::ProxyTransaction(
       header_rewriter_(header_rewriter),
       retry_policy_(retry_policy),
       complete_cb_(std::move(complete_cb)),
+      codec_(std::make_unique<UpstreamHttpCodec>()),
       start_time_(std::chrono::steady_clock::now()),
       stream_sender_(std::move(stream_sender))
 {
@@ -318,8 +319,8 @@ void ProxyTransaction::Start() {
 
     // Tell the codec the request method so it handles HEAD correctly
     // (no body despite Content-Length/Transfer-Encoding in response).
-    codec_.SetRequestMethod(method_);
-    codec_.SetSink(this);
+    codec_->SetRequestMethod(method_);
+    codec_->SetSink(this);
     relay_mode_ = RelayMode::BUFFERED;
     response_headers_seen_ = false;
     response_committed_ = false;
@@ -411,9 +412,13 @@ void ProxyTransaction::Start() {
         }
     }
 
-    // Serialize the upstream request (cached for retry)
-    serialized_request_ = HttpRequestSerializer::Serialize(
-        method_, upstream_path, query_, rewritten_headers_, request_body_);
+    // Cache for retry and for the H2 dispatch path's :path pseudo-header.
+    upstream_path_ = upstream_path;
+
+    // Note: serialized_request_ is built lazily on the first H1 send so
+    // the H2 dispatch path doesn't pay the cost of a second copy of the
+    // request body (which is also held in request_body_ for retry replay
+    // and in the H2 stream's body_source).
 
     logging::Get()->debug("ProxyTransaction::Start client_fd={} service={} "
                           "upstream={}:{} {} {}",
@@ -572,7 +577,39 @@ void ProxyTransaction::AttemptCheckout() {
     }
     ActivateAttemptTracking();
     EnsureCheckoutCancelToken();
+
+    // Fast path: if a usable multiplexed H2 session already exists for
+    // this upstream, dispatch onto it without consuming a pool slot.
+    // Without this, with `pool.max_connections` set near 1 the donated
+    // H2 transport permanently occupies the only pool slot — subsequent
+    // requests would queue forever in CheckoutAsync instead of
+    // multiplexing onto the existing session. H2 concurrency would be
+    // bounded by spare pool slots rather than max_concurrent_streams_pref.
+    if (TryDispatchExistingH2Session()) {
+        return;
+    }
+
     StartCheckoutAsync();
+}
+
+bool ProxyTransaction::TryDispatchExistingH2Session() {
+    if (!upstream_manager_ || dispatcher_index_ < 0) return false;
+    PoolPartition* partition = upstream_manager_->GetPoolPartition(
+        service_name_, static_cast<size_t>(dispatcher_index_));
+    if (!partition) return false;
+    auto cfg = partition->LoadHttp2ConfigSnapshot();
+    if (!cfg || !cfg->enabled || cfg->prefer == "never") return false;
+    auto existing = partition->FindUsableH2Connection(service_name_);
+    if (!existing) return false;
+    // Existing session is reusable. Skip CheckoutAsync entirely and
+    // dispatch through the H2 path with an EMPTY lease — DispatchH2's
+    // AcquireH2Connection FAST branch returns the same session without
+    // touching the lease, and lease_ stays empty (the existing session
+    // owns its own donated lease for transport lifetime). Advance to
+    // SENDING_REQUEST as if OnCheckoutReady had granted us a lease.
+    state_ = State::SENDING_REQUEST;
+    DispatchH2();
+    return true;
 }
 
 void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
@@ -628,6 +665,106 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
                           client_fd_, service_name_, transport->fd(),
                           attempt_);
 
+    // Decide H1 vs H2 dispatch. The partition holds the live H2
+    // sub-config snapshot (atomic-loaded each call so reload-time
+    // commits are observed). For TLS upstreams in `auto` prefer mode
+    // we wait for the handshake-complete callback to read ALPN; bare
+    // TCP `auto` falls through to H1 (no ALPN signal available).
+    PoolPartition* partition = nullptr;
+    if (upstream_manager_ && dispatcher_index_ >= 0) {
+        partition = upstream_manager_->GetPoolPartition(
+            service_name_, static_cast<size_t>(dispatcher_index_));
+    }
+    std::shared_ptr<const Http2UpstreamConfig> cfg;
+    if (partition) cfg = partition->LoadHttp2ConfigSnapshot();
+
+    bool want_h2 = false;
+    bool defer_for_handshake = false;
+    if (cfg && cfg->enabled) {
+        const std::string& prefer = cfg->prefer;
+        if (prefer == "always") {
+            want_h2 = true;
+        } else if (prefer == "auto") {
+            if (transport->IsTlsReady()) {
+                want_h2 = (transport->GetAlpnProtocol() == "h2");
+            } else if (transport->HasTls()) {
+                defer_for_handshake = true;
+            }
+        }
+    }
+
+    if (defer_for_handshake) {
+        std::weak_ptr<ProxyTransaction> wk_self = weak_from_this();
+        std::weak_ptr<ConnectionHandler> wk_t = transport;
+        // The pool's close/error fan-out routes a disconnect to
+        // borrower_cb = handler->GetOnMessageCb() with empty data.
+        // Without this transient hook, a TLS handshake failure (peer
+        // RST, cert error, ALPN abort) wedges the transaction in
+        // CHECKOUT_PENDING with the lease + breaker admission stranded
+        // until the request deadline tears it down.
+        transport->SetOnMessageCb(
+            [wk_self](std::shared_ptr<ConnectionHandler>, std::string& data) {
+                if (!data.empty()) return;
+                auto self = wk_self.lock();
+                if (!self || self->cancelled_) return;
+                self->OnError(RESULT_UPSTREAM_DISCONNECT,
+                              "upstream disconnected during TLS handshake");
+            });
+        transport->SetHandshakeCompleteCallback(
+            [wk_self, wk_t]() {
+                auto self = wk_self.lock();
+                if (!self || self->cancelled_) return;
+                auto t = wk_t.lock();
+                bool h2 = t && (t->GetAlpnProtocol() == "h2");
+                if (h2) self->DispatchH2();
+                else    self->DispatchH1();
+            });
+        return;
+    }
+
+    if (want_h2) {
+        DispatchH2();
+    } else {
+        DispatchH1();
+    }
+}
+
+void ProxyTransaction::DispatchH1() {
+    // If the previous attempt used H2, codec_ is UpstreamH2Codec.
+    // ResetForRetryAttempt() only Reset()s the existing codec — it
+    // does NOT re-construct. Without this swap, the H1 fallback's
+    // first response bytes would route through UpstreamH2Codec::Parse
+    // (HTTP/2 frame parser) and fail immediately with a parse error.
+    // Hot-path overhead is one dynamic_cast per DispatchH1 invocation
+    // (constant-time, single vtable lookup); the codec swap itself
+    // only happens on H2→H1 retry fallback in prefer="auto" mode.
+    if (dynamic_cast<UpstreamH2Codec*>(codec_.get()) != nullptr) {
+        codec_ = std::make_unique<UpstreamHttpCodec>();
+        codec_->SetRequestMethod(method_);
+        codec_->SetSink(this);
+    }
+
+    auto* upstream_conn = lease_.Get();
+    if (!upstream_conn) {
+        ReleaseBreakerAdmissionNeutral();
+        if (DeliverPendingRetryable5xxResponse("dispatch_h1_empty_lease")) {
+            return;
+        }
+        OnError(RESULT_CHECKOUT_FAILED,
+                "DispatchH1 called without a valid lease");
+        return;
+    }
+    auto transport = upstream_conn->GetTransport();
+    if (!transport) {
+        ReleaseBreakerAdmissionNeutral();
+        if (DeliverPendingRetryable5xxResponse("dispatch_h1_no_transport")) {
+            return;
+        }
+        OnError(RESULT_CHECKOUT_FAILED,
+                "DispatchH1: upstream connection has no transport");
+        return;
+    }
+
     // Bound how much raw upstream data can accumulate in the transport's
     // ET read loop before the codec/backpressure path gets a chance to run.
     // This cap is per checked-out transaction and is cleared before the
@@ -661,6 +798,97 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
     );
 
     SendUpstreamRequest();
+}
+
+void ProxyTransaction::DispatchH2() {
+    PoolPartition* partition = nullptr;
+    if (upstream_manager_ && dispatcher_index_ >= 0) {
+        partition = upstream_manager_->GetPoolPartition(
+            service_name_, static_cast<size_t>(dispatcher_index_));
+    }
+    if (!partition) {
+        MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
+        return;
+    }
+
+    auto h2 = partition->AcquireH2Connection(service_name_, lease_);
+    if (!h2) {
+        MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
+        return;
+    }
+    // Reuse path: lease_ was untouched by AcquireH2Connection; fresh-
+    // session path: lease_ has been moved into the H2 connection. In
+    // either case the transaction no longer needs a direct lease —
+    // return any leftover handle to the pool so a sibling H1 dispatch
+    // doesn't accidentally reach the same transport.
+    if (lease_) lease_.Release();
+
+    // Switch the codec to the H2 implementation. The codec object
+    // owns response parsing state for the H1 fallback path; on the H2
+    // path it is unused at the connection layer (sink callbacks fire
+    // directly from nghttp2 frame callbacks).
+    auto h2_codec = std::make_unique<UpstreamH2Codec>();
+    h2_codec->SetRequestMethod(method_);
+    h2_codec->SetSink(this);
+    codec_ = std::move(h2_codec);
+
+    // Build :authority by reusing the H1 Host header that
+    // HeaderRewriter::RewriteRequest already produced. RFC 9113 §8.3.1
+    // makes :authority the H2 equivalent of the H1 Host header; using
+    // the already-resolved value gives us H1/H2 byte-parity for free,
+    // including:
+    //   * `rewrite_host=false` passthrough (preserves client-supplied
+    //     Host, which the static derivation here would silently
+    //     overwrite, breaking backend vhost routing for routes that
+    //     opt out of rewriting);
+    //   * TLS-by-IP with `tls.sni_hostname` set (rewriter prefers SNI);
+    //   * IPv6 literal bracketing (via DnsResolver::FormatAuthority);
+    //   * default-port elision for the active scheme.
+    // Fallback to the static derivation only when the rewriter produced
+    // no host at all — defensively handles a rewriter contract change
+    // rather than emitting an empty :authority (which nghttp2 would
+    // reject).
+    std::string authority;
+    auto host_it = rewritten_headers_.find("host");
+    if (host_it != rewritten_headers_.end() && !host_it->second.empty()) {
+        authority = host_it->second;
+    } else {
+        const std::string& host_src =
+            (upstream_tls_ && !sni_hostname_.empty())
+                ? sni_hostname_
+                : upstream_host_;
+        const std::string host_value =
+            NET_DNS_NAMESPACE::DnsResolver::StripTrailingDot(host_src);
+        const bool omit_port = (!upstream_tls_ && upstream_port_ == 80) ||
+                               (upstream_tls_ && upstream_port_ == 443);
+        authority = NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
+            host_value, upstream_port_, omit_port);
+    }
+    const std::string scheme = upstream_tls_ ? "https" : "http";
+
+    // Compose path with query, mirroring the H1 serializer.
+    std::string path_with_query = upstream_path_.empty() ? "/" : upstream_path_;
+    if (!query_.empty()) {
+        path_with_query.push_back('?');
+        path_with_query.append(query_);
+    }
+
+    int32_t stream_id = h2->SubmitRequest(
+        method_, scheme, authority, path_with_query,
+        rewritten_headers_, request_body_, this);
+    if (stream_id < 0) {
+        logging::Get()->warn(
+            "ProxyTransaction H2 submit failed client_fd={} service={} "
+            "attempt={}", client_fd_, service_name_, attempt_);
+        MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
+        return;
+    }
+
+    h2_path_ = true;
+    h2_stream_id_ = stream_id;
+    h2_conn_weak_ = h2;
+    state_ = State::AWAITING_RESPONSE;
+    ArmResponseTimeout();
 }
 
 void ProxyTransaction::OnCheckoutError(int error_code) {
@@ -797,6 +1025,15 @@ void ProxyTransaction::SendUpstreamRequest() {
     held_retryable_5xx_saw_eof_ = false;
     state_ = State::SENDING_REQUEST;
 
+    // Lazy-serialize on first H1 send. Cached on subsequent retries that
+    // also land on H1 (rewritten_headers_ / method_ / upstream_path_ /
+    // request_body_ are immutable across retries). H2 dispatches never
+    // reach this path, avoiding a second large copy of the body.
+    if (serialized_request_.empty()) {
+        serialized_request_ = HttpRequestSerializer::Serialize(
+            method_, upstream_path_, query_, rewritten_headers_, request_body_);
+    }
+
     logging::Get()->debug("ProxyTransaction sending request client_fd={} "
                           "service={} upstream_fd={} bytes={}",
                           client_fd_, service_name_, transport->fd(),
@@ -867,11 +1104,11 @@ void ProxyTransaction::OnUpstreamData(
     // llhttp needs an EOF signal to finalize the response. Try Finish()
     // first — if it completes the response, deliver it instead of retrying.
     if (parse_input.empty()) {
-        if (holding_retryable_5xx_response_ && codec_.IsPaused()) {
+        if (holding_retryable_5xx_response_ && codec_->IsPaused()) {
             held_retryable_5xx_saw_eof_ = true;
             return;
         }
-        if (codec_.Finish()) {
+        if (codec_->Finish()) {
             // EOF-delimited response completed successfully
             poison_connection_ = true;  // connection-close: not reusable
             if (body_complete_) {
@@ -884,7 +1121,7 @@ void ProxyTransaction::OnUpstreamData(
                              "client_fd={} service={} upstream_fd={} "
                              "body_complete_={} codec_paused={} paused_bytes={}",
                              client_fd_, service_name_, upstream_fd,
-                             body_complete_, codec_.IsPaused(), paused_parse_bytes_.size());
+                             body_complete_, codec_->IsPaused(), paused_parse_bytes_.size());
         logging::Get()->warn("ProxyTransaction upstream disconnect (EOF) "
                              "client_fd={} service={} upstream_fd={} "
                              "state={} attempt={}",
@@ -897,7 +1134,7 @@ void ProxyTransaction::OnUpstreamData(
     }
 
     // Parse upstream response data
-    size_t consumed = codec_.Parse(parse_input.data(), parse_input.size());
+    size_t consumed = codec_->Parse(parse_input.data(), parse_input.size());
 
     // Body/header callbacks may have already completed or torn down the
     // transaction (for example, downstream closed during streaming body
@@ -908,16 +1145,16 @@ void ProxyTransaction::OnUpstreamData(
 
     // Check for parse error — the HTTP stream is desynchronized and the
     // connection must not be returned to the idle pool.
-    if (codec_.HasError()) {
+    if (codec_->HasError()) {
         poison_connection_ = true;
         int upstream_fd = conn ? conn->fd() : -1;
         OnError(RESULT_PARSE_ERROR,
-                "Upstream response parse error: " + codec_.GetError() +
+                "Upstream response parse error: " + codec_->GetError() +
                 " upstream_fd=" + std::to_string(upstream_fd));
         return;
     }
 
-    if (codec_.IsPaused() && consumed < parse_input.size()) {
+    if (codec_->IsPaused() && consumed < parse_input.size()) {
         paused_parse_bytes_.assign(parse_input.data() + consumed,
                                    parse_input.size() - consumed);
         if (holding_retryable_5xx_response_) {
@@ -997,13 +1234,25 @@ bool ProxyTransaction::OnHeaders(
         if (ShouldRetryResponse5xx() && CanRetryResponse5xxNow()) {
             retry_from_headers_pending_ = true;
             poison_connection_ = true;
-            codec_.PauseParsing();
+            codec_->PauseParsing();
             if (auto* upstream_conn = lease_.Get()) {
                 // Hold the upstream body at the transport edge while the retry
                 // timer/local gates decide whether we will actually abandon
                 // this response. Pausing llhttp alone would keep appending raw
                 // bytes into paused_parse_bytes_ without the relay cap.
                 upstream_conn->IncReadDisable();
+            }
+            // H2: there is no parser-loop driver to dispatch the retry
+            // decision later, and we cannot pause the multiplexed
+            // transport without stalling sibling streams. Make the retry
+            // decision synchronously so subsequent body chunks land on a
+            // detached sink (Cleanup nulls stream->sink via ResetStream)
+            // and never reach the client. Snapshot-as-complete fallback
+            // if the retry is rejected — whatever H2 DATA arrived before
+            // the headers triggered the decision is treated as the full
+            // body for replay.
+            if (h2_path_) {
+                ProcessHeadersRetryDecision();
             }
             return true;
         } else if (ShouldRetryResponse5xx()) {
@@ -1098,6 +1347,17 @@ void ProxyTransaction::OnTrailers(
 void ProxyTransaction::OnComplete() {
     if (cancelled_ || IsKilledForShutdown()) return;
     body_complete_ = true;
+    // H2 streams have no per-byte parser loop, so there is no equivalent
+    // of the H1 OnUpstreamData path that checks `if (body_complete_)
+    // OnResponseComplete()` after each parse. Drive the same delivery
+    // flow here for the H2 path.
+    if (h2_path_) {
+        // Skip if a synchronous retry was already scheduled from
+        // OnHeaders — would double-fire OnResponseComplete and race
+        // with the in-flight retry.
+        if (retry_from_headers_pending_) return;
+        OnResponseComplete();
+    }
 }
 
 void ProxyTransaction::OnUpstreamWriteComplete(
@@ -1190,6 +1450,36 @@ void ProxyTransaction::OnResponseComplete() {
 void ProxyTransaction::OnError(int result_code,
                                 const std::string& log_message) {
     if (cancelled_ || IsKilledForShutdown()) return;
+
+    // H2 transport-level failures arrive here through sink->OnError —
+    // unlike H1, which detects transport failure inside OnUpstreamData
+    // and calls MaybeRetry(UPSTREAM_DISCONNECT) directly before the sink
+    // ever sees an error. Bring H2 to feature parity: when the result is
+    // a retryable disconnect AND no response has been committed AND the
+    // transaction is not already terminal, route through MaybeRetry so
+    // the retry policy fires (idempotent method, attempt budget, retry
+    // budget all honored). The state guard guards against a late
+    // OnError fired from a stream-close callback that the partition
+    // didn't manage to suppress, after a previous attempt's terminal
+    // delivery (Cleanup → ResetStream → sink=nullptr is the primary
+    // defense; the local guard makes the invariant explicit). Cleanup()
+    // inside MaybeRetry's success branch tears down the H2 stream
+    // state; its retry-not-allowed branch falls through to
+    // DeliverTerminalError.
+    if (h2_path_ && !response_committed_ &&
+        state_ != State::FAILED && state_ != State::COMPLETE &&
+        result_code == RESULT_UPSTREAM_DISCONNECT) {
+        ReportBreakerOutcome(result_code);
+        MaybeRetry(RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
+        return;
+    }
+
+    DeliverTerminalError(result_code, log_message);
+}
+
+void ProxyTransaction::DeliverTerminalError(int result_code,
+                                              const std::string& log_message) {
+    if (cancelled_ || IsKilledForShutdown()) return;
     InvalidateStreamTimers();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start_time_);
@@ -1200,12 +1490,11 @@ void ProxyTransaction::OnError(int result_code,
                          attempt_, duration.count(), log_message);
 
     // Report the outcome if an admission is still held. Most error paths
-    // call ReportBreakerOutcome themselves BEFORE reaching OnError (so a
+    // call ReportBreakerOutcome themselves BEFORE reaching here (so a
     // retry's ConsultBreaker sees the fresh signal) — this is a safety
-    // net for error paths that skipped reporting, e.g., RESULT_SEND_FAILED
-    // and RESULT_RESPONSE_TIMEOUT from the on-upstream-data paths.
-    // ReportBreakerOutcome is idempotent: it clears admission_generation_
-    // on the first call so a double-call drops harmlessly.
+    // net for paths that skipped reporting (RESULT_SEND_FAILED,
+    // RESULT_RESPONSE_TIMEOUT from on-upstream-data paths, MaybeRetry's
+    // retry-not-allowed fallback). ReportBreakerOutcome is idempotent.
     ReportBreakerOutcome(result_code);
 
     state_ = State::FAILED;
@@ -1241,6 +1530,22 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             pending_retryable_5xx_head_ = response_head_;
             pending_retryable_5xx_body_ = std::move(snapshot.body);
             pending_retryable_5xx_body_complete_ = snapshot.complete;
+            // The keep_held branch below relies on H1's transport-level pause
+            // (codec_->PauseParsing + IncReadDisable on the transport) to
+            // hold the original 5xx body in case the retry is later rejected.
+            // H2 has no equivalent: the multiplexed transport must keep
+            // serving sibling streams, lease_ is empty post-DispatchH2 so
+            // IncReadDisable is a no-op, and UpstreamH2Codec::PauseParsing
+            // only flips a flag nothing reads. Force-clearing the holding
+            // flag steers MaybeRetry into the Cleanup-driven path: ResetStream
+            // cleanly cancels the in-flight body and the retry attempt
+            // actually contacts the upstream. The trade-off is that an H2
+            // retry-rejection delivers the headers-only snapshot rather than
+            // the full upstream 5xx body — same trade-off the H2 OnHeaders
+            // synchronous-decision path already accepts.
+            if (h2_path_) {
+                pending_retryable_5xx_body_complete_ = true;
+            }
             holding_retryable_5xx_response_ =
                 !pending_retryable_5xx_body_complete_;
             held_retryable_5xx_saw_eof_ = false;
@@ -1384,7 +1689,7 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                                      "client_fd={} service={} status={} "
                                      "attempt={} duration={}ms",
                                      client_fd_, service_name_,
-                                     codec_.GetResponse().status_code,
+                                     response_head_.status_code,
                                      attempt_, duration.count());
                 state_ = State::COMPLETE;
                 HttpResponse client_response = BuildClientResponse();
@@ -1393,7 +1698,12 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             }
     }
 
-    OnError(result_code, "Retry exhausted or not allowed for condition=" +
+    // Use DeliverTerminalError instead of OnError so we don't bounce
+    // back through OnError's H2 retry escape hatch — that would loop
+    // when the retry was just denied here.
+    DeliverTerminalError(
+        result_code,
+        "Retry exhausted or not allowed for condition=" +
             std::to_string(static_cast<int>(condition)));
 }
 
@@ -1593,7 +1903,40 @@ void ProxyTransaction::Cleanup() {
     // (empty) guard decrements the old counter immediately.
     inflight_guard_ = CIRCUIT_BREAKER_NAMESPACE::RetryBudget::InFlightGuard{};
 
-    if (lease_) {
+    // H2 path: the transport is owned by the multiplexed
+    // UpstreamH2Connection — its callbacks are bound to the H2 session
+    // for its full lifetime, NOT to this single stream. Issue
+    // RST_STREAM (if the session is still alive) and let the session
+    // continue serving sibling streams; do NOT touch transport
+    // callbacks or release a lease (the lease was donated to the H2
+    // connection at dispatch time).
+    if (h2_path_) {
+        if (h2_stream_id_ >= 0) {
+            if (auto h2 = h2_conn_weak_.lock()) {
+                h2->ResetStream(h2_stream_id_);
+            }
+        }
+        h2_stream_id_ = -1;
+        h2_conn_weak_.reset();
+        // ClearResponseTimeout MUST run while h2_path_ is still true:
+        // its H2 branch keys on h2_path_ to bump
+        // h2_response_timeout_generation_, which invalidates any queued
+        // EnQueueDelayed task. If we cleared h2_path_ first, the queued
+        // task would survive — fire later against this transaction (now
+        // possibly mid-retry on the H1 path or already destructed) and
+        // produce a spurious RESPONSE_TIMEOUT against the wrong attempt.
+        ClearResponseTimeout();
+        // Reset h2_path_ so a subsequent retry attempt that lands on H1
+        // (e.g. ALPN renegotiated, or the H2 connection died and prefer=auto's
+        // next probe selects http/1.1) goes through the H1 lease-release
+        // branch on its own Cleanup. Without this reset the H1 lease leaks.
+        h2_path_ = false;
+        // Cancelled mid-stream H2 requests are neutral from the breaker's
+        // perspective — RST_STREAM is a client-initiated abort, not an
+        // upstream failure. Release any held admission token so the slot
+        // is not stranded. Idempotent when OnResponseComplete already ran.
+        ReleaseBreakerAdmissionNeutral();
+    } else if (lease_) {
         auto* conn = lease_.Get();
         if (conn) {
             auto transport = conn->GetTransport();
@@ -1669,12 +2012,12 @@ void ProxyTransaction::ReleaseHeldRetryable5xxTransport() {
 }
 
 void ProxyTransaction::ResetForRetryAttempt() {
-    codec_.Reset();
+    codec_->Reset();
     // Re-apply request method after reset — llhttp_init() zeroes
     // parser.method, so HEAD responses would be parsed as if they
     // carry a body, causing the retried request to hang.
-    codec_.SetRequestMethod(method_);
-    codec_.SetSink(this);
+    codec_->SetRequestMethod(method_);
+    codec_->SetSink(this);
     poison_connection_ = false;
     relay_mode_ = RelayMode::BUFFERED;
     response_headers_seen_ = false;
@@ -1994,8 +2337,8 @@ void ProxyTransaction::ProcessHeadersRetryDecision() {
 }
 
 void ProxyTransaction::ResumePausedParsing() {
-    if (!codec_.IsPaused()) return;
-    codec_.ResumeParsing();
+    if (!codec_->IsPaused()) return;
+    codec_->ResumeParsing();
     if (paused_parse_bytes_.empty()) return;
     auto pending = std::move(paused_parse_bytes_);
     paused_parse_bytes_.clear();
@@ -2019,6 +2362,18 @@ void ProxyTransaction::HandleStreamSendResult(
         return;
     }
 
+    // H2 path: the transport is shared across every multiplexed stream,
+    // so transport-level IncReadDisable would pause sibling streams when
+    // this stream's downstream is slow. nghttp2's auto-WINDOW_UPDATE is
+    // on by default in this code path, so the peer's stream-level window
+    // tracks the auto-update cadence (~initial_window_size in practice)
+    // plus MAX_FRAME_SIZE rather than a hard cap. Disabling auto-update
+    // and pausing per-stream consumption via nghttp2_session_consume_stream
+    // is the future refinement that would give a strict bound.
+    if (h2_path_) {
+        return;
+    }
+
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn || upstream_conn->IsReadDisabled()) {
         return;
@@ -2026,7 +2381,7 @@ void ProxyTransaction::HandleStreamSendResult(
 
     SuspendStreamIdleTimer();
     upstream_conn->IncReadDisable();
-    codec_.PauseParsing();
+    codec_->PauseParsing();
     std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
     stream_sender_.SetDrainListener([weak_self]() {
         auto self = weak_self.lock();
@@ -2159,6 +2514,43 @@ void ProxyTransaction::ArmResponseTimeout(int explicit_budget_ms) {
         return;
     }
 
+    // H2 path: schedule a per-transaction dispatcher task. The transport
+    // is shared across every multiplexed stream — installing a transport
+    // deadline here would tear down sibling streams when one stalls.
+    if (h2_path_) {
+        if (!dispatcher_) return;
+        const uint64_t generation = ++h2_response_timeout_generation_;
+        std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+        dispatcher_->EnQueueDelayed(
+            [weak_self, generation]() {
+                auto self = weak_self.lock();
+                if (!self) return;
+                if (self->cancelled_) return;
+                if (generation != self->h2_response_timeout_generation_) return;
+                logging::Get()->warn(
+                    "ProxyTransaction H2 response timeout client_fd={} "
+                    "service={} attempt={} stream={}",
+                    self->client_fd_, self->service_name_, self->attempt_,
+                    self->h2_stream_id_);
+                if (self->state_ == State::SENDING_REQUEST ||
+                    self->state_ == State::AWAITING_RESPONSE ||
+                    self->state_ == State::RECEIVING_BODY) {
+                    self->ReportBreakerOutcome(RESULT_RESPONSE_TIMEOUT);
+                    self->MaybeRetry(
+                        RetryPolicy::RetryCondition::RESPONSE_TIMEOUT);
+                } else {
+                    self->OnError(RESULT_RESPONSE_TIMEOUT,
+                                  "Response timeout");
+                }
+            },
+            std::chrono::milliseconds(budget_ms));
+        logging::Get()->debug("ProxyTransaction armed H2 response timeout "
+                              "{}ms client_fd={} service={} stream={}",
+                              budget_ms, client_fd_, service_name_,
+                              h2_stream_id_);
+        return;
+    }
+
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn) return;
 
@@ -2219,6 +2611,14 @@ void ProxyTransaction::ArmResponseTimeout(int explicit_budget_ms) {
 }
 
 void ProxyTransaction::ClearResponseTimeout() {
+    // H2 path: invalidate any queued response-timeout task by bumping
+    // the generation. The closure compares against the current value
+    // before firing.
+    if (h2_path_) {
+        ++h2_response_timeout_generation_;
+        return;
+    }
+
     if (!lease_) return;
 
     auto* upstream_conn = lease_.Get();

@@ -28,6 +28,11 @@ public:
     // SSL_CTX_set_alpn_protos() (not the server selection callback).
     void SetAlpnProtocols(const std::vector<std::string>& protocols);
 
+    // Read-only view of the wire-format ALPN advertisement (length-prefixed
+    // concatenation of protocol names). Empty when SetAlpnProtocols has
+    // never been called. Exposed for tests / diagnostics.
+    const std::vector<unsigned char>& GetAlpnWire() const { return alpn_wire_; }
+
 private:
     SSL_CTX* ctx_;
 

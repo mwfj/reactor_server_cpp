@@ -270,7 +270,59 @@ Upstream connection pools are configured via the `upstreams` array in the JSON c
 
 **Validator constraint:** `verify_peer: true` with an IP-literal `host` and no `sni_hostname` override is rejected at config load with an error. Use `sni_hostname` to supply the certificate name when connecting to an upstream by IP address with peer verification enabled.
 
-**Note:** Upstream configuration changes require a server restart — pools are built once during `Start()` and cannot be rebuilt at runtime.
+**Note:** Upstream configuration changes require a server restart — pools are built once during `Start()` and cannot be rebuilt at runtime. The `upstreams[].http2.*` block is the exception: most fields are live-reloadable via SIGHUP. See **Upstream HTTP/2** below.
+
+### Upstream HTTP/2
+
+The proxy engine can dispatch outbound requests over multiplexed HTTP/2 instead of HTTP/1.1 by adding an `http2` block to an upstream entry. Each upstream's H2 setting is independent — some can use H2 while others stay on H1.
+
+```json
+{
+    "upstreams": [
+        {
+            "name": "grpc-backend",
+            "host": "rpc.internal",
+            "port": 443,
+            "tls": { "enabled": true, "ca_file": "/etc/ssl/ca-bundle.crt" },
+            "http2": {
+                "enabled": true,
+                "prefer": "auto",
+                "max_concurrent_streams_pref": 100,
+                "initial_window_size": 1048576,
+                "max_frame_size": 16384,
+                "header_table_size": 4096,
+                "max_header_list_size": 65536,
+                "ping_idle_sec": 60,
+                "ping_timeout_sec": 10,
+                "goaway_drain_timeout_sec": 30,
+                "saturation_open_pct": 0
+            }
+        }
+    ]
+}
+```
+
+**H2 fields** (`http2.*`):
+
+| Field | Default | Live-reloadable | Description |
+|-------|---------|-----------------|-------------|
+| `enabled` | false | no (restart) | Master switch — H2 is opt-in per upstream |
+| `prefer` | `"auto"` | no (restart) | `"auto"` (use ALPN result), `"always"` (force H2; fails if peer doesn't speak it), `"never"` (force H1) |
+| `max_concurrent_streams_pref` | 100 | yes | Local cap on concurrent streams per H2 connection |
+| `initial_window_size` | 1048576 | yes | Per-stream initial flow-control window (bytes) |
+| `max_frame_size` | 16384 | yes | Max DATA frame size advertised in SETTINGS (RFC 9113 range: 16384–16777215) |
+| `header_table_size` | 4096 | yes | HPACK dynamic table size (0 disables) |
+| `max_header_list_size` | 65536 | yes | Cap on the upstream's HEADERS+CONTINUATION block (bytes). Advertised in SETTINGS; nghttp2 enforces. Raise for upstreams that emit large trailer-only metadata (e.g. some gRPC servers). |
+| `ping_idle_sec` | 60 | yes | Send a PING after this many seconds of inactivity (0 disables) |
+| `ping_timeout_sec` | 10 | yes | Close the H2 connection if a PING goes unanswered for this long (0 disables) |
+| `goaway_drain_timeout_sec` | 30 | yes | Bound on how long to wait for in-flight streams after GOAWAY |
+| `saturation_open_pct` | 0 | yes | Future use — saturation-mode routing not yet enforced |
+
+**TLS requirement:** `http2.enabled = true` requires `tls.enabled = true` (no h2c support). `http2.prefer = "always"` additionally rejects at config-load if TLS is disabled.
+
+**Reload semantics:** The non-restart fields above can be edited via SIGHUP and take effect on **new** H2 connections. Existing multiplexed sessions keep the snapshot they were constructed with — RFC 9113 doesn't cleanly support mid-session SETTINGS renegotiation. Operator changes propagate within a few seconds depending on connection turnover.
+
+For the operator runbook (failure modes, troubleshooting, monitoring), see [docs/http2_upstream.md](http2_upstream.md).
 
 ### Proxy Route Configuration
 
@@ -353,7 +405,7 @@ Hop-by-hop headers listed in RFC 7230 §6.1 (`Connection`, `Keep-Alive`, `Proxy-
 - Worker threads > 0
 - If TLS enabled, cert_file and key_file must be non-empty
 - shutdown_drain_timeout_sec: 0-300 (0 = immediate close)
-- If HTTP/2 enabled: max_concurrent_streams >= 1, initial_window_size 1 to 2^31-1, max_frame_size 16384 to 16777215, max_header_list_size >= 1
+- If HTTP/2 enabled: max_concurrent_streams >= 1, initial_window_size 1 to 2^31-1, max_frame_size 16384 to 16777215, max_header_list_size >= 4096, header_table_size 0 to 16777216 (per-upstream)
 
 Throws `std::invalid_argument` on validation failure.
 

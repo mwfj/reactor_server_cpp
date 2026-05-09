@@ -15,13 +15,10 @@ public:
     static constexpr int CONNECT_ERROR       = -1;  // SO_ERROR != 0 or getsockopt failure
 
 private:
-    // fd_ is read by NetServer::HandleNewConnection on the conn-dispatcher
-    // thread for diagnostic logging while the owning-dispatcher's
-    // CallCloseCb path may concurrently write -1 via ReleaseFd(). The
-    // value is racy but bounded (an int) so a relaxed atomic gives TSan
-    // happiness without cross-thread fences. The pitfalls file calls
-    // out the same pattern: any FD or pointer field shared across
-    // threads MUST be std::atomic<T>.
+    // Concurrently read by NetServer::HandleNewConnection (conn dispatcher,
+    // diagnostic logging) while ReleaseFd() on the owning dispatcher may
+    // write -1. Relaxed ordering is sufficient — a torn int read on a
+    // diagnostic path is harmless.
     std::atomic<int> fd_{-1};
     std::string ip_addr_;
     int port_;

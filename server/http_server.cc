@@ -377,39 +377,6 @@ static int CeilMsToSec(int ms) {
     return static_cast<int>(sec64);
 }
 
-// Convert a timeout in milliseconds to a DISPATCHER TIMER CADENCE in
-// whole seconds. Distinct from CeilMsToSec because cadence sizing has
-// different requirements than cap sizing:
-//
-//   - Sub-2s timeouts (1000, 2000) ms are CLAMPED to 1s cadence
-//     instead of being rounded up to 2s. Otherwise a 1100ms deadline
-//     is scanned only every 2s and can fire up to ~0.9s late —
-//     under-delivering the documented "1s resolution" for ms-based
-//     upstream timeouts. This also protects other sub-2s deadlines on
-//     the same dispatcher (e.g. session / request-timeout deadlines
-//     that would inherit a coarse cadence from an upstream round-up).
-//
-//   - For >= 2s timeouts, ceiling still gives the correct cadence:
-//     cadence equal to the timeout budget in seconds. Scanning at a
-//     finer granularity would burn CPU for no correctness win; the
-//     overshoot is already bounded by `cadence - (ms/1000)` which is
-//     in [0, 1) by construction.
-//
-//   - Zero/negative inputs normalize to 1s (the finest representable
-//     cadence), matching historic call-site behavior.
-//
-// Saturates at INT_MAX and returns at least 1. int64_t intermediate
-// to avoid the same overflow concern as CeilMsToSec.
-static int CadenceSecFromMs(int ms) {
-    if (ms <= 0) return 1;
-    if (ms < 2000) return 1;
-    int64_t sec64 = (static_cast<int64_t>(ms) + 999) / 1000;
-    if (sec64 > std::numeric_limits<int>::max()) {
-        return std::numeric_limits<int>::max();
-    }
-    return static_cast<int>(sec64);
-}
-
 // Normalize a route pattern for dedup comparison by stripping all param
 // and catch-all names. E.g., "/api/:id/users/*rest" → "/api/:/users/*".
 // This way, semantically identical routes with different param names
@@ -994,6 +961,11 @@ void HttpServer::MarkServerReady() {
             // `upstream.host` for effective-SNI derivation.
             upstream_manager_ = std::make_unique<UpstreamManager>(
                 upstream_configs_, dispatchers, upstream_resolved_);
+            // Initial H2 snapshot bootstrap. Reload uses the same path
+            // for live propagation. Disabled-H2 entries publish a
+            // shared_ptr<const Http2UpstreamConfig> with enabled=false
+            // so observers see the off state explicitly.
+            upstream_manager_->CommitHttp2Snapshots(upstream_configs_);
         } catch (...) {
             logging::Get()->error("Upstream pool init failed, stopping server");
             net_server_.Stop();
@@ -1135,28 +1107,10 @@ void HttpServer::MarkServerReady() {
 
         // Ensure the timer cadence is fast enough for upstream connect timeouts.
         // SetDeadline stores a ms-precision deadline, but TimerHandler only fires
-        // at the timer scan interval. If connect_timeout_ms < current interval,
-        // timeouts would fire late. Reduce the interval if needed.
-        int min_upstream_sec = std::numeric_limits<int>::max();
-        for (const auto& u : upstream_configs_) {
-            // CadenceSecFromMs: clamps sub-2s timeouts to 1s cadence
-            // (instead of rounding up to 2s), preserving the documented
-            // 1s resolution for ms-based upstream timeouts.
-            int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
-            min_upstream_sec = std::min(min_upstream_sec, connect_sec);
-            // Also consider idle timeout for eviction cadence
-            if (u.pool.idle_timeout_sec > 0) {
-                min_upstream_sec = std::min(min_upstream_sec,
-                                            u.pool.idle_timeout_sec);
-            }
-            // Also consider proxy response timeout — if configured,
-            // the timer scan must fire often enough to detect stalled
-            // upstream responses within one interval of the deadline.
-            if (u.proxy.response_timeout_ms > 0) {
-                int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
-                min_upstream_sec = std::min(min_upstream_sec, response_sec);
-            }
-        }
+        // at the timer scan interval. If any upstream timeout is shorter
+        // than the current scan interval, narrow the interval so timeouts
+        // fire on time.
+        int min_upstream_sec = UpstreamManager::ComputeMinUpstreamCadenceSec(upstream_configs_);
         if (min_upstream_sec < std::numeric_limits<int>::max()) {
             int current_interval = net_server_.GetTimerInterval();
             if (min_upstream_sec < current_interval) {
@@ -6061,22 +6015,30 @@ bool HttpServer::Reload(ServerConfig new_config) {
     {
         int new_interval = ComputeTimerInterval(new_config.idle_timeout_sec,
                                                  new_config.request_timeout_sec);
-        // Preserve upstream timeout cadence — upstream configs are restart-only,
-        // but the timer interval must not widen past the shortest upstream timeout.
-        // CadenceSecFromMs clamps sub-2s timeouts to 1s so reload-time
-        // recomputation matches the startup-time cadence.
-        for (const auto& u : upstream_configs_) {
-            int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
-            new_interval = std::min(new_interval, connect_sec);
-            if (u.pool.idle_timeout_sec > 0) {
-                new_interval = std::min(new_interval, u.pool.idle_timeout_sec);
-            }
-            // Also preserve proxy response timeout cadence
-            if (u.proxy.response_timeout_ms > 0) {
-                int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
-                new_interval = std::min(new_interval, response_sec);
+        // Topology fields (pool.connect_timeout_ms, idle_timeout_sec,
+        // proxy.response_timeout_ms) are restart-only, so upstream_configs_
+        // is correct for them. But the H2 timer block (ping_idle_sec,
+        // ping_timeout_sec, goaway_drain_timeout_sec) is LIVE-reloadable;
+        // CommitHttp2Snapshots below will publish the staged values to
+        // live partitions when LiveEqual (restart-only fields) matches.
+        // Build a cadence-view that mirrors that decision so an H2-only
+        // SIGHUP recomputes the timer interval from the JUST-APPLIED
+        // timeouts, not the pre-reload ones.
+        std::vector<UpstreamConfig> cadence_view = upstream_configs_;
+        std::unordered_map<std::string, const Http2UpstreamConfig*> staged_h2;
+        staged_h2.reserve(new_config.upstreams.size());
+        for (const auto& u : new_config.upstreams) {
+            staged_h2.emplace(u.name, &u.http2);
+        }
+        for (auto& u : cadence_view) {
+            auto it = staged_h2.find(u.name);
+            if (it != staged_h2.end() && u.http2.LiveEqual(*it->second)) {
+                u.http2 = *it->second;
             }
         }
+        int upstream_min = UpstreamManager::ComputeMinUpstreamCadenceSec(cadence_view);
+        
+        new_interval = std::min(new_interval, upstream_min);
         net_server_.SetTimerInterval(new_interval);
     }
 
@@ -6121,6 +6083,15 @@ bool HttpServer::Reload(ServerConfig new_config) {
     // so a CB-only SIGHUP is a clean hot reload with no spurious warn.
     if (circuit_breaker_manager_) {
         circuit_breaker_manager_->Reload(new_config.upstreams);
+    }
+
+    // H2 sub-config live propagation. Topology (added/removed upstreams)
+    // is restart-required, so live partitions only see commits for
+    // upstreams that already exist; new entries in new_config.upstreams
+    // are ignored at runtime until restart. Live partitions missing
+    // from the staged set keep their existing snapshot.
+    if (upstream_manager_) {
+        upstream_manager_->CommitHttp2Snapshots(new_config.upstreams);
     }
 
     // AuthManager::Reload was invoked earlier (auth-first reject gate,

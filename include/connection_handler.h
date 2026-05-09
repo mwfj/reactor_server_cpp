@@ -57,6 +57,12 @@ private:
     using ConnectCompleteCallback = std::function<void(std::shared_ptr<ConnectionHandler>)>;
     ConnectCompleteCallback connect_complete_callback_ = nullptr;
 
+    // Fires once when TLS handshake transitions to READY (consume-on-fire).
+    // Wired by the H2 upstream codec so it can inspect ALPN immediately on
+    // completion. Cleared after invocation. See SetHandshakeCompleteCallback.
+    using HandshakeCompleteCallback = std::function<void()>;
+    HandshakeCompleteCallback handshake_complete_callback_ = nullptr;
+
     // TLS support
     bool tls_ready_from_write_ = false;  // TLS handshake completed via CallWriteCb
     enum class TlsState { NONE, HANDSHAKE, READY };
@@ -206,6 +212,16 @@ public:
     // Get the ALPN-negotiated protocol from the TLS connection.
     // Returns empty string if no TLS or ALPN not negotiated.
     std::string GetAlpnProtocol() const;
+
+    // One-shot — fires exactly once when the TLS handshake transitions
+    // to READY, then is cleared. Used by the H2 upstream codec to
+    // inspect ALPN at the moment of completion. Capture weak_ptr in
+    // the closure — same lifetime contract as the other callbacks here.
+    // The HandshakeCompleteCallback alias is declared next to its field
+    // (above) so the field type and the public typedef stay in sync.
+    void SetHandshakeCompleteCallback(HandshakeCompleteCallback cb) {
+        handshake_complete_callback_ = std::move(cb);
+    }
 
     // Deadline: if set, IsTimeOut returns true when deadline is exceeded
     void SetDeadline(std::chrono::steady_clock::time_point deadline);

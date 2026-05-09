@@ -847,6 +847,74 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     cb_int("retry_budget_min_concurrency", 3);
             }
 
+            if (item.contains("http2")) {
+                if (!item["http2"].is_object())
+                    throw std::runtime_error(
+                        "upstream http2 must be an object");
+                auto& h2 = item["http2"];
+                if (h2.contains("enabled")) {
+                    if (!h2["enabled"].is_boolean())
+                        throw std::runtime_error(
+                            "upstream http2.enabled must be a boolean");
+                    upstream.http2.enabled = h2["enabled"].get<bool>();
+                }
+                if (h2.contains("prefer")) {
+                    if (!h2["prefer"].is_string())
+                        throw std::runtime_error(
+                            "upstream http2.prefer must be a string");
+                    upstream.http2.prefer = h2["prefer"].get<std::string>();
+                }
+                if (h2.contains("max_concurrent_streams_pref")) {
+                    if (!h2["max_concurrent_streams_pref"].is_number_unsigned())
+                        throw std::runtime_error(
+                            "upstream http2.max_concurrent_streams_pref must be a non-negative integer");
+                    upstream.http2.max_concurrent_streams_pref =
+                        h2["max_concurrent_streams_pref"].get<uint32_t>();
+                }
+                if (h2.contains("initial_window_size")) {
+                    if (!h2["initial_window_size"].is_number_unsigned())
+                        throw std::runtime_error(
+                            "upstream http2.initial_window_size must be a non-negative integer");
+                    upstream.http2.initial_window_size =
+                        h2["initial_window_size"].get<uint32_t>();
+                }
+                if (h2.contains("max_frame_size")) {
+                    if (!h2["max_frame_size"].is_number_unsigned())
+                        throw std::runtime_error(
+                            "upstream http2.max_frame_size must be a non-negative integer");
+                    upstream.http2.max_frame_size =
+                        h2["max_frame_size"].get<uint32_t>();
+                }
+                if (h2.contains("header_table_size")) {
+                    if (!h2["header_table_size"].is_number_unsigned())
+                        throw std::runtime_error(
+                            "upstream http2.header_table_size must be a non-negative integer");
+                    upstream.http2.header_table_size =
+                        h2["header_table_size"].get<uint32_t>();
+                }
+                if (h2.contains("max_header_list_size")) {
+                    if (!h2["max_header_list_size"].is_number_unsigned())
+                        throw std::runtime_error(
+                            "upstream http2.max_header_list_size must be a non-negative integer");
+                    upstream.http2.max_header_list_size =
+                        h2["max_header_list_size"].get<uint32_t>();
+                }
+                upstream.http2.ping_idle_sec = ParseStrictInt(
+                    h2, "ping_idle_sec", upstream.http2.ping_idle_sec,
+                    up_ctx + ".http2");
+                upstream.http2.ping_timeout_sec = ParseStrictInt(
+                    h2, "ping_timeout_sec", upstream.http2.ping_timeout_sec,
+                    up_ctx + ".http2");
+                upstream.http2.goaway_drain_timeout_sec = ParseStrictInt(
+                    h2, "goaway_drain_timeout_sec",
+                    upstream.http2.goaway_drain_timeout_sec,
+                    up_ctx + ".http2");
+                upstream.http2.saturation_open_pct = ParseStrictInt(
+                    h2, "saturation_open_pct",
+                    upstream.http2.saturation_open_pct,
+                    up_ctx + ".http2");
+            }
+
             config.upstreams.push_back(std::move(upstream));
         }
     }
@@ -1892,25 +1960,128 @@ void ConfigLoader::ValidateHotReloadable(
         }
     }
 
+    // Per-upstream HTTP/2 structural validation runs for ALL staged
+    // entries — input shape is independent of live-state scope, and
+    // surfacing a typo (e.g., http2.prefer="autoo") on SIGHUP rather
+    // than at the next restart matches the existing auth-issuer pattern
+    // above. Range/numeric validation for live-reloadable fields runs
+    // below scoped to live_upstream_names (per the AUTH_CONFIG.md
+    // "Hot-reload validation scope wider than apply scope" rule).
+    for (size_t i = 0; i < config.upstreams.size(); ++i) {
+        const auto& u = config.upstreams[i];
+        const std::string idx = "upstreams[" + std::to_string(i) + "]";
+        if (u.http2.prefer != "auto" && u.http2.prefer != "always" &&
+            u.http2.prefer != "never") {
+            throw std::invalid_argument(
+                idx + " ('" + u.name +
+                "'): http2.prefer must be 'auto', 'always', or 'never', got '" +
+                u.http2.prefer + "'");
+        }
+    }
+
     for (size_t i = 0; i < config.upstreams.size(); ++i) {
         const auto& u = config.upstreams[i];
         const std::string idx = "upstreams[" + std::to_string(i) + "]";
 
-        // CB-field validation is scoped to upstreams that are LIVE in
-        // the running server. CircuitBreakerManager::Reload only
+        // CB- and H2-field validation is scoped to upstreams that are
+        // LIVE in the running server. CircuitBreakerManager::Reload only
         // applies CB changes to pre-existing hosts — new/renamed
         // entries are restart-only and skipped with a warn — so
         // validating their CB blocks here would block otherwise-safe
         // reloads (e.g. a reload that stages a new upstream alongside
         // a log-level edit would abort even though the live server
-        // would never apply the new upstream's CB block).
+        // would never apply the new upstream's CB block). Same scope
+        // rule applies to per-upstream H2 live fields.
         //
         // The empty-set case (no live upstreams yet) is handled by
         // the same check: every entry is "new", so every entry is
-        // skipped — only the duplicate-name check runs.
+        // skipped — only the duplicate-name check + structural
+        // prefer-allowlist run.
         if (live_upstream_names.find(u.name) == live_upstream_names.end()) {
             continue;
         }
+
+        // HTTP/2 live-field range validation (matches the same rules
+        // applied at startup in Validate() so SIGHUP and startup reject
+        // the same set). prefer is restart-only, but the prefer+TLS
+        // coupling is validated here for live upstreams because a reload
+        // that sets prefer="always" on a non-TLS upstream would survive
+        // the outer topology-equality check and reach the routing path,
+        // causing every H2 dispatch to fail at the wire.
+        {
+            const auto& h2 = u.http2;
+            // Mirror the startup rule: H2 outbound requires TLS (no h2c).
+            // Without this, a SIGHUP that toggles enabled→true on a
+            // non-TLS upstream passes hot-reload validation, prints
+            // "restart required" warning, and the server fails to start
+            // at the next restart — operator hits a delayed surprise.
+            if (h2.enabled && !u.tls.enabled) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.enabled=true requires tls.enabled=true (h2c not supported)");
+            }
+            if (h2.prefer == "always" && !u.tls.enabled) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.prefer='always' requires tls.enabled=true");
+            }
+            if (h2.max_concurrent_streams_pref < 1 ||
+                h2.max_concurrent_streams_pref > HTTP2_CONSTANTS::MAX_WINDOW_SIZE) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.max_concurrent_streams_pref must be 1 to 2^31-1");
+            }
+            if (h2.initial_window_size < 1 ||
+                h2.initial_window_size > HTTP2_CONSTANTS::MAX_WINDOW_SIZE) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.initial_window_size must be 1 to 2^31-1");
+            }
+            if (h2.max_frame_size < HTTP2_CONSTANTS::MIN_MAX_FRAME_SIZE ||
+                h2.max_frame_size > HTTP2_CONSTANTS::MAX_MAX_FRAME_SIZE) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.max_frame_size must be 16384 to 16777215");
+            }
+            // 0 disables HPACK dynamic table (accepted). The ceiling
+            // bounds per-stream HPACK allocation against operator typo
+            // (UINT32_MAX would allocate 4 GiB per stream).
+            if (h2.header_table_size > HTTP2_CONSTANTS::MAX_HEADER_TABLE_SIZE) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.header_table_size must be 0 to 16777216 (16 MiB)");
+            }
+            // Sub-4096 max_header_list_size rejects every real H2 request
+            // with COMPRESSION_ERROR (RFC 9113 §6.5.2 — typical request
+            // headers + HPACK overhead exceeds this trivially).
+            if (h2.max_header_list_size < HTTP2_CONSTANTS::MIN_MAX_HEADER_LIST_SIZE) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.max_header_list_size must be >= 4096");
+            }
+            if (h2.ping_idle_sec < 0) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.ping_idle_sec must be >= 0");
+            }
+            if (h2.ping_timeout_sec < 0) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.ping_timeout_sec must be >= 0");
+            }
+            if (h2.goaway_drain_timeout_sec < 0) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.goaway_drain_timeout_sec must be >= 0");
+            }
+            if (h2.saturation_open_pct < 0 ||
+                h2.saturation_open_pct > 100) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.saturation_open_pct must be in [0, 100]");
+            }
+        }
+
         const auto& cb = u.circuit_breaker;
         if (cb.consecutive_failure_threshold < 1 ||
             cb.consecutive_failure_threshold > 10000) {
@@ -2460,9 +2631,13 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             throw std::invalid_argument(
                 "http2.max_frame_size must be 16384 to 16777215");
         }
-        if (config.http2.max_header_list_size < 1) {
+        // Sub-4096 rejects every real H2 request with COMPRESSION_ERROR
+        // (RFC 9113 §6.5.2 — typical request headers + HPACK overhead
+        // exceeds this trivially).
+        if (config.http2.max_header_list_size <
+            HTTP2_CONSTANTS::MIN_MAX_HEADER_LIST_SIZE) {
             throw std::invalid_argument(
-                "http2.max_header_list_size must be >= 1");
+                "http2.max_header_list_size must be >= 4096");
         }
     }
 
@@ -2748,6 +2923,89 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         "'): circuit_breaker.retry_budget_min_concurrency must be >= 0");
                 }
             }
+
+            // Per-upstream HTTP/2 validation. Outbound H2 requires
+            // TLS+ALPN; non-TLS h2c is not supported. Range checks
+            // follow RFC 9113 max_frame_size bounds plus
+            // initial_window_size >= 1 (we use manual flow control via
+            // nghttp2_option_set_no_auto_window_update).
+            {
+                const auto& h2 = u.http2;
+                if (h2.enabled && !u.tls.enabled) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.enabled=true requires tls.enabled=true "
+                        "(outbound H2 requires TLS+ALPN; h2c is not supported)");
+                }
+                if (h2.prefer != "auto" && h2.prefer != "always" &&
+                    h2.prefer != "never") {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.prefer must be 'auto', 'always', or 'never', got '" +
+                        h2.prefer + "'");
+                }
+                if (h2.prefer == "always" && !u.tls.enabled) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.prefer='always' requires tls.enabled=true");
+                }
+                if (h2.max_concurrent_streams_pref < 1 ||
+                    h2.max_concurrent_streams_pref > HTTP2_CONSTANTS::MAX_WINDOW_SIZE) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.max_concurrent_streams_pref must be 1 to 2^31-1");
+                }
+                if (h2.initial_window_size < 1 ||
+                    h2.initial_window_size > HTTP2_CONSTANTS::MAX_WINDOW_SIZE) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.initial_window_size must be 1 to 2^31-1");
+                }
+                if (h2.max_frame_size < HTTP2_CONSTANTS::MIN_MAX_FRAME_SIZE ||
+                    h2.max_frame_size > HTTP2_CONSTANTS::MAX_MAX_FRAME_SIZE) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.max_frame_size must be 16384 to 16777215");
+                }
+                // 0 disables HPACK dynamic table (accepted). The ceiling
+                // bounds per-stream HPACK allocation against an operator
+                // typo (UINT32_MAX would allocate 4 GiB per stream).
+                if (h2.header_table_size > HTTP2_CONSTANTS::MAX_HEADER_TABLE_SIZE) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.header_table_size must be 0 to 16777216 (16 MiB)");
+                }
+                // Sub-4096 max_header_list_size rejects every real H2 request
+                // with COMPRESSION_ERROR (RFC 9113 §6.5.2 — typical request
+                // headers + HPACK overhead exceeds this trivially).
+                if (h2.max_header_list_size < HTTP2_CONSTANTS::MIN_MAX_HEADER_LIST_SIZE) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.max_header_list_size must be >= 4096");
+                }
+                if (h2.ping_idle_sec < 0) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.ping_idle_sec must be >= 0");
+                }
+                if (h2.ping_timeout_sec < 0) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.ping_timeout_sec must be >= 0");
+                }
+                if (h2.goaway_drain_timeout_sec < 0) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.goaway_drain_timeout_sec must be >= 0");
+                }
+                if (h2.saturation_open_pct < 0 ||
+                    h2.saturation_open_pct > 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.saturation_open_pct must be in [0, 100]");
+                }
+            }
+
             // Validate method names — reject unknowns and duplicates.
             // Duplicates would cause RouteAsync to throw at startup.
             {
@@ -3743,6 +4001,22 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             cbj["retry_budget_min_concurrency"] =
                 u.circuit_breaker.retry_budget_min_concurrency;
             uj["circuit_breaker"] = cbj;
+        }
+        if (u.http2 != Http2UpstreamConfig{}) {
+            nlohmann::json hj;
+            hj["enabled"] = u.http2.enabled;
+            hj["prefer"] = u.http2.prefer;
+            hj["max_concurrent_streams_pref"] =
+                u.http2.max_concurrent_streams_pref;
+            hj["initial_window_size"] = u.http2.initial_window_size;
+            hj["max_frame_size"] = u.http2.max_frame_size;
+            hj["header_table_size"] = u.http2.header_table_size;
+            hj["max_header_list_size"] = u.http2.max_header_list_size;
+            hj["ping_idle_sec"] = u.http2.ping_idle_sec;
+            hj["ping_timeout_sec"] = u.http2.ping_timeout_sec;
+            hj["goaway_drain_timeout_sec"] = u.http2.goaway_drain_timeout_sec;
+            hj["saturation_open_pct"] = u.http2.saturation_open_pct;
+            uj["http2"] = hj;
         }
         j["upstreams"].push_back(uj);
     }

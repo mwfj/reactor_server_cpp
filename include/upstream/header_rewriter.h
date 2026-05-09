@@ -67,12 +67,15 @@ public:
     // Via header value appended by the proxy (RFC 7230 §5.7.1).
     static constexpr const char* VIA_ENTRY = "1.1 reactor-gateway";
 
+    // Hop-by-hop headers to strip (RFC 7230 section 6.1):
+    // connection, keep-alive, proxy-connection, transfer-encoding, te,
+    // trailer, upgrade, proxy-authenticate, proxy-authorization. Pure
+    // RFC predicate — public so the H2 outbound path can reuse it
+    // without duplicating the list.
+    static bool IsHopByHopHeader(const std::string& name);
+
 private:
     Config config_;
-
-    // Hop-by-hop headers to strip (RFC 7230 section 6.1):
-    // connection, keep-alive, proxy-connection, transfer-encoding, te, trailer, upgrade
-    static bool IsHopByHopHeader(const std::string& name);
 
     // Parse comma-separated Connection header to find additional hop-by-hop headers
     static std::vector<std::string> ParseConnectionHeader(const std::string& value);

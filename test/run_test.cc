@@ -37,6 +37,7 @@
 #include "auth_race_test.h"
 #include "dns_resolver_test.h"
 #include "dual_stack_test.h"
+#include "h2_upstream_test.h"
 #include "router_async_middleware_test.h"
 #include "introspection_cache_test.h"
 #include "introspection_client_test.h"
@@ -200,6 +201,10 @@ void RunAllTest(){
     // DNS / dual-stack feature family (transport layer, not inbound auth).
     RunAllDnsFamily();
 
+    // H2 upstream client path (H2 codec, connection table, pool snapshots,
+    // wire-level nghttp2 session tests).
+    H2UpstreamTests::RunAllH2UpstreamTests();
+
     // Observability foundation — pure value-type tests (TraceId / SpanId /
     // TraceFlags / TraceState / SpanContext / LabelSet / AttrValue).
     ObservabilityFoundationTests::RunAllTests();
@@ -344,6 +349,8 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
     std::cout << "  dual_stack         Sub-suite — dual-stack integration only (OS-sensitive)" << std::endl;
     std::cout << "  dns_resolver       Sub-suite — DnsResolver primitives only (timing-sensitive)" << std::endl;
+    std::cout << "  h2_upstream        H2 upstream client path — codec, H2ConnectionTable," << std::endl;
+    std::cout << "                     pool snapshots, wire-level nghttp2 session tests" << std::endl;
     std::cout << "  help,        -h    Show this help message" << std::endl;
     std::cout << "\nNo arguments: Run all tests (full sweep — every suite above plus the dual_stack and DnsResolver suites)." << std::endl;
 }
@@ -456,7 +463,7 @@ int main(int argc, char* argv[]) {
         // Run auth race condition tests
         }else if(mode == "auth_race" || mode == "-Q"){
             AuthRaceTests::RunAllTests();
-        // Run router async-middleware tests (P3-0)
+        // Run router async-middleware tests
         }else if(mode == "router_async" || mode == "-N"){
             RouterAsyncMiddlewareTests::RunAllTests();
         // Run introspection cache unit tests
@@ -489,6 +496,10 @@ int main(int argc, char* argv[]) {
         // Run auth observability tests
         }else if(mode == "auth_observability" || mode == "-o"){
             AuthObservabilityTests::RunAllTests();
+        // Run H2 upstream client path tests (codec, connection table, pool
+        // snapshots, wire-level nghttp2 session tests).
+        }else if(mode == "h2_upstream"){
+            H2UpstreamTests::RunAllH2UpstreamTests();
         // Run observability foundation value-type tests (TraceId / SpanId /
         // TraceFlags / TraceState / SpanContext / LabelSet / AttrValue).
         }else if(mode == "obs_foundation"){
