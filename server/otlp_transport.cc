@@ -23,9 +23,10 @@ int OtlpTimeoutCeilSeconds(std::chrono::milliseconds ms) noexcept {
 }
 
 OtlpHttpExporter::TransportFn MakeOtlpTransport(
-    std::weak_ptr<AUTH_NAMESPACE::UpstreamHttpClient> client_weak) {
+    std::weak_ptr<AUTH_NAMESPACE::UpstreamHttpClient> client_weak,
+    HostLookupFn host_lookup) {
 
-    return [client_weak]
+    return [client_weak, host_lookup = std::move(host_lookup)]
         (OtlpHttpExporter::ExportPayload payload,
          std::chrono::steady_clock::time_point deadline) -> ExportResult {
 
@@ -41,10 +42,34 @@ OtlpHttpExporter::TransportFn MakeOtlpTransport(
         req.headers["content-type"] = "application/json";
         req.body    = std::move(payload.body);
         req.timeout_sec = OtlpTimeoutCeilSeconds(payload.timeout);
+        // Set Host explicitly from the upstream's configured hostname.
+        // Without this, UpstreamHttpClient defaults Host to the pool
+        // name (an internal alias), which a vhost-routed or strict-Host
+        // collector would reject. Empty return from host_lookup keeps
+        // the default behaviour.
+        if (host_lookup) {
+            std::string host = host_lookup(payload.upstream_pool_name);
+            if (!host.empty()) {
+                req.host_header = std::move(host);
+            }
+        }
         // No req.issue_ctx: exporter activity is not traced.
 
         auto promise = std::make_shared<std::promise<ExportResult>>();
         auto fut = promise->get_future();
+        // dispatcher_index=0 funnels all OTLP traffic through one
+        // socket dispatcher. This is intentional and currently safe:
+        // (1) volume is low (one POST per export interval, default
+        // ~5s for traces / ~10s for metrics); (2) the BSP/PMR worker
+        // threads are NOT dispatcher threads, so they don't block the
+        // dispatcher they enqueue to; (3) HttpServer::Stop() runs from
+        // the main thread (not dispatcher 0). Phase 3's
+        // ScheduleStopAfterCurrentResponse() runs on conn_dispatcher_,
+        // which is also distinct from the socket dispatchers. If a
+        // future caller ever invokes the FlushObservability path on
+        // socket dispatcher 0 while this transport is mid-Issue, the
+        // dispatcher would block its own queued export task and
+        // deadlock — review that constraint before adding such a path.
         client->Issue(
             payload.upstream_pool_name,
             /*dispatcher_index=*/0,

@@ -109,17 +109,17 @@ Headers and timeout are live-reloadable; `upstream` and `exporter` are restart-r
 ```json
 "traces": {
   "batch": {
-    "max_queue_size":         2048,
-    "max_export_batch_size":  512,
-    "schedule_delay_ms":      5000,
-    "export_timeout_ms":      30000,
-    "retries":                3,
-    "retry_backoff_ms":       1000
+    "max_queue_size":              2048,
+    "max_export_batch_size":       512,
+    "schedule_delay_ms":           5000,
+    "retries.max_attempts":        3,
+    "retries.initial_backoff_ms":  1000,
+    "retries.max_backoff_ms":      10000
   }
 }
 ```
 
-All `batch.*` fields are live-reloadable; the worker re-reads them on the next iteration after `cv_.notify_all()`.
+The per-batch export deadline is sourced from `traces.otlp.timeout_ms` — there is no separate `batch.export_timeout_ms` field. Batch shape (`max_export_batch_size`, `schedule_delay_ms`) and retry policy (`retries.*`) are all live-reloadable; the worker re-reads them on the next iteration after `cv_.notify_all()`. `max_queue_size` allocates the queue at construction and is restart-only.
 
 ### Propagation
 
@@ -321,12 +321,12 @@ The gateway treats the inbound as no parent and starts a fresh trace. Run with d
 | `sampler.default_root` | string | `always_on` | YES |
 | `sampler.routes` | array | `[]` | YES |
 | `propagators` | array | `["w3c"]` | YES |
-| `batch.max_queue_size` | int | 2048 | YES |
+| `batch.max_queue_size` | int | 2048 | NO (allocated at construction) |
 | `batch.max_export_batch_size` | int | 512 | YES |
 | `batch.schedule_delay_ms` | int | 5000 | YES |
-| `batch.export_timeout_ms` | int | 30000 | YES |
-| `batch.retries` | int | 3 | YES |
-| `batch.retry_backoff_ms` | int | 1000 | YES |
+| `batch.retries.max_attempts` | int | 3 | YES |
+| `batch.retries.initial_backoff_ms` | int | 1000 | YES |
+| `batch.retries.max_backoff_ms` | int | 10000 | YES |
 
 ### `observability.metrics` block
 

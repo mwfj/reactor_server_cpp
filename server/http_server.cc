@@ -1325,6 +1325,19 @@ void HttpServer::MarkServerReady() {
             std::make_shared<AUTH_NAMESPACE::UpstreamHttpClient>(
                 upstream_manager_.get(), dispatchers);
     }
+    // Build a snapshot of pool-name -> configured-host so the OTLP
+    // transport can populate Request.host_header from the upstream's
+    // real hostname instead of letting it default to the pool alias.
+    // The map is captured by value into the transport lambdas.
+    std::map<std::string, std::string> otlp_pool_to_host;
+    for (const auto& u : upstream_configs_) {
+        otlp_pool_to_host[u.name] = u.host;
+    }
+    OBSERVABILITY_NAMESPACE::HostLookupFn otlp_host_lookup =
+        [otlp_pool_to_host](const std::string& pool) -> std::string {
+            auto it = otlp_pool_to_host.find(pool);
+            return it == otlp_pool_to_host.end() ? std::string{} : it->second;
+        };
     if (otlp_traces_on) {
         const auto& cfg = observability_manager_->config();
         OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Options opts;
@@ -1339,7 +1352,8 @@ void HttpServer::MarkServerReady() {
 
         otlp_exporter_ = OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Create(
             std::move(opts),
-            OBSERVABILITY_NAMESPACE::MakeOtlpTransport(otlp_upstream_http_client_));
+            OBSERVABILITY_NAMESPACE::MakeOtlpTransport(
+                    otlp_upstream_http_client_, otlp_host_lookup));
 
         OBSERVABILITY_NAMESPACE::BatchSpanProcessorOptions bsp_opts;
         bsp_opts.max_queue_size          = cfg.traces.batch.max_queue_size;
@@ -1375,7 +1389,8 @@ void HttpServer::MarkServerReady() {
             m_opts.metrics.timeout            = cfg.metrics.otlp.timeout_ms;
             metrics_exporter = OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Create(
                 std::move(m_opts),
-                OBSERVABILITY_NAMESPACE::MakeOtlpTransport(otlp_upstream_http_client_));
+                OBSERVABILITY_NAMESPACE::MakeOtlpTransport(
+                    otlp_upstream_http_client_, otlp_host_lookup));
             otlp_exporter_ = metrics_exporter;  // for lifetime ownership
         }
 
@@ -6276,12 +6291,35 @@ bool HttpServer::Reload(ServerConfig new_config) {
         // does not see SIGHUP otherwise. Push the (live-reloadable)
         // headers + timeouts into it so rotated auth tokens / changed
         // export deadlines take effect without a restart.
-        if (otlp_exporter_) {
+        //
+        // Gate the push on the exporter-identity restart-only fields
+        // (exporter type + otlp.upstream). If those changed in the
+        // staged config, we already warned the operator that a restart
+        // is required — pushing the staged headers/timeout into the
+        // live exporter would silently apply a partial change (e.g. a
+        // SIGHUP that switches metrics to prometheus_pull would clear
+        // the live OTLP auth headers, breaking exports until restart).
+        // Keep the live exporter exactly as it was.
+        const bool exporter_identity_unchanged =
+            live_config_.observability.traces.exporter
+                == new_config.observability.traces.exporter
+            && live_config_.observability.metrics.exporter
+                == new_config.observability.metrics.exporter
+            && live_config_.observability.traces.otlp.upstream
+                == new_config.observability.traces.otlp.upstream
+            && live_config_.observability.metrics.otlp.upstream
+                == new_config.observability.metrics.otlp.upstream;
+        if (otlp_exporter_ && exporter_identity_unchanged) {
             otlp_exporter_->ReloadHeaders(
                 new_config.observability.traces.otlp.headers,
                 new_config.observability.metrics.otlp.headers,
                 new_config.observability.traces.otlp.timeout_ms,
                 new_config.observability.metrics.otlp.timeout_ms);
+        } else if (otlp_exporter_) {
+            logging::Get()->info(
+                "Reload: OTLP exporter identity changed (exporter or "
+                "otlp.upstream) — restart required; live exporter "
+                "options preserved (headers, timeout)");
         }
         // Preserve restart-only fields in the live snapshot so that
         // /config and any subsequent in-process Reload read the values

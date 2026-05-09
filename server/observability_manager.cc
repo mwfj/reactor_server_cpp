@@ -74,13 +74,17 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
     // request and the proxy strip transparent W3C propagation —
     // pure overhead with no telemetry to show for it.
     //
-    // PRECONDITION: span_processor_ is set once at Init() and never
-    // hot-swapped. A future caller that swaps the processor at
-    // runtime (e.g. exporter pipeline rebuild on SIGHUP) MUST call
-    // PublishLiveFlags(config_) explicitly post-swap — otherwise
-    // traces_enabled_ stays cached against the stale processor and
-    // either overcommits work to a now-null pipeline or silently
-    // disables tracing on a pipeline that just came online.
+    // PRECONDITION: span_processor_ is non-null whenever
+    // PublishLiveFlags is called with c.traces.enabled=true. The
+    // boot-time placeholder is NoopSpanProcessor (always non-null);
+    // SwapToBatchSpanProcessor (called once from MarkServerReady to
+    // upgrade from Noop to BSP) only swaps Noop → real processor and
+    // therefore preserves the gate's behaviour without re-publishing.
+    // If a future code path ever installs nullptr as a processor
+    // (e.g. tear-down without dropping the manager), it MUST call
+    // PublishLiveFlags(config_) explicitly — otherwise traces_enabled_
+    // would stay true against a now-null pipeline and the inbound
+    // middleware would allocate snapshots whose spans go nowhere.
     const bool traces_pipeline_present = c.traces.enabled && span_processor_ != nullptr;
     traces_enabled_.store(traces_pipeline_present,
                             std::memory_order_release);
@@ -729,6 +733,13 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
             new_config.traces.batch.retries.initial_backoff;
         po.retries_max_backoff =
             new_config.traces.batch.retries.max_backoff;
+        // Push the live OTLP export timeout into the BSP atomic so a
+        // SIGHUP that relaxes (or tightens) traces.otlp.timeout_ms
+        // takes effect without restart. The exporter side is reloaded
+        // via OtlpHttpExporter::ReloadHeaders elsewhere; without this
+        // line the BSP's outer deadline would still fire at the
+        // construction-time value and override the operator's intent.
+        po.export_timeout = new_config.traces.otlp.timeout_ms;
         tracer_provider_->Reload(new_sampler, po);
     }
 

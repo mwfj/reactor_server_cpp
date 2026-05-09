@@ -465,6 +465,31 @@ void TestPropagatorsListUnknownRejected() {
     }
 }
 
+// Build({"w3c", "w3c"}) would otherwise silently construct two
+// W3CPropagator children — wasteful and ambiguous about operator
+// intent. Validator must reject duplicates at config load.
+void TestPropagatorsListDuplicateRejected() {
+    try {
+        bool threw = false;
+        try {
+            ConfigLoader::LoadFromString(R"({
+                "observability": {"enabled": true,
+                    "traces": {"propagators": ["w3c", "jaeger", "w3c"]}}
+            })");
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators duplicate name rejected",
+            threw, threw ? "" : "didn't throw",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators duplicate name rejected",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- ObservabilityConfig::operator== ----
 
 void TestOperatorEqIgnoresLiveFields() {
@@ -636,6 +661,7 @@ void RunAllTests() {
     TestPropagatorsListDefaultIsW3C();
     TestPropagatorsListEmptyRejected();
     TestPropagatorsListUnknownRejected();
+    TestPropagatorsListDuplicateRejected();
     TestValidatePromPathMustStartWithSlash();
     TestValidateRejectsHistogramBucketsOutOfOrder();
     TestHotReloadableRejectsBadLiveValue();

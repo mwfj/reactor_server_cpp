@@ -200,6 +200,33 @@ void TestStripOwnedHeaders() {
     }
 }
 
+// Mixed-case headers must extract correctly — production traffic over
+// HTTP/1 lowercases by convention and HTTP/2 forces lowercase, but a
+// raw-header caller (test fixture, future code path) would otherwise
+// silently see no parent and fall through to a fresh trace.
+void TestExtractCaseInsensitive() {
+    try {
+        JaegerPropagator p;
+        Propagator::HeadersMap h = {
+            {"Uber-Trace-Id",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1"}};
+        auto ctx = p.Extract(h);
+        const bool extracted = ctx.has_value() && ctx->IsValid();
+        const bool flag_ok = extracted && ctx->flags().IsSampled();
+        const bool pass = extracted && flag_ok;
+        TestFramework::RecordTest(
+            "ObsJaeger: Extract is case-insensitive (Uber-Trace-Id)",
+            pass, pass ? ""
+                      : "extracted=" + std::to_string(extracted)
+                       + " sampled=" + std::to_string(flag_ok),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsJaeger: Extract is case-insensitive (Uber-Trace-Id)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Mixed-case duplicates ("Uber-Trace-Id") would otherwise leak through
 // to the upstream — Strip must match case-insensitively, like W3C.
 void TestStripOwnedHeadersCaseInsensitive() {
@@ -459,6 +486,7 @@ void RunAllTests() {
     TestParseHeaderAbsent();
     TestStripOwnedHeaders();
     TestStripOwnedHeadersCaseInsensitive();
+    TestExtractCaseInsensitive();
     TestNameIsJaeger();
     TestInjectAlways128Bit();
     TestInjectUnsampledFlagsZero();

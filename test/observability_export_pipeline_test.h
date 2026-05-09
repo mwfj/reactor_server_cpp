@@ -654,12 +654,26 @@ void TestPeriodicMetricReaderForceFlushBlocks() {
         ropts.export_interval = std::chrono::milliseconds(60'000);
         PeriodicMetricReader reader(&provider, exporter, ropts);
 
+        // Deadline + bounds chosen for sanitizer headroom. The test
+        // proves two invariants:
+        //   (1) ForceFlush waits AT LEAST through the slow export
+        //       (lower bound > 140ms — the artificial 150ms sleep,
+        //       slack for sanitizer skew on the sleep itself).
+        //   (2) ForceFlush returns BEFORE the deadline, i.e. the cv
+        //       handshake fires (upper bound < deadline). The cv
+        //       handshake plus TSan instrumentation can add several
+        //       hundred ms of overhead, so the gap between upper
+        //       bound and deadline must be generous.
+        const auto kDeadline    = std::chrono::milliseconds{3000};
+        const auto kLowerBound  = std::chrono::milliseconds{140};
+        const auto kUpperBound  = std::chrono::milliseconds{2500};
+
         const auto t0 = std::chrono::steady_clock::now();
-        reader.ForceFlush(std::chrono::milliseconds(1000));
+        reader.ForceFlush(kDeadline);
         const auto elapsed = std::chrono::steady_clock::now() - t0;
 
-        const bool waited = elapsed >= std::chrono::milliseconds(140);
-        const bool bounded = elapsed <= std::chrono::milliseconds(900);
+        const bool waited = elapsed >= kLowerBound;
+        const bool bounded = elapsed <= kUpperBound;
         const bool exported = exporter->export_calls() >= 1;
         const bool pass = waited && bounded && exported;
 

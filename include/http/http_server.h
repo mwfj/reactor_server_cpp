@@ -560,6 +560,26 @@ private:
     AUTH_NAMESPACE::AuthConfig auth_config_;
     std::unique_ptr<AUTH_NAMESPACE::AuthManager> auth_manager_;
 
+    // OTLP push pipeline — constructed in MarkServerReady when
+    // traces.exporter or metrics.exporter == "otlp_http". The exporter
+    // routes both signals through per-signal SignalOptions; a single
+    // instance is shared between BatchSpanProcessor and the metric
+    // reader to keep the shutdown drain coordinated.
+    //
+    // MUST be declared BEFORE observability_manager_. Members destruct
+    // in reverse declaration order; the manager's dtor calls
+    // BeginShutdown which performs a final BSP/PMR drain — that drain
+    // routes through this exporter and through Issue() on the upstream
+    // client. If those go away first, client_weak.lock() returns
+    // nullptr in the OTLP transport lambda and the final batch is
+    // silently dropped. Production paths flush via Stop() before
+    // dtor, so this guards the abnormal-path case (test fixtures,
+    // exception during startup).
+    std::shared_ptr<AUTH_NAMESPACE::UpstreamHttpClient>
+        otlp_upstream_http_client_;
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::OtlpHttpExporter>
+        otlp_exporter_;
+
     // OpenTelemetry observability manager — null when observability
     // is disabled (the default deployment). When non-null, the request
     // callback invokes FinalizeIfSnapshot at completion. shared_ptr
@@ -569,16 +589,6 @@ private:
     // weak_from_this().
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
         observability_manager_;
-
-    // OTLP push pipeline — constructed in MarkServerReady when
-    // traces.exporter or metrics.exporter == "otlp_http". The exporter
-    // routes both signals through per-signal SignalOptions; a single
-    // instance is shared between BatchSpanProcessor and the metric
-    // reader to keep the shutdown drain coordinated.
-    std::shared_ptr<AUTH_NAMESPACE::UpstreamHttpClient>
-        otlp_upstream_http_client_;
-    std::shared_ptr<OBSERVABILITY_NAMESPACE::OtlpHttpExporter>
-        otlp_exporter_;
 
     // Proxy handlers keyed by (upstream_service_name + normalized prefix).
     // shared_ptr (not unique_ptr) so that route lambdas capture shared

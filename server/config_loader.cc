@@ -1030,6 +1030,7 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                         "non-empty array");
                 std::vector<std::string> names;
                 names.reserve(tj["propagators"].size());
+                std::set<std::string> seen;
                 for (const auto& v : tj["propagators"]) {
                     if (!v.is_string())
                         throw std::invalid_argument(
@@ -1040,6 +1041,16 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                         throw std::invalid_argument(
                             "observability.traces.propagators: unknown '"
                             + s + "' (recognised: 'w3c', 'jaeger')");
+                    }
+                    // Reject duplicates — Build({"w3c", "w3c"}) would
+                    // otherwise construct two of the same child, which
+                    // is wasteful and obscures operator intent (extract
+                    // precedence is meaningless for duplicates and
+                    // inject would write the same headers twice).
+                    if (!seen.insert(s).second) {
+                        throw std::invalid_argument(
+                            "observability.traces.propagators: duplicate '"
+                            + s + "' — each propagator may appear at most once");
                     }
                     names.push_back(std::move(s));
                 }

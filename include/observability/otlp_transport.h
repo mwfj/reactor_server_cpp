@@ -14,7 +14,9 @@
 #include "observability/otlp_http_exporter.h"
 
 #include <chrono>
+#include <functional>
 #include <memory>
+#include <string>
 
 namespace AUTH_NAMESPACE {
 class UpstreamHttpClient;
@@ -30,7 +32,16 @@ namespace OBSERVABILITY_NAMESPACE {
 // direct testing — the lambda captured by MakeOtlpTransport calls this.
 int OtlpTimeoutCeilSeconds(std::chrono::milliseconds ms) noexcept;
 
+// Maps an OTLP pool alias (e.g. "otel-collector") to the configured
+// upstream hostname (e.g. "otel.svc.cluster.local"). Returning an empty
+// string means "use the pool name as the Host header" (the existing
+// UpstreamHttpClient default). Without this, vhost-routed or
+// strict-Host-validating collectors would reject OTLP requests because
+// the Host header would carry the internal alias.
+using HostLookupFn = std::function<std::string(const std::string&)>;
+
 OtlpHttpExporter::TransportFn MakeOtlpTransport(
-    std::weak_ptr<AUTH_NAMESPACE::UpstreamHttpClient> client_weak);
+    std::weak_ptr<AUTH_NAMESPACE::UpstreamHttpClient> client_weak,
+    HostLookupFn host_lookup = nullptr);
 
 }  // namespace OBSERVABILITY_NAMESPACE

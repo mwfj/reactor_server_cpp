@@ -87,9 +87,16 @@ std::optional<SpanContext> JaegerPropagator::Parse(std::string_view value) {
 
 std::optional<SpanContext> JaegerPropagator::Extract(
     const HeadersMap& headers) const {
+    // Fast path: case-sensitive find for the canonical lowercase key.
     auto it = headers.find(kHeader);
-    if (it == headers.end()) return std::nullopt;
-    return Parse(it->second);
+    if (it != headers.end()) return Parse(it->second);
+    // Fallback: tolerate mixed-case keys (e.g. "Uber-Trace-Id") so a
+    // caller that built the map from raw client bytes still extracts
+    // correctly. Mirrors W3C's case-insensitive FindHeader sweep.
+    for (const auto& [k, v] : headers) {
+        if (EqualsLowerAscii(k, kHeader)) return Parse(v);
+    }
+    return std::nullopt;
 }
 
 bool JaegerPropagator::Inject(const SpanContext& ctx,
