@@ -1,4 +1,5 @@
 #include "upstream/h2_connection_table.h"
+#include "log/logger.h"
 
 namespace {
 
@@ -76,9 +77,23 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
                 continue;
             }
             const auto& cfg = c->config_snapshot();
-            int idle = cfg ? cfg->ping_idle_sec : 0;
-            int timeout = cfg ? cfg->ping_timeout_sec : 0;
-            int goaway_drain = cfg ? cfg->goaway_drain_timeout_sec : 0;
+            if (!cfg) {
+                // UpstreamH2Connection's class invariant requires a
+                // non-null cfg captured at construction. A null here means
+                // a malformed connection slipped past Init() (or some
+                // future refactor breaks the invariant). Treating each
+                // timer as 0 (disabled) silently keeps the connection
+                // alive forever — surface it instead and evict.
+                logging::Get()->error(
+                    "H2ConnectionTable::TickAll: connection has null "
+                    "config_snapshot — class invariant violated; evicting");
+                c->MarkDead();
+                it = conns.erase(it);
+                continue;
+            }
+            int idle = cfg->ping_idle_sec;
+            int timeout = cfg->ping_timeout_sec;
+            int goaway_drain = cfg->goaway_drain_timeout_sec;
             if (!c->Tick(now, idle, timeout, goaway_drain)) {
                 // MarkDead BEFORE FailAllStreams: between the failure
                 // fan-out and the table erase below, FindUsable could be

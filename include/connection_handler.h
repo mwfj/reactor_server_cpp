@@ -60,7 +60,8 @@ private:
     // Fires once when TLS handshake transitions to READY (consume-on-fire).
     // Wired by the H2 upstream codec so it can inspect ALPN immediately on
     // completion. Cleared after invocation. See SetHandshakeCompleteCallback.
-    std::function<void()> handshake_complete_callback_ = nullptr;
+    using HandshakeCompleteCallback = std::function<void()>;
+    HandshakeCompleteCallback handshake_complete_callback_ = nullptr;
 
     // TLS support
     bool tls_ready_from_write_ = false;  // TLS handshake completed via CallWriteCb
@@ -216,7 +217,8 @@ public:
     // to READY, then is cleared. Used by the H2 upstream codec to
     // inspect ALPN at the moment of completion. Capture weak_ptr in
     // the closure — same lifetime contract as the other callbacks here.
-    using HandshakeCompleteCallback = std::function<void()>;
+    // The HandshakeCompleteCallback alias is declared next to its field
+    // (above) so the field type and the public typedef stay in sync.
     void SetHandshakeCompleteCallback(HandshakeCompleteCallback cb) {
         handshake_complete_callback_ = std::move(cb);
     }

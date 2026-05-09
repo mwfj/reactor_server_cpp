@@ -587,8 +587,24 @@ std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
                 h->FailAllStreams(
                     ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                     "h2 session fatal error");
+                data.clear();
+                return;
             }
-            data.clear();
+            // nghttp2_session_mem_recv2 contracts to consume the entire
+            // input on success — UpstreamH2Connection::HandleBytes returns
+            // either rv<0 or rv==len. Be defensive against future contract
+            // drift: erase only the consumed prefix and log loudly so a
+            // partial-consume regression surfaces in tests / staging.
+            const size_t consumed = static_cast<size_t>(rv);
+            if (consumed < data.size()) {
+                logging::Get()->error(
+                    "H2 HandleBytes partial consume: rv={} of {} bytes — "
+                    "preserving remainder; nghttp2 contract drift?",
+                    consumed, data.size());
+                data.erase(0, consumed);
+            } else {
+                data.clear();
+            }
         });
     transport->SetCloseCb(
         [wk](std::shared_ptr<ConnectionHandler>) {
@@ -1549,6 +1565,14 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     transport->SetWriteProgressCb(nullptr);
     transport->SetConnectCompleteCallback(nullptr);
     transport->SetDeadlineTimeoutCb(nullptr);
+    // OnCheckoutReady's defer_for_handshake path installs a one-shot
+    // handshake callback when ALPN inspection is needed. Consume-on-fire
+    // (connection_handler.cc) and weak_self short-circuit on cancel make
+    // a stale residual callback safe today, but the safety relies on
+    // those subtle invariants. Clearing here makes pool-returned
+    // connections structurally clean — defense-in-depth against a future
+    // refactor that removes consume-on-fire.
+    transport->SetHandshakeCompleteCallback(nullptr);
     // Reset transport-level flags that track an in-flight borrower's
     // backpressure / cap-stop state. ForceClose clears these too; resetting
     // here guarantees they can never survive the borrower-return boundary

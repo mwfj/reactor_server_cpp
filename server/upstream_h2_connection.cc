@@ -691,6 +691,14 @@ int32_t UpstreamH2Connection::SubmitRequest(
     if (!body.empty()) {
         // body_source lifetime equals this streams_ entry; nghttp2 stops
         // invoking the read_callback once on_stream_close fires.
+        // Body is COPIED into body_source rather than aliased: the caller
+        // (ProxyTransaction) owns the original `request_body_` for retry
+        // replay, and an alias would couple body_source's lifetime to a
+        // ProxyTransaction member that may outlive the H2 stream (or, on
+        // retry-then-detach, be moved out from under us). Same memory
+        // profile as the H1 path during dispatch (txn copy + transport
+        // buffer copy); H2 holds the body_source until nghttp2 has read
+        // the full body, which can be slow with small per-stream windows.
         stream->body_source = std::make_unique<UpstreamH2BodySource>();
         stream->body_source->body = body;
         provider.source.ptr = stream->body_source.get();
