@@ -100,7 +100,7 @@ void TestInjectFromIssueContext() {
         // it carries our local trace_id / span_id.
         bool round_trip = false;
         if (present) {
-            auto parsed = W3CPropagator::ParseTraceparent(it->second);
+            auto parsed = W3CPropagator{}.ParseTraceparent(it->second);
             if (parsed
                 && parsed->trace_id() == ictx.local.trace_id()
                 && parsed->span_id() == ictx.local.span_id()) {

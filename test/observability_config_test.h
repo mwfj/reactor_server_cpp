@@ -381,6 +381,90 @@ void TestOtlpHttpExporterRejectsUnknownMetricsUpstream() {
     }
 }
 
+// ---- traces.propagators (Phase 2 Task 8.5) ----
+
+void TestPropagatorsListLoad() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {"enabled": true,
+                "traces": {"propagators": ["jaeger", "w3c"]}}
+        })");
+        bool pass = cfg.observability.traces.propagators.size() == 2
+                  && cfg.observability.traces.propagators[0] == "jaeger"
+                  && cfg.observability.traces.propagators[1] == "w3c";
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators ordered list parsed",
+            pass, pass ? "" : "list mismatch",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators ordered list parsed",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestPropagatorsListDefaultIsW3C() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {"enabled": true}
+        })");
+        bool pass = cfg.observability.traces.propagators.size() == 1
+                  && cfg.observability.traces.propagators[0] == "w3c";
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators defaults to ['w3c']",
+            pass, pass ? "" : "default mismatch",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators defaults to ['w3c']",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestPropagatorsListEmptyRejected() {
+    try {
+        bool threw = false;
+        try {
+            ConfigLoader::LoadFromString(R"({
+                "observability": {"enabled": true,
+                    "traces": {"propagators": []}}
+            })");
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators empty array rejected",
+            threw, threw ? "" : "didn't throw",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators empty array rejected",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestPropagatorsListUnknownRejected() {
+    try {
+        bool threw = false;
+        try {
+            ConfigLoader::LoadFromString(R"({
+                "observability": {"enabled": true,
+                    "traces": {"propagators": ["xray"]}}
+            })");
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators unknown name rejected",
+            threw, threw ? "" : "didn't throw",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators unknown name rejected",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- ObservabilityConfig::operator== ----
 
 void TestOperatorEqIgnoresLiveFields() {
@@ -548,6 +632,10 @@ void RunAllTests() {
     TestValidateRejectsUnknownOtlpUpstream();
     TestOtlpHttpExporterValidatesAtLoad();
     TestOtlpHttpExporterRejectsUnknownMetricsUpstream();
+    TestPropagatorsListLoad();
+    TestPropagatorsListDefaultIsW3C();
+    TestPropagatorsListEmptyRejected();
+    TestPropagatorsListUnknownRejected();
     TestValidatePromPathMustStartWithSlash();
     TestValidateRejectsHistogramBucketsOutOfOrder();
     TestHotReloadableRejectsBadLiveValue();

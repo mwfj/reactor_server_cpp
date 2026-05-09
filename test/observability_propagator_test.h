@@ -12,12 +12,14 @@
 #include "observability/trace_state.h"
 
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace ObservabilityPropagatorTests {
 
+using OBSERVABILITY_NAMESPACE::Propagator;
 using OBSERVABILITY_NAMESPACE::SpanContext;
 using OBSERVABILITY_NAMESPACE::SpanId;
 using OBSERVABILITY_NAMESPACE::TraceFlags;
@@ -30,13 +32,13 @@ void TestTraceparentRoundTrip() {
     try {
         const std::string hdr =
             "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01";
-        auto ctx = W3CPropagator::ParseTraceparent(hdr);
+        auto ctx = W3CPropagator{}.ParseTraceparent(hdr);
         bool pass = ctx.has_value() && ctx->IsValid() && ctx->is_remote() &&
                     ctx->trace_id().ToHex() == "0af7651916cd43dd8448eb211c80319c" &&
                     ctx->span_id().ToHex() == "00f067aa0ba902b7" &&
                     ctx->flags().IsSampled();
         if (pass) {
-            auto out = W3CPropagator::SerializeTraceparent(*ctx);
+            auto out = W3CPropagator{}.SerializeTraceparent(*ctx);
             pass = out.has_value() && *out == hdr;
         }
         TestFramework::RecordTest(
@@ -83,7 +85,7 @@ void TestTraceparentInvalidForms() {
         bool pass = true;
         std::string err;
         for (const auto& v : variants) {
-            auto ctx = W3CPropagator::ParseTraceparent(v.hdr);
+            auto ctx = W3CPropagator{}.ParseTraceparent(v.hdr);
             if (ctx.has_value()) {
                 pass = false;
                 err = std::string{v.name} + " not rejected";
@@ -107,8 +109,8 @@ void TestTraceparentSampledBit() {
             "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01";
         const std::string unsampled =
             "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-00";
-        auto a = W3CPropagator::ParseTraceparent(sampled);
-        auto b = W3CPropagator::ParseTraceparent(unsampled);
+        auto a = W3CPropagator{}.ParseTraceparent(sampled);
+        auto b = W3CPropagator{}.ParseTraceparent(unsampled);
         bool pass = a.has_value() && b.has_value() &&
                     a->flags().IsSampled() && !b->flags().IsSampled();
         TestFramework::RecordTest(
@@ -130,7 +132,7 @@ void TestExtractCombined() {
         headers["traceparent"] =
             "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01";
         headers["tracestate"] = "vendor1=abc,vendor2=xyz";
-        auto ctx = W3CPropagator::Extract(headers);
+        auto ctx = W3CPropagator{}.Extract(headers);
         bool pass = ctx.has_value() && ctx->IsValid() &&
                     ctx->state().Size() == 2 &&
                     ctx->state().Get("vendor1") == "abc" &&
@@ -161,7 +163,7 @@ void TestExtractTracestateInvalidDropped() {
         }
         headers["tracestate"] = ts;
 
-        auto ctx = W3CPropagator::Extract(headers);
+        auto ctx = W3CPropagator{}.Extract(headers);
         // Traceparent valid → ctx is present, but tracestate is dropped.
         bool pass = ctx.has_value() && ctx->state().Empty();
         TestFramework::RecordTest(
@@ -180,7 +182,7 @@ void TestExtractAbsentTraceparent() {
     try {
         std::map<std::string, std::string> headers;
         headers["host"] = "example.com";
-        auto ctx = W3CPropagator::Extract(headers);
+        auto ctx = W3CPropagator{}.Extract(headers);
         bool pass = !ctx.has_value();
         TestFramework::RecordTest(
             "ObsProp: Extract returns nullopt when traceparent missing",
@@ -204,7 +206,7 @@ void TestInjectIntoMap() {
         if (ts) ctx.mutable_state() = std::move(*ts);
 
         std::map<std::string, std::string> headers;
-        bool ok = W3CPropagator::Inject(ctx, headers);
+        bool ok = W3CPropagator{}.Inject(ctx, headers);
         bool pass = ok &&
                     headers["traceparent"] ==
                         "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01" &&
@@ -235,7 +237,7 @@ void TestInjectStripsExistingHeaderInVector() {
         headers.emplace_back("TraceParent", "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00");
         headers.emplace_back("host", "example.com");
 
-        bool ok = W3CPropagator::Inject(ctx, headers);
+        bool ok = W3CPropagator{}.Inject(ctx, headers);
         // Old traceparent should be gone; new one appended; host preserved.
         size_t tp_count = 0;
         std::string tp_value;
@@ -282,7 +284,7 @@ void TestInjectStripsTracestateOnEmptyState() {
         headers.emplace_back("TraceState", "vendorA=stale,vendorB=alsostale");
         headers.emplace_back("host", "example.com");
 
-        bool ok = W3CPropagator::Inject(ctx, headers);
+        bool ok = W3CPropagator{}.Inject(ctx, headers);
         size_t ts_count = 0;
         for (const auto& [k, v] : headers) {
             (void)v;
@@ -309,7 +311,7 @@ void TestInjectInvalidContextNoOp() {
         SpanContext ctx;  // default — all-zero ids, IsValid() == false
         std::map<std::string, std::string> headers;
         headers["host"] = "example.com";
-        bool ok = W3CPropagator::Inject(ctx, headers);
+        bool ok = W3CPropagator{}.Inject(ctx, headers);
         bool pass = !ok && headers.find("traceparent") == headers.end() &&
                     headers["host"] == "example.com";
         TestFramework::RecordTest(
@@ -319,6 +321,46 @@ void TestInjectInvalidContextNoOp() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "ObsProp: Inject with invalid SpanContext is a no-op",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// W3CPropagator must satisfy the Propagator base interface so the
+// composite can fan calls across multiple propagators uniformly.
+void TestW3CPropagatorImplementsInterface() {
+    try {
+        std::unique_ptr<Propagator> p =
+            std::make_unique<W3CPropagator>();
+        std::map<std::string, std::string> headers = {
+            {"traceparent",
+             "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01"}};
+        auto ctx = p->Extract(headers);
+        bool extracted = ctx.has_value()
+                       && ctx->trace_id().ToHex()
+                           == "0af7651916cd43dd8448eb211c80319c";
+
+        std::map<std::string, std::string> out;
+        bool injected = ctx.has_value() && p->Inject(*ctx, out)
+                      && out.count("traceparent") == 1;
+
+        std::map<std::string, std::string> stripped = headers;
+        p->StripOwnedHeaders(stripped);
+        bool stripped_ok = stripped.count("traceparent") == 0
+                         && stripped.count("tracestate") == 0;
+
+        bool name_ok = std::string(p->Name()) == "w3c";
+        bool pass = extracted && injected && stripped_ok && name_ok;
+        TestFramework::RecordTest(
+            "ObsProp: W3CPropagator implements Propagator interface",
+            pass, pass ? ""
+                      : "extracted=" + std::to_string(extracted)
+                       + " injected=" + std::to_string(injected)
+                       + " stripped=" + std::to_string(stripped_ok)
+                       + " name=" + std::to_string(name_ok),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsProp: W3CPropagator implements Propagator interface",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -338,6 +380,7 @@ void RunAllTests() {
     TestInjectStripsExistingHeaderInVector();
     TestInjectStripsTracestateOnEmptyState();
     TestInjectInvalidContextNoOp();
+    TestW3CPropagatorImplementsInterface();
 }
 
 }  // namespace ObservabilityPropagatorTests

@@ -531,6 +531,68 @@ void TestExporterIsSharedFalseForSeparateInstances() {
     }
 }
 
+// ---- Phase 2: traces.propagators wiring (Task 8.5) ----
+
+void TestManagerPropagatorReflectsConfig() {
+    try {
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.propagators = {"jaeger", "w3c"};
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0030ULL));
+        auto p = mgr->propagator();
+        std::map<std::string, std::string> h = {
+            {"uber-trace-id",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1"}};
+        bool pass = p && p->Extract(h).has_value();
+        TestFramework::RecordTest(
+            "ObsMgr: propagator() reflects traces.propagators config",
+            pass, pass ? "" : "jaeger extract failed",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: propagator() reflects traces.propagators config",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestManagerReloadSwapsPropagator() {
+    try {
+        // Boot with W3C only — Jaeger header should be ignored.
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.propagators = {"w3c"};
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0031ULL));
+        std::map<std::string, std::string> jaeger_only = {
+            {"uber-trace-id",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1"}};
+        bool before = !mgr->propagator()->Extract(jaeger_only).has_value();
+
+        // SIGHUP adds Jaeger to the list — propagator must swap atomically.
+        ObservabilityConfig flipped = DefaultConfig();
+        flipped.traces.propagators = {"jaeger", "w3c"};
+        mgr->Reload(flipped);
+        bool after = mgr->propagator()->Extract(jaeger_only).has_value();
+
+        bool pass = before && after;
+        TestFramework::RecordTest(
+            "ObsMgr: Reload swaps propagator atomically",
+            pass, pass ? ""
+                      : "before=" + std::to_string(before)
+                       + " after=" + std::to_string(after),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: Reload swaps propagator atomically",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- Phase 2: live traces.enabled SIGHUP without restart (Task 1.5) ----
 //
 // Pipeline allocation in MarkServerReady is gated on `traces.exporter`
@@ -691,6 +753,52 @@ void TestMiddlewareBuildsSnapshotAndSpan() {
     }
 }
 
+// End-to-end: a Jaeger uber-trace-id header on an inbound request
+// must produce a populated remote_parent when the manager's composite
+// includes the Jaeger propagator. This locks in Task 8.6's swap from
+// the static W3C-only Extract to the manager-provided composite.
+void TestMiddlewareHonorsCompositePropagator() {
+    try {
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.propagators = {"jaeger", "w3c"};
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<InMemorySpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0040ULL));
+        auto mw = MakeObservabilityMiddleware(mgr);
+
+        HttpRequest req;
+        req.method = "GET";
+        req.path   = "/test";
+        req.headers["uber-trace-id"] =
+            "1234567890abcdef1234567890abcdef:0011223344556677:0:1";
+        req.route_match.pattern = "/test";
+        req.route_match.kind = RouteKind::Sync;
+        req.route_match.method_for_dispatch = "GET";
+
+        HttpResponse resp;
+        bool ok = mw(req, resp);
+
+        bool pass = ok && req.trace_ctx.has_value()
+                       && req.trace_ctx->remote_parent.IsValid()
+                       && req.trace_ctx->remote_parent.trace_id().ToHex()
+                           == "1234567890abcdef1234567890abcdef";
+
+        if (req.obs_snapshot) {
+            mgr->FinalizeFromSnapshot(*req.obs_snapshot, 200, 0, "");
+        }
+        TestFramework::RecordTest(
+            "ObsMgr: middleware extract honors composite propagator (Jaeger)",
+            pass, pass ? "" : "remote_parent not extracted from uber-trace-id",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: middleware extract honors composite propagator (Jaeger)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Middleware skips Span allocation when traces are disabled, but
 // still builds the snapshot (so middleware-rejection paths can finalize).
 void TestMiddlewareTracesDisabledStillBuildsSnapshot() {
@@ -770,8 +878,11 @@ void RunAllTests() {
     TestSwapToBatchSpanProcessorReplacesNoop();
     TestExporterIsSharedDetectsCoLocatedExporter();
     TestExporterIsSharedFalseForSeparateInstances();
+    TestManagerPropagatorReflectsConfig();
+    TestManagerReloadSwapsPropagator();
     TestLiveTracesEnabledFlipKeepsBatchProcessor();
     TestMiddlewareBuildsSnapshotAndSpan();
+    TestMiddlewareHonorsCompositePropagator();
     TestMiddlewareTracesDisabledStillBuildsSnapshot();
     TestMiddlewareNullManagerNoOp();
 }

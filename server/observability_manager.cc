@@ -116,6 +116,10 @@ void ObservabilityManager::Init() {
     meter_provider_ = std::make_unique<MeterProvider>(
         resource_, kDefaultMetricShards);
 
+    std::atomic_store_explicit(&propagator_,
+        CompositePropagator::Build(config_.traces.propagators),
+        std::memory_order_release);
+
     MeterReaderOptions ro;
     ro.export_interval = config_.metrics.reader.export_interval;
     ro.export_timeout  = config_.metrics.reader.export_timeout;
@@ -486,6 +490,10 @@ void ObservabilityManager::RegisterMetricReader(
     metric_reader_ = std::move(reader);
 }
 
+std::shared_ptr<const Propagator> ObservabilityManager::propagator() const noexcept {
+    return std::atomic_load_explicit(&propagator_, std::memory_order_acquire);
+}
+
 void ObservabilityManager::FlushAll(std::chrono::milliseconds deadline) {
     const auto t_end = std::chrono::steady_clock::now() + deadline;
     auto remaining = [t_end]() {
@@ -685,6 +693,12 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
         new_config.traces.batch.max_export_batch_size;
     config_.traces.batch.schedule_delay  = new_config.traces.batch.schedule_delay;
     config_.traces.batch.retries         = new_config.traces.batch.retries;
+    if (new_config.traces.propagators != config_.traces.propagators) {
+        config_.traces.propagators = new_config.traces.propagators;
+        std::atomic_store_explicit(&propagator_,
+            CompositePropagator::Build(config_.traces.propagators),
+            std::memory_order_release);
+    }
 
     config_.metrics.enabled              = new_config.metrics.enabled;
     config_.metrics.otlp.headers         = new_config.metrics.otlp.headers;

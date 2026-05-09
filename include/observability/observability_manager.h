@@ -39,6 +39,7 @@
 #include "observability/meter_provider.h"
 #include "observability/observability_config.h"
 #include "observability/observability_snapshot.h"
+#include "observability/propagator.h"
 #include "observability/sampler.h"
 #include "observability/span_processor.h"
 #include "observability/tracer_provider.h"
@@ -144,6 +145,11 @@ public:
     // / no-PMR configuration costs only a virtual dispatch.
     void FlushAll(std::chrono::milliseconds deadline);
 
+    // Live trace-context propagator (CompositePropagator over the names
+    // in `traces.propagators`). The shared_ptr is atomic-swapped on
+    // Reload so per-request middleware always sees a coherent snapshot.
+    std::shared_ptr<const Propagator> propagator() const noexcept;
+
     // Idempotent. Drains processor + reader bounded by `timeout`.
     void BeginShutdown(std::chrono::milliseconds timeout);
 
@@ -241,6 +247,12 @@ private:
     std::shared_ptr<SpanProcessor>            span_processor_;
     // Phase 2: drained alongside span_processor_ at BeginShutdown.
     std::shared_ptr<PeriodicMetricReader>     metric_reader_;
+
+    // Live propagator snapshot. atomic_load / atomic_store on the
+    // shared_ptr (C++17 free-function form) gives lock-free reads on
+    // the hot path; Reload swaps in a fresh CompositePropagator built
+    // from the new `traces.propagators` list.
+    std::shared_ptr<const Propagator>         propagator_;
 
     std::unique_ptr<TracerProvider>           tracer_provider_;
     std::unique_ptr<MeterProvider>            meter_provider_;

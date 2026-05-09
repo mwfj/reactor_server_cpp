@@ -107,6 +107,8 @@ OBSERVABILITY_SRCS = $(SERVER_DIR)/trace_id.cc $(SERVER_DIR)/trace_state.cc \
                      $(SERVER_DIR)/observability_manager.cc \
                      $(SERVER_DIR)/observability_middleware.cc \
                      $(SERVER_DIR)/propagator.cc \
+                     $(SERVER_DIR)/jaeger_propagator.cc \
+                     $(SERVER_DIR)/composite_propagator.cc \
                      $(SERVER_DIR)/batch_span_processor.cc \
                      $(SERVER_DIR)/periodic_metric_reader.cc \
                      $(SERVER_DIR)/otlp_http_exporter.cc \
@@ -413,6 +415,10 @@ test_obs_mgr: $(TARGET)
 test_obs_propagator: $(TARGET)
 	@echo "Running W3C propagator tests..."
 	./$(TARGET) obs_propagator
+
+test_obs_jaeger_propagator: $(TARGET)
+	@echo "Running Jaeger propagator tests..."
+	./$(TARGET) obs_jaeger_propagator
 
 test_obs_export: $(TARGET)
 	@echo "Running observability export pipeline tests..."

@@ -8,6 +8,7 @@
 #include "net/dns_resolver.h"        // IsValidHostOrIpLiteral grammar
 #include "rate_limit/rate_limit_zone.h"  // RateLimitZone::SHARD_COUNT
 #include "observability/observability_config.h"
+#include "observability/propagator.h"
 #include "nlohmann/json.hpp"
 
 #include <fstream>
@@ -1021,6 +1022,28 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     throw std::runtime_error(
                         "observability.traces.exporter must be a string");
                 oc.traces.exporter = tj["exporter"].get<std::string>();
+            }
+            if (tj.contains("propagators")) {
+                if (!tj["propagators"].is_array() || tj["propagators"].empty())
+                    throw std::invalid_argument(
+                        "observability.traces.propagators must be a "
+                        "non-empty array");
+                std::vector<std::string> names;
+                names.reserve(tj["propagators"].size());
+                for (const auto& v : tj["propagators"]) {
+                    if (!v.is_string())
+                        throw std::invalid_argument(
+                            "observability.traces.propagators[] entries "
+                            "must be strings");
+                    auto s = v.get<std::string>();
+                    if (!OBSERVABILITY_NAMESPACE::IsKnownPropagatorName(s)) {
+                        throw std::invalid_argument(
+                            "observability.traces.propagators: unknown '"
+                            + s + "' (recognised: 'w3c', 'jaeger')");
+                    }
+                    names.push_back(std::move(s));
+                }
+                oc.traces.propagators = std::move(names);
             }
             if (tj.contains("sampler")) {
                 if (!tj["sampler"].is_object())

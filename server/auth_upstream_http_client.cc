@@ -280,7 +280,7 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     if (req.issue_ctx.has_value()
         && req.issue_ctx->local.IsValid()
         && req.issue_ctx->tracer != nullptr) {
-        OBSERVABILITY_NAMESPACE::W3CPropagator::Inject(
+        OBSERVABILITY_NAMESPACE::W3CPropagator{}.Inject(
             req.issue_ctx->local, req.headers);
     }
 }

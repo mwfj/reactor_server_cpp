@@ -2,15 +2,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <set>
 
 namespace OBSERVABILITY_NAMESPACE {
 
 namespace {
 
-// Lower-case ASCII compare — used to find the traceparent / tracestate
-// headers in a header map that may contain mixed-case keys (HTTP/1
-// stores lower-cased; HTTP/2 emits lower-cased; defensive to support
-// either).
 inline std::string ToLower(std::string_view s) {
     std::string out(s);
     std::transform(out.begin(), out.end(), out.begin(),
@@ -18,25 +15,11 @@ inline std::string ToLower(std::string_view s) {
     return out;
 }
 
-// W3C Trace Context Level 1 §3.2 mandates LOWERCASE hex for the
-// trace-id, parent-id, and trace-flags fields of version 00. An
-// inbound traceparent with uppercase hex is malformed and must be
-// treated as absent (no remote parent), per the spec — accepting it
-// would let the gateway propagate an invalid trace context to
-// downstream services.
-inline bool IsHexCharLower(char c) noexcept {
-    return (c >= '0' && c <= '9') ||
-           (c >= 'a' && c <= 'f');
-}
-
-// Find a header value by lower-cased key. Returns nullptr when absent.
 const std::string* FindHeader(
     const std::map<std::string, std::string>& headers,
     const std::string& lower_key) {
     auto it = headers.find(lower_key);
     if (it != headers.end()) return &it->second;
-    // Tolerate non-lower-case keys (defensive — shouldn't happen with
-    // the project's HttpRequest convention but cheap to scan).
     for (const auto& [k, v] : headers) {
         if (k.size() == lower_key.size() && ToLower(k) == lower_key) {
             return &v;
@@ -45,22 +28,76 @@ const std::string* FindHeader(
     return nullptr;
 }
 
+inline bool EqualsLowerAscii(std::string_view name, std::string_view lower) {
+    if (name.size() != lower.size()) return false;
+    for (size_t i = 0; i < lower.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(name[i])) != lower[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline void EraseVecHeader(
+    std::vector<std::pair<std::string, std::string>>& headers,
+    std::string_view lower_key) {
+    headers.erase(
+        std::remove_if(headers.begin(), headers.end(),
+            [&](const std::pair<std::string, std::string>& kv) {
+                return EqualsLowerAscii(kv.first, lower_key);
+            }),
+        headers.end());
+}
+
+inline void AppendFlagsHex(uint8_t flags, std::string& out) {
+    static constexpr const char digits[] = "0123456789abcdef";
+    out.push_back(digits[(flags >> 4) & 0x0f]);
+    out.push_back(digits[flags & 0x0f]);
+}
+
 }  // namespace
 
+// ---------- Propagator base default overloads ----------
+
+bool Propagator::Inject(const SpanContext& ctx, HeadersVec& headers) const {
+    HeadersMap tmp;
+    if (!Inject(ctx, tmp)) return false;
+    // Strip the keys we're about to write so we don't duplicate. The
+    // map-side Inject already strip-replaced its owned keys via the
+    // concrete impl; here we mirror that on the vector representation.
+    for (const auto& [k, _] : tmp) EraseVecHeader(headers, k);
+    for (auto& kv : tmp) {
+        headers.emplace_back(kv.first, std::move(kv.second));
+    }
+    return true;
+}
+
+void Propagator::StripOwnedHeaders(HeadersVec& headers) const {
+    HeadersMap tmp;
+    for (auto& kv : headers) tmp.emplace(kv.first, kv.second);
+    StripOwnedHeaders(tmp);
+    // Build a set of surviving lowercase keys; remove vector entries
+    // whose key (lowercased) is not in the survivor set.
+    std::set<std::string> survivors;
+    for (const auto& [k, _] : tmp) survivors.insert(ToLower(k));
+    headers.erase(
+        std::remove_if(headers.begin(), headers.end(),
+            [&](const std::pair<std::string, std::string>& kv) {
+                return survivors.find(ToLower(kv.first)) == survivors.end();
+            }),
+        headers.end());
+}
+
+// ---------- W3CPropagator ----------
+
 std::optional<SpanContext> W3CPropagator::ParseTraceparent(
-    std::string_view header) noexcept {
+    std::string_view header) const noexcept {
     if (header.size() != kTraceparentLen) return std::nullopt;
-    // Layout: pp pp - tttttttttttttttttttttttttttttttt - pppppppppppppppp - ff
-    //         0  1   2                                  35                  52
-    //         (dashes at offsets 2, 35, 52)
     if (header[2] != '-' || header[35] != '-' || header[52] != '-') {
         return std::nullopt;
     }
-    // Version must be "00".
     if (header[0] != '0' || header[1] != '0') return std::nullopt;
 
-    // All other characters must be lowercase hex (per W3C §3.2.2.1
-    // — an uppercase hex digit makes the header malformed).
     for (size_t i = 3; i < kTraceparentLen; ++i) {
         if (i == 35 || i == 52) continue;
         if (!IsHexCharLower(header[i])) return std::nullopt;
@@ -71,9 +108,6 @@ std::optional<SpanContext> W3CPropagator::ParseTraceparent(
     auto span_id = SpanId::FromHex(header.substr(36, 16));
     if (!span_id.IsValid()) return std::nullopt;
 
-    // Parse trace-flags as 2 lowercase hex chars → uint8_t. The
-    // earlier IsHexCharLower scan already rejected uppercase, so
-    // this lambda is just the digit→nibble conversion.
     auto from_hex = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
         if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
@@ -84,23 +118,22 @@ std::optional<SpanContext> W3CPropagator::ParseTraceparent(
     if (hi < 0 || lo < 0) return std::nullopt;
     TraceFlags flags{static_cast<uint8_t>((hi << 4) | lo)};
 
-    SpanContext ctx(trace_id, span_id, flags, TraceState{}, /*is_remote=*/true);
-    return ctx;
+    return SpanContext(trace_id, span_id, flags, TraceState{},
+                        /*is_remote=*/true);
 }
 
 std::optional<TraceState> W3CPropagator::ParseTracestate(
-    std::string_view header) {
+    std::string_view header) const {
     return TraceState::Parse(header);
 }
 
 std::optional<SpanContext> W3CPropagator::Extract(
-    const std::map<std::string, std::string>& headers) {
+    const HeadersMap& headers) const {
     const std::string* tp = FindHeader(headers, "traceparent");
     if (!tp) return std::nullopt;
     auto ctx = ParseTraceparent(*tp);
     if (!ctx) return std::nullopt;
-    // Tracestate parse failure does NOT invalidate the traceparent
-    // (per W3C §3.3.5 — drop tracestate silently).
+    // tracestate parse failure does NOT invalidate traceparent (W3C §3.3.5).
     const std::string* ts = FindHeader(headers, "tracestate");
     if (ts) {
         auto parsed = ParseTracestate(*ts);
@@ -109,19 +142,8 @@ std::optional<SpanContext> W3CPropagator::Extract(
     return ctx;
 }
 
-namespace {
-
-// Encode a TraceFlags value as 2 lowercase hex chars.
-inline void AppendFlagsHex(uint8_t flags, std::string& out) {
-    static constexpr const char digits[] = "0123456789abcdef";
-    out.push_back(digits[(flags >> 4) & 0x0f]);
-    out.push_back(digits[flags & 0x0f]);
-}
-
-}  // namespace
-
 std::optional<std::string> W3CPropagator::SerializeTraceparent(
-    const SpanContext& ctx) {
+    const SpanContext& ctx) const {
     if (!ctx.IsValid()) return std::nullopt;
     std::string out;
     out.reserve(kTraceparentLen);
@@ -136,10 +158,7 @@ std::optional<std::string> W3CPropagator::SerializeTraceparent(
 }
 
 bool W3CPropagator::Inject(const SpanContext& ctx,
-                             std::map<std::string, std::string>& headers) {
-    // Strip-then-inject contract — symmetric with the vector overload.
-    // A new context with empty state must NOT leave a previous
-    // vendor's tracestate paired with the fresh traceparent.
+                              HeadersMap& headers) const {
     auto tp = SerializeTraceparent(ctx);
     if (!tp) return false;
     headers["traceparent"] = std::move(*tp);
@@ -152,37 +171,35 @@ bool W3CPropagator::Inject(const SpanContext& ctx,
 }
 
 bool W3CPropagator::Inject(const SpanContext& ctx,
-                             std::vector<std::pair<std::string, std::string>>& headers) {
+                              HeadersVec& headers) const {
     auto tp = SerializeTraceparent(ctx);
     if (!tp) return false;
-    // Replace existing traceparent / tracestate if present (case-
-    // insensitive match) — same strip-then-inject contract.
-    auto erase_if_match = [&](std::string_view name_lower) {
-        headers.erase(
-            std::remove_if(headers.begin(), headers.end(),
-                [&](const std::pair<std::string, std::string>& kv) {
-                    if (kv.first.size() != name_lower.size()) return false;
-                    for (size_t i = 0; i < name_lower.size(); ++i) {
-                        if (std::tolower(static_cast<unsigned char>(kv.first[i]))
-                            != name_lower[i]) {
-                            return false;
-                        }
-                    }
-                    return true;
-                }),
-            headers.end());
-    };
-    erase_if_match("traceparent");
+    EraseVecHeader(headers, "traceparent");
     headers.emplace_back("traceparent", std::move(*tp));
-    // Always strip stale tracestate — the vector overload's contract
-    // is strip-then-inject, so a new context with empty state must NOT
-    // leave a previous vendor's tracestate paired with the fresh
-    // traceparent. Append only when the new state is non-empty.
-    erase_if_match("tracestate");
+    EraseVecHeader(headers, "tracestate");
     if (!ctx.state().Empty()) {
         headers.emplace_back("tracestate", ctx.state().Serialize());
     }
     return true;
+}
+
+void W3CPropagator::StripOwnedHeaders(HeadersMap& headers) const {
+    headers.erase("traceparent");
+    headers.erase("tracestate");
+    // Tolerate any non-lower-case duplicates a caller might have built.
+    for (auto it = headers.begin(); it != headers.end(); ) {
+        const std::string lower = ToLower(it->first);
+        if (lower == "traceparent" || lower == "tracestate") {
+            it = headers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void W3CPropagator::StripOwnedHeaders(HeadersVec& headers) const {
+    EraseVecHeader(headers, "traceparent");
+    EraseVecHeader(headers, "tracestate");
 }
 
 }  // namespace OBSERVABILITY_NAMESPACE

@@ -47,6 +47,7 @@
 #include "observability_metrics_test.h"
 #include "observability_manager_test.h"
 #include "observability_propagator_test.h"
+#include "observability_jaeger_propagator_test.h"
 #include "observability_export_pipeline_test.h"
 #include "observability_prometheus_test.h"
 #include "observability_config_test.h"
@@ -220,6 +221,10 @@ void RunAllTest(){
     // traceparent / tracestate parse + serialize + Inject / Extract.
     ObservabilityPropagatorTests::RunAllTests();
 
+    // Jaeger uber-trace-id propagator tests — parse 128/64-bit ids,
+    // sampled flag, malformed-input rejection.
+    ObservabilityJaegerPropagatorTests::RunAllTests();
+
     // Export pipeline tests — BatchSpanProcessor (worker thread + queue
     // overflow + shutdown propagation), PeriodicMetricReader (interval
     // worker), OtlpHttpExporter (OTLP/JSON serialization + lifecycle
@@ -318,6 +323,7 @@ void PrintUsage(const char* program_name) {
     std::cout << "  obs_e2e            Observability end-to-end tests (boot real" << std::endl;
     std::cout << "                     HttpServer, send HTTP requests, verify spans)" << std::endl;
     std::cout << "  obs_propagator     W3C Trace Context propagator tests" << std::endl;
+    std::cout << "  obs_jaeger_propagator  Jaeger uber-trace-id propagator tests" << std::endl;
     std::cout << "                     (traceparent / tracestate parse + Inject)" << std::endl;
     std::cout << "  obs_export         Export pipeline tests (BatchSpanProcessor /" << std::endl;
     std::cout << "                     PeriodicMetricReader / OtlpHttpExporter)" << std::endl;
@@ -508,6 +514,9 @@ int main(int argc, char* argv[]) {
         // tracestate parse + serialize + Inject / Extract).
         }else if(mode == "obs_propagator"){
             ObservabilityPropagatorTests::RunAllTests();
+        // Run Jaeger uber-trace-id propagator tests.
+        }else if(mode == "obs_jaeger_propagator"){
+            ObservabilityJaegerPropagatorTests::RunAllTests();
         // Run export pipeline tests (BatchSpanProcessor /
         // PeriodicMetricReader / OtlpHttpExporter).
         }else if(mode == "obs_export"){
