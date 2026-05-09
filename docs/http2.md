@@ -165,7 +165,7 @@ RFC 9113 constraints enforced by `ConfigLoader::Validate()`:
 - `max_concurrent_streams` >= 1
 - `initial_window_size`: 1 to 2^31-1
 - `max_frame_size`: 16384 to 16777215
-- `max_header_list_size` >= 1
+- `max_header_list_size` >= 4096 (below this, every real H2 request is rejected with COMPRESSION_ERROR)
 
 ## Security
 
