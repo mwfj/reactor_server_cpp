@@ -531,22 +531,44 @@ std::shared_ptr<void> PoolPartition::MakeInflightGuard() {
     });
 }
 
-std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
-    const std::string& upstream_name, UpstreamLease& lease)
+std::shared_ptr<UpstreamH2Connection> PoolPartition::FindUsableH2Connection(
+    const std::string& upstream_name)
 {
-    // Reuse a multiplexed session if one is still healthy AND its
-    // transport matches the partition's currently-published
-    // resolved_endpoint_. After a hostname re-resolution, an existing
-    // session pinned to the old IP must NOT serve fresh requests; mark
-    // it dead so future FindUsable() skips it and the table walker
-    // reaps it on the next Tick. In-flight streams continue on the
-    // stale endpoint (mirrors the H1 keepalive reuse contract).
+    // After a hostname re-resolution, an existing session pinned to the
+    // old IP must NOT serve fresh requests; mark it dead so future
+    // FindUsable() skips it. In-flight streams on that connection are
+    // deliberately NOT failed here — mirrors the H1 keepalive reuse
+    // contract that lets requests already on the wire complete
+    // naturally. Three paths reap the dead connection afterwards:
+    // (a) normal stream completion drains active_stream_count to 0 and
+    //     TickAll's `IsDead() && empty` branch erases the entry;
+    // (b) transport close/error fires SetCloseCb / SetErrorCb (wired
+    //     in AcquireH2Connection's construct branch) which run
+    //     FailAllStreams + the table walker erases on the next Tick;
+    // (c) endpoint loss times out via ping_timeout_sec /
+    //     goaway_drain_timeout_sec, Tick returns false, FailAllStreams
+    //     fires, table walker erases.
     if (auto existing = h2_table_.FindUsable(upstream_name)) {
         UpstreamConnection* t = existing->transport();
         if (t && ConnectionEndpointMatches(*t)) {
             return existing;
         }
         existing->MarkDead();
+    }
+    return nullptr;
+}
+
+std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
+    const std::string& upstream_name, UpstreamLease& lease)
+{
+    // Reuse a multiplexed session if one is still healthy AND its
+    // transport matches the partition's currently-published endpoint.
+    // Same FindUsableH2Connection helper that ProxyTransaction's
+    // pre-checkout fast path uses — caller's lease (if any) is
+    // untouched on the reuse branch. See FindUsableH2Connection's
+    // doc comment for the H1-keepalive-parity / dead-conn reap chain.
+    if (auto existing = FindUsableH2Connection(upstream_name)) {
+        return existing;
     }
 
     auto cfg = LoadHttp2ConfigSnapshot();

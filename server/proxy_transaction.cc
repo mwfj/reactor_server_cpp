@@ -577,7 +577,39 @@ void ProxyTransaction::AttemptCheckout() {
     }
     ActivateAttemptTracking();
     EnsureCheckoutCancelToken();
+
+    // Fast path: if a usable multiplexed H2 session already exists for
+    // this upstream, dispatch onto it without consuming a pool slot.
+    // Without this, with `pool.max_connections` set near 1 the donated
+    // H2 transport permanently occupies the only pool slot — subsequent
+    // requests would queue forever in CheckoutAsync instead of
+    // multiplexing onto the existing session. H2 concurrency would be
+    // bounded by spare pool slots rather than max_concurrent_streams_pref.
+    if (TryDispatchExistingH2Session()) {
+        return;
+    }
+
     StartCheckoutAsync();
+}
+
+bool ProxyTransaction::TryDispatchExistingH2Session() {
+    if (!upstream_manager_ || dispatcher_index_ < 0) return false;
+    PoolPartition* partition = upstream_manager_->GetPoolPartition(
+        service_name_, static_cast<size_t>(dispatcher_index_));
+    if (!partition) return false;
+    auto cfg = partition->LoadHttp2ConfigSnapshot();
+    if (!cfg || !cfg->enabled || cfg->prefer == "never") return false;
+    auto existing = partition->FindUsableH2Connection(service_name_);
+    if (!existing) return false;
+    // Existing session is reusable. Skip CheckoutAsync entirely and
+    // dispatch through the H2 path with an EMPTY lease — DispatchH2's
+    // AcquireH2Connection FAST branch returns the same session without
+    // touching the lease, and lease_ stays empty (the existing session
+    // owns its own donated lease for transport lifetime). Advance to
+    // SENDING_REQUEST as if OnCheckoutReady had granted us a lease.
+    state_ = State::SENDING_REQUEST;
+    DispatchH2();
+    return true;
 }
 
 void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
@@ -684,6 +716,20 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
 }
 
 void ProxyTransaction::DispatchH1() {
+    // If the previous attempt used H2, codec_ is UpstreamH2Codec.
+    // ResetForRetryAttempt() only Reset()s the existing codec — it
+    // does NOT re-construct. Without this swap, the H1 fallback's
+    // first response bytes would route through UpstreamH2Codec::Parse
+    // (HTTP/2 frame parser) and fail immediately with a parse error.
+    // Hot-path overhead is one dynamic_cast per DispatchH1 invocation
+    // (constant-time, single vtable lookup); the codec swap itself
+    // only happens on H2→H1 retry fallback in prefer="auto" mode.
+    if (dynamic_cast<UpstreamH2Codec*>(codec_.get()) != nullptr) {
+        codec_ = std::make_unique<UpstreamHttpCodec>();
+        codec_->SetRequestMethod(method_);
+        codec_->SetSink(this);
+    }
+
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn) {
         ReleaseBreakerAdmissionNeutral();
@@ -1391,12 +1437,19 @@ void ProxyTransaction::OnError(int result_code,
     // unlike H1, which detects transport failure inside OnUpstreamData
     // and calls MaybeRetry(UPSTREAM_DISCONNECT) directly before the sink
     // ever sees an error. Bring H2 to feature parity: when the result is
-    // a retryable disconnect AND no response has been committed, route
-    // through MaybeRetry so the retry policy fires (idempotent method,
-    // attempt budget, retry budget all honored). Cleanup() inside
-    // MaybeRetry's success branch tears down the H2 stream state; its
-    // retry-not-allowed branch falls through to DeliverTerminalError.
+    // a retryable disconnect AND no response has been committed AND the
+    // transaction is not already terminal, route through MaybeRetry so
+    // the retry policy fires (idempotent method, attempt budget, retry
+    // budget all honored). The state guard guards against a late
+    // OnError fired from a stream-close callback that the partition
+    // didn't manage to suppress, after a previous attempt's terminal
+    // delivery (Cleanup → ResetStream → sink=nullptr is the primary
+    // defense; the local guard makes the invariant explicit). Cleanup()
+    // inside MaybeRetry's success branch tears down the H2 stream
+    // state; its retry-not-allowed branch falls through to
+    // DeliverTerminalError.
     if (h2_path_ && !response_committed_ &&
+        state_ != State::FAILED && state_ != State::COMPLETE &&
         result_code == RESULT_UPSTREAM_DISCONNECT) {
         ReportBreakerOutcome(result_code);
         MaybeRetry(RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);

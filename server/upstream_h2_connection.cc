@@ -180,12 +180,15 @@ ssize_t H2BodyReadCallback(nghttp2_session* /*session*/, int32_t /*stream_id*/,
     if (!src) {
         // SubmitRequest always sets source.ptr before passing the
         // provider to nghttp2; reaching here means a regression.
-        // Log loudly so it surfaces in CI / production rather than
-        // silently truncating the request body.
+        // Returning 0 + END_STREAM would silently send the upstream a
+        // truncated request body. Returning TEMPORAL_CALLBACK_FAILURE
+        // makes nghttp2 RST_STREAM the request — the proxy then sees a
+        // stream-close-with-error and surfaces a 502 (or retries on the
+        // standard path), failure-loud all the way through.
         logging::Get()->error(
-            "BUG: H2BodyReadCallback invoked with null source->ptr");
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-        return 0;
+            "BUG: H2BodyReadCallback invoked with null source->ptr — "
+            "RST_STREAM via TEMPORAL_CALLBACK_FAILURE");
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     }
     size_t remaining = src->body.size() - src->offset;
     size_t copy = std::min(remaining, length);
@@ -411,6 +414,14 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
     goaway_last_stream_id_ = last_stream_id;
     goaway_seen_at_ = now;
     last_activity_at_ = now;
+    // SendPing returns false when goaway_seen_, so no NEW PINGs fire
+    // after this point. But an outstanding PING (sent before GOAWAY)
+    // would still let Tick evict at min(ping_timeout_sec,
+    // goaway_drain_timeout_sec) instead of the documented bound of
+    // goaway_drain_timeout_sec. Clearing pending_ping_at_ keeps the
+    // drain window honest — a peer mid-shutdown is unlikely to PONG,
+    // and a missed PONG ACK after GOAWAY is uninteresting anyway.
+    pending_ping_at_.reset();
 
     // RFC 9113 §6.8: streams whose id > last_stream_id were not processed
     // by the peer and MUST be safe to retry on a fresh connection. Fail
@@ -449,6 +460,28 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
         if (stream && stream->sink) {
             if (error_code == NGHTTP2_NO_ERROR) {
                 stream->sink->OnComplete();
+            } else if (error_code == NGHTTP2_HTTP_1_1_REQUIRED) {
+                // RFC 9113 §13 (error code 0xd): peer indicates THIS
+                // request must be retried over HTTP/1.1. Retrying on H2
+                // will fail again — under prefer=always there is no H1
+                // fallback, and even under prefer=auto a fresh H2 session
+                // may hit the same response-side rejection. Two actions:
+                //   1. Mark the H2 connection dead so future
+                //      AcquireH2Connection callers skip it (a fresh
+                //      transport will renegotiate ALPN; under
+                //      prefer=auto an h1-only peer would land on H1).
+                //   2. Surface RESULT_PARSE_ERROR (terminal, 502) to
+                //      bypass ProxyTransaction::OnError's H2 retry
+                //      escape hatch (which only fires for
+                //      UPSTREAM_DISCONNECT). Without #2, the retry
+                //      budget would burn looping against an H2 session
+                //      that fundamentally rejects this request shape.
+                MarkDead();
+                stream->sink->OnError(
+                    ProxyTransaction::RESULT_PARSE_ERROR,
+                    "h2 peer sent HTTP_1_1_REQUIRED — set "
+                    "upstream http2.prefer=never or reconfigure "
+                    "upstream H2 routing");
             } else {
                 // Translate the H2 stream error to a proxy RESULT_* code.
                 // Without this translation the raw nghttp2 code (positive

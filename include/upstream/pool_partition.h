@@ -171,6 +171,20 @@ public:
     std::shared_ptr<UpstreamH2Connection> AcquireH2Connection(
         const std::string& upstream_name, UpstreamLease& lease);
 
+    // Pre-checkout fast path: returns a usable H2 session for
+    // `upstream_name` if one already exists in the partition's H2 table
+    // AND its transport matches the partition's currently-published
+    // resolved_endpoint_. Returns null otherwise. Used by
+    // ProxyTransaction::AttemptCheckout to bypass CheckoutAsync when a
+    // multiplexed session is reusable — without this, with
+    // pool.max_connections set near 1 the donated H2 transport
+    // permanently occupies the only pool slot and subsequent requests
+    // would queue forever instead of multiplexing onto the existing
+    // session. Idempotent with AcquireH2Connection's reuse branch.
+    // Dispatcher-thread-only.
+    std::shared_ptr<UpstreamH2Connection> FindUsableH2Connection(
+        const std::string& upstream_name);
+
     // Stats (dispatcher-thread-only reads)
     size_t IdleCount() const { return idle_conns_.size(); }
     size_t ActiveCount() const { return active_conns_.size(); }

@@ -2502,7 +2502,9 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
     if (config.http2_reload_barrier_timeout_sec > 60) {
         logging::Get()->warn(
             "http2_reload_barrier_timeout_sec={} exceeds documented soft "
-            "cap of 60s — long waits block reload thread",
+            "cap of 60s — note: this knob is RESERVED and currently has "
+            "NO RUNTIME EFFECT (CommitHttp2Snapshots is synchronous); "
+            "the soft cap will apply once the futures-barrier path lands",
             config.http2_reload_barrier_timeout_sec);
     }
 

@@ -356,6 +356,11 @@ private:
     void ActivateAttemptTracking();
     void EnsureCheckoutCancelToken();
     void StartCheckoutAsync();
+    // Pre-checkout fast path for H2 reuse — see implementation comment.
+    // Returns true if the transaction was dispatched through an
+    // existing multiplexed H2 session (caller must NOT then call
+    // StartCheckoutAsync); false if no existing session is reusable.
+    bool TryDispatchExistingH2Session();
     void OnCheckoutReady(UpstreamLease lease);
     void OnCheckoutError(int error_code);
 

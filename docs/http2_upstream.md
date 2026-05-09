@@ -4,7 +4,7 @@ Lets the proxy engine reach upstream services over multiplexed HTTP/2 instead of
 
 If you don't need it, you can ignore this doc — H1 remains the default for every upstream that doesn't explicitly opt in.
 
-For the field reference, see [docs/configuration.md § Upstream HTTP/2](configuration.md#upstream-http2). For the architecture details, see [.claude/documents/features/HTTP2_UPSTREAM.md](../.claude/documents/features/HTTP2_UPSTREAM.md).
+For the field reference, see [docs/configuration.md § Upstream HTTP/2](configuration.md#upstream-http2).
 
 ---
 
@@ -106,20 +106,6 @@ Look for these `[reactor]` log lines when H2 is active:
 
 A successful H2 request flow shows: `submit` → `OnHeaders` → `OnBodyChunk` (one or more) → `OnComplete` → stream erase.
 
-### Common failure modes
-
-**Symptom: every H2 request 502s with `CONNECT_FAILURE`.**
-Cause: `prefer: "always"` against a peer that doesn't speak H2 (e.g., misconfigured upstream still serving H1 only). Fix: set `prefer: "auto"` or correct the upstream's H2 config.
-
-**Symptom: H2 requests hang and eventually time out via the response timeout.**
-Cause (resolved in current build): historical bug where H2 happy-path completion never drove `OnResponseComplete`. Build verification: tests `H2UpstreamTests::TestC1...` cover this. If you see this on current code, the most likely cause is the response timeout being shorter than the upstream's actual response time — check `proxy.response_timeout_ms`.
-
-**Symptom: PING-timeout warnings, connections cycling.**
-Cause: a flaky upstream or aggressive middlebox dropping idle TLS connections. Either bump `ping_idle_sec` (PING less often → less chance of detecting middlebox drop, but fewer false alarms) or increase `ping_timeout_sec` (give the upstream more grace).
-
-**Symptom: GOAWAY received messages on every reload of the upstream.**
-Cause: the upstream is shedding connections (often a graceful restart). The proxy will drain in-flight streams and open a fresh connection on the next request — no operator action needed.
-
 ### Monitoring
 
 The following metrics aren't currently exposed via `/stats` but show up in logs at debug/info level:
@@ -128,7 +114,7 @@ The following metrics aren't currently exposed via `/stats` but show up in logs 
 - Active stream count at retire time (visible in the GOAWAY-drain logs).
 - PING send / ACK latency (correlate `submit_ping` debug log with `OnPingAck`).
 
-Future work (see [HTTP2_UPSTREAM.md § Deferred items](../.claude/documents/features/HTTP2_UPSTREAM.md#deferred-items)) will add these to `/stats`.
+`/stats` exposure for these counters is planned for a future release.
 
 ---
 
@@ -150,5 +136,3 @@ The defaults are conservative and work for most deployments. Tune only if you ob
 - **No mid-stream SETTINGS update** — reloads apply to NEW connections only. Existing sessions keep their construction-time settings.
 - **One H2 connection per upstream per dispatcher** — until saturation routing lands (`saturation_open_pct`), each partition holds one multiplexed connection per upstream. For very-high-fanout workloads this can be a bottleneck; mitigate by increasing the dispatcher count.
 - **Per-stream backpressure relies on the static stream window** — H2 streams currently bound upstream buffering to `initial_window_size` (default 1 MiB) per stream; the proxy does NOT call `nghttp2_session_consume_stream` to dynamically narrow the window when downstream is slow. A slow downstream client paired with a fast H2 upstream may buffer up to `initial_window_size + StreamingResponseSender high-water` bytes per stream before the peer's flow-control window fills and the upstream stops sending. For workloads with bursty downstream stalls and a high `initial_window_size`, watch RSS and consider lowering the window size. Per-stream `WINDOW_UPDATE` pause via `nghttp2_session_consume_stream` is a future refinement.
-
-For the full architecture (donated-lease, GOAWAY/PING state machine, dispatch decision), the internal-development reference is [.claude/documents/features/HTTP2_UPSTREAM.md](../.claude/documents/features/HTTP2_UPSTREAM.md).

@@ -5,8 +5,16 @@ namespace {
 
 bool IsExpired(const std::shared_ptr<UpstreamH2Connection>& c) {
     if (!c) return true;
-    if (c->IsDead()) return true;
-    return c->goaway_seen() && c->active_stream_count() == 0;
+    // A connection is reapable only when it cannot serve traffic AND
+    // has no in-flight streams to drain. Dead+empty and goaway+empty
+    // are both fully drained — but `dead && active>0` is the
+    // endpoint-mismatch case (PoolPartition::AcquireH2Connection
+    // calls MarkDead WITHOUT FailAllStreams to let in-flight streams
+    // finish on the stale-IP transport — H1 keepalive parity).
+    // Reaping that case here would drop the table's last strong ref,
+    // destroy the nghttp2 session, and strand the in-flight requests.
+    return c->active_stream_count() == 0 &&
+           (c->IsDead() || c->goaway_seen());
 }
 
 }  // namespace
