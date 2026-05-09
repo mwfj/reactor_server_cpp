@@ -48,9 +48,9 @@ struct Http2Config {
 // Field classification (see operator==/LiveEqual + ConfigLoader::ValidateHotReloadable):
 //   Restart-only: enabled, prefer  (topology — affects ALPN list / pool layout)
 //   Live:         max_concurrent_streams_pref, initial_window_size,
-//                 max_frame_size, header_table_size, ping_idle_sec,
-//                 ping_timeout_sec, goaway_drain_timeout_sec,
-//                 saturation_open_pct
+//                 max_frame_size, header_table_size, max_header_list_size,
+//                 ping_idle_sec, ping_timeout_sec,
+//                 goaway_drain_timeout_sec, saturation_open_pct
 struct Http2UpstreamConfig {
     bool enabled = false;
     std::string prefer = "auto";                 // "auto" | "always" | "never"
@@ -58,6 +58,7 @@ struct Http2UpstreamConfig {
     uint32_t initial_window_size = 1048576;      // per-stream initial window (1 MB)
     uint32_t max_frame_size = 16384;             // RFC 9113 default
     uint32_t header_table_size = 4096;           // HPACK dynamic table
+    uint32_t max_header_list_size = 65536;       // peer header block cap (64 KB)
     int ping_idle_sec = 60;                      // emit PING after this idle window
     int ping_timeout_sec = 10;                   // close conn if no PONG within this
     int goaway_drain_timeout_sec = 30;           // bound on graceful drain
@@ -70,6 +71,7 @@ struct Http2UpstreamConfig {
                initial_window_size == o.initial_window_size &&
                max_frame_size == o.max_frame_size &&
                header_table_size == o.header_table_size &&
+               max_header_list_size == o.max_header_list_size &&
                ping_idle_sec == o.ping_idle_sec &&
                ping_timeout_sec == o.ping_timeout_sec &&
                goaway_drain_timeout_sec == o.goaway_drain_timeout_sec &&
@@ -401,16 +403,6 @@ struct ServerConfig {
     //
     // 0 = immediate (skip waits, force-close); negative rejected by Validate.
     int shutdown_drain_timeout_sec = 30;
-    // RESERVED for a future per-partition H2 apply futures-barrier in
-    // HttpServer::Reload. The current `CommitHttp2Snapshots` path is
-    // synchronous (atomic-store of the staged snapshot per live
-    // partition) and does NOT consume this knob — operators tuning it
-    // today get silent no-op. Field is parsed / validated / serialized /
-    // documented so a future barrier-based commit can adopt it without
-    // breaking existing config files. TODO: wire into the per-partition
-    // EnQueue + std::future barrier path once that lands.
-    // Validated to [1, 60] at load time.
-    int http2_reload_barrier_timeout_sec = 5;
     Http2Config http2;
     std::vector<UpstreamConfig> upstreams;
     RateLimitConfig rate_limit;

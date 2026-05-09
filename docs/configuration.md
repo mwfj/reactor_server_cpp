@@ -291,6 +291,7 @@ The proxy engine can dispatch outbound requests over multiplexed HTTP/2 instead 
                 "initial_window_size": 1048576,
                 "max_frame_size": 16384,
                 "header_table_size": 4096,
+                "max_header_list_size": 65536,
                 "ping_idle_sec": 60,
                 "ping_timeout_sec": 10,
                 "goaway_drain_timeout_sec": 30,
@@ -311,6 +312,7 @@ The proxy engine can dispatch outbound requests over multiplexed HTTP/2 instead 
 | `initial_window_size` | 1048576 | yes | Per-stream initial flow-control window (bytes) |
 | `max_frame_size` | 16384 | yes | Max DATA frame size advertised in SETTINGS (RFC 9113 range: 16384–16777215) |
 | `header_table_size` | 4096 | yes | HPACK dynamic table size (0 disables) |
+| `max_header_list_size` | 65536 | yes | Cap on the upstream's HEADERS+CONTINUATION block (bytes). Advertised in SETTINGS; nghttp2 enforces. Raise for upstreams that emit large trailer-only metadata (e.g. some gRPC servers). |
 | `ping_idle_sec` | 60 | yes | Send a PING after this many seconds of inactivity (0 disables) |
 | `ping_timeout_sec` | 10 | yes | Close the H2 connection if a PING goes unanswered for this long (0 disables) |
 | `goaway_drain_timeout_sec` | 30 | yes | Bound on how long to wait for in-flight streams after GOAWAY |
@@ -319,8 +321,6 @@ The proxy engine can dispatch outbound requests over multiplexed HTTP/2 instead 
 **TLS requirement:** `http2.enabled = true` requires `tls.enabled = true` (no h2c support). `http2.prefer = "always"` additionally rejects at config-load if TLS is disabled.
 
 **Reload semantics:** The non-restart fields above can be edited via SIGHUP and take effect on **new** H2 connections. Existing multiplexed sessions keep the snapshot they were constructed with — RFC 9113 doesn't cleanly support mid-session SETTINGS renegotiation. Operator changes propagate within a few seconds depending on connection turnover.
-
-**`http2_reload_barrier_timeout_sec`** (top-level config, default 5): RESERVED for a future per-partition H2 apply futures-barrier. The current `CommitHttp2Snapshots` reload path is synchronous (atomic-store of the staged snapshot per live partition), so this value is **not consulted at runtime today** — operators tuning it get a silent no-op until the barrier path lands. Validated in 1–60 so existing config files keep validating once the field is wired.
 
 For the operator runbook (failure modes, troubleshooting, monitoring), see [docs/http2_upstream.md](http2_upstream.md).
 

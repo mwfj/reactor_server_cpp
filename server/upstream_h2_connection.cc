@@ -249,6 +249,14 @@ UpstreamH2Connection::~UpstreamH2Connection() {
         }
     }
     if (session_) {
+        // Defense-in-depth: callers may destroy with active streams (a
+        // future evict+replace path, a unit test, etc.); FailAllStreams
+        // prevents sink leak. MarkDead first to mirror every other
+        // call site's invariant (UPSTREAM_PROXY.md: "After any
+        // FailAllStreams call site, the connection MUST be marked dead").
+        MarkDead();
+        FailAllStreams(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                       "h2 session destroyed");
         // Best-effort polite shutdown. Failure is non-fatal — the
         // transport will be torn down regardless when the lease ends.
         nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
@@ -674,8 +682,13 @@ int32_t UpstreamH2Connection::SubmitRequest(
     lower_names.reserve(headers.size());
     for (const auto& kv : headers) {
         std::string lower = kv.first;
-        std::transform(lower.begin(), lower.end(), lower.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+        // RFC 9113 §8.2 mandates ASCII-lowercase header names. std::tolower
+        // is locale-dependent (e.g. Turkish locale would lowercase 'I' to
+        // 'ı', producing a non-ASCII byte sequence that nghttp2 rejects).
+        // The explicit branch is locale-independent and faster.
+        for (char& c : lower) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c | 0x20);
+        }
         lower_names.push_back(std::move(lower));
     }
 

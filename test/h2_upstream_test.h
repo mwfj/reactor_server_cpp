@@ -780,24 +780,26 @@ void TestApplyNullClearsSnapshot() {
 
 // A12 — BuildSettingsArray values
 void TestBuildSettingsArray() {
-    std::cout << "\n[TEST] H2Upstream A12: BuildSettingsArray produces correct 4-entry vector..." << std::endl;
+    std::cout << "\n[TEST] H2Upstream A12: BuildSettingsArray produces correct 5-entry vector..." << std::endl;
     try {
         Http2UpstreamConfig cfg;
-        cfg.initial_window_size = 131072;
-        cfg.max_frame_size      = 32768;
-        cfg.header_table_size   = 8192;
+        cfg.initial_window_size   = 131072;
+        cfg.max_frame_size        = 32768;
+        cfg.header_table_size     = 8192;
+        cfg.max_header_list_size  = 32768;
 
         auto settings = UPSTREAM_H2_SETTINGS::BuildSettingsArray(cfg);
 
         bool pass = true;
         std::string err;
 
-        if (settings.size() != 4) { pass = false; err += "expected 4 entries; "; }
+        if (settings.size() != 5) { pass = false; err += "expected 5 entries; "; }
 
-        bool found_iws  = false;
-        bool found_mfs  = false;
-        bool found_hts  = false;
-        bool found_push = false;
+        bool found_iws   = false;
+        bool found_mfs   = false;
+        bool found_hts   = false;
+        bool found_mhls  = false;
+        bool found_push  = false;
 
         for (const auto& s : settings) {
             if (s.settings_id == NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE) {
@@ -809,21 +811,25 @@ void TestBuildSettingsArray() {
             } else if (s.settings_id == NGHTTP2_SETTINGS_HEADER_TABLE_SIZE) {
                 found_hts = true;
                 if (s.value != 8192) { pass = false; err += "header_table_size mismatch; "; }
+            } else if (s.settings_id == NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE) {
+                found_mhls = true;
+                if (s.value != 32768) { pass = false; err += "max_header_list_size mismatch; "; }
             } else if (s.settings_id == NGHTTP2_SETTINGS_ENABLE_PUSH) {
                 found_push = true;
                 if (s.value != 0) { pass = false; err += "ENABLE_PUSH should be 0; "; }
             }
         }
 
-        if (!found_iws)  { pass = false; err += "missing INITIAL_WINDOW_SIZE; "; }
-        if (!found_mfs)  { pass = false; err += "missing MAX_FRAME_SIZE; "; }
-        if (!found_hts)  { pass = false; err += "missing HEADER_TABLE_SIZE; "; }
-        if (!found_push) { pass = false; err += "missing ENABLE_PUSH; "; }
+        if (!found_iws)   { pass = false; err += "missing INITIAL_WINDOW_SIZE; "; }
+        if (!found_mfs)   { pass = false; err += "missing MAX_FRAME_SIZE; "; }
+        if (!found_hts)   { pass = false; err += "missing HEADER_TABLE_SIZE; "; }
+        if (!found_mhls)  { pass = false; err += "missing MAX_HEADER_LIST_SIZE; "; }
+        if (!found_push)  { pass = false; err += "missing ENABLE_PUSH; "; }
 
-        TestFramework::RecordTest("H2Upstream A12: BuildSettingsArray produces correct 4-entry vector",
+        TestFramework::RecordTest("H2Upstream A12: BuildSettingsArray produces correct 5-entry vector",
                                    pass, err);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("H2Upstream A12: BuildSettingsArray produces correct 4-entry vector",
+        TestFramework::RecordTest("H2Upstream A12: BuildSettingsArray produces correct 5-entry vector",
                                    false, e.what());
     }
 }
@@ -1617,6 +1623,10 @@ void TestB10HandleBytesDispatchesValidStatus() {
         cfg->ping_timeout_sec = 0;
         cfg->goaway_drain_timeout_sec = 0;
 
+        // sink/codec declared before conn so they outlive ~UpstreamH2Connection's
+        // defensive FailAllStreams (sinks notified at dtor time).
+        UpstreamH2Codec codec;
+        RecordingSink sink;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
@@ -1624,10 +1634,6 @@ void TestB10HandleBytesDispatchesValidStatus() {
                 false, "Init failed");
             return;
         }
-        // Submit a request so stream 1 is registered; the outbound HEADERS
-        // are silently drained by FlushSend (null transport).
-        UpstreamH2Codec codec;
-        RecordingSink sink;
         int32_t sid = conn.SubmitRequest(
             "GET", "http", "example.com", "/", {}, "", &codec, &sink);
         if (sid != 1) {
@@ -1672,6 +1678,9 @@ void TestB11HandleBytesRejectsInvalidStatus() {
         cfg->ping_timeout_sec = 0;
         cfg->goaway_drain_timeout_sec = 0;
 
+        // sink/codec must outlive conn (~UpstreamH2Connection FailAllStreams).
+        UpstreamH2Codec codec;
+        RecordingSink sink;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
@@ -1679,8 +1688,6 @@ void TestB11HandleBytesRejectsInvalidStatus() {
                 false, "Init failed");
             return;
         }
-        UpstreamH2Codec codec;
-        RecordingSink sink;
         int32_t sid = conn.SubmitRequest(
             "GET", "http", "example.com", "/", {}, "", &codec, &sink);
         if (sid != 1) {
@@ -1729,6 +1736,9 @@ void TestB12TickGoawayDrainTimeout() {
         cfg->ping_timeout_sec = 0;
         cfg->goaway_drain_timeout_sec = 2;
 
+        // sink/codec must outlive conn (~UpstreamH2Connection FailAllStreams).
+        UpstreamH2Codec codec;
+        RecordingSink sink;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
@@ -1736,8 +1746,6 @@ void TestB12TickGoawayDrainTimeout() {
                 false, "Init failed");
             return;
         }
-        UpstreamH2Codec codec;
-        RecordingSink sink;
         int32_t sid = conn.SubmitRequest(
             "GET", "http", "example.com", "/", {}, "", &codec, &sink);
         if (sid != 1) {
@@ -1799,6 +1807,9 @@ void TestB12bGoawayFailsStreamsAbovePeerLastId() {
         cfg->enabled = true;
         cfg->max_concurrent_streams_pref = 10;
 
+        // sinks/codecs must outlive conn (~UpstreamH2Connection FailAllStreams).
+        UpstreamH2Codec codec_a, codec_b;
+        RecordingSink sink_a, sink_b;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
@@ -1806,9 +1817,6 @@ void TestB12bGoawayFailsStreamsAbovePeerLastId() {
                 false, "Init failed");
             return;
         }
-
-        UpstreamH2Codec codec_a, codec_b;
-        RecordingSink sink_a, sink_b;
         int32_t sid_a = conn.SubmitRequest(
             "GET", "http", "example.com", "/a", {}, "", &codec_a, &sink_a);
         int32_t sid_b = conn.SubmitRequest(
@@ -2038,8 +2046,9 @@ void TestC3StreamsEmptyAfterFailAll() {
         cfg->ping_timeout_sec = 0;
         cfg->goaway_drain_timeout_sec = 0;
 
-        UpstreamH2Connection conn(nullptr, cfg);
+        // sink must outlive conn (~UpstreamH2Connection FailAllStreams).
         RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
 
         // FailAllStreams on an empty table must be a no-op
         conn.FailAllStreams(-1, "test");
@@ -2190,6 +2199,7 @@ void TestConfigParseH2Block() {
                     "initial_window_size": 1048576,
                     "max_frame_size": 16384,
                     "header_table_size": 4096,
+                    "max_header_list_size": 32768,
                     "ping_idle_sec": 30,
                     "ping_timeout_sec": 5,
                     "goaway_drain_timeout_sec": 20,
@@ -2209,6 +2219,7 @@ void TestConfigParseH2Block() {
             if (h2.initial_window_size != 1048576)     { pass = false; err += "initial_window; "; }
             if (h2.max_frame_size != 16384)            { pass = false; err += "max_frame; "; }
             if (h2.header_table_size != 4096)          { pass = false; err += "header_table; "; }
+            if (h2.max_header_list_size != 32768)      { pass = false; err += "max_header_list; "; }
             if (h2.ping_idle_sec != 30)                { pass = false; err += "ping_idle; "; }
             if (h2.ping_timeout_sec != 5)              { pass = false; err += "ping_timeout; "; }
             if (h2.goaway_drain_timeout_sec != 20)     { pass = false; err += "goaway_drain; "; }
@@ -2543,10 +2554,12 @@ void TestSubmitRequestNullSession() {
         auto cfg = std::make_shared<Http2UpstreamConfig>();
         cfg->enabled = true;
         cfg->max_concurrent_streams_pref = 10;
-        UpstreamH2Connection conn(nullptr, cfg);
 
+        // sink/codec must outlive conn (~UpstreamH2Connection FailAllStreams).
         RecordingSink sink;
         UpstreamH2Codec codec;
+        UpstreamH2Connection conn(nullptr, cfg);
+
         int32_t sid = conn.SubmitRequest(
             "GET", "http", "localhost", "/", {}, "", &codec, &sink);
         bool pass = (sid == -1);
@@ -2638,9 +2651,22 @@ void TestBuildSettingsArrayDefaults() {
     try {
         Http2UpstreamConfig cfg;  // all defaults
         auto settings = UPSTREAM_H2_SETTINGS::BuildSettingsArray(cfg);
-        bool pass = (settings.size() == 4);
+        bool pass = (settings.size() == 5);
         std::string err;
-        if (!pass) err = "expected 4 settings entries";
+        if (!pass) err = "expected 5 settings entries";
+        // Confirm MAX_HEADER_LIST_SIZE is present at the default value.
+        bool found_mhls = false;
+        for (const auto& s : settings) {
+            if (s.settings_id == NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE) {
+                found_mhls = true;
+                if (s.value != 65536) {
+                    pass = false;
+                    err += "default max_header_list_size != 65536; ";
+                }
+                break;
+            }
+        }
+        if (!found_mhls) { pass = false; err += "missing MAX_HEADER_LIST_SIZE; "; }
         TestFramework::RecordTest("H2Upstream BuildSettingsArray: default config values",
                                    pass, err);
     } catch (const std::exception& e) {

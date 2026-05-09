@@ -16,13 +16,17 @@ inline std::vector<nghttp2_settings_entry> BuildSettingsArray(
     const Http2UpstreamConfig& cfg)
 {
     std::vector<nghttp2_settings_entry> out;
-    out.reserve(4);
+    out.reserve(5);
     out.push_back({NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
                     cfg.initial_window_size});
     out.push_back({NGHTTP2_SETTINGS_MAX_FRAME_SIZE,
                     cfg.max_frame_size});
     out.push_back({NGHTTP2_SETTINGS_HEADER_TABLE_SIZE,
                     cfg.header_table_size});
+    // nghttp2 defaults this to UINT32_MAX (unbounded). Explicit cap
+    // bounds peer header blocks (RFC 9113 §6.5.2).
+    out.push_back({NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,
+                    cfg.max_header_list_size});
     out.push_back({NGHTTP2_SETTINGS_ENABLE_PUSH, 0});
     return out;
 }

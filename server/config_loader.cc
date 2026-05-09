@@ -572,9 +572,6 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
     config.shutdown_drain_timeout_sec = ParseStrictInt(
         j, "shutdown_drain_timeout_sec",
         config.shutdown_drain_timeout_sec, "");
-    config.http2_reload_barrier_timeout_sec = ParseStrictInt(
-        j, "http2_reload_barrier_timeout_sec",
-        config.http2_reload_barrier_timeout_sec, "");
 
     // TLS section
     if (j.contains("tls")) {
@@ -893,6 +890,13 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                             "upstream http2.header_table_size must be a non-negative integer");
                     upstream.http2.header_table_size =
                         h2["header_table_size"].get<uint32_t>();
+                }
+                if (h2.contains("max_header_list_size")) {
+                    if (!h2["max_header_list_size"].is_number_unsigned())
+                        throw std::runtime_error(
+                            "upstream http2.max_header_list_size must be a non-negative integer");
+                    upstream.http2.max_header_list_size =
+                        h2["max_header_list_size"].get<uint32_t>();
                 }
                 upstream.http2.ping_idle_sec = ParseStrictInt(
                     h2, "ping_idle_sec", upstream.http2.ping_idle_sec,
@@ -2005,6 +2009,11 @@ void ConfigLoader::ValidateHotReloadable(
                     idx + " ('" + u.name +
                     "'): http2.max_frame_size must be 16384 to 16777215");
             }
+            if (h2.max_header_list_size < 1) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.max_header_list_size must be >= 1");
+            }
             if (h2.ping_idle_sec < 0) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
@@ -2488,26 +2497,6 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             " (must be 0-300)");
     }
 
-    // http2_reload_barrier_timeout_sec — RESERVED for a future per-
-    // partition H2 apply futures-barrier; CURRENTLY UNUSED at runtime
-    // (CommitHttp2Snapshots is synchronous). Validated here so config
-    // files keep validating once the barrier path lands. Must allow at
-    // least 1s; values above 60 are accepted but warned.
-    if (config.http2_reload_barrier_timeout_sec < 1) {
-        throw std::invalid_argument(
-            "Invalid http2_reload_barrier_timeout_sec: " +
-            std::to_string(config.http2_reload_barrier_timeout_sec) +
-            " (must be >= 1)");
-    }
-    if (config.http2_reload_barrier_timeout_sec > 60) {
-        logging::Get()->warn(
-            "http2_reload_barrier_timeout_sec={} exceeds documented soft "
-            "cap of 60s — note: this knob is RESERVED and currently has "
-            "NO RUNTIME EFFECT (CommitHttp2Snapshots is synchronous); "
-            "the soft cap will apply once the futures-barrier path lands",
-            config.http2_reload_barrier_timeout_sec);
-    }
-
     if (config.request_timeout_sec < 0) {
         throw std::invalid_argument(
             "Invalid request_timeout_sec: " + std::to_string(config.request_timeout_sec) +
@@ -2959,6 +2948,11 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                 // header_table_size: 32-bit unsigned per nghttp2.
                 // 0 disables HPACK dynamic table — accepted. Upper
                 // bound is implicit in the uint32_t type.
+                if (h2.max_header_list_size < 1) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.max_header_list_size must be >= 1");
+                }
                 if (h2.ping_idle_sec < 0) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
@@ -3864,8 +3858,6 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
     j["max_ws_message_size"]= config.max_ws_message_size;
     j["request_timeout_sec"]= config.request_timeout_sec;
     j["shutdown_drain_timeout_sec"] = config.shutdown_drain_timeout_sec;
-    j["http2_reload_barrier_timeout_sec"] =
-        config.http2_reload_barrier_timeout_sec;
     j["tls"]["enabled"]     = config.tls.enabled;
     j["tls"]["cert_file"]   = config.tls.cert_file;
     j["tls"]["key_file"]    = config.tls.key_file;
@@ -3989,6 +3981,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             hj["initial_window_size"] = u.http2.initial_window_size;
             hj["max_frame_size"] = u.http2.max_frame_size;
             hj["header_table_size"] = u.http2.header_table_size;
+            hj["max_header_list_size"] = u.http2.max_header_list_size;
             hj["ping_idle_sec"] = u.http2.ping_idle_sec;
             hj["ping_timeout_sec"] = u.http2.ping_timeout_sec;
             hj["goaway_drain_timeout_sec"] = u.http2.goaway_drain_timeout_sec;

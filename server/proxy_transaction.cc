@@ -1338,6 +1338,10 @@ void ProxyTransaction::OnComplete() {
     // OnResponseComplete()` after each parse. Drive the same delivery
     // flow here for the H2 path.
     if (h2_path_) {
+        // Skip if a synchronous retry was already scheduled from
+        // OnHeaders — would double-fire OnResponseComplete and race
+        // with the in-flight retry.
+        if (retry_from_headers_pending_) return;
         OnResponseComplete();
     }
 }
@@ -2346,12 +2350,12 @@ void ProxyTransaction::HandleStreamSendResult(
 
     // H2 path: the transport is shared across every multiplexed stream,
     // so transport-level IncReadDisable would pause sibling streams when
-    // this stream's downstream is slow. The peer's stream-level window
-    // (cfg_->initial_window_size, default 1 MB) bounds how much the
-    // upstream can buffer for this stream without WINDOW_UPDATE, which
-    // is sufficient minimal-viable backpressure. Per-stream
-    // flow-control pause via nghttp2_session_consume_stream is a future
-    // refinement.
+    // this stream's downstream is slow. nghttp2's auto-WINDOW_UPDATE is
+    // on by default in this code path, so the peer's stream-level window
+    // tracks the auto-update cadence (~initial_window_size in practice)
+    // plus MAX_FRAME_SIZE rather than a hard cap. Disabling auto-update
+    // and pausing per-stream consumption via nghttp2_session_consume_stream
+    // is the future refinement that would give a strict bound.
     if (h2_path_) {
         return;
     }
