@@ -1,10 +1,9 @@
 #pragma once
 
 #include "common.h"
-#include "upstream/upstream_response.h"
 #include "upstream/upstream_response_sink.h"
 #include "upstream/upstream_callbacks.h"
-// <cstdint>, <string>, <memory> provided by common.h (via upstream_response.h)
+// <cstdint>, <string>, <memory> provided by common.h.
 
 // Heap-held source that nghttp2 reads from when streaming a request body.
 // Owned by the UpstreamH2Stream that submitted the request — the data
@@ -22,7 +21,6 @@ struct UpstreamH2BodySource {
 // public-fields layout of UpstreamHttpCodec for the same reason).
 struct UpstreamH2Stream {
     int32_t stream_id = -1;
-    UpstreamResponse response;
     // Snapshot of the response head delivered to OnHeaders. Built from
     // the per-frame :status / header rows so the sink contract receives
     // a well-formed UpstreamResponseHead even though the parser-driven

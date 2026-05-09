@@ -2093,10 +2093,16 @@ void TestC1InReceiveDataGuard() {
             pass = false;
             err += "in_receive_data_ leaked after HandleBytes returned; ";
         }
-        // sid_a was failed (above last_stream_id); sid_b should have been
-        // RST'd by the reentrant ResetStream — sink->stream entry for b
-        // should be detached (sink=nullptr) and stream count <= 1 before
-        // the eventual on_stream_close fires.
+        // sid_b's sink was detached by sink_a's reentrant ResetStream
+        // BEFORE OnGoawayReceived's outer loop iterates to sid_b — so its
+        // OnError fan-out short-circuits on the null sink check. This
+        // confirms the sink-detach race is closed: a regression that
+        // failed to detach in time would surface here as error_calls=1.
+        if (sink_b.error_calls != 0) {
+            pass = false;
+            err += "sink_b.error_calls=" + std::to_string(sink_b.error_calls) +
+                   " expected 0 (sink should have been detached before fan-out); ";
+        }
         TestFramework::RecordTest(
             "H2Upstream C1: in_receive_data_ guard blocks reentrant FlushSend",
             pass, err);

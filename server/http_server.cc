@@ -1105,8 +1105,7 @@ void HttpServer::MarkServerReady() {
         // at the timer scan interval. If any upstream timeout is shorter
         // than the current scan interval, narrow the interval so timeouts
         // fire on time.
-        int min_upstream_sec =
-            UpstreamManager::ComputeMinUpstreamCadenceSec(upstream_configs_);
+        int min_upstream_sec = UpstreamManager::ComputeMinUpstreamCadenceSec(upstream_configs_);
         if (min_upstream_sec < std::numeric_limits<int>::max()) {
             int current_interval = net_server_.GetTimerInterval();
             if (min_upstream_sec < current_interval) {
@@ -5920,8 +5919,8 @@ bool HttpServer::Reload(ServerConfig new_config) {
                 u.http2 = *it->second;
             }
         }
-        int upstream_min =
-            UpstreamManager::ComputeMinUpstreamCadenceSec(cadence_view);
+        int upstream_min = UpstreamManager::ComputeMinUpstreamCadenceSec(cadence_view);
+        
         new_interval = std::min(new_interval, upstream_min);
         net_server_.SetTimerInterval(new_interval);
     }

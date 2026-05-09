@@ -34,8 +34,7 @@ public:
 
     // Wire the response sink. The sink pointer must outlive Parse() /
     // Finish() calls — owning ProxyTransaction lifetime is the contract.
-    virtual void SetSink(
-        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink) = 0;
+    virtual void SetSink(UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink) = 0;
 
     // Feed raw bytes from the upstream transport. Returns bytes consumed.
     // Callers check IsPaused() / HasError() / GetResponse().complete after.

@@ -23,8 +23,7 @@ public:
 
     void Reset() override;
     void SetRequestMethod(const std::string& method) override;
-    void SetSink(
-        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink) override;
+    void SetSink(UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink) override;
     size_t Parse(const char* data, size_t len) override;
     bool Finish() override;
     void PauseParsing() override;

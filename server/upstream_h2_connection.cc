@@ -88,7 +88,6 @@ int OnBeginHeadersCallback(nghttp2_session* /*session*/,
         !stream->head_dispatched && stream->saw_1xx_interim) {
         stream->response_head.headers.clear();
         stream->response_head.status_code = 0;
-        stream->response.status_code = 0;
     }
     return 0;
 }
@@ -154,7 +153,6 @@ int OnHeaderCallback(nghttp2_session* /*session*/, const nghttp2_frame* frame,
                 return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
             }
             stream->response_head.status_code = s;
-            stream->response.status_code = s;
         }
         // Other pseudo-headers (request pseudos in trailers are illegal,
         // unknown response pseudos are reserved) — drop silently.
@@ -450,6 +448,13 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
     for (auto& kv : streams_) {
         if (kv.first > last_stream_id) to_fail.push_back(kv.first);
     }
+    // Fail in ascending stream_id order (= oldest first). streams_ is
+    // unordered_map so the iteration above produces an unspecified order;
+    // sorting gives deterministic fan-out so a sink's reentrant
+    // ResetStream can reliably detach a later-numbered sibling before its
+    // turn comes — matches the per-stream lifecycle invariant the
+    // sink-detach race depends on.
+    std::sort(to_fail.begin(), to_fail.end());
     for (int32_t sid : to_fail) {
         auto it = streams_.find(sid);
         if (it == streams_.end()) continue;
@@ -525,7 +530,6 @@ void UpstreamH2Connection::OnHeadersComplete(int32_t stream_id,
     auto& stream = it->second;
     if (!stream || stream->head_dispatched || !stream->sink) return;
     stream->head_dispatched = true;
-    stream->response.headers_complete = true;
 
     // H2 connections are multiplexed — the transport is never returned to
     // the H1 idle pool, so keep_alive=true prevents poison_connection_
@@ -645,8 +649,8 @@ void UpstreamH2Connection::ResetStream(int32_t stream_id) {
     // OnStreamClose does not fire OnError on a transaction that has
     // already moved on (e.g. a retry in progress).
     if (it->second) it->second->sink = nullptr;
-    int rv = nghttp2_submit_rst_stream(
-        session_, NGHTTP2_FLAG_NONE, stream_id, NGHTTP2_CANCEL);
+    int rv = nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE, stream_id, NGHTTP2_CANCEL);
+    
     if (rv != 0) {
         logging::Get()->warn(
             "UpstreamH2Connection: submit_rst_stream sid={} rv={}",
