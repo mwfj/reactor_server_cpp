@@ -390,7 +390,6 @@ When adding a suite to `test/run_test.cc::RunAllTest()`:
 4. If it's stress-shaped, add it to `nightly-stress.yml` (invoked via an explicit `./test_runner <flag>` step). If the suite has heavy variants you also want to gate out of the per-PR no-arg invocation, mirror the existing stress pattern: gate the call site in `RunAllTest()` on `getenv("GITHUB_ACTIONS")` so local runs include it but the GitHub Actions PR matrix skips it.
 5. If it's memory-safety-flavored and not timing-sensitive, add it to the loop in `weekly-valgrind.yml`.
 
-Internal contributors: see `.claude/rules/DEVELOPMENT_RULES.md` "CI workflow maintenance" for the full pre-PR audit checklist.
 
 ## Thread Pool Tests
 

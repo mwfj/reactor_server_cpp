@@ -1,7 +1,9 @@
 #pragma once
 
 #include "common.h"
+#include "upstream/upstream_codec.h"
 #include "upstream/upstream_http_codec.h"
+#include "upstream/upstream_h2_codec.h"
 #include "upstream/upstream_response_sink.h"
 #include "upstream/upstream_lease.h"
 #include "upstream/header_rewriter.h"
@@ -19,6 +21,7 @@
 class UpstreamManager;
 class ConnectionHandler;
 class Dispatcher;
+class UpstreamH2Connection;
 
 namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerSlice;
@@ -184,6 +187,10 @@ private:
     // Rewritten headers and serialized request (cached for retry)
     std::map<std::string, std::string> rewritten_headers_;
     std::string serialized_request_;
+    // Computed upstream path (after strip_prefix / catch-all override).
+    // Cached so DispatchH2 builds the H2 :path pseudo-header without
+    // recomputing the prefix logic that lives in Start().
+    std::string upstream_path_;
 
     // Captured by value at construction from client_request.auth so the
     // overlay snapshot outlives any retry cycle. HttpRequest is invalidated
@@ -212,7 +219,14 @@ private:
 
     // Upstream connection state (per attempt)
     UpstreamLease lease_;
-    UpstreamHttpCodec codec_;
+    // Codec interface — H1 path always constructs UpstreamHttpCodec; H2
+    // path constructs UpstreamH2Codec. Single field through the abstract
+    // base lets ProxyTransaction dispatch parsing without protocol-
+    // specific downcasts. Protocol-specific extensions (e.g.,
+    // UpstreamH2Codec::SubmitH2Request) reach through static_cast at the
+    // OnCheckoutReady branch that constructed
+    // the matching concrete type.
+    std::unique_ptr<UpstreamCodec> codec_;
 
     // Connection poisoning flag: set when the upstream connection must NOT be
     // returned to the idle pool. Reasons include:
@@ -268,6 +282,29 @@ private:
     // token was consumed, so no ReleaseRetry is required.
     bool retry_token_held_ = false;
 
+    // H2 dispatch state. `h2_path_` flips true once DispatchH2 has
+    // successfully submitted a stream; cleanup paths gate H1-specific
+    // teardown on `!h2_path_`. The weak_ptr lets a mid-flight Cleanup
+    // / Cancel issue RST_STREAM if the H2 session is still alive.
+    std::weak_ptr<UpstreamH2Connection> h2_conn_weak_;
+    int32_t h2_stream_id_ = -1;
+    bool h2_path_ = false;
+
+    // H2 response timeout uses a dispatcher-scheduled task instead of a
+    // transport-level deadline: the transport is shared across every
+    // stream on the multiplexed session, so SetDeadline would tear down
+    // sibling streams when one stalls. The generation counter
+    // invalidates a queued task when ClearResponseTimeout fires before
+    // the task runs.
+    //
+    // dispatcher-thread-only: every reader and writer of this field
+    // (ArmResponseTimeout, ClearResponseTimeout, the EnQueueDelayed
+    // closure) runs on `dispatcher_`'s loop thread. Plain `uint64_t`
+    // is sufficient. If the H2 timeout path ever moves to a centralized
+    // timer pool or a different dispatcher, this field becomes a race
+    // and must promote to `std::atomic<uint64_t>` with relaxed ordering.
+    uint64_t h2_response_timeout_generation_ = 0;
+
     // Snapshot held for the link site in Start(). The shutdown kill
     // loop sets kill_for_shutdown_ via MarkKilledForShutdown(); terminal
     // callbacks read it before Span::End so shutdown wins every race
@@ -319,13 +356,41 @@ private:
     void ActivateAttemptTracking();
     void EnsureCheckoutCancelToken();
     void StartCheckoutAsync();
+    // Pre-checkout fast path for H2 reuse — see implementation comment.
+    // Returns true if the transaction was dispatched through an
+    // existing multiplexed H2 session (caller must NOT then call
+    // StartCheckoutAsync); false if no existing session is reusable.
+    bool TryDispatchExistingH2Session();
     void OnCheckoutReady(UpstreamLease lease);
     void OnCheckoutError(int error_code);
+
+    // H1 dispatch: wires transport callbacks on the lease's transport
+    // and serializes the request. Reads `lease_` (already moved in by
+    // OnCheckoutReady) and assumes the transport is ready to write.
+    void DispatchH1();
+
+    // H2 dispatch: routes the request through the partition's
+    // multiplexed H2 session. Reads `lease_`; on a fresh checkout the
+    // lease is donated to the H2 connection (transport stays out of
+    // the idle pool until every stream exits). On reuse of an existing
+    // session, the lease is released back to the pool immediately.
+    // No cfg parameter — AcquireH2Connection re-reads the partition's
+    // live snapshot via LoadHttp2ConfigSnapshot(), which is always the
+    // freshest published value (a SIGHUP between the handshake-defer
+    // capture site and the actual dispatch can publish a new snapshot).
+    void DispatchH2();
+
     void SendUpstreamRequest();
     void OnUpstreamData(std::shared_ptr<ConnectionHandler> conn, std::string& data);
     void OnUpstreamWriteComplete(std::shared_ptr<ConnectionHandler> conn);
     void OnResponseComplete();
     void MaybeRetry(RetryPolicy::RetryCondition condition);
+    // Terminal-failure delivery extracted from OnError so MaybeRetry's
+    // retry-not-allowed fallback can avoid bouncing through OnError's
+    // H2 retry escape hatch (would otherwise loop). Caller-owned
+    // ReportBreakerOutcome inside; idempotent.
+    void DeliverTerminalError(int result_code,
+                              const std::string& log_message);
     void DeliverResponse(HttpResponse response);
     void Cleanup();
     void ReleaseAttemptAccounting();
@@ -381,13 +446,13 @@ private:
     // plain 503 for those codes if called generically.
     static HttpResponse MakeErrorResponse(int result_code);
 
-    // Emit the circuit-open response (design §12.1):
+    // Emit the circuit-open response:
     //   503 + Retry-After (seconds until slice->OpenUntil())
     //       + X-Circuit-Breaker: open
     //       + X-Upstream-Host: service:host:port
     HttpResponse MakeCircuitOpenResponse() const;
 
-    // Emit the retry-budget-exhausted response (design §12.2):
+    // Emit the retry-budget-exhausted response:
     //   503 + X-Retry-Budget-Exhausted: 1
     static HttpResponse MakeRetryBudgetResponse();
 

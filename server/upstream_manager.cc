@@ -12,8 +12,7 @@
 // documented — a 1100ms deadline rounded to 2s cadence would be
 // checked only every 2s, firing up to ~0.9s late. Promotes to int64_t
 // to avoid signed overflow on INT_MAX-range operator typos. Saturates
-// to INT_MAX and returns at least 1. Mirrors the helper in
-// http_server.cc — keep them in sync.
+// to INT_MAX and returns at least 1.
 static int CadenceSecFromMs(int ms) {
     if (ms <= 0) return 1;
     if (ms < 2000) return 1;
@@ -112,8 +111,20 @@ UpstreamManager::UpstreamManager(
                 }
                 // Default 1.2 is already set in TlsClientContext constructor
 
-                // Set ALPN for HTTP/1.1 (HTTP/2 upstream deferred)
-                tls_ctx->SetAlpnProtocols({"http/1.1"});
+                // ALPN advertisement matches the upstream's H2 prefer mode.
+                // When http2.enabled and prefer != "never" we offer "h2"
+                // first so peers that support both protocols pick H2;
+                // "http/1.1" stays in the list so the auto path can fall
+                // back when the peer is H1-only. With prefer=never (or
+                // http2.enabled=false) we keep the H1-only advertisement
+                // — sending "h2" but rejecting H2 framing would mislead
+                // the peer.
+                std::vector<std::string> alpn;
+                if (upstream.http2.enabled && upstream.http2.prefer != "never") {
+                    alpn.push_back("h2");
+                }
+                alpn.push_back("http/1.1");
+                tls_ctx->SetAlpnProtocols(alpn);
 
                 tls_contexts_[upstream.name] = tls_ctx;
                 logging::Get()->info("TLS client context created for upstream '{}'",
@@ -142,7 +153,7 @@ UpstreamManager::UpstreamManager(
         std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>
             resolved_endpoint = it->second;
 
-        // Effective SNI (§5.10). The rule has three tiers:
+        // Effective SNI selection rule. Three tiers:
         //   1. Explicit `tls.sni_hostname` wins (operator intent).
         //   2. Hostname `upstream.host` falls back — it is a verifiable
         //      identity and matches cert CN/SAN for the common
@@ -187,28 +198,9 @@ UpstreamManager::UpstreamManager(
 
     // Adjust dispatcher timer intervals for upstream timeout enforcement.
     // Without this, standalone dispatchers use their default interval (often
-    // 60s), making connect_timeout_ms / idle_timeout_sec / proxy
-    // response_timeout_ms fire tens of seconds late.
-    // HttpServer::MarkServerReady does this for production; this covers
-    // standalone UpstreamManager usage (see HttpServer::MarkServerReady
-    // for the mirrored logic).
-    int min_upstream_sec = std::numeric_limits<int>::max();
-    for (const auto& u : upstreams) {
-        int connect_sec = CadenceSecFromMs(u.pool.connect_timeout_ms);
-        min_upstream_sec = std::min(min_upstream_sec, connect_sec);
-        if (u.pool.idle_timeout_sec > 0) {
-            min_upstream_sec = std::min(min_upstream_sec, u.pool.idle_timeout_sec);
-        }
-        // Proxy response timeout: also drives timer scan cadence when
-        // ProxyTransaction::ArmResponseTimeout sets a deadline on the
-        // transport. Without folding this in, a configured
-        // proxy.response_timeout_ms can still fire at the default ~60s
-        // cadence instead of its configured budget.
-        if (u.proxy.response_timeout_ms > 0) {
-            int response_sec = CadenceSecFromMs(u.proxy.response_timeout_ms);
-            min_upstream_sec = std::min(min_upstream_sec, response_sec);
-        }
-    }
+    // 60s), making upstream-side timeouts fire tens of seconds late.
+    // HttpServer::MarkServerReady mirrors this for production.
+    int min_upstream_sec = ComputeMinUpstreamCadenceSec(upstreams);
     if (min_upstream_sec < std::numeric_limits<int>::max()) {
         for (auto& disp : dispatchers_) {
             // Only narrow the interval, never widen. The dispatcher may
@@ -410,5 +402,94 @@ void UpstreamManager::UpdateResolvedEndpoints(
         if (it == pools_.end()) continue;
         if (!new_ep) continue;
         it->second->UpdateResolvedEndpoint(new_ep);
+    }
+}
+
+std::optional<Http2UpstreamConfig>
+UpstreamManager::LookupStagedH2ForLivePartitionForTesting(
+    const std::string& upstream_name,
+    const std::vector<UpstreamConfig>& staged_upstreams) const
+{
+    if (pools_.find(upstream_name) == pools_.end()) {
+        return std::nullopt;
+    }
+    for (const auto& staged : staged_upstreams) {
+        if (staged.name == upstream_name) {
+            return staged.http2;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<UpstreamManager::LivePartitionRef>
+UpstreamManager::LivePartitions() const
+{
+    std::vector<LivePartitionRef> out;
+    for (const auto& [name, pool] : pools_) {
+        if (!pool) continue;
+        for (size_t i = 0; i < pool->partition_count(); ++i) {
+            PoolPartition* p = pool->GetPartition(i);
+            if (p) out.push_back({name, p});
+        }
+    }
+    return out;
+}
+
+int UpstreamManager::ComputeMinUpstreamCadenceSec(
+    const std::vector<UpstreamConfig>& upstreams)
+{
+    int m = std::numeric_limits<int>::max();
+    for (const auto& u : upstreams) {
+        m = std::min(m, CadenceSecFromMs(u.pool.connect_timeout_ms));
+        if (u.pool.idle_timeout_sec > 0) {
+            m = std::min(m, u.pool.idle_timeout_sec);
+        }
+        if (u.proxy.response_timeout_ms > 0) {
+            m = std::min(m, CadenceSecFromMs(u.proxy.response_timeout_ms));
+        }
+        m = std::min(m, u.http2.MinCadenceSec());
+    }
+    return m;
+}
+
+void UpstreamManager::CommitHttp2Snapshots(
+    const std::vector<UpstreamConfig>& upstreams)
+{
+    // Build staged map once (O(N)). LivePartitions can grow as K * P (K
+    // upstreams, P partitions) — a per-partition linear scan would make
+    // this O(K * P * N).
+    std::unordered_map<std::string, const Http2UpstreamConfig*> staged;
+    staged.reserve(upstreams.size());
+    for (const auto& u : upstreams) {
+        staged.emplace(u.name, &u.http2);
+    }
+    for (const auto& live : LivePartitions()) {
+        auto it = staged.find(live.upstream_name);
+        if (it == staged.end()) continue;  // missing → keep live snapshot
+        // Restart-only-field guard: `enabled` and `prefer` drive the
+        // ALPN list that was baked into the TLS client context at
+        // construction time. Live-publishing a snapshot whose restart-
+        // only fields disagree with the live ALPN advertisement creates
+        // an inconsistent runtime: the dispatch decision in
+        // `OnCheckoutReady` honors the new `enabled`/`prefer`, but the
+        // wire still sends what ALPN negotiated at startup. Result for
+        // false→true: H2 framing on an H1-negotiated connection (peer
+        // rejects). Result for true→false: H1 framing on an
+        // H2-negotiated connection (peer rejects). Skip the commit and
+        // log a warn so the operator sees that a restart is required;
+        // live-reloadable fields (windows, PING, drain, frame-size)
+        // remain on the previous snapshot until restart, matching the
+        // "unchanged enable state" contract.
+        auto live_snap = live.partition->LoadHttp2ConfigSnapshot();
+        if (live_snap && !live_snap->LiveEqual(*it->second)) {
+            logging::Get()->warn(
+                "UpstreamManager::CommitHttp2Snapshots: upstream={} has "
+                "restart-only H2 field change (enabled or prefer); keeping "
+                "live snapshot — restart required",
+                live.upstream_name);
+            continue;
+        }
+        live.partition->ApplyHttp2ConfigCommit(
+            std::make_shared<const Http2UpstreamConfig>(*it->second));
     }
 }

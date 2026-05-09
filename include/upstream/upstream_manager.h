@@ -6,6 +6,7 @@
 #include "config/server_config.h"
 #include "net/dns_resolver.h"
 #include <condition_variable>
+#include <optional>
 // <memory>, <unordered_map>, <atomic>, <mutex> provided by common.h
 
 class TlsClientContext;
@@ -145,6 +146,58 @@ public:
     // Called by HttpServer::Reload while holding reload_mtx_.
     void UpdateResolvedEndpoints(
         const NET_DNS_NAMESPACE::ResolvedMap& merged);
+
+    // Single-key staged-lookup helper. Production reload uses
+    // CommitHttp2Snapshots() which builds an O(N) name→config map once
+    // and applies in O(K+P); this single-key variant is retained for
+    // unit-test coverage of the lookup semantics (live-only narrow,
+    // missing-from-staged returns nullopt). Pure lookup — does not
+    // mutate partition state. Safe from any thread.
+    std::optional<Http2UpstreamConfig> LookupStagedH2ForLivePartitionForTesting(
+        const std::string& upstream_name,
+        const std::vector<UpstreamConfig>& staged_upstreams) const;
+
+    // Reload-time enumerator: pairs every live PoolPartition with its
+    // upstream service name. Pointers stay valid until UpstreamManager
+    // destruction (pools_ is built once at ctor and never modified).
+    struct LivePartitionRef {
+        std::string upstream_name;
+        PoolPartition* partition;
+    };
+    std::vector<LivePartitionRef> LivePartitions() const;
+
+    // Smallest cadence-relevant upstream timeout across all entries, or
+    // INT_MAX when no upstream contributes. Folds connect_timeout_ms,
+    // pool.idle_timeout_sec, proxy.response_timeout_ms, and the per-
+    // upstream H2 timer block (see Http2UpstreamConfig::MinCadenceSec).
+    // Used at the three dispatcher-cadence narrow sites (Initialize,
+    // HttpServer::MarkServerReady, HttpServer::Reload) — narrow only,
+    // never widen.
+    static int ComputeMinUpstreamCadenceSec(
+        const std::vector<UpstreamConfig>& upstreams);
+
+    // Per-upstream H2 snapshot commit pipeline. For each live partition,
+    // resolve the matching staged Http2UpstreamConfig and release-store
+    // it via PoolPartition::ApplyHttp2ConfigCommit. Live partitions
+    // missing from the staged set keep their existing snapshot
+    // (conservative narrow). Build the staged map once, then look up
+    // each partition by name in O(1). Safe to call from any thread —
+    // each partition's commit is an atomic_store on shared_ptr, and
+    // pools_ is build-once at ctor. Used by HttpServer::MarkServerReady
+    // for initial bootstrap and HttpServer::Reload for live propagation.
+    void CommitHttp2Snapshots(
+        const std::vector<UpstreamConfig>& upstreams);
+
+    // Read access to the per-upstream TLS client context. Returns null
+    // when the upstream is plaintext (no TLS) or when the name is
+    // unknown. Exposed for tests / diagnostics — production code uses
+    // PoolPartition's stored shared_ptr directly. Safe from any thread:
+    // tls_contexts_ is populated at construction and never mutated.
+    std::shared_ptr<TlsClientContext> GetTlsContextForUpstream(
+        const std::string& upstream_name) const {
+        auto it = tls_contexts_.find(upstream_name);
+        return it == tls_contexts_.end() ? nullptr : it->second;
+    }
 
     // Install a non-owning pointer to the server's CircuitBreakerManager.
     // Called once from HttpServer::MarkServerReady after both managers are

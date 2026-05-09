@@ -1,6 +1,8 @@
 #include "upstream/pool_partition.h"
 #include "upstream/upstream_lease.h"
 #include "upstream/upstream_connection.h"
+#include "upstream/upstream_h2_connection.h"
+#include "upstream/proxy_transaction.h"   // for RESULT_UPSTREAM_DISCONNECT
 #include "socket_handler.h"
 #include "tls/tls_client_context.h"
 #include "tls/tls_connection.h"
@@ -112,6 +114,17 @@ PoolPartition::~PoolPartition() {
     auto on_dispatcher = [this]() {
         // On dispatcher thread — single-threaded, no concurrent mutation.
         // Safe to walk containers and touch connection transports.
+        // Drop H2 sessions FIRST so their nghttp2_session destructors
+        // run before the underlying transports get their callbacks
+        // nulled (the H2 connection's lease destructor returns the
+        // transport to the pool and the pool walk below frees them).
+        // ~UpstreamH2Connection nulls its transport callbacks BEFORE
+        // running terminate_session + FlushSend, so a stray incoming-
+        // bytes event during the destruction window cannot reenter
+        // HandleBytes on a session about to be torn down. This is
+        // independent of SendRaw's was_stopped() drop — closes the
+        // door on a future SendRaw refactor that removes that check.
+        h2_table_.Clear();
         auto clear = [](auto& container) {
             for (auto& c : container) {
                 if (!c) continue;
@@ -502,6 +515,10 @@ void PoolPartition::EvictExpired() {
     PurgeExpiredWaitEntries();
     if (!alive_local->load(std::memory_order_acquire)) return;
 
+    // Periodic H2 liveness sweep — drives PING idle/timeout per
+    // session and reaps drained or PING-timed-out connections.
+    h2_table_.TickAll(now);
+
     // Eviction freed capacity — retry queued checkouts.
     ServiceWaitQueue();
 }
@@ -512,6 +529,140 @@ std::shared_ptr<void> PoolPartition::MakeInflightGuard() {
     return std::shared_ptr<void>(nullptr, [inflight](void*) {
         inflight->fetch_sub(1, std::memory_order_release);
     });
+}
+
+std::shared_ptr<UpstreamH2Connection> PoolPartition::FindUsableH2Connection(
+    const std::string& upstream_name)
+{
+    // After a hostname re-resolution, an existing session pinned to the
+    // old IP must NOT serve fresh requests; mark it dead so future
+    // FindUsable() skips it. In-flight streams on that connection are
+    // deliberately NOT failed here — mirrors the H1 keepalive reuse
+    // contract that lets requests already on the wire complete
+    // naturally. Three paths reap the dead connection afterwards:
+    // (a) normal stream completion drains active_stream_count to 0 and
+    //     TickAll's `IsDead() && empty` branch erases the entry;
+    // (b) transport close/error fires SetCloseCb / SetErrorCb (wired
+    //     in AcquireH2Connection's construct branch) which run
+    //     FailAllStreams + the table walker erases on the next Tick;
+    // (c) endpoint loss times out via ping_timeout_sec /
+    //     goaway_drain_timeout_sec, Tick returns false, FailAllStreams
+    //     fires, table walker erases.
+    if (auto existing = h2_table_.FindUsable(upstream_name)) {
+        UpstreamConnection* t = existing->transport();
+        if (t && ConnectionEndpointMatches(*t)) {
+            return existing;
+        }
+        existing->MarkDead();
+    }
+    return nullptr;
+}
+
+std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
+    const std::string& upstream_name, UpstreamLease& lease)
+{
+    // Reuse a multiplexed session if one is still healthy AND its
+    // transport matches the partition's currently-published endpoint.
+    // Same FindUsableH2Connection helper that ProxyTransaction's
+    // pre-checkout fast path uses — caller's lease (if any) is
+    // untouched on the reuse branch. See FindUsableH2Connection's
+    // doc comment for the H1-keepalive-parity / dead-conn reap chain.
+    if (auto existing = FindUsableH2Connection(upstream_name)) {
+        return existing;
+    }
+
+    auto cfg = LoadHttp2ConfigSnapshot();
+    if (!cfg || !cfg->enabled) return nullptr;
+
+    auto* up = lease.Get();
+    if (!up) return nullptr;
+    auto transport = up->GetTransport();
+    if (!transport) return nullptr;
+
+    auto h2 = std::make_shared<UpstreamH2Connection>(up, cfg);
+    if (!h2->Init()) {
+        logging::Get()->warn(
+            "PoolPartition::AcquireH2Connection: Init failed upstream={} "
+            "host={}:{}",
+            upstream_name, upstream_host_, upstream_port_);
+        return nullptr;
+    }
+
+    // Wire transport callbacks for the H2 session lifecycle. The H2
+    // connection multiplexes the transport for its lifetime, so we
+    // overwrite the pool-owned message and close callbacks: pool
+    // accounting then follows the lease destructor when the H2
+    // connection retires (lease_ is moved into the H2 connection
+    // below — its return-to-pool is what reclaims the slot).
+    std::weak_ptr<UpstreamH2Connection> wk = h2;
+    transport->SetOnMessageCb(
+        [wk](std::shared_ptr<ConnectionHandler>, std::string& data) {
+            auto h = wk.lock();
+            if (!h) return;
+            ssize_t rv = h->HandleBytes(data.data(), data.size());
+            if (rv < 0) {
+                // MarkDead BEFORE the fail-fan-out so a concurrent
+                // FindUsable can't pick this conn between the in-flight
+                // streams being failed and the table eviction. See the
+                // UPSTREAM_PROXY.md pitfall on dead_ vs goaway_seen_.
+                h->MarkDead();
+                h->FailAllStreams(
+                    ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                    "h2 session fatal error");
+                data.clear();
+                return;
+            }
+            // nghttp2_session_mem_recv2 contracts to consume the entire
+            // input on success — UpstreamH2Connection::HandleBytes returns
+            // either rv<0 or rv==len. Be defensive against future contract
+            // drift: erase only the consumed prefix and log loudly so a
+            // partial-consume regression surfaces in tests / staging.
+            const size_t consumed = static_cast<size_t>(rv);
+            if (consumed < data.size()) {
+                logging::Get()->error(
+                    "H2 HandleBytes partial consume: rv={} of {} bytes — "
+                    "preserving remainder; nghttp2 contract drift?",
+                    consumed, data.size());
+                data.erase(0, consumed);
+            } else {
+                data.clear();
+            }
+        });
+    transport->SetCloseCb(
+        [wk](std::shared_ptr<ConnectionHandler>) {
+            auto h = wk.lock();
+            if (!h) return;
+            // MarkDead BEFORE FailAllStreams (mirrors PING-timeout and
+            // session-fatal-error sites). A FindUsable racing the
+            // fan-out would otherwise see streams_.empty() with
+            // dead_=false and return this conn, whose transport is
+            // already gone.
+            h->MarkDead();
+            h->FailAllStreams(
+                ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                "transport closed");
+        });
+    // EPOLLERR / EVENT_ERR is routed through SetErrorCb only — the
+    // close callback is deliberately suppressed on the error path
+    // (`connection_handler.cc` comments "NOT close handler — avoid
+    // duplicate callbacks"). Without an error hook here, a pure
+    // EPOLLERR on an H2 transport would tear down the channel
+    // without notifying nghttp2: queued streams would hang until
+    // their per-transaction response timeout instead of failing
+    // immediately. Mirror SetCloseCb's MarkDead + FailAllStreams.
+    transport->SetErrorCb(
+        [wk](std::shared_ptr<ConnectionHandler>) {
+            auto h = wk.lock();
+            if (!h) return;
+            h->MarkDead();
+            h->FailAllStreams(
+                ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                "transport error");
+        });
+
+    h2->AdoptLease(std::move(lease));
+    h2_table_.Insert(upstream_name, h2);
+    return h2;
 }
 
 void PoolPartition::ScheduleInitiateShutdown() {
@@ -667,6 +818,14 @@ void PoolPartition::StoreResolvedEndpoint(
 {
     std::atomic_store_explicit(&resolved_endpoint_,
                                 std::move(new_ep),
+                                std::memory_order_release);
+}
+
+void PoolPartition::ApplyHttp2ConfigCommit(
+    std::shared_ptr<const Http2UpstreamConfig> snapshot)
+{
+    std::atomic_store_explicit(&http2_config_snapshot_,
+                                std::move(snapshot),
                                 std::memory_order_release);
 }
 
@@ -1428,6 +1587,14 @@ void PoolPartition::WirePoolCallbacks(UpstreamConnection* conn) {
     transport->SetWriteProgressCb(nullptr);
     transport->SetConnectCompleteCallback(nullptr);
     transport->SetDeadlineTimeoutCb(nullptr);
+    // OnCheckoutReady's defer_for_handshake path installs a one-shot
+    // handshake callback when ALPN inspection is needed. Consume-on-fire
+    // (connection_handler.cc) and weak_self short-circuit on cancel make
+    // a stale residual callback safe today, but the safety relies on
+    // those subtle invariants. Clearing here makes pool-returned
+    // connections structurally clean — defense-in-depth against a future
+    // refactor that removes consume-on-fire.
+    transport->SetHandshakeCompleteCallback(nullptr);
     // Reset transport-level flags that track an in-flight borrower's
     // backpressure / cap-stop state. ForceClose clears these too; resetting
     // here guarantees they can never survive the borrower-return boundary

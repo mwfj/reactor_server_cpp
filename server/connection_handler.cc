@@ -271,6 +271,19 @@ void ConnectionHandler::OnMessage(){
     // so the upstream pool's checkout completes for HTTP/1.1 upstreams too.
     // Inbound connections always have connect_state_ == NONE, so this doesn't
     // affect the server-side path.
+    // One-shot fire on TLS READY, before on_message_callback runs so
+    // the H2 upstream codec can inspect ALPN before bytes are delivered.
+    if (tls_just_ready && handshake_complete_callback_) {
+        auto cb = std::move(handshake_complete_callback_);
+        handshake_complete_callback_ = nullptr;
+        try { cb(); }
+        catch (const std::exception& e) {
+            logging::Get()->error(
+                "Exception in handshake-complete callback fd={}: {}",
+                fd(), e.what());
+        }
+    }
+
     bool alpn_h2_ready = tls_just_ready && input_bf_.Size() == 0 && tls_ &&
                          (GetAlpnProtocol() == "h2" ||
                           connect_state_ == ConnectState::CONNECTED);

@@ -5,6 +5,7 @@
 #include "upstream/upstream_connection.h"
 #include "upstream/upstream_lease.h"
 #include "upstream/upstream_callbacks.h"
+#include "upstream/h2_connection_table.h"
 #include "config/server_config.h"
 #include "net/dns_resolver.h"    // ResolvedEndpoint — held via atomic shared_ptr
 #include <condition_variable>
@@ -142,6 +143,58 @@ public:
     void EnqueueIdleCleanupOnEndpointChange(
         std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> old_ep);
 
+    // Reload-time H2 sub-config commit. Release-store of the new snapshot;
+    // observable to any subsequent atomic_load_explicit(acquire) on the
+    // hot path. Callable from ANY thread (typically the reload thread
+    // holding HttpServer::reload_mtx_). Passing null deliberately clears
+    // the cache (used on enabled→false toggles).
+    void ApplyHttp2ConfigCommit(
+        std::shared_ptr<const Http2UpstreamConfig> snapshot);
+
+    // Acquire-load of the current H2 snapshot. Returns null when no
+    // commit has happened yet, or when the staged set explicitly
+    // disabled H2 for this entry.
+    std::shared_ptr<const Http2UpstreamConfig> LoadHttp2ConfigSnapshot() const {
+        return std::atomic_load_explicit(&http2_config_snapshot_,
+                                         std::memory_order_acquire);
+    }
+
+    // Acquire a usable H2 connection for `upstream_name`.
+    //
+    // Lease handover contract — three branches, three lifetimes:
+    //
+    //   reuse branch     (return non-null, fast path) → lease UNTOUCHED;
+    //                      caller releases the lease back to the pool.
+    //   construct branch (return non-null, slow path) → lease MOVED into
+    //                      the new UpstreamH2Connection (donated). Pool
+    //                      accounting follows the lease destructor when
+    //                      the H2 connection retires. Caller's lease is
+    //                      empty after the call.
+    //   Init() failure   (return null)               → lease UNTOUCHED;
+    //                      caller MUST decide what to do (fall back to
+    //                      H1 with the same lease, retry, or release).
+    //                      Defensive: never assume the failure branch
+    //                      released the lease — it does not.
+    //
+    // Dispatcher-thread-only — runs on the same dispatcher as
+    // ProxyTransaction since `dispatcher_index_` lines up.
+    std::shared_ptr<UpstreamH2Connection> AcquireH2Connection(
+        const std::string& upstream_name, UpstreamLease& lease);
+
+    // Pre-checkout fast path: returns a usable H2 session for
+    // `upstream_name` if one already exists in the partition's H2 table
+    // AND its transport matches the partition's currently-published
+    // resolved_endpoint_. Returns null otherwise. Used by
+    // ProxyTransaction::AttemptCheckout to bypass CheckoutAsync when a
+    // multiplexed session is reusable — without this, with
+    // pool.max_connections set near 1 the donated H2 transport
+    // permanently occupies the only pool slot and subsequent requests
+    // would queue forever instead of multiplexing onto the existing
+    // session. Idempotent with AcquireH2Connection's reuse branch.
+    // Dispatcher-thread-only.
+    std::shared_ptr<UpstreamH2Connection> FindUsableH2Connection(
+        const std::string& upstream_name);
+
     // Stats (dispatcher-thread-only reads)
     size_t IdleCount() const { return idle_conns_.size(); }
     size_t ActiveCount() const { return active_conns_.size(); }
@@ -166,16 +219,21 @@ private:
     std::shared_ptr<Dispatcher> dispatcher_;
     std::string upstream_host_;     // Original operator host (hostname OR literal). LOGGING ONLY — connect reads resolved_endpoint_.
     int upstream_port_;              // Original operator port. Logs / fallback SNI port.
-    std::string sni_hostname_;       // Empty = use upstream_host_ for SNI (§5.10)
+    std::string sni_hostname_;       // Empty = use upstream_host_ for SNI
     UpstreamPoolConfig config_;
     std::shared_ptr<TlsClientContext> tls_ctx_;
 
     // C++17 note: `std::atomic_load_explicit(shared_ptr*)` is the
     // standard-compliant form. C++20 deprecates the free-function
-    // overloads in favor of `std::atomic<std::shared_ptr<T>>`; a
-    // migration when this project moves to C++20 is tracked alongside
-    // the step-11 publisher.
+    // overloads in favor of `std::atomic<std::shared_ptr<T>>`.
     std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint_;
+
+    // Atomic-snapshot of the per-partition H2 sub-config. Written by the
+    // reload thread via ApplyHttp2ConfigCommit (release-store); read on
+    // the hot path by the partition's dispatcher via
+    // LoadHttp2ConfigSnapshot (acquire-load). Null when H2 is disabled
+    // for this entry — observers skip the H2 path.
+    std::shared_ptr<const Http2UpstreamConfig> http2_config_snapshot_;
 
     // Manager-owned drain coordination — partitions signal when empty
     std::atomic<int64_t>& outstanding_conns_;
@@ -227,12 +285,12 @@ private:
 
     // Returns true when the connection's captured endpoint pointer
     // matches the partition's currently-published resolved_endpoint_.
-    // Mismatch means a hostname-aware reload (step 11) atomic-stored a
-    // new endpoint after this connection was created — the keepalive
-    // is still bound to the old IP and must not be handed back out.
-    // resolved_endpoint_ never changes after construction, 
-    // so this check is a same-pointer compare and always true; 
-    // installing the wiring now keeps every idle-pop call site in sync when step 11 lands.
+    // Mismatch means a hostname-aware reload atomic-stored a new endpoint
+    // after this connection was created — the keepalive is still bound
+    // to the old IP and must not be handed back out.
+    // resolved_endpoint_ never changes after construction,
+    // so this check is a same-pointer compare and always true;
+    // the wiring is in place for when reload-time endpoint replacement lands.
     bool ConnectionEndpointMatches(const UpstreamConnection& c) const;
 
     size_t partition_max_connections_;
@@ -250,6 +308,12 @@ private:
     // returning, guaranteeing no lambda can access freed members.
     std::shared_ptr<std::atomic<int>> inflight_tasks_ =
         std::make_shared<std::atomic<int>>(0);
+
+    // Multiplexed H2 sessions held by this partition. Keyed by upstream
+    // service name. Populated by AcquireH2Connection on first H2 dispatch
+    // for a given upstream and reused for the lifetime of each session
+    // (until GOAWAY drains the streams or PING timeout closes it).
+    H2ConnectionTable h2_table_;
 
     // True when a self-rescheduling wait-queue purge chain is already
     // scheduled. Prevents spawning duplicate chains per queued waiter.
