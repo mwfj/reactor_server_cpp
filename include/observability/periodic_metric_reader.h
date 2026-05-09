@@ -82,6 +82,13 @@ private:
     std::atomic<int64_t>            signal_shutdown_calls_{0};
     std::atomic<int64_t>            worker_loop_iterations_{0};
 
+    // ForceFlush handshake — caller snapshots flush_completed_count_,
+    // signals flush_requested_ + cv_, then waits on flush_cv_ until the
+    // worker bumps the count past the snapshot OR the deadline expires.
+    std::mutex                      flush_mtx_;
+    std::condition_variable         flush_cv_;
+    int64_t                         flush_completed_count_ = 0;
+
     std::thread                     worker_;
     std::atomic<bool>               worker_started_{false};
     // See BatchSpanProcessor for the same handshake — JoinWorkers

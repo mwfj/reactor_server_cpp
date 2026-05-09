@@ -486,6 +486,17 @@ void ObservabilityManager::RegisterMetricReader(
     metric_reader_ = std::move(reader);
 }
 
+void ObservabilityManager::FlushAll(std::chrono::milliseconds deadline) {
+    const auto t_end = std::chrono::steady_clock::now() + deadline;
+    auto remaining = [t_end]() {
+        const auto now = std::chrono::steady_clock::now();
+        return now >= t_end ? std::chrono::milliseconds{0}
+            : std::chrono::duration_cast<std::chrono::milliseconds>(t_end - now);
+    };
+    if (span_processor_) span_processor_->ForceFlush(remaining());
+    if (metric_reader_)  metric_reader_->ForceFlush(remaining());
+}
+
 void ObservabilityManager::SwapToBatchSpanProcessor(
     std::shared_ptr<SpanProcessor> new_processor) {
     if (!new_processor) return;

@@ -90,6 +90,29 @@ private:
     std::atomic<int> cancel_count_{0};
 };
 
+// Slow MetricExporter — sleeps inside Export() so tests can assert
+// ForceFlush actually blocked through the export round-trip.
+class SlowMetricExporter : public MetricExporter {
+public:
+    explicit SlowMetricExporter(std::chrono::milliseconds latency)
+        : latency_(latency) {}
+    ExportResult Export(MetricsSnapshot,
+                         std::chrono::steady_clock::time_point) override {
+        std::this_thread::sleep_for(latency_);
+        export_calls_.fetch_add(1, std::memory_order_relaxed);
+        return ExportResult::kSuccess;
+    }
+    void SignalShutdown() override {}
+    void CancelAllActiveExports() override {}
+    int export_calls() const {
+        return export_calls_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::chrono::milliseconds latency_;
+    std::atomic<int> export_calls_{0};
+};
+
 // Capture-style MetricExporter.
 class CaptureMetricExporter : public MetricExporter {
 public:
@@ -615,6 +638,48 @@ void TestBatchSpanProcessorOverridesForceFlush() {
     }
 }
 
+// PeriodicMetricReader::ForceFlush blocks until the worker completes
+// at least one export cycle (or the deadline expires). Without the
+// blocking handshake, ForceFlush would return near-instantly and the
+// shutdown drain would race the in-flight export.
+void TestPeriodicMetricReaderForceFlushBlocks() {
+    try {
+        MeterProvider provider(std::make_shared<Resource>(), 1);
+        auto exporter = std::make_shared<SlowMetricExporter>(
+            std::chrono::milliseconds(150));
+        MeterReaderOptions ropts;
+        // Long interval so the periodic tick can't satisfy ForceFlush
+        // on its own — the export MUST be flush-driven.
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        PeriodicMetricReader reader(&provider, exporter, ropts);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        reader.ForceFlush(std::chrono::milliseconds(1000));
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        const bool waited = elapsed >= std::chrono::milliseconds(140);
+        const bool bounded = elapsed <= std::chrono::milliseconds(900);
+        const bool exported = exporter->export_calls() >= 1;
+        const bool pass = waited && bounded && exported;
+
+        reader.SignalShutdown();
+        reader.JoinWorkers(std::chrono::milliseconds(500));
+
+        TestFramework::RecordTest(
+            "ObsExport: PeriodicMetricReader::ForceFlush blocks for export",
+            pass, pass ? ""
+                      : "elapsed_ms=" + std::to_string(
+                          std::chrono::duration_cast<
+                              std::chrono::milliseconds>(elapsed).count())
+                       + " exports=" + std::to_string(exporter->export_calls()),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: PeriodicMetricReader::ForceFlush blocks for export",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "OBSERVABILITY EXPORT PIPELINE TESTS" << std::endl;
@@ -633,6 +698,7 @@ void RunAllTests() {
     TestNoopProcessorForceFlushIsNoop();
     TestInMemoryProcessorForceFlushIsNoop();
     TestBatchSpanProcessorOverridesForceFlush();
+    TestPeriodicMetricReaderForceFlushBlocks();
 }
 
 }  // namespace ObservabilityExportPipelineTests

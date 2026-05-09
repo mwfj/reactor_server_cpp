@@ -61,8 +61,16 @@ void PeriodicMetricReader::WorkerLoop() {
                 "PeriodicMetricReader::Export threw unknown exception");
         }
 
+        // Any ForceFlush waiter that captured its target before this
+        // cycle is now satisfied.
+        {
+            std::lock_guard<std::mutex> g(flush_mtx_);
+            ++flush_completed_count_;
+        }
+        flush_cv_.notify_all();
+
         if (shutdown) break;
-        (void)flush;  // forced flush already handled by the loop iteration above.
+        (void)flush;
     }
     // Final-flush already happened above (the last iteration with
     // shutdown=true exported once). Signal the exporter unless the
@@ -128,9 +136,26 @@ void PeriodicMetricReader::Reload(MeterReaderOptions new_options) {
     cv_.notify_all();
 }
 
-void PeriodicMetricReader::ForceFlush(std::chrono::milliseconds /*deadline*/) {
+void PeriodicMetricReader::ForceFlush(std::chrono::milliseconds deadline) {
+    if (!worker_started_.load(std::memory_order_acquire)) return;
+    int64_t target;
+    {
+        std::lock_guard<std::mutex> g(flush_mtx_);
+        target = flush_completed_count_ + 1;
+    }
     flush_requested_.store(true, std::memory_order_release);
     cv_.notify_all();
+
+    // Deadline contract mirrors JoinWorkers: zero = no-wait, negative =
+    // unbounded, positive = bounded.
+    if (deadline.count() == 0) return;
+    std::unique_lock<std::mutex> lk(flush_mtx_);
+    auto pred = [this, target] {
+        return flush_completed_count_ >= target
+            || shutting_down_.load(std::memory_order_acquire);
+    };
+    if (deadline.count() < 0) flush_cv_.wait(lk, pred);
+    else                       flush_cv_.wait_for(lk, deadline, pred);
 }
 
 }  // namespace OBSERVABILITY_NAMESPACE

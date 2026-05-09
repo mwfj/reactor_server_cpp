@@ -138,6 +138,12 @@ public:
         return metric_reader_.get();
     }
 
+    // Drain queued spans + run a final metric export round-trip, bounded
+    // by `deadline`. Span and metric flushes run sequentially; each call
+    // is polymorphic through the base interfaces so a NoopSpanProcessor
+    // / no-PMR configuration costs only a virtual dispatch.
+    void FlushAll(std::chrono::milliseconds deadline);
+
     // Idempotent. Drains processor + reader bounded by `timeout`.
     void BeginShutdown(std::chrono::milliseconds timeout);
 

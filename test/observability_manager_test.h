@@ -531,6 +531,67 @@ void TestExporterIsSharedFalseForSeparateInstances() {
     }
 }
 
+// ---- Phase 2: live traces.enabled SIGHUP without restart (Task 1.5) ----
+//
+// Pipeline allocation in MarkServerReady is gated on `traces.exporter`
+// (restart-only), NOT on `traces.enabled` (live). A SIGHUP that flips
+// `traces.enabled` from false to true must therefore emit spans on the
+// next request without any process restart, since the BSP is already
+// installed and ready behind the live flag.
+
+void TestLiveTracesEnabledFlipKeepsBatchProcessor() {
+    try {
+        // Boot with traces.enabled=false — this is the "exporter wired,
+        // emission silenced" case Task 1.5 cares about.
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.enabled = false;
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0020ULL));
+
+        // Simulate MarkServerReady's wiring — swap in a BSP regardless
+        // of the live `enabled` flag.
+        auto exporter = std::make_shared<SharedDualExporter>();
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(exporter), bsp_opts);
+        mgr->SwapToBatchSpanProcessor(bsp);
+
+        const bool batch_installed = mgr->span_processor_is_batch_for_test();
+        const bool traces_off_before = !mgr->TracesEnabled();
+
+        // SIGHUP flips traces.enabled to true. The BSP is already there —
+        // we only flip the live flag.
+        ObservabilityConfig flipped = DefaultConfig();
+        flipped.traces.enabled = true;
+        mgr->Reload(flipped);
+
+        const bool traces_on_after = mgr->TracesEnabled();
+        // BSP must survive the reload (no processor swap on Reload).
+        const bool batch_still = mgr->span_processor_is_batch_for_test();
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        const bool pass = batch_installed && traces_off_before
+                       && traces_on_after && batch_still;
+        TestFramework::RecordTest(
+            "ObsMgr: traces.enabled SIGHUP flip preserves wired BSP",
+            pass, pass ? ""
+                      : "installed=" + std::to_string(batch_installed)
+                       + " off_before=" + std::to_string(traces_off_before)
+                       + " on_after=" + std::to_string(traces_on_after)
+                       + " still=" + std::to_string(batch_still),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: traces.enabled SIGHUP flip preserves wired BSP",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- Phase 2: SwapToBatchSpanProcessor (boot-time hot-swap) ----
 
 void TestSwapToBatchSpanProcessorReplacesNoop() {
@@ -709,6 +770,7 @@ void RunAllTests() {
     TestSwapToBatchSpanProcessorReplacesNoop();
     TestExporterIsSharedDetectsCoLocatedExporter();
     TestExporterIsSharedFalseForSeparateInstances();
+    TestLiveTracesEnabledFlipKeepsBatchProcessor();
     TestMiddlewareBuildsSnapshotAndSpan();
     TestMiddlewareTracesDisabledStillBuildsSnapshot();
     TestMiddlewareNullManagerNoOp();

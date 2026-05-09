@@ -3477,12 +3477,20 @@ bool HttpServer::WaitForAllAsyncDrain(
 
 bool HttpServer::FlushObservabilityForShutdown(
         std::chrono::milliseconds budget) {
-    bool drained = WaitForAllAsyncDrain(budget);
-    // TODO: when the OTLP push pipeline is wired, call
-    // BatchSpanProcessor::ForceFlush here. The pre-upstream-shutdown
-    // placement keeps those exporter checkouts against live pools.
-    // ForceFlush is not on the SpanProcessor base interface today —
-    // either dynamic_cast or expand the base when wiring lands.
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    auto remaining = [deadline]() {
+        const auto now = std::chrono::steady_clock::now();
+        return now >= deadline ? std::chrono::milliseconds{0}
+            : std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now);
+    };
+
+    // Drain in-flight requests first so their FinalizeIfSnapshot calls
+    // populate the processor queues BEFORE FlushAll runs.
+    const bool drained = WaitForAllAsyncDrain(remaining());
+    if (observability_manager_) {
+        observability_manager_->FlushAll(remaining());
+    }
     return drained;
 }
 
