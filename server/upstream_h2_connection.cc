@@ -249,11 +249,12 @@ UpstreamH2Connection::~UpstreamH2Connection() {
         }
     }
     if (session_) {
-        // Defense-in-depth: callers may destroy with active streams (a
-        // future evict+replace path, a unit test, etc.); FailAllStreams
-        // prevents sink leak. MarkDead first to mirror every other
-        // call site's invariant (UPSTREAM_PROXY.md: "After any
-        // FailAllStreams call site, the connection MUST be marked dead").
+        // Defense-in-depth: callers may destroy with active streams
+        // (future evict+replace path, unit test, etc.); FailAllStreams
+        // prevents sink leak. MarkDead first so any reentrant call
+        // from a sink's OnError closure observes IsUsable()==false
+        // and does not attempt further work on the session about to
+        // be torn down below.
         MarkDead();
         FailAllStreams(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                        "h2 session destroyed");

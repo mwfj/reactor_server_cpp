@@ -2014,6 +2014,13 @@ void ConfigLoader::ValidateHotReloadable(
                     idx + " ('" + u.name +
                     "'): http2.max_header_list_size must be >= 1");
             }
+            if (h2.max_header_list_size < 4096) {
+                logging::Get()->warn(
+                    "{} ('{}'): http2.max_header_list_size={} is below 4096 — "
+                    "every real H2 request will exceed this and be rejected "
+                    "with COMPRESSION_ERROR",
+                    idx, u.name, h2.max_header_list_size);
+            }
             if (h2.ping_idle_sec < 0) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
@@ -2617,6 +2624,12 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             throw std::invalid_argument(
                 "http2.max_header_list_size must be >= 1");
         }
+        if (config.http2.max_header_list_size < 4096) {
+            logging::Get()->warn(
+                "http2.max_header_list_size={} is below 4096 — every real H2 "
+                "request will exceed this and be rejected with COMPRESSION_ERROR",
+                config.http2.max_header_list_size);
+        }
     }
 
     if (config.tls.enabled) {
@@ -2952,6 +2965,13 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
                         "'): http2.max_header_list_size must be >= 1");
+                }
+                if (h2.max_header_list_size < 4096) {
+                    logging::Get()->warn(
+                        "{} ('{}'): http2.max_header_list_size={} is below 4096 — "
+                        "every real H2 request will exceed this and be rejected "
+                        "with COMPRESSION_ERROR",
+                        idx, u.name, h2.max_header_list_size);
                 }
                 if (h2.ping_idle_sec < 0) {
                     throw std::invalid_argument(
