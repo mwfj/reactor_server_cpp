@@ -45,6 +45,12 @@ public:
     // BatchSpanProcessor overrides these.
     virtual void SignalShutdown() {}
     virtual void JoinWorkers(std::chrono::milliseconds /*deadline*/) {}
+
+    // Drain any buffered spans into the exporter. Bounded by `deadline`.
+    // Default no-op for processors with no buffer (Noop, InMemory).
+    // BatchSpanProcessor overrides with a real flush so callers can drive
+    // shutdown drains polymorphically through the base interface.
+    virtual void ForceFlush(std::chrono::milliseconds /*deadline*/) {}
 };
 
 // In-memory processor that retains SpanData for inspection. Test-only;

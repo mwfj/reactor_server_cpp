@@ -27,6 +27,7 @@ PeriodicMetricReader::~PeriodicMetricReader() {
 
 void PeriodicMetricReader::WorkerLoop() {
     while (true) {
+        worker_loop_iterations_.fetch_add(1, std::memory_order_relaxed);
         const auto interval_ns = interval_ns_.load(std::memory_order_acquire);
 
         std::unique_lock<std::mutex> lk(mtx_);
@@ -79,6 +80,7 @@ void PeriodicMetricReader::WorkerLoop() {
 }
 
 void PeriodicMetricReader::SignalShutdown() {
+    signal_shutdown_calls_.fetch_add(1, std::memory_order_relaxed);
     bool expected = false;
     if (!shutting_down_.compare_exchange_strong(expected, true,
             std::memory_order_acq_rel)) {

@@ -1,5 +1,7 @@
 #include "observability/observability_manager.h"
 
+#include "observability/batch_span_processor.h"
+#include "observability/periodic_metric_reader.h"
 #include "observability/sampler.h"
 #include "observability/semantic_conventions.h"
 #include "observability/span.h"
@@ -473,6 +475,48 @@ void ObservabilityManager::OnFinalizeWinner(
     }
 }
 
+void ObservabilityManager::RegisterMetricReader(
+    std::shared_ptr<PeriodicMetricReader> reader) {
+    if (!reader) return;
+    if (metric_reader_) {
+        logging::Get()->warn(
+            "ObservabilityManager::RegisterMetricReader: reader already set; ignoring");
+        return;
+    }
+    metric_reader_ = std::move(reader);
+}
+
+void ObservabilityManager::SwapToBatchSpanProcessor(
+    std::shared_ptr<SpanProcessor> new_processor) {
+    if (!new_processor) return;
+    // Idempotent: only swap when we're still on the boot-time Noop. A
+    // second swap (e.g. SIGHUP-driven exporter rebuild) is a future-phase
+    // concern — today the OTLP wiring runs once at MarkServerReady.
+    if (dynamic_cast<NoopSpanProcessor*>(span_processor_.get()) == nullptr) {
+        logging::Get()->warn(
+            "SwapToBatchSpanProcessor: processor already swapped; ignoring");
+        return;
+    }
+    span_processor_ = new_processor;
+    if (tracer_provider_) {
+        tracer_provider_->SwapProcessorAcrossTracers(new_processor);
+    }
+}
+
+bool ObservabilityManager::span_processor_is_batch_for_test() const noexcept {
+    return dynamic_cast<BatchSpanProcessor*>(span_processor_.get()) != nullptr;
+}
+
+bool ObservabilityManager::exporter_is_shared_for_test() const noexcept {
+    auto bsp = std::dynamic_pointer_cast<BatchSpanProcessor>(span_processor_);
+    if (!bsp || !metric_reader_) return false;
+    auto span_exp   = bsp->exporter();
+    auto metric_exp = metric_reader_->exporter();
+    if (!span_exp || !metric_exp) return false;
+    return dynamic_cast<void*>(span_exp.get())
+        == dynamic_cast<void*>(metric_exp.get());
+}
+
 void ObservabilityManager::BeginShutdown(
     std::chrono::milliseconds timeout) {
     // The shutdown_started_ latch is one-shot — never reset. Production
@@ -485,9 +529,49 @@ void ObservabilityManager::BeginShutdown(
             std::memory_order_acq_rel)) {
         return;  // idempotent
     }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto remaining = [deadline]() {
+        const auto now = std::chrono::steady_clock::now();
+        return now >= deadline ? std::chrono::milliseconds{0}
+            : std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    };
+
+    // Detect a single exporter wired into BOTH BSP and PMR (e.g.
+    // OtlpHttpExporter inherits both interfaces). Per-worker self-signal
+    // would race: the first to finish would shut the exporter down before
+    // the other could flush. dynamic_cast<void*> yields the most-derived
+    // address, so the two interface sub-object pointers (different vtable
+    // offsets) reduce to the same pointer when they point to the same
+    // object.
+    auto bsp = std::dynamic_pointer_cast<BatchSpanProcessor>(span_processor_);
+    std::shared_ptr<SpanExporter>   shared_span_exporter;
+    std::shared_ptr<MetricExporter> shared_metric_exporter;
+    if (bsp && metric_reader_) {
+        shared_span_exporter   = bsp->exporter();
+        shared_metric_exporter = metric_reader_->exporter();
+    }
+    const bool exporter_shared =
+        shared_span_exporter && shared_metric_exporter
+        && dynamic_cast<void*>(shared_span_exporter.get())
+            == dynamic_cast<void*>(shared_metric_exporter.get());
+
+    if (exporter_shared) {
+        bsp->DisableExporterShutdownOnDrain();
+        metric_reader_->DisableExporterShutdownOnDrain();
+    }
+
     if (span_processor_) {
         span_processor_->SignalShutdown();
-        span_processor_->JoinWorkers(timeout);
+        span_processor_->JoinWorkers(remaining());
+    }
+    if (metric_reader_) {
+        metric_reader_->SignalShutdown();
+        metric_reader_->JoinWorkers(remaining());
+    }
+
+    if (exporter_shared && shared_span_exporter) {
+        shared_span_exporter->SignalShutdown();
     }
 }
 

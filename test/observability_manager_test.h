@@ -12,6 +12,10 @@
 #include "observability/observability_middleware.h"
 #include "observability/observability_snapshot.h"
 #include "observability/resource.h"
+#include "observability/batch_span_processor.h"
+#include "observability/metric_exporter.h"
+#include "observability/periodic_metric_reader.h"
+#include "observability/span_exporter.h"
 #include "observability/sampler.h"
 #include "observability/span_processor.h"
 #include "observability/trace_id.h"
@@ -24,14 +28,23 @@
 namespace ObservabilityManagerTests {
 
 using OBSERVABILITY_NAMESPACE::AlwaysOnSampler;
+using OBSERVABILITY_NAMESPACE::BatchSpanProcessor;
+using OBSERVABILITY_NAMESPACE::BatchSpanProcessorOptions;
+using OBSERVABILITY_NAMESPACE::ExportResult;
 using OBSERVABILITY_NAMESPACE::InMemorySpanProcessor;
 using OBSERVABILITY_NAMESPACE::MakeObservabilityMiddleware;
+using OBSERVABILITY_NAMESPACE::MeterReaderOptions;
+using OBSERVABILITY_NAMESPACE::MetricExporter;
+using OBSERVABILITY_NAMESPACE::MetricsSnapshot;
 using OBSERVABILITY_NAMESPACE::ObservabilityConfig;
 using OBSERVABILITY_NAMESPACE::ObservabilityManager;
 using OBSERVABILITY_NAMESPACE::ObservabilitySnapshot;
+using OBSERVABILITY_NAMESPACE::PeriodicMetricReader;
 using OBSERVABILITY_NAMESPACE::RandomSource;
 using OBSERVABILITY_NAMESPACE::Resource;
 using OBSERVABILITY_NAMESPACE::SamplerType;
+using OBSERVABILITY_NAMESPACE::SpanData;
+using OBSERVABILITY_NAMESPACE::SpanExporter;
 
 namespace {
 
@@ -273,6 +286,301 @@ void TestBeginShutdownIdempotent() {
     }
 }
 
+// ---- Phase 2: PeriodicMetricReader registration + drain ----
+
+namespace {
+class CountingMetricExporter : public MetricExporter {
+public:
+    ExportResult Export(MetricsSnapshot,
+                         std::chrono::steady_clock::time_point) override {
+        return ExportResult::kSuccess;
+    }
+    void SignalShutdown() override {}
+    void CancelAllActiveExports() override {}
+};
+}  // namespace
+
+void TestRegisterMetricReaderDrainedOnBeginShutdown() {
+    try {
+        auto mgr = MakeManager();
+        auto exporter = std::make_shared<CountingMetricExporter>();
+        MeterReaderOptions opts;
+        opts.export_interval = std::chrono::milliseconds(50);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(), exporter, opts);
+        mgr->RegisterMetricReader(reader);
+
+        bool has_reader = mgr->HasMetricReader();
+        // Worker auto-starts in PMR ctor; let it iterate at least once.
+        for (int i = 0; i < 50 && reader->worker_loop_iterations() == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        int64_t iters_before = reader->worker_loop_iterations();
+        bool started = iters_before >= 1
+                     && reader->signal_shutdown_calls() == 0;
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool drained = reader->signal_shutdown_calls() == 1;
+        // Worker should have stopped — counter is stable.
+        int64_t iters_after = reader->worker_loop_iterations();
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        bool stable = reader->worker_loop_iterations() == iters_after;
+
+        bool pass = has_reader && started && drained && stable;
+        std::string err;
+        if (!has_reader) err = "HasMetricReader was false";
+        else if (!started) err = "worker did not iterate before BeginShutdown";
+        else if (!drained) err = "signal_shutdown_calls != 1, got "
+                                + std::to_string(reader->signal_shutdown_calls());
+        else if (!stable) err = "worker_loop_iterations still increasing post-join";
+        TestFramework::RecordTest(
+            "ObsMgr: RegisterMetricReader drained on BeginShutdown",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: RegisterMetricReader drained on BeginShutdown",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- Phase 2: shared-exporter shutdown coordination (Task 1.1a) ----
+
+namespace {
+// Shim implementing BOTH SpanExporter AND MetricExporter — same shape
+// as OtlpHttpExporter — so a single instance can sit behind both BSP
+// and PMR. Counts SignalShutdown calls to verify the manager fires it
+// at most once when the exporter is shared.
+class SharedDualExporter
+    : public SpanExporter,
+      public MetricExporter {
+public:
+    ExportResult Export(std::vector<SpanData>,
+                         std::chrono::steady_clock::time_point) override {
+        return ExportResult::kSuccess;
+    }
+    ExportResult Export(MetricsSnapshot,
+                         std::chrono::steady_clock::time_point) override {
+        return ExportResult::kSuccess;
+    }
+    void SignalShutdown() override {
+        signal_count_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    void CancelAllActiveExports() override {}
+    int signal_count() const { return signal_count_.load(); }
+
+private:
+    std::atomic<int> signal_count_{0};
+};
+}  // namespace
+
+void TestSharedExporterSignalledOnceOnShutdown() {
+    try {
+        auto exporter = std::make_shared<SharedDualExporter>();
+        std::shared_ptr<SpanExporter>   span_exp   = exporter;
+        std::shared_ptr<MetricExporter> metric_exp = exporter;
+
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(span_exp, bsp_opts);
+
+        auto mgr = ObservabilityManager::Create(
+            DefaultConfig(),
+            std::make_shared<Resource>(),
+            bsp,
+            std::make_shared<RandomSource>(0xCAFE0002ULL));
+
+        MeterReaderOptions ropts;
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(), metric_exp, ropts);
+        mgr->RegisterMetricReader(reader);
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool pass = exporter->signal_count() == 1;
+        TestFramework::RecordTest(
+            "ObsMgr: shared exporter signalled exactly once on shutdown",
+            pass, pass ? "" : "signal_count = " + std::to_string(exporter->signal_count()),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: shared exporter signalled exactly once on shutdown",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Negative case: when traces and metrics use DIFFERENT exporter
+// instances, the manager must NOT cross-coordinate — each per-worker
+// path signals its own exporter.
+void TestSeparateExportersEachSignalledOnce() {
+    try {
+        auto trace_exp  = std::make_shared<SharedDualExporter>();
+        auto metric_exp = std::make_shared<SharedDualExporter>();
+
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(trace_exp), bsp_opts);
+
+        auto mgr = ObservabilityManager::Create(
+            DefaultConfig(),
+            std::make_shared<Resource>(),
+            bsp,
+            std::make_shared<RandomSource>(0xCAFE0003ULL));
+
+        MeterReaderOptions ropts;
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(),
+            std::shared_ptr<MetricExporter>(metric_exp), ropts);
+        mgr->RegisterMetricReader(reader);
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool pass = trace_exp->signal_count()  == 1
+                  && metric_exp->signal_count() == 1;
+        TestFramework::RecordTest(
+            "ObsMgr: separate exporters each signalled once",
+            pass, pass ? ""
+                      : "trace=" + std::to_string(trace_exp->signal_count())
+                       + ", metric=" + std::to_string(metric_exp->signal_count()),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: separate exporters each signalled once",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- Phase 2: exporter_is_shared_for_test() ----
+//
+// Mirrors how MarkServerReady wires the metrics-side PMR onto the same
+// OtlpHttpExporter the trace-side BSP holds: the manager detects the
+// shared exporter and BeginShutdown coordinates the single signal.
+
+void TestExporterIsSharedDetectsCoLocatedExporter() {
+    try {
+        auto exporter = std::make_shared<SharedDualExporter>();
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(exporter), bsp_opts);
+
+        auto mgr = ObservabilityManager::Create(
+            DefaultConfig(), std::make_shared<Resource>(), bsp,
+            std::make_shared<RandomSource>(0xCAFE0010ULL));
+
+        bool unshared_before = !mgr->exporter_is_shared_for_test();
+
+        MeterReaderOptions ropts;
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(),
+            std::shared_ptr<MetricExporter>(exporter), ropts);
+        mgr->RegisterMetricReader(reader);
+
+        bool shared_after = mgr->exporter_is_shared_for_test();
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool pass = unshared_before && shared_after;
+        TestFramework::RecordTest(
+            "ObsMgr: exporter_is_shared_for_test detects shared instance",
+            pass, pass ? ""
+                      : "before=" + std::to_string(unshared_before)
+                       + " after=" + std::to_string(shared_after),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: exporter_is_shared_for_test detects shared instance",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestExporterIsSharedFalseForSeparateInstances() {
+    try {
+        auto trace_exp  = std::make_shared<SharedDualExporter>();
+        auto metric_exp = std::make_shared<SharedDualExporter>();
+
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(trace_exp), bsp_opts);
+
+        auto mgr = ObservabilityManager::Create(
+            DefaultConfig(), std::make_shared<Resource>(), bsp,
+            std::make_shared<RandomSource>(0xCAFE0011ULL));
+
+        MeterReaderOptions ropts;
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(),
+            std::shared_ptr<MetricExporter>(metric_exp), ropts);
+        mgr->RegisterMetricReader(reader);
+
+        bool pass = !mgr->exporter_is_shared_for_test();
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+        TestFramework::RecordTest(
+            "ObsMgr: exporter_is_shared_for_test false for separate exporters",
+            pass, pass ? "" : "incorrectly reported shared",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: exporter_is_shared_for_test false for separate exporters",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- Phase 2: SwapToBatchSpanProcessor (boot-time hot-swap) ----
+
+void TestSwapToBatchSpanProcessorReplacesNoop() {
+    try {
+        // Manager starts on the boot-time NoopSpanProcessor — same path
+        // production takes when traces.exporter == "otlp_http" (main.cc
+        // installs Noop; HttpServer::MarkServerReady performs the swap).
+        ObservabilityConfig cfg = DefaultConfig();
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0004ULL));
+
+        bool noop_before = !mgr->span_processor_is_batch_for_test();
+
+        auto exporter = std::make_shared<SharedDualExporter>();
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(exporter), bsp_opts);
+        mgr->SwapToBatchSpanProcessor(bsp);
+
+        bool batch_after = mgr->span_processor_is_batch_for_test();
+
+        // Idempotent: a second swap is rejected (logs a warn; manager
+        // stays on the originally-installed BSP).
+        auto bsp2 = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(exporter), bsp_opts);
+        mgr->SwapToBatchSpanProcessor(bsp2);
+        bool batch_still = mgr->span_processor_is_batch_for_test();
+
+        // Drain so the BSP worker exits cleanly before destruction.
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool pass = noop_before && batch_after && batch_still;
+        TestFramework::RecordTest(
+            "ObsMgr: SwapToBatchSpanProcessor replaces Noop (idempotent)",
+            pass, pass ? ""
+                      : "noop_before=" + std::to_string(noop_before)
+                       + " after=" + std::to_string(batch_after)
+                       + " still=" + std::to_string(batch_still),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: SwapToBatchSpanProcessor replaces Noop (idempotent)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- Middleware end-to-end ----
 void TestMiddlewareBuildsSnapshotAndSpan() {
     try {
@@ -395,6 +703,12 @@ void RunAllTests() {
     TestReloadFlipsTracesEnabled();
     TestReloadFlipsMetricsEnabled();
     TestBeginShutdownIdempotent();
+    TestRegisterMetricReaderDrainedOnBeginShutdown();
+    TestSharedExporterSignalledOnceOnShutdown();
+    TestSeparateExportersEachSignalledOnce();
+    TestSwapToBatchSpanProcessorReplacesNoop();
+    TestExporterIsSharedDetectsCoLocatedExporter();
+    TestExporterIsSharedFalseForSeparateInstances();
     TestMiddlewareBuildsSnapshotAndSpan();
     TestMiddlewareTracesDisabledStillBuildsSnapshot();
     TestMiddlewareNullManagerNoOp();

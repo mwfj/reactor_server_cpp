@@ -44,12 +44,25 @@ public:
     int64_t exported_cycles() const noexcept {
         return exported_cycles_.load(std::memory_order_acquire);
     }
+    int64_t signal_shutdown_calls() const noexcept {
+        return signal_shutdown_calls_.load(std::memory_order_relaxed);
+    }
+    int64_t worker_loop_iterations() const noexcept {
+        return worker_loop_iterations_.load(std::memory_order_relaxed);
+    }
 
     // Skip the worker-loop exporter SignalShutdown when the exporter
     // is shared with a BatchSpanProcessor — see the matching method
     // on BatchSpanProcessor for the rationale.
     void DisableExporterShutdownOnDrain() noexcept {
         exporter_shutdown_disabled_.store(true, std::memory_order_release);
+    }
+
+    // Phase 2 — exposed so ObservabilityManager::BeginShutdown can detect
+    // a MetricExporter shared with the BatchSpanProcessor and coordinate
+    // the single SignalShutdown call after both workers have joined.
+    std::shared_ptr<MetricExporter> exporter() const noexcept {
+        return exporter_;
     }
 
 private:
@@ -66,6 +79,8 @@ private:
     std::atomic<bool>               shutting_down_{false};
     std::atomic<bool>               flush_requested_{false};
     std::atomic<int64_t>            exported_cycles_{0};
+    std::atomic<int64_t>            signal_shutdown_calls_{0};
+    std::atomic<int64_t>            worker_loop_iterations_{0};
 
     std::thread                     worker_;
     std::atomic<bool>               worker_started_{false};

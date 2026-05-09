@@ -36,6 +36,10 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
+// Canonical exporter id values for `traces.exporter` / `metrics.exporter`.
+inline constexpr const char* kExporterOtlpHttp      = "otlp_http";
+inline constexpr const char* kExporterPrometheusPull = "prometheus_pull";
+
 enum class SamplerType {
     AlwaysOn       = 0,
     AlwaysOff      = 1,

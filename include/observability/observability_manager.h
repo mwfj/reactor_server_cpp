@@ -30,14 +30,9 @@
 //                              it before EnQueue + decrements when the
 //                              closure runs.
 //
-// BeginShutdown(t) signals shutdown to the SpanProcessor and joins
-// its workers, bounded by t. Idempotent.
-//
-// TODO: when the PeriodicMetricReader is wired into the manager (it
-// is constructed/owned externally today and only used in tests),
-// extend BeginShutdown to drain it too — otherwise the final metrics
-// flush is silently dropped on every Stop(). Until that wiring lands,
-// the manager has no PMR to drain.
+// BeginShutdown(t) signals shutdown to the SpanProcessor and the
+// PeriodicMetricReader (when registered via RegisterMetricReader) and
+// joins their workers, bounded by t. Idempotent.
 
 #include "observability/common.h"
 #include "observability/histogram.h"
@@ -53,6 +48,8 @@
 // <atomic>, <chrono>, <memory>, <mutex>, <string>, <unordered_map> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
+
+class PeriodicMetricReader;
 
 class ObservabilityManager
     : public std::enable_shared_from_this<ObservabilityManager> {
@@ -81,6 +78,11 @@ public:
         return tracer_provider_->GetTracer(name, version);
     }
 
+    // Read-only view of the live config snapshot. Restart-only fields
+    // (exporter, otlp.upstream) are stable; live-reloadable fields are
+    // refreshed on each Reload().
+    const ObservabilityConfig& config() const noexcept { return config_; }
+
     // ---- Live-flag accessors (used by hot path to skip work) ----
     bool TracesEnabled() const noexcept {
         return traces_enabled_.load(std::memory_order_acquire);
@@ -107,6 +109,34 @@ public:
                                 int      status_code,
                                 uint64_t wire_body_size,
                                 std::string error_type);
+
+    // Wire a PeriodicMetricReader the manager will drain at BeginShutdown.
+    // Set-once: subsequent calls are no-ops with a warn log. Manager keeps
+    // a strong reference for the reader's lifetime. Registration MUST
+    // happen AFTER Create() returns (PMR ctor needs meter_provider()).
+    void RegisterMetricReader(std::shared_ptr<PeriodicMetricReader> reader);
+
+    // One-shot swap from the boot-time NoopSpanProcessor to a real
+    // BatchSpanProcessor once UpstreamHttpClient is alive (called from
+    // HttpServer::MarkServerReady). Idempotent: subsequent calls are
+    // warn-logged no-ops. Fans the swap across every cached Tracer.
+    void SwapToBatchSpanProcessor(std::shared_ptr<SpanProcessor> new_processor);
+
+    // Test-only — production code uses TracesEnabled() instead.
+    bool span_processor_is_batch_for_test() const noexcept;
+
+    // Test-only — true when the BSP and PMR hold the same OtlpHttpExporter
+    // instance (the BeginShutdown path detects this and signals the
+    // exporter exactly once after both workers join).
+    bool exporter_is_shared_for_test() const noexcept;
+
+    bool HasMetricReader() const noexcept {
+        return metric_reader_ != nullptr;
+    }
+
+    PeriodicMetricReader* metric_reader() const noexcept {
+        return metric_reader_.get();
+    }
 
     // Idempotent. Drains processor + reader bounded by `timeout`.
     void BeginShutdown(std::chrono::milliseconds timeout);
@@ -203,6 +233,8 @@ private:
     std::shared_ptr<const Resource>           resource_;
     std::shared_ptr<RandomSource>             random_;
     std::shared_ptr<SpanProcessor>            span_processor_;
+    // Phase 2: drained alongside span_processor_ at BeginShutdown.
+    std::shared_ptr<PeriodicMetricReader>     metric_reader_;
 
     std::unique_ptr<TracerProvider>           tracer_provider_;
     std::unique_ptr<MeterProvider>            meter_provider_;

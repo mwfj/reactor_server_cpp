@@ -2173,48 +2173,24 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
     const auto& oc = config.observability;
     if (!oc.enabled) return;
 
-    if (!oc.traces.exporter.empty() && oc.traces.exporter != "otlp_http")
+    if (!oc.traces.exporter.empty()
+        && oc.traces.exporter != OBSERVABILITY_NAMESPACE::kExporterOtlpHttp)
         throw std::invalid_argument(
             "observability.traces.exporter must be empty or 'otlp_http'");
     if (!oc.metrics.exporter.empty()
-        && oc.metrics.exporter != "otlp_http"
-        && oc.metrics.exporter != "prometheus_pull")
+        && oc.metrics.exporter != OBSERVABILITY_NAMESPACE::kExporterOtlpHttp
+        && oc.metrics.exporter != OBSERVABILITY_NAMESPACE::kExporterPrometheusPull)
         throw std::invalid_argument(
             "observability.metrics.exporter must be empty, 'otlp_http' or "
             "'prometheus_pull'");
 
-    // OTLP push pipeline acceptance is gated on the bootstrap path
-    // in main.cc actually wiring an OtlpHttpExporter through
-    // UpstreamHttpClient. That wiring is non-trivial because the
-    // UpstreamHttpClient needs HttpServer's live dispatchers (built
-    // during Start()) while the ObservabilityManager must be
-    // attached BEFORE Start() so the middleware fires — i.e. the
-    // processor swap has to go through a post-Start re-bind, which
-    // is a focused follow-up not yet in this PR. Until that lands,
-    // reject `otlp_http` here at validate time so `validate` /
-    // `config` / `start` give consistent answers (the alternative —
-    // accept at validate, install NoopSpanProcessor at start —
-    // silently drops every span/metric the operator configured for
-    // export).
-    if (oc.traces.exporter == "otlp_http") {
-        throw std::invalid_argument(
-            "observability.traces.exporter='otlp_http' is not yet wired "
-            "in this build; remove the exporter or wait for the OTLP "
-            "push pipeline bootstrap to land");
-    }
-    if (oc.metrics.exporter == "otlp_http") {
-        throw std::invalid_argument(
-            "observability.metrics.exporter='otlp_http' is not yet wired "
-            "in this build; use 'prometheus_pull' or remove the exporter");
-    }
-
-    if (oc.metrics.exporter == "prometheus_pull"
+    if (oc.metrics.exporter == OBSERVABILITY_NAMESPACE::kExporterPrometheusPull
         && oc.metrics.prometheus.path.empty()) {
         throw std::invalid_argument(
             "observability.metrics.prometheus.path must be non-empty when "
             "metrics.exporter='prometheus_pull'");
     }
-    if (oc.metrics.exporter == "prometheus_pull"
+    if (oc.metrics.exporter == OBSERVABILITY_NAMESPACE::kExporterPrometheusPull
         && (oc.metrics.prometheus.path.empty()
             || oc.metrics.prometheus.path[0] != '/')) {
         throw std::invalid_argument(
@@ -2223,10 +2199,7 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
 
     // Cross-references into upstreams[] — only at startup (reload_copy
     // strips upstreams to skip topology checks; the reload path warns
-    // separately on staged otlp.upstream renames). An empty `upstream`
-    // when the exporter is otlp_http is a configuration error: the
-    // pipeline has no collector to route to, so requests would be
-    // silently discarded post-startup.
+    // separately on staged otlp.upstream renames).
     if (!reload_copy) {
         auto cross_ref = [&](const std::string& name, const char* field) {
             if (name.empty()) {
@@ -2242,10 +2215,10 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
                 std::string(field) + " references unknown upstream '" +
                 name + "' — must match one of the upstreams[].name");
         };
-        if (oc.traces.exporter == "otlp_http")
+        if (oc.traces.exporter == OBSERVABILITY_NAMESPACE::kExporterOtlpHttp)
             cross_ref(oc.traces.otlp.upstream,
                       "observability.traces.otlp.upstream");
-        if (oc.metrics.exporter == "otlp_http")
+        if (oc.metrics.exporter == OBSERVABILITY_NAMESPACE::kExporterOtlpHttp)
             cross_ref(oc.metrics.otlp.upstream,
                       "observability.metrics.otlp.upstream");
     }

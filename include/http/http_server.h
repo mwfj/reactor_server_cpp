@@ -31,6 +31,10 @@ namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerManager;
 }
 
+namespace AUTH_NAMESPACE {
+class UpstreamHttpClient;
+}
+
 
 class HttpServer {
 public:
@@ -565,6 +569,16 @@ private:
     // weak_from_this().
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
         observability_manager_;
+
+    // OTLP push pipeline — constructed in MarkServerReady when
+    // traces.exporter or metrics.exporter == "otlp_http". The exporter
+    // routes both signals through per-signal SignalOptions; a single
+    // instance is shared between BatchSpanProcessor and the metric
+    // reader to keep the shutdown drain coordinated.
+    std::shared_ptr<AUTH_NAMESPACE::UpstreamHttpClient>
+        otlp_upstream_http_client_;
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::OtlpHttpExporter>
+        otlp_exporter_;
 
     // Proxy handlers keyed by (upstream_service_name + normalized prefix).
     // shared_ptr (not unique_ptr) so that route lambdas capture shared

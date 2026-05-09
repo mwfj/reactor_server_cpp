@@ -321,6 +321,66 @@ void TestHotReloadableSkipsRestartFields() {
     }
 }
 
+// ---- OTLP exporter validation (Phase 2 — pipeline now wired) ----
+
+// Phase 1 fail-closed rejected `otlp_http` outright at Validate(). Phase 2
+// wires the OTLP push pipeline, so the rejection is gone and a config that
+// names a valid upstream must Validate cleanly.
+void TestOtlpHttpExporterValidatesAtLoad() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "upstreams": [{"name": "otel_collector", "host": "127.0.0.1",
+                            "port": 4318, "tls": {"enabled": false},
+                            "pool": {"max_connections": 4, "max_idle_connections": 4}}],
+            "observability": {
+                "enabled": true,
+                "traces":  {"exporter": "otlp_http", "otlp": {"upstream": "otel_collector"}},
+                "metrics": {"exporter": "otlp_http", "otlp": {"upstream": "otel_collector"}}
+            }
+        })");
+        std::string err;
+        try { ConfigLoader::Validate(cfg); }
+        catch (const std::exception& e) { err = e.what(); }
+        bool pass = err.empty()
+                  && cfg.observability.traces.exporter == "otlp_http"
+                  && cfg.observability.traces.otlp.upstream == "otel_collector"
+                  && cfg.observability.metrics.exporter == "otlp_http"
+                  && cfg.observability.metrics.otlp.upstream == "otel_collector";
+        TestFramework::RecordTest(
+            "ObsCfg: Validate accepts otlp_http with matching upstream",
+            pass, !err.empty() ? "Validate threw: " + err : (pass ? "" : "field mismatch"),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: Validate accepts otlp_http with matching upstream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// metrics-side cross-reference: the existing TestValidateRejectsUnknownOtlpUpstream
+// covers traces; this asserts the metrics path is checked too.
+void TestOtlpHttpExporterRejectsUnknownMetricsUpstream() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "upstreams": [],
+            "observability": {"enabled": true,
+                "metrics": {"exporter": "otlp_http", "otlp": {"upstream": "missing"}}
+            }
+        })");
+        bool threw = false;
+        try { ConfigLoader::Validate(cfg); }
+        catch (const std::invalid_argument&) { threw = true; }
+        TestFramework::RecordTest(
+            "ObsCfg: Validate rejects unknown metrics.otlp.upstream",
+            threw, threw ? "" : "didn't throw on unknown metrics upstream",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: Validate rejects unknown metrics.otlp.upstream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- ObservabilityConfig::operator== ----
 
 void TestOperatorEqIgnoresLiveFields() {
@@ -486,6 +546,8 @@ void RunAllTests() {
     TestValidateRejectsBadInterval();
     TestValidateRejectsRatioOutOfRange();
     TestValidateRejectsUnknownOtlpUpstream();
+    TestOtlpHttpExporterValidatesAtLoad();
+    TestOtlpHttpExporterRejectsUnknownMetricsUpstream();
     TestValidatePromPathMustStartWithSlash();
     TestValidateRejectsHistogramBucketsOutOfOrder();
     TestHotReloadableRejectsBadLiveValue();

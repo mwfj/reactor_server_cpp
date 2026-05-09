@@ -543,6 +543,78 @@ void TestOtlpExporterSerializesMetricsToJson() {
     }
 }
 
+// ---- ForceFlush base virtual (Phase 2 Task 1.0) ----
+// HttpServer::FlushObservabilityForShutdown calls ForceFlush
+// polymorphically via the base interface (no dynamic_cast). Verify the
+// virtual exists and that the no-op processors compile + return cleanly.
+void TestNoopProcessorForceFlushIsNoop() {
+    try {
+        OBSERVABILITY_NAMESPACE::NoopSpanProcessor p;
+        p.ForceFlush(std::chrono::milliseconds(0));
+        TestFramework::RecordTest(
+            "ObsExport: NoopSpanProcessor ForceFlush is no-op",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: NoopSpanProcessor ForceFlush is no-op",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestInMemoryProcessorForceFlushIsNoop() {
+    try {
+        OBSERVABILITY_NAMESPACE::InMemorySpanProcessor p;
+        p.ForceFlush(std::chrono::milliseconds(0));
+        TestFramework::RecordTest(
+            "ObsExport: InMemorySpanProcessor ForceFlush is no-op",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: InMemorySpanProcessor ForceFlush is no-op",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BatchSpanProcessor's override drains buffered spans into the exporter.
+void TestBatchSpanProcessorOverridesForceFlush() {
+    try {
+        auto exporter = std::make_shared<CaptureSpanExporter>();
+        BatchSpanProcessorOptions opts;
+        opts.max_export_batch_size = 16;
+        opts.schedule_delay = std::chrono::milliseconds{60'000};  // long; flush is the trigger
+        BatchSpanProcessor bsp(exporter, opts);
+
+        auto resource = std::make_shared<Resource>();
+        auto random   = std::make_shared<RandomSource>(0x1ULL);
+        TracerProvider provider(
+            resource,
+            std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
+                &bsp, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
+            std::make_shared<AlwaysOnSampler>(), random);
+        Tracer* t = provider.GetTracer("flush_test");
+        for (int i = 0; i < 3; ++i) { t->StartSpan("op", {})->End(); }
+
+        bsp.ForceFlush(std::chrono::milliseconds(500));
+        // ForceFlush returns when the in-memory queue empties; Export()
+        // may still be running on the worker. Poll until the captured
+        // count catches up (small bounded wait).
+        for (int i = 0; i < 50 && exporter->Size() < 3; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        bool pass = exporter->Size() == 3;
+        TestFramework::RecordTest(
+            "ObsExport: BatchSpanProcessor::ForceFlush drains queue via base virtual",
+            pass, pass ? "" : "got " + std::to_string(exporter->Size()) + "/3",
+            TestFramework::TestCategory::OTHER);
+        bsp.SignalShutdown();
+        bsp.JoinWorkers(std::chrono::milliseconds(500));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: BatchSpanProcessor::ForceFlush drains queue via base virtual",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "OBSERVABILITY EXPORT PIPELINE TESTS" << std::endl;
@@ -558,6 +630,9 @@ void RunAllTests() {
     TestOtlpExporterShutdownRefusesExport();
     TestOtlpExporterReloadHeaders();
     TestOtlpExporterSerializesMetricsToJson();
+    TestNoopProcessorForceFlushIsNoop();
+    TestInMemoryProcessorForceFlushIsNoop();
+    TestBatchSpanProcessorOverridesForceFlush();
 }
 
 }  // namespace ObservabilityExportPipelineTests

@@ -36,6 +36,16 @@ Tracer* TracerProvider::GetTracer(const std::string& name,
     return raw;
 }
 
+void TracerProvider::SwapProcessorAcrossTracers(
+        std::shared_ptr<SpanProcessor> new_processor) {
+    if (!new_processor) return;
+    std::lock_guard<std::mutex> g(tracer_mtx_);
+    processor_ = new_processor;   // future GetTracer() picks this up
+    for (auto& [_, tracer] : tracers_) {
+        tracer->SwapProcessor(new_processor);
+    }
+}
+
 void TracerProvider::Reload(std::shared_ptr<const Sampler> new_sampler,
                               ProcessorOptions               new_processor_options) {
     std::shared_ptr<SpanProcessor> processor_for_reload;

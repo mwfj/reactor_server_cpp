@@ -88,9 +88,16 @@ public:
         exporter_shutdown_disabled_.store(true, std::memory_order_release);
     }
 
+    // Phase 2 — exposed so ObservabilityManager::BeginShutdown can detect
+    // a SpanExporter shared with the metric reader and coordinate the
+    // single SignalShutdown call after both workers have joined.
+    std::shared_ptr<SpanExporter> exporter() const noexcept {
+        return exporter_;
+    }
+
     // Force a flush; returns when the queue drains or `deadline`
     // expires. Idempotent.
-    void ForceFlush(std::chrono::milliseconds deadline);
+    void ForceFlush(std::chrono::milliseconds deadline) override;
 
     // Diagnostics counters surfaced via self-metrics.
     size_t  queue_depth() const noexcept;

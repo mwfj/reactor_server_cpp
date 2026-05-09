@@ -6,9 +6,14 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
 #include "auth/auth_manager.h"
+#include "auth/upstream_http_client.h"
+#include "observability/batch_span_processor.h"
 #include "observability/observability_manager.h"
 #include "observability/observability_middleware.h"
 #include "observability/observability_snapshot.h"
+#include "observability/otlp_http_exporter.h"
+#include "observability/otlp_transport.h"
+#include "observability/periodic_metric_reader.h"
 #include "auth/auth_middleware.h"
 #include "circuit_breaker/circuit_breaker_manager.h"
 #include "circuit_breaker/circuit_breaker_host.h"
@@ -1300,6 +1305,95 @@ void HttpServer::MarkServerReady() {
     // programmatic HttpServer::Proxy() API). See RecomputeAsyncDeferredCap
     // for the sizing logic and opt-out sentinel.
     RecomputeAsyncDeferredCap();
+
+    // OTLP push pipeline — boot-time hot-swap from NoopSpanProcessor to
+    // BatchSpanProcessor + OtlpHttpExporter. The exporter is owned here
+    // (not via auth's UpstreamHttpClient) so OTLP traffic doesn't share
+    // auth's per-issuer cancel-token state.
+    const bool otlp_traces_on =
+        observability_manager_
+        && observability_manager_->config().enabled
+        && observability_manager_->config().traces.exporter
+            == OBSERVABILITY_NAMESPACE::kExporterOtlpHttp;
+    const bool otlp_metrics_on =
+        observability_manager_
+        && observability_manager_->config().enabled
+        && observability_manager_->config().metrics.exporter
+            == OBSERVABILITY_NAMESPACE::kExporterOtlpHttp;
+    if (otlp_traces_on || otlp_metrics_on) {
+        otlp_upstream_http_client_ =
+            std::make_shared<AUTH_NAMESPACE::UpstreamHttpClient>(
+                upstream_manager_.get(), dispatchers);
+    }
+    if (otlp_traces_on) {
+        const auto& cfg = observability_manager_->config();
+        OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Options opts;
+        opts.traces.upstream_pool_name = cfg.traces.otlp.upstream;
+        opts.traces.headers            = cfg.traces.otlp.headers;
+        opts.traces.timeout            = cfg.traces.otlp.timeout_ms;
+        if (otlp_metrics_on) {
+            opts.metrics.upstream_pool_name = cfg.metrics.otlp.upstream;
+            opts.metrics.headers            = cfg.metrics.otlp.headers;
+            opts.metrics.timeout            = cfg.metrics.otlp.timeout_ms;
+        }
+
+        otlp_exporter_ = OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Create(
+            std::move(opts),
+            OBSERVABILITY_NAMESPACE::MakeOtlpTransport(otlp_upstream_http_client_));
+
+        OBSERVABILITY_NAMESPACE::BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.max_queue_size          = cfg.traces.batch.max_queue_size;
+        bsp_opts.max_export_batch_size   = cfg.traces.batch.max_export_batch_size;
+        bsp_opts.schedule_delay          = cfg.traces.batch.schedule_delay;
+        bsp_opts.export_timeout          = cfg.traces.otlp.timeout_ms;
+        bsp_opts.retries_max_attempts    = cfg.traces.batch.retries.max_attempts;
+        bsp_opts.retries_initial_backoff = cfg.traces.batch.retries.initial_backoff;
+        bsp_opts.retries_max_backoff     = cfg.traces.batch.retries.max_backoff;
+
+        auto bsp = std::make_shared<
+            OBSERVABILITY_NAMESPACE::BatchSpanProcessor>(otlp_exporter_, bsp_opts);
+        observability_manager_->SwapToBatchSpanProcessor(bsp);
+
+        logging::Get()->info(
+            "OTLP traces exporter wired (upstream={}, schedule_delay={}ms)",
+            cfg.traces.otlp.upstream,
+            static_cast<long long>(bsp_opts.schedule_delay.count()));
+    }
+    if (otlp_metrics_on) {
+        const auto& cfg = observability_manager_->config();
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::OtlpHttpExporter> metrics_exporter;
+        if (otlp_exporter_) {
+            // Trace-side block already populated `opts.metrics` SignalOptions
+            // for the exporter — reuse the same instance. The shared exporter
+            // is the contract that ObservabilityManager::BeginShutdown's
+            // coordinated-SignalShutdown path detects.
+            metrics_exporter = otlp_exporter_;
+        } else {
+            OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Options m_opts;
+            m_opts.metrics.upstream_pool_name = cfg.metrics.otlp.upstream;
+            m_opts.metrics.headers            = cfg.metrics.otlp.headers;
+            m_opts.metrics.timeout            = cfg.metrics.otlp.timeout_ms;
+            metrics_exporter = OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Create(
+                std::move(m_opts),
+                OBSERVABILITY_NAMESPACE::MakeOtlpTransport(otlp_upstream_http_client_));
+            otlp_exporter_ = metrics_exporter;  // for lifetime ownership
+        }
+
+        OBSERVABILITY_NAMESPACE::MeterReaderOptions reader_opts;
+        reader_opts.export_interval = cfg.metrics.reader.export_interval;
+        reader_opts.export_timeout  = cfg.metrics.reader.export_timeout;
+
+        auto reader = std::make_shared<OBSERVABILITY_NAMESPACE::PeriodicMetricReader>(
+            observability_manager_->meter_provider(),
+            metrics_exporter, reader_opts);
+        observability_manager_->RegisterMetricReader(std::move(reader));
+
+        logging::Get()->info(
+            "OTLP metrics exporter wired (upstream={}, export_interval={}ms{})",
+            cfg.metrics.otlp.upstream,
+            static_cast<long long>(reader_opts.export_interval.count()),
+            otlp_traces_on ? ", shared with traces" : "");
+    }
 
     // Observability middleware — installed LAST so PrependMiddleware's
     // "last prepend runs first" places it at the HEAD of the chain.
