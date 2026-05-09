@@ -406,7 +406,7 @@ void UpstreamManager::UpdateResolvedEndpoints(
 }
 
 std::optional<Http2UpstreamConfig>
-UpstreamManager::LookupStagedH2ForLivePartition(
+UpstreamManager::LookupStagedH2ForLivePartitionForTesting(
     const std::string& upstream_name,
     const std::vector<UpstreamConfig>& staged_upstreams) const
 {

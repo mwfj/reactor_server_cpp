@@ -85,7 +85,8 @@ Validation rejects out-of-range values at SIGHUP time:
 - `prefer == "always"` requires `tls.enabled = true` (live-rejected for upstreams already in pools_).
 - `max_concurrent_streams_pref`, `initial_window_size` must be in `[1, 2^31-1]`.
 - `max_frame_size` must be in `[16384, 16777215]` (RFC 9113 §6.5.2).
-- `max_header_list_size` must be ≥ 1. Defaults to `65536` (64 KB). Advertised in the SETTINGS preface (RFC 9113 §6.5.2); nghttp2 enforces locally on inbound HEADERS+CONTINUATION blocks.
+- `max_header_list_size` must be ≥ 4096. Defaults to `65536` (64 KB). Advertised in the SETTINGS preface (RFC 9113 §6.5.2); nghttp2 enforces locally on inbound HEADERS+CONTINUATION blocks. Below 4096 every real H2 request is rejected with COMPRESSION_ERROR.
+- `header_table_size` is bounded to `[0, 16777216]` (16 MiB). 0 disables HPACK dynamic table.
 - `ping_idle_sec`, `ping_timeout_sec`, `goaway_drain_timeout_sec` must be ≥ 0 (0 disables the corresponding check).
 
 If a SIGHUP fails validation, the live config is unchanged — the server logs the rejection and continues with the previous values.

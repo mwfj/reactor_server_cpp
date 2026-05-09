@@ -159,13 +159,23 @@ public:
                                          std::memory_order_acquire);
     }
 
-    // Acquire a usable H2 connection for `upstream_name`. If a usable
-    // multiplexed session already exists in the partition's table,
-    // returns it and leaves `lease` UNTOUCHED — the caller should
-    // release the lease back to the pool. Otherwise, donates `lease`
-    // to a freshly built UpstreamH2Connection bound to the lease's
-    // transport, calls Init() and inserts the connection into the
-    // table. Returns null on Init() failure (lease is left intact).
+    // Acquire a usable H2 connection for `upstream_name`.
+    //
+    // Lease handover contract — three branches, three lifetimes:
+    //
+    //   reuse branch     (return non-null, fast path) → lease UNTOUCHED;
+    //                      caller releases the lease back to the pool.
+    //   construct branch (return non-null, slow path) → lease MOVED into
+    //                      the new UpstreamH2Connection (donated). Pool
+    //                      accounting follows the lease destructor when
+    //                      the H2 connection retires. Caller's lease is
+    //                      empty after the call.
+    //   Init() failure   (return null)               → lease UNTOUCHED;
+    //                      caller MUST decide what to do (fall back to
+    //                      H1 with the same lease, retry, or release).
+    //                      Defensive: never assume the failure branch
+    //                      released the lease — it does not.
+    //
     // Dispatcher-thread-only — runs on the same dispatcher as
     // ProxyTransaction since `dispatcher_index_` lines up.
     std::shared_ptr<UpstreamH2Connection> AcquireH2Connection(

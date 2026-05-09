@@ -11,7 +11,7 @@
 //     A5.  H2ConnectionTable::ReapDrained correctness
 //     A6.  H2ConnectionTable::Clear correctness
 //     A7.  H2ConnectionTable::TickAll PING-timeout removal
-//     A8.  UpstreamManager::LookupStagedH2ForLivePartition
+//     A8.  UpstreamManager::LookupStagedH2ForLivePartitionForTesting
 //     A9.  UpstreamManager::CommitHttp2Snapshots bootstrap
 //     A10. UpstreamManager::ComputeMinUpstreamCadenceSec
 //     A11. PoolPartition::ApplyHttp2ConfigCommit / LoadHttp2ConfigSnapshot
@@ -173,6 +173,31 @@ struct RecordingSink : public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink
     void OnComplete() override { ++complete_calls; }
     void OnError(int code, const std::string& msg) override {
         ++error_calls; last_error_code = code; last_error_msg = msg;
+    }
+};
+
+// Sink that reentrantly calls back into the H2 connection during OnError —
+// used by C1 to exercise the in_receive_data_ guard. The connection
+// pointer is set by the test before driving bytes through HandleBytes.
+struct ReentrantResetSink : public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink {
+    UpstreamH2Connection* conn = nullptr;
+    int32_t reset_target = -1;
+    bool observed_in_receive_data = false;
+    int error_calls = 0;
+
+    bool OnHeaders(const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead&) override { return true; }
+    bool OnBodyChunk(const char*, size_t) override { return true; }
+    void OnTrailers(const std::vector<std::pair<std::string, std::string>>&) override {}
+    void OnComplete() override {}
+    void OnError(int, const std::string&) override {
+        ++error_calls;
+        if (conn) {
+            // CAPTURE the in_receive_data flag at the moment we re-enter
+            // the connection — this is what proves the guard is active
+            // during the synchronous callback chain.
+            observed_in_receive_data = conn->in_receive_data();
+            if (reset_target >= 0) conn->ResetStream(reset_target);
+        }
     }
 };
 
@@ -534,7 +559,7 @@ void TestTickAllKeepsLiveConnections() {
     }
 }
 
-// A8 — UpstreamManager::LookupStagedH2ForLivePartition
+// A8 — UpstreamManager::LookupStagedH2ForLivePartitionForTesting
 void TestLookupStagedH2Found() {
     std::cout << "\n[TEST] H2Upstream A8a: LookupStagedH2 returns config when upstream exists..." << std::endl;
     try {
@@ -548,7 +573,7 @@ void TestLookupStagedH2Found() {
         UpstreamConfig staged = live_cfg;
         staged.http2.ping_idle_sec = 45;
 
-        auto result = mgr.LookupStagedH2ForLivePartition("backend", {staged});
+        auto result = mgr.LookupStagedH2ForLivePartitionForTesting("backend", {staged});
         bool pass = result.has_value() && result->ping_idle_sec == 45;
         TestFramework::RecordTest("H2Upstream A8a: LookupStagedH2 returns config when upstream exists",
                                    pass,
@@ -569,7 +594,7 @@ void TestLookupStagedH2MissingFromStaged() {
         DispatcherThreadGuard dtg{disp, t};
 
         // Staged set does NOT contain "backend"
-        auto result = mgr.LookupStagedH2ForLivePartition("backend", {});
+        auto result = mgr.LookupStagedH2ForLivePartitionForTesting("backend", {});
         bool pass = !result.has_value();
         TestFramework::RecordTest("H2Upstream A8b: LookupStagedH2 returns nullopt when missing from staged",
                                    pass,
@@ -591,7 +616,7 @@ void TestLookupStagedH2UnknownLivePartition() {
 
         // Query a name that is not in the live pools
         UpstreamConfig staged = MakeH2UpstreamConfig("other", "127.0.0.1", 9998);
-        auto result = mgr.LookupStagedH2ForLivePartition("other", {staged});
+        auto result = mgr.LookupStagedH2ForLivePartitionForTesting("other", {staged});
         bool pass = !result.has_value();
         TestFramework::RecordTest("H2Upstream A8c: LookupStagedH2 returns nullopt for unknown live upstream",
                                    pass,
@@ -1576,6 +1601,32 @@ inline std::vector<uint8_t> BuildHeadersFrame(
     return frame;
 }
 
+// Build a GOAWAY frame with the given last_stream_id and error_code.
+// RFC 9113 §6.8: 8-byte payload (last_stream_id + error_code), no debug
+// data, stream_id always 0 for connection-level frames.
+inline std::vector<uint8_t> BuildGoawayFrame(int32_t last_stream_id,
+                                              uint32_t error_code) {
+    std::vector<uint8_t> frame;
+    frame.reserve(17);
+    // 24-bit length = 8
+    frame.push_back(0); frame.push_back(0); frame.push_back(8);
+    frame.push_back(NGHTTP2_GOAWAY);
+    frame.push_back(0);  // flags
+    // stream_id = 0
+    frame.push_back(0); frame.push_back(0);
+    frame.push_back(0); frame.push_back(0);
+    // last_stream_id (R bit clear)
+    frame.push_back(static_cast<uint8_t>((last_stream_id >> 24) & 0x7f));
+    frame.push_back(static_cast<uint8_t>((last_stream_id >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((last_stream_id >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(last_stream_id & 0xff));
+    frame.push_back(static_cast<uint8_t>((error_code >> 24) & 0xff));
+    frame.push_back(static_cast<uint8_t>((error_code >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((error_code >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(error_code & 0xff));
+    return frame;
+}
+
 }  // namespace H2WireTest
 
 // B9 — Empty SETTINGS frame is consumed by the real HandleBytes path
@@ -1623,9 +1674,8 @@ void TestB10HandleBytesDispatchesValidStatus() {
         cfg->ping_timeout_sec = 0;
         cfg->goaway_drain_timeout_sec = 0;
 
-        // sink/codec declared before conn so they outlive ~UpstreamH2Connection's
+        // sink declared before conn so it outlives ~UpstreamH2Connection's
         // defensive FailAllStreams (sinks notified at dtor time).
-        UpstreamH2Codec codec;
         RecordingSink sink;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
@@ -1635,7 +1685,7 @@ void TestB10HandleBytesDispatchesValidStatus() {
             return;
         }
         int32_t sid = conn.SubmitRequest(
-            "GET", "http", "example.com", "/", {}, "", &codec, &sink);
+            "GET", "http", "example.com", "/", {}, "", &sink);
         if (sid != 1) {
             TestFramework::RecordTest(
                 "H2Upstream B10: HandleBytes dispatches OnHeaders for :status=200",
@@ -1678,8 +1728,7 @@ void TestB11HandleBytesRejectsInvalidStatus() {
         cfg->ping_timeout_sec = 0;
         cfg->goaway_drain_timeout_sec = 0;
 
-        // sink/codec must outlive conn (~UpstreamH2Connection FailAllStreams).
-        UpstreamH2Codec codec;
+        // sink must outlive conn (~UpstreamH2Connection FailAllStreams).
         RecordingSink sink;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
@@ -1689,7 +1738,7 @@ void TestB11HandleBytesRejectsInvalidStatus() {
             return;
         }
         int32_t sid = conn.SubmitRequest(
-            "GET", "http", "example.com", "/", {}, "", &codec, &sink);
+            "GET", "http", "example.com", "/", {}, "", &sink);
         if (sid != 1) {
             TestFramework::RecordTest(
                 "H2Upstream B11: HandleBytes rejects :status='abc'",
@@ -1736,8 +1785,7 @@ void TestB12TickGoawayDrainTimeout() {
         cfg->ping_timeout_sec = 0;
         cfg->goaway_drain_timeout_sec = 2;
 
-        // sink/codec must outlive conn (~UpstreamH2Connection FailAllStreams).
-        UpstreamH2Codec codec;
+        // sink must outlive conn (~UpstreamH2Connection FailAllStreams).
         RecordingSink sink;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
@@ -1747,7 +1795,7 @@ void TestB12TickGoawayDrainTimeout() {
             return;
         }
         int32_t sid = conn.SubmitRequest(
-            "GET", "http", "example.com", "/", {}, "", &codec, &sink);
+            "GET", "http", "example.com", "/", {}, "", &sink);
         if (sid != 1) {
             TestFramework::RecordTest(
                 "H2Upstream B12: Tick fires on stuck GOAWAY drain",
@@ -1807,8 +1855,7 @@ void TestB12bGoawayFailsStreamsAbovePeerLastId() {
         cfg->enabled = true;
         cfg->max_concurrent_streams_pref = 10;
 
-        // sinks/codecs must outlive conn (~UpstreamH2Connection FailAllStreams).
-        UpstreamH2Codec codec_a, codec_b;
+        // sinks must outlive conn (~UpstreamH2Connection FailAllStreams).
         RecordingSink sink_a, sink_b;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
@@ -1818,9 +1865,9 @@ void TestB12bGoawayFailsStreamsAbovePeerLastId() {
             return;
         }
         int32_t sid_a = conn.SubmitRequest(
-            "GET", "http", "example.com", "/a", {}, "", &codec_a, &sink_a);
+            "GET", "http", "example.com", "/a", {}, "", &sink_a);
         int32_t sid_b = conn.SubmitRequest(
-            "GET", "http", "example.com", "/b", {}, "", &codec_b, &sink_b);
+            "GET", "http", "example.com", "/b", {}, "", &sink_b);
         // nghttp2 assigns client-initiated stream ids 1, 3, 5, ...
         if (sid_a != 1 || sid_b != 3) {
             TestFramework::RecordTest(
@@ -1987,9 +2034,12 @@ void TestB14AuthorityDerivationCases() {
 // Tier C — Race / lifetime / memory
 // ---------------------------------------------------------------------------
 
-// C1 — in_receive_data_ flag prevents re-entrant FlushSend
+// C1 — in_receive_data_ is observed true during the synchronous
+// callback chain triggered by HandleBytes, so any reentrant
+// SubmitRequest / ResetStream defers its FlushSend to the outer
+// post-recv flush. See pitfalls/UPSTREAM_PROXY.md.
 void TestC1InReceiveDataGuard() {
-    std::cout << "\n[TEST] H2Upstream C1: in_receive_data_ is false outside HandleBytes..." << std::endl;
+    std::cout << "\n[TEST] H2Upstream C1: in_receive_data_ guard blocks reentrant FlushSend..." << std::endl;
     try {
         auto cfg = std::make_shared<Http2UpstreamConfig>();
         cfg->enabled = true;
@@ -1998,15 +2048,63 @@ void TestC1InReceiveDataGuard() {
         cfg->ping_timeout_sec = 0;
         cfg->goaway_drain_timeout_sec = 0;
 
+        // Storage outlives `conn` — see existing B-test convention.
+        ReentrantResetSink sink_a;
+        RecordingSink sink_b;
         UpstreamH2Connection conn(nullptr, cfg);
-        // Outside any HandleBytes call, in_receive_data() must be false
-        bool pass = !conn.in_receive_data();
-        TestFramework::RecordTest("H2Upstream C1: in_receive_data_ is false outside HandleBytes",
-                                   pass,
-                                   pass ? "" : "in_receive_data should be false at rest");
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream C1: in_receive_data_ guard blocks reentrant FlushSend",
+                false, "Init failed");
+            return;
+        }
+        sink_a.conn = &conn;
+        int32_t sid_a = conn.SubmitRequest(
+            "GET", "http", "example.com", "/a", {}, "", &sink_a);
+        int32_t sid_b = conn.SubmitRequest(
+            "GET", "http", "example.com", "/b", {}, "", &sink_b);
+        // sink_a's OnError will call conn.ResetStream(sid_b).
+        sink_a.reset_target = sid_b;
+
+        // Build a GOAWAY frame with last_stream_id < sid_a so OnGoawayReceived
+        // synchronously fails sink_a above the limit (RFC 9113 §6.8 retry-safe).
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto goaway = H2WireTest::BuildGoawayFrame(0, NGHTTP2_NO_ERROR);
+        wire.insert(wire.end(), goaway.begin(), goaway.end());
+
+        ssize_t consumed = conn.HandleBytes(
+            reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        bool pass = true;
+        std::string err;
+        if (consumed < 0) { pass = false; err += "HandleBytes failed; "; }
+        // The reentrant ResetStream from sink_a's OnError MUST have observed
+        // in_receive_data_ == true (proving the guard was active).
+        if (sink_a.error_calls != 1) {
+            pass = false;
+            err += "sink_a.error_calls=" + std::to_string(sink_a.error_calls) + " expected 1; ";
+        }
+        if (!sink_a.observed_in_receive_data) {
+            pass = false;
+            err += "in_receive_data_ was false during reentrant callback; ";
+        }
+        // Outside HandleBytes, in_receive_data_ must be false again.
+        if (conn.in_receive_data()) {
+            pass = false;
+            err += "in_receive_data_ leaked after HandleBytes returned; ";
+        }
+        // sid_a was failed (above last_stream_id); sid_b should have been
+        // RST'd by the reentrant ResetStream — sink->stream entry for b
+        // should be detached (sink=nullptr) and stream count <= 1 before
+        // the eventual on_stream_close fires.
+        TestFramework::RecordTest(
+            "H2Upstream C1: in_receive_data_ guard blocks reentrant FlushSend",
+            pass, err);
+        (void)sid_a;
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("H2Upstream C1: in_receive_data_ is false outside HandleBytes",
-                                   false, e.what());
+        TestFramework::RecordTest(
+            "H2Upstream C1: in_receive_data_ guard blocks reentrant FlushSend",
+            false, e.what());
     }
 }
 
@@ -2555,13 +2653,12 @@ void TestSubmitRequestNullSession() {
         cfg->enabled = true;
         cfg->max_concurrent_streams_pref = 10;
 
-        // sink/codec must outlive conn (~UpstreamH2Connection FailAllStreams).
+        // sink must outlive conn (~UpstreamH2Connection FailAllStreams).
         RecordingSink sink;
-        UpstreamH2Codec codec;
         UpstreamH2Connection conn(nullptr, cfg);
 
         int32_t sid = conn.SubmitRequest(
-            "GET", "http", "localhost", "/", {}, "", &codec, &sink);
+            "GET", "http", "localhost", "/", {}, "", &sink);
         bool pass = (sid == -1);
         TestFramework::RecordTest("H2Upstream SubmitRequest: null session returns -1",
                                    pass, pass ? "" : "SubmitRequest should return -1 with null session");
@@ -2675,6 +2772,56 @@ void TestBuildSettingsArrayDefaults() {
     }
 }
 
+// C6 — RST_STREAM detaches sink so a later on_stream_close (or dtor's
+// defensive FailAllStreams) does NOT fire OnError on a transaction that
+// has already moved on to a retry. Pitfall: without detach, the inner
+// retry's fresh codec/sink could be double-delivered an error.
+void TestC6ResetStreamSinkDetachSurvivesDtor() {
+    std::cout << "\n[TEST] H2Upstream C6: ResetStream detaches sink — dtor's FailAllStreams skips it..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec   = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 0;
+
+        RecordingSink sink;
+        {
+            UpstreamH2Connection conn(nullptr, cfg);
+            if (!conn.Init()) {
+                TestFramework::RecordTest(
+                    "H2Upstream C6: ResetStream detaches sink — dtor's FailAllStreams skips it",
+                    false, "Init failed");
+                return;
+            }
+            int32_t sid = conn.SubmitRequest(
+                "GET", "http", "example.com", "/", {}, "", &sink);
+            if (sid != 1) {
+                TestFramework::RecordTest(
+                    "H2Upstream C6: ResetStream detaches sink — dtor's FailAllStreams skips it",
+                    false, "SubmitRequest failed");
+                return;
+            }
+            // ResetStream MUST detach the sink BEFORE submitting RST so a
+            // later on_stream_close / dtor FailAllStreams doesn't fire
+            // OnError on the (potentially retried) transaction.
+            conn.ResetStream(sid);
+        }  // ~conn fires defensive FailAllStreams; sink detached → no OnError
+
+        bool pass = (sink.error_calls == 0);
+        std::string err;
+        if (!pass) err = "sink.error_calls=" + std::to_string(sink.error_calls) + " expected 0";
+        TestFramework::RecordTest(
+            "H2Upstream C6: ResetStream detaches sink — dtor's FailAllStreams skips it",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream C6: ResetStream detaches sink — dtor's FailAllStreams skips it",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RunAll aggregator
 // ---------------------------------------------------------------------------
@@ -2770,6 +2917,7 @@ void RunAllH2UpstreamTests() {
     TestC4GoawayMarksNotUsable();
     TestC4bMarkDeadDisablesUsable();
     TestC5AcquireReleaseNoTornRead();
+    TestC6ResetStreamSinkDetachSurvivesDtor();
 }
 
 }  // namespace H2UpstreamTests

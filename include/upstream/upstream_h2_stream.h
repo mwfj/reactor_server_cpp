@@ -6,8 +6,6 @@
 #include "upstream/upstream_callbacks.h"
 // <cstdint>, <string>, <memory> provided by common.h (via upstream_response.h)
 
-class UpstreamH2Codec;
-
 // Heap-held source that nghttp2 reads from when streaming a request body.
 // Owned by the UpstreamH2Stream that submitted the request — the data
 // provider read_callback dereferences `this` until offset == body.size(),
@@ -31,7 +29,6 @@ struct UpstreamH2Stream {
     // H1 path uses a different intermediate.
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead response_head;
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink = nullptr;
-    UpstreamH2Codec* codec = nullptr;
     bool ended = false;
     // Set true after the first END_HEADERS HEADERS frame fires
     // OnHeaders. Subsequent HEADERS frames (e.g. trailers) take a

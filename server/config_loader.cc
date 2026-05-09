@@ -2009,17 +2009,21 @@ void ConfigLoader::ValidateHotReloadable(
                     idx + " ('" + u.name +
                     "'): http2.max_frame_size must be 16384 to 16777215");
             }
-            if (h2.max_header_list_size < 1) {
+            // 0 disables HPACK dynamic table (accepted). The ceiling
+            // bounds per-stream HPACK allocation against operator typo
+            // (UINT32_MAX would allocate 4 GiB per stream).
+            if (h2.header_table_size > HTTP2_CONSTANTS::MAX_HEADER_TABLE_SIZE) {
                 throw std::invalid_argument(
                     idx + " ('" + u.name +
-                    "'): http2.max_header_list_size must be >= 1");
+                    "'): http2.header_table_size must be 0 to 16777216 (16 MiB)");
             }
-            if (h2.max_header_list_size < 4096) {
-                logging::Get()->warn(
-                    "{} ('{}'): http2.max_header_list_size={} is below 4096 — "
-                    "every real H2 request will exceed this and be rejected "
-                    "with COMPRESSION_ERROR",
-                    idx, u.name, h2.max_header_list_size);
+            // Sub-4096 max_header_list_size rejects every real H2 request
+            // with COMPRESSION_ERROR (RFC 9113 §6.5.2 — typical request
+            // headers + HPACK overhead exceeds this trivially).
+            if (h2.max_header_list_size < HTTP2_CONSTANTS::MIN_MAX_HEADER_LIST_SIZE) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.max_header_list_size must be >= 4096");
             }
             if (h2.ping_idle_sec < 0) {
                 throw std::invalid_argument(
@@ -2620,15 +2624,13 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
             throw std::invalid_argument(
                 "http2.max_frame_size must be 16384 to 16777215");
         }
-        if (config.http2.max_header_list_size < 1) {
+        // Sub-4096 rejects every real H2 request with COMPRESSION_ERROR
+        // (RFC 9113 §6.5.2 — typical request headers + HPACK overhead
+        // exceeds this trivially).
+        if (config.http2.max_header_list_size <
+            HTTP2_CONSTANTS::MIN_MAX_HEADER_LIST_SIZE) {
             throw std::invalid_argument(
-                "http2.max_header_list_size must be >= 1");
-        }
-        if (config.http2.max_header_list_size < 4096) {
-            logging::Get()->warn(
-                "http2.max_header_list_size={} is below 4096 — every real H2 "
-                "request will exceed this and be rejected with COMPRESSION_ERROR",
-                config.http2.max_header_list_size);
+                "http2.max_header_list_size must be >= 4096");
         }
     }
 
@@ -2958,20 +2960,21 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         idx + " ('" + u.name +
                         "'): http2.max_frame_size must be 16384 to 16777215");
                 }
-                // header_table_size: 32-bit unsigned per nghttp2.
-                // 0 disables HPACK dynamic table — accepted. Upper
-                // bound is implicit in the uint32_t type.
-                if (h2.max_header_list_size < 1) {
+                // 0 disables HPACK dynamic table (accepted). The ceiling
+                // bounds per-stream HPACK allocation against an operator
+                // typo (UINT32_MAX would allocate 4 GiB per stream).
+                if (h2.header_table_size > HTTP2_CONSTANTS::MAX_HEADER_TABLE_SIZE) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
-                        "'): http2.max_header_list_size must be >= 1");
+                        "'): http2.header_table_size must be 0 to 16777216 (16 MiB)");
                 }
-                if (h2.max_header_list_size < 4096) {
-                    logging::Get()->warn(
-                        "{} ('{}'): http2.max_header_list_size={} is below 4096 — "
-                        "every real H2 request will exceed this and be rejected "
-                        "with COMPRESSION_ERROR",
-                        idx, u.name, h2.max_header_list_size);
+                // Sub-4096 max_header_list_size rejects every real H2 request
+                // with COMPRESSION_ERROR (RFC 9113 §6.5.2 — typical request
+                // headers + HPACK overhead exceeds this trivially).
+                if (h2.max_header_list_size < HTTP2_CONSTANTS::MIN_MAX_HEADER_LIST_SIZE) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.max_header_list_size must be >= 4096");
                 }
                 if (h2.ping_idle_sec < 0) {
                     throw std::invalid_argument(

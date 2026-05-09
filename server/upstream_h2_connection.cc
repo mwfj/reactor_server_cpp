@@ -88,7 +88,6 @@ int OnBeginHeadersCallback(nghttp2_session* /*session*/,
         !stream->head_dispatched && stream->saw_1xx_interim) {
         stream->response_head.headers.clear();
         stream->response_head.status_code = 0;
-        stream->response.headers.clear();
         stream->response.status_code = 0;
     }
     return 0;
@@ -165,8 +164,8 @@ int OnHeaderCallback(nghttp2_session* /*session*/, const nghttp2_frame* frame,
     if (to_trailers) {
         stream->trailers.emplace_back(std::move(nm), std::move(val));
     } else {
-        stream->response_head.headers.emplace_back(nm, val);
-        stream->response.headers.emplace_back(std::move(nm), std::move(val));
+        stream->response_head.headers.emplace_back(std::move(nm),
+                                                   std::move(val));
     }
     return 0;
 }
@@ -419,6 +418,13 @@ void UpstreamH2Connection::OnPingAck() {
 
 void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
     auto now = std::chrono::steady_clock::now();
+    // Set goaway_seen_=true BEFORE the fan-out below: a sink's OnError
+    // closure can synchronously call back into TryDispatchExistingH2Session
+    // / IsUsable() — both check goaway_seen_ and reject this connection,
+    // which is required to prevent the same-conn from being reselected
+    // and a fresh stream submitted onto a session that's already
+    // draining. Reordering the assignment after fan-out would silently
+    // break the guarantee.
     goaway_seen_ = true;
     goaway_last_stream_id_ = last_stream_id;
     goaway_seen_at_ = now;
@@ -628,6 +634,11 @@ void UpstreamH2Connection::FailAllStreams(int error_code,
 
 void UpstreamH2Connection::ResetStream(int32_t stream_id) {
     if (!session_) return;
+    // dead_ guard: during dtor teardown, MarkDead runs before
+    // FailAllStreams fan-out; if any sink's OnError closure reentrantly
+    // calls ResetStream, the submit below would warn-spam against an
+    // about-to-be-freed session.
+    if (dead_) return;
     auto it = streams_.find(stream_id);
     if (it == streams_.end()) return;
     // Detach the sink before submitting RST_STREAM so the eventual
@@ -672,7 +683,6 @@ int32_t UpstreamH2Connection::SubmitRequest(
     const std::string& path,
     const std::map<std::string, std::string>& headers,
     const std::string& body,
-    UpstreamH2Codec* codec,
     UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink)
 {
     if (!IsUsable()) return -1;
@@ -730,7 +740,6 @@ int32_t UpstreamH2Connection::SubmitRequest(
     }
 
     auto stream = std::make_shared<UpstreamH2Stream>();
-    stream->codec = codec;
     stream->sink = sink;
 
     nghttp2_data_provider2 provider = {};

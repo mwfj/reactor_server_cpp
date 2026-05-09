@@ -696,6 +696,20 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
     if (defer_for_handshake) {
         std::weak_ptr<ProxyTransaction> wk_self = weak_from_this();
         std::weak_ptr<ConnectionHandler> wk_t = transport;
+        // The pool's close/error fan-out routes a disconnect to
+        // borrower_cb = handler->GetOnMessageCb() with empty data.
+        // Without this transient hook, a TLS handshake failure (peer
+        // RST, cert error, ALPN abort) wedges the transaction in
+        // CHECKOUT_PENDING with the lease + breaker admission stranded
+        // until the request deadline tears it down.
+        transport->SetOnMessageCb(
+            [wk_self](std::shared_ptr<ConnectionHandler>, std::string& data) {
+                if (!data.empty()) return;
+                auto self = wk_self.lock();
+                if (!self || self->cancelled_) return;
+                self->OnError(RESULT_UPSTREAM_DISCONNECT,
+                              "upstream disconnected during TLS handshake");
+            });
         transport->SetHandshakeCompleteCallback(
             [wk_self, wk_t]() {
                 auto self = wk_self.lock();
@@ -809,13 +823,13 @@ void ProxyTransaction::DispatchH2() {
     // doesn't accidentally reach the same transport.
     if (lease_) lease_.Release();
 
-    // Switch the codec to the H2 implementation. Sink wiring happens
-    // through the SubmitRequest call below; the codec object itself
-    // serves as the per-stream identity for nghttp2 callbacks.
+    // Switch the codec to the H2 implementation. The codec object
+    // owns response parsing state for the H1 fallback path; on the H2
+    // path it is unused at the connection layer (sink callbacks fire
+    // directly from nghttp2 frame callbacks).
     auto h2_codec = std::make_unique<UpstreamH2Codec>();
     h2_codec->SetRequestMethod(method_);
     h2_codec->SetSink(this);
-    UpstreamH2Codec* raw_codec = h2_codec.get();
     codec_ = std::move(h2_codec);
 
     // Build :authority by reusing the H1 Host header that
@@ -861,7 +875,7 @@ void ProxyTransaction::DispatchH2() {
 
     int32_t stream_id = h2->SubmitRequest(
         method_, scheme, authority, path_with_query,
-        rewritten_headers_, request_body_, raw_codec, this);
+        rewritten_headers_, request_body_, this);
     if (stream_id < 0) {
         logging::Get()->warn(
             "ProxyTransaction H2 submit failed client_fd={} service={} "

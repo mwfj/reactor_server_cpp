@@ -20,6 +20,8 @@ inline constexpr uint32_t DEFAULT_MAX_HEADER_LIST_SIZE    = 65536;  // 64 KB
 inline constexpr uint32_t MIN_MAX_FRAME_SIZE              = 16384;
 inline constexpr uint32_t MAX_MAX_FRAME_SIZE              = 16777215;
 inline constexpr uint32_t MAX_WINDOW_SIZE                 = 2147483647;  // 2^31 - 1
+inline constexpr uint32_t MAX_HEADER_TABLE_SIZE           = 16 * 1024 * 1024;  // 16 MiB
+inline constexpr uint32_t MIN_MAX_HEADER_LIST_SIZE        = 4096;
 
 // Flood protection thresholds (per sliding window interval)
 inline constexpr int MAX_SETTINGS_PER_INTERVAL            = 100;

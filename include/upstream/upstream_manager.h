@@ -153,7 +153,7 @@ public:
     // unit-test coverage of the lookup semantics (live-only narrow,
     // missing-from-staged returns nullopt). Pure lookup — does not
     // mutate partition state. Safe from any thread.
-    std::optional<Http2UpstreamConfig> LookupStagedH2ForLivePartition(
+    std::optional<Http2UpstreamConfig> LookupStagedH2ForLivePartitionForTesting(
         const std::string& upstream_name,
         const std::vector<UpstreamConfig>& staged_upstreams) const;
 

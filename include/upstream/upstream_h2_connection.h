@@ -97,7 +97,6 @@ public:
         const std::string& path,
         const std::map<std::string, std::string>& headers,
         const std::string& body,
-        UpstreamH2Codec* codec,
         UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink);
 
     // Cancel an in-flight stream. Submits RST_STREAM with NGHTTP2_CANCEL

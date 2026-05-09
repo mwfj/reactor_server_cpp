@@ -405,7 +405,7 @@ Hop-by-hop headers listed in RFC 7230 §6.1 (`Connection`, `Keep-Alive`, `Proxy-
 - Worker threads > 0
 - If TLS enabled, cert_file and key_file must be non-empty
 - shutdown_drain_timeout_sec: 0-300 (0 = immediate close)
-- If HTTP/2 enabled: max_concurrent_streams >= 1, initial_window_size 1 to 2^31-1, max_frame_size 16384 to 16777215, max_header_list_size >= 1
+- If HTTP/2 enabled: max_concurrent_streams >= 1, initial_window_size 1 to 2^31-1, max_frame_size 16384 to 16777215, max_header_list_size >= 4096, header_table_size 0 to 16777216 (per-upstream)
 
 Throws `std::invalid_argument` on validation failure.
 
