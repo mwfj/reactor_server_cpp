@@ -484,6 +484,51 @@ void TestCompositeStripsAllOwnedHeaders() {
     }
 }
 
+// Direct Vec-form Strip on JaegerPropagator: must remove every case
+// variant of `uber-trace-id` in a single linear pass without going
+// through the base default's map roundtrip. Verifies the override is
+// installed and case-insensitive.
+void TestJaegerStripsOwnedHeadersVec() {
+    try {
+        JaegerPropagator p;
+        std::vector<std::pair<std::string, std::string>> headers;
+        headers.emplace_back("uber-trace-id",   "lowercase-spoof");
+        headers.emplace_back("Uber-Trace-Id",   "mixedcase-spoof");
+        headers.emplace_back("UBER-TRACE-ID",   "uppercase-spoof");
+        headers.emplace_back("traceparent",     "left-alone");
+        headers.emplace_back("host",            "example.com");
+
+        p.StripOwnedHeaders(headers);
+
+        size_t ut_count = 0;
+        bool tp_kept = false, host_kept = false;
+        for (const auto& [k, v] : headers) {
+            (void)v;
+            std::string lk;
+            for (char c : k) lk.push_back(
+                static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            if (lk == "uber-trace-id") ++ut_count;
+            else if (lk == "traceparent") tp_kept = true;
+            else if (lk == "host")        host_kept = true;
+        }
+        // Strip removes every uber-trace-id variant; foreign trace
+        // headers (W3C-owned) are NOT touched (Strip is per-format),
+        // unrelated headers preserved.
+        bool pass = ut_count == 0 && tp_kept && host_kept;
+        TestFramework::RecordTest(
+            "ObsJaeger: Strip(vec) override removes all uber-trace-id case variants",
+            pass, pass ? ""
+                      : "ut=" + std::to_string(ut_count)
+                       + " tp=" + std::to_string(tp_kept)
+                       + " host=" + std::to_string(host_kept),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsJaeger: Strip(vec) override removes all uber-trace-id case variants",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Vec-form Strip override on Composite delegates to each child's Vec
 // StripOwnedHeaders. Verifies (a) every child-owned name is stripped,
 // (b) case-insensitive sweep covers mixed-case duplicates, (c)
@@ -680,6 +725,7 @@ void RunAllTests() {
     TestCompositeExtractPrecedence();
     TestCompositeExtractFallthrough();
     TestCompositeInjectAll();
+    TestJaegerStripsOwnedHeadersVec();
     TestCompositeStripsAllOwnedHeaders();
     TestCompositeStripsAllOwnedHeadersVec();
     TestCompositeBuildEmptyRejected();

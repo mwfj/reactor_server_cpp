@@ -1,6 +1,8 @@
 #include "observability/otlp_transport.h"
 
 #include "auth/upstream_http_client.h"
+#include "dispatcher.h"
+#include "log/logger.h"
 
 #include <algorithm>
 #include <chrono>
@@ -32,6 +34,28 @@ OtlpHttpExporter::TransportFn MakeOtlpTransport(
 
         auto client = client_weak.lock();
         if (!client) {
+            return ExportResult::kFailedNotRetryable;
+        }
+
+        // Self-deadlock guard: dispatcher_index=0 below funnels every
+        // export through socket dispatcher 0. If a caller ever invokes
+        // this transport WHILE running on dispatcher 0, the Issue call
+        // would EnQueue work onto its own loop and then promise.wait()
+        // would block that loop forever. Today no caller does this
+        // (BSP/PMR worker threads are NOT dispatcher threads, and
+        // HttpServer::Stop runs on the main thread), but a future
+        // FlushObservability path that runs from a socket-dispatcher
+        // hop would hit this gate. Cheap one-comparison check; release
+        // builds keep it because preventing the deadlock outright is
+        // strictly safer than crashing on a debug-only assert.
+        const auto& dispatchers = client->dispatchers();
+        if (!dispatchers.empty() && dispatchers[0]
+            && dispatchers[0]->is_on_loop_thread()) {
+            logging::Get()->error(
+                "OTLP transport invoked from socket dispatcher 0 — "
+                "would self-deadlock; aborting export "
+                "(pool={} path={})",
+                payload.upstream_pool_name, payload.path);
             return ExportResult::kFailedNotRetryable;
         }
 

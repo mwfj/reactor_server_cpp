@@ -163,6 +163,10 @@ public:
     bool Inject(const SpanContext& ctx,
                  HeadersMap& headers) const override;
     void StripOwnedHeaders(HeadersMap& headers) const override;
+    // Vec-form override (mirrors W3C). Avoids the base default's
+    // map-roundtrip + survivor-set rebuild — relevant when the
+    // composite propagator's vec-form Strip fans out across children.
+    void StripOwnedHeaders(HeadersVec& headers) const override;
     const char* Name() const noexcept override { return "jaeger"; }
 
 private:

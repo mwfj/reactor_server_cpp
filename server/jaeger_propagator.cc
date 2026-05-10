@@ -137,4 +137,15 @@ void JaegerPropagator::StripOwnedHeaders(HeadersMap& headers) const {
     }
 }
 
+void JaegerPropagator::StripOwnedHeaders(HeadersVec& headers) const {
+    // Single-pass remove_if mirrors W3C's vec-form strip — case-
+    // insensitive, no per-header allocation, no map roundtrip.
+    headers.erase(
+        std::remove_if(headers.begin(), headers.end(),
+            [](const std::pair<std::string, std::string>& kv) {
+                return EqualsLowerAscii(kv.first, kHeader);
+            }),
+        headers.end());
+}
+
 }  // namespace OBSERVABILITY_NAMESPACE

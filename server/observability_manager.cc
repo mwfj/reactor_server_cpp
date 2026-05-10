@@ -244,10 +244,9 @@ ObservabilityManager::EffectiveSamplerForPath(
         if (r.path_prefix.empty()) continue;
         if (path.size() < r.path_prefix.size()) continue;
 
-        // FIXME: Is this has the potential memory leak or performance issue? 
-        // We are doing memcmp for every request, and the path_prefix can be of arbitrary length. 
-        // We should consider using a more efficient data structure for route overrides, 
-        // such as a trie or prefix tree, to optimize the lookup process?
+        // Linear prefix scan. Typical operator configs carry 1-5
+        // route overrides; the per-request cost is negligible at that
+        // scale. A trie would only pay off for hundreds of overrides.
         if (std::memcmp(path.data(), r.path_prefix.data(),
                          r.path_prefix.size()) != 0) {
             continue;
