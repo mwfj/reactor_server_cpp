@@ -295,6 +295,52 @@ void TestHotReloadableForcesLiveValidationWhenLive() {
     }
 }
 
+// ValidateHotReloadable must mirror LoadFromString's checks on
+// `traces.propagators` (live-reloadable). LoadFromString validates at
+// JSON parse time, but a hand-built ServerConfig that bypasses the
+// loader would otherwise reach ObservabilityManager::Reload, where
+// CompositePropagator::Build throws AFTER earlier subsystems already
+// committed — violating the atomic-reload contract. The validator
+// must hard-reject empty / unknown / duplicate names at the gate.
+void TestHotReloadableRejectsBadPropagators() {
+    try {
+        // Hand-built config bypasses LoadFromString's validation.
+        ServerConfig empty_cfg;
+        empty_cfg.observability.enabled = true;
+        empty_cfg.observability.traces.propagators = {};
+        bool threw_empty = false;
+        try { ConfigLoader::ValidateHotReloadable(empty_cfg, {}); }
+        catch (const std::invalid_argument&) { threw_empty = true; }
+
+        ServerConfig unknown_cfg;
+        unknown_cfg.observability.enabled = true;
+        unknown_cfg.observability.traces.propagators = {"w3c", "garbage"};
+        bool threw_unknown = false;
+        try { ConfigLoader::ValidateHotReloadable(unknown_cfg, {}); }
+        catch (const std::invalid_argument&) { threw_unknown = true; }
+
+        ServerConfig dup_cfg;
+        dup_cfg.observability.enabled = true;
+        dup_cfg.observability.traces.propagators = {"w3c", "w3c"};
+        bool threw_dup = false;
+        try { ConfigLoader::ValidateHotReloadable(dup_cfg, {}); }
+        catch (const std::invalid_argument&) { threw_dup = true; }
+
+        bool pass = threw_empty && threw_unknown && threw_dup;
+        TestFramework::RecordTest(
+            "ObsCfg: ValidateHotReloadable rejects empty/unknown/duplicate propagators",
+            pass, pass ? ""
+                      : "empty=" + std::to_string(threw_empty)
+                       + " unknown=" + std::to_string(threw_unknown)
+                       + " dup=" + std::to_string(threw_dup),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: ValidateHotReloadable rejects empty/unknown/duplicate propagators",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // HotReloadable should NOT reject restart-required-only fields (those
 // are surfaced by HttpServer::Reload's outer warn).
 void TestHotReloadableSkipsRestartFields() {
@@ -317,6 +363,175 @@ void TestHotReloadableSkipsRestartFields() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "ObsCfg: ValidateHotReloadable skips restart-only otlp.upstream cross-ref",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- OTLP exporter validation (Phase 2 — pipeline now wired) ----
+
+// Phase 1 fail-closed rejected `otlp_http` outright at Validate(). Phase 2
+// wires the OTLP push pipeline, so the rejection is gone and a config that
+// names a valid upstream must Validate cleanly.
+void TestOtlpHttpExporterValidatesAtLoad() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "upstreams": [{"name": "otel_collector", "host": "127.0.0.1",
+                            "port": 4318, "tls": {"enabled": false},
+                            "pool": {"max_connections": 4, "max_idle_connections": 4}}],
+            "observability": {
+                "enabled": true,
+                "traces":  {"exporter": "otlp_http", "otlp": {"upstream": "otel_collector"}},
+                "metrics": {"exporter": "otlp_http", "otlp": {"upstream": "otel_collector"}}
+            }
+        })");
+        std::string err;
+        try { ConfigLoader::Validate(cfg); }
+        catch (const std::exception& e) { err = e.what(); }
+        bool pass = err.empty()
+                  && cfg.observability.traces.exporter == "otlp_http"
+                  && cfg.observability.traces.otlp.upstream == "otel_collector"
+                  && cfg.observability.metrics.exporter == "otlp_http"
+                  && cfg.observability.metrics.otlp.upstream == "otel_collector";
+        TestFramework::RecordTest(
+            "ObsCfg: Validate accepts otlp_http with matching upstream",
+            pass, !err.empty() ? "Validate threw: " + err : (pass ? "" : "field mismatch"),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: Validate accepts otlp_http with matching upstream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// metrics-side cross-reference: the existing TestValidateRejectsUnknownOtlpUpstream
+// covers traces; this asserts the metrics path is checked too.
+void TestOtlpHttpExporterRejectsUnknownMetricsUpstream() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "upstreams": [],
+            "observability": {"enabled": true,
+                "metrics": {"exporter": "otlp_http", "otlp": {"upstream": "missing"}}
+            }
+        })");
+        bool threw = false;
+        try { ConfigLoader::Validate(cfg); }
+        catch (const std::invalid_argument&) { threw = true; }
+        TestFramework::RecordTest(
+            "ObsCfg: Validate rejects unknown metrics.otlp.upstream",
+            threw, threw ? "" : "didn't throw on unknown metrics upstream",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: Validate rejects unknown metrics.otlp.upstream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- traces.propagators (Phase 2 Task 8.5) ----
+
+void TestPropagatorsListLoad() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {"enabled": true,
+                "traces": {"propagators": ["jaeger", "w3c"]}}
+        })");
+        bool pass = cfg.observability.traces.propagators.size() == 2
+                  && cfg.observability.traces.propagators[0] == "jaeger"
+                  && cfg.observability.traces.propagators[1] == "w3c";
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators ordered list parsed",
+            pass, pass ? "" : "list mismatch",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators ordered list parsed",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestPropagatorsListDefaultIsW3C() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {"enabled": true}
+        })");
+        bool pass = cfg.observability.traces.propagators.size() == 1
+                  && cfg.observability.traces.propagators[0] == "w3c";
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators defaults to ['w3c']",
+            pass, pass ? "" : "default mismatch",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators defaults to ['w3c']",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestPropagatorsListEmptyRejected() {
+    try {
+        bool threw = false;
+        try {
+            ConfigLoader::LoadFromString(R"({
+                "observability": {"enabled": true,
+                    "traces": {"propagators": []}}
+            })");
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators empty array rejected",
+            threw, threw ? "" : "didn't throw",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators empty array rejected",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestPropagatorsListUnknownRejected() {
+    try {
+        bool threw = false;
+        try {
+            ConfigLoader::LoadFromString(R"({
+                "observability": {"enabled": true,
+                    "traces": {"propagators": ["xray"]}}
+            })");
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators unknown name rejected",
+            threw, threw ? "" : "didn't throw",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators unknown name rejected",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Build({"w3c", "w3c"}) would otherwise silently construct two
+// W3CPropagator children — wasteful and ambiguous about operator
+// intent. Validator must reject duplicates at config load.
+void TestPropagatorsListDuplicateRejected() {
+    try {
+        bool threw = false;
+        try {
+            ConfigLoader::LoadFromString(R"({
+                "observability": {"enabled": true,
+                    "traces": {"propagators": ["w3c", "jaeger", "w3c"]}}
+            })");
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators duplicate name rejected",
+            threw, threw ? "" : "didn't throw",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.propagators duplicate name rejected",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -486,11 +701,19 @@ void RunAllTests() {
     TestValidateRejectsBadInterval();
     TestValidateRejectsRatioOutOfRange();
     TestValidateRejectsUnknownOtlpUpstream();
+    TestOtlpHttpExporterValidatesAtLoad();
+    TestOtlpHttpExporterRejectsUnknownMetricsUpstream();
+    TestPropagatorsListLoad();
+    TestPropagatorsListDefaultIsW3C();
+    TestPropagatorsListEmptyRejected();
+    TestPropagatorsListUnknownRejected();
+    TestPropagatorsListDuplicateRejected();
     TestValidatePromPathMustStartWithSlash();
     TestValidateRejectsHistogramBucketsOutOfOrder();
     TestHotReloadableRejectsBadLiveValue();
     TestHotReloadableSkipsBadLiveValueWhenNotLive();
     TestHotReloadableForcesLiveValidationWhenLive();
+    TestHotReloadableRejectsBadPropagators();
     TestHotReloadableSkipsRestartFields();
     TestOperatorEqIgnoresLiveFields();
     TestOperatorEqDetectsRestartChange();

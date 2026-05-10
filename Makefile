@@ -107,9 +107,12 @@ OBSERVABILITY_SRCS = $(SERVER_DIR)/trace_id.cc $(SERVER_DIR)/trace_state.cc \
                      $(SERVER_DIR)/observability_manager.cc \
                      $(SERVER_DIR)/observability_middleware.cc \
                      $(SERVER_DIR)/propagator.cc \
+                     $(SERVER_DIR)/jaeger_propagator.cc \
+                     $(SERVER_DIR)/composite_propagator.cc \
                      $(SERVER_DIR)/batch_span_processor.cc \
                      $(SERVER_DIR)/periodic_metric_reader.cc \
                      $(SERVER_DIR)/otlp_http_exporter.cc \
+                     $(SERVER_DIR)/otlp_transport.cc \
                      $(SERVER_DIR)/prometheus_exporter.cc \
                      $(SERVER_DIR)/metrics_handler.cc
 
@@ -175,7 +178,7 @@ THREAD_POOL_HEADERS = $(THREAD_POOL_DIR)/include/threadpool.h $(THREAD_POOL_DIR)
 UTIL_HEADERS = $(UTIL_DIR)/timestamp.h $(UTIL_DIR)/base64.h
 FOUNDATION_HEADERS = $(LIB_DIR)/log/logger.h $(LIB_DIR)/log/log_utils.h $(LIB_DIR)/config/server_config.h $(LIB_DIR)/config/config_loader.h
 HTTP_HEADERS = $(LIB_DIR)/http/http_callbacks.h $(LIB_DIR)/http/http_connection_handler.h $(LIB_DIR)/http/http_parser.h $(LIB_DIR)/http/http_request.h $(LIB_DIR)/http/http_response.h $(LIB_DIR)/http/http_router.h $(LIB_DIR)/http/http_server.h $(LIB_DIR)/http/http_status.h $(LIB_DIR)/http/route_match.h $(LIB_DIR)/http/route_trie.h $(LIB_DIR)/http/route_trie_impl.h $(LIB_DIR)/http/streaming_response_sender.h $(LIB_DIR)/http/streaming_response_sender_utils.h $(LIB_DIR)/http/trailer_policy.h
-OBSERVABILITY_HEADERS = $(LIB_DIR)/observability/common.h $(LIB_DIR)/observability/attr_value.h $(LIB_DIR)/observability/batch_span_processor.h $(LIB_DIR)/observability/counter.h $(LIB_DIR)/observability/histogram.h $(LIB_DIR)/observability/instrumentation_scope.h $(LIB_DIR)/observability/meter.h $(LIB_DIR)/observability/meter_provider.h $(LIB_DIR)/observability/metric_exporter.h $(LIB_DIR)/observability/metric_label_registry.h $(LIB_DIR)/observability/metric_writer_context.h $(LIB_DIR)/observability/metrics_handler.h $(LIB_DIR)/observability/metrics_snapshot.h $(LIB_DIR)/observability/observability_config.h $(LIB_DIR)/observability/observability_manager.h $(LIB_DIR)/observability/observability_middleware.h $(LIB_DIR)/observability/observability_snapshot.h $(LIB_DIR)/observability/otlp_http_exporter.h $(LIB_DIR)/observability/periodic_metric_reader.h $(LIB_DIR)/observability/prometheus_exporter.h $(LIB_DIR)/observability/propagator.h $(LIB_DIR)/observability/resource.h $(LIB_DIR)/observability/sampler.h $(LIB_DIR)/observability/semantic_conventions.h $(LIB_DIR)/observability/span.h $(LIB_DIR)/observability/span_context.h $(LIB_DIR)/observability/span_data.h $(LIB_DIR)/observability/span_exporter.h $(LIB_DIR)/observability/span_kind.h $(LIB_DIR)/observability/span_processor.h $(LIB_DIR)/observability/span_status.h $(LIB_DIR)/observability/trace_context.h $(LIB_DIR)/observability/trace_id.h $(LIB_DIR)/observability/trace_state.h $(LIB_DIR)/observability/tracer.h $(LIB_DIR)/observability/tracer_provider.h
+OBSERVABILITY_HEADERS = $(LIB_DIR)/observability/common.h $(LIB_DIR)/observability/attr_value.h $(LIB_DIR)/observability/batch_span_processor.h $(LIB_DIR)/observability/counter.h $(LIB_DIR)/observability/histogram.h $(LIB_DIR)/observability/instrumentation_scope.h $(LIB_DIR)/observability/meter.h $(LIB_DIR)/observability/meter_provider.h $(LIB_DIR)/observability/metric_exporter.h $(LIB_DIR)/observability/metric_label_registry.h $(LIB_DIR)/observability/metric_writer_context.h $(LIB_DIR)/observability/metrics_handler.h $(LIB_DIR)/observability/metrics_snapshot.h $(LIB_DIR)/observability/observability_config.h $(LIB_DIR)/observability/observability_manager.h $(LIB_DIR)/observability/observability_middleware.h $(LIB_DIR)/observability/observability_snapshot.h $(LIB_DIR)/observability/otlp_http_exporter.h $(LIB_DIR)/observability/otlp_transport.h $(LIB_DIR)/observability/periodic_metric_reader.h $(LIB_DIR)/observability/prometheus_exporter.h $(LIB_DIR)/observability/propagator.h $(LIB_DIR)/observability/resource.h $(LIB_DIR)/observability/sampler.h $(LIB_DIR)/observability/semantic_conventions.h $(LIB_DIR)/observability/span.h $(LIB_DIR)/observability/span_context.h $(LIB_DIR)/observability/span_data.h $(LIB_DIR)/observability/span_exporter.h $(LIB_DIR)/observability/span_kind.h $(LIB_DIR)/observability/span_processor.h $(LIB_DIR)/observability/span_status.h $(LIB_DIR)/observability/trace_context.h $(LIB_DIR)/observability/trace_id.h $(LIB_DIR)/observability/trace_state.h $(LIB_DIR)/observability/tracer.h $(LIB_DIR)/observability/tracer_provider.h
 HTTP2_HEADERS = $(LIB_DIR)/http2/http2_callbacks.h $(LIB_DIR)/http2/http2_connection_handler.h $(LIB_DIR)/http2/http2_constants.h $(LIB_DIR)/http2/http2_session.h $(LIB_DIR)/http2/http2_stream.h $(LIB_DIR)/http2/protocol_detector.h
 WS_HEADERS = $(LIB_DIR)/ws/websocket_connection.h $(LIB_DIR)/ws/websocket_frame.h $(LIB_DIR)/ws/websocket_handshake.h $(LIB_DIR)/ws/websocket_parser.h $(LIB_DIR)/ws/utf8_validate.h
 TLS_HEADERS = $(LIB_DIR)/tls/tls_context.h $(LIB_DIR)/tls/tls_connection.h $(LIB_DIR)/tls/tls_client_context.h
@@ -394,8 +397,8 @@ test_h2_upstream: $(TARGET)
 # target (the runner doesn't ship an umbrella flag — unknown flags
 # exit through the unknown-option path).
 test_obs: test_obs_foundation test_obs_tracer test_obs_metrics \
-          test_obs_mgr test_obs_propagator test_obs_export \
-          test_obs_prom test_obs_config test_obs_shutdown \
+          test_obs_mgr test_obs_propagator test_obs_jaeger_propagator \
+          test_obs_export test_obs_prom test_obs_config test_obs_shutdown \
           test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e
 	@echo "All observability suites passed."
 
@@ -418,6 +421,10 @@ test_obs_mgr: $(TARGET)
 test_obs_propagator: $(TARGET)
 	@echo "Running W3C propagator tests..."
 	./$(TARGET) obs_propagator
+
+test_obs_jaeger_propagator: $(TARGET)
+	@echo "Running Jaeger propagator tests..."
+	./$(TARGET) obs_jaeger_propagator
 
 test_obs_export: $(TARGET)
 	@echo "Running observability export pipeline tests..."
@@ -553,4 +560,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_auth_foundation test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dns test_dual_stack test_dual_stack_tsan test_dns_resolver test_auth_observability test_h2_upstream test_obs test_obs_foundation test_obs_tracer test_obs_metrics test_obs_mgr test_obs_propagator test_obs_export test_obs_prom test_obs_config test_obs_shutdown test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_auth_foundation test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dns test_dual_stack test_dual_stack_tsan test_dns_resolver test_auth_observability test_h2_upstream test_obs test_obs_foundation test_obs_tracer test_obs_metrics test_obs_mgr test_obs_propagator test_obs_jaeger_propagator test_obs_export test_obs_prom test_obs_config test_obs_shutdown test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e help

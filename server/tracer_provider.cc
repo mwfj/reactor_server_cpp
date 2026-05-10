@@ -36,6 +36,16 @@ Tracer* TracerProvider::GetTracer(const std::string& name,
     return raw;
 }
 
+void TracerProvider::SwapProcessorAcrossTracers(
+        std::shared_ptr<SpanProcessor> new_processor) {
+    if (!new_processor) return;
+    std::lock_guard<std::mutex> g(tracer_mtx_);
+    processor_ = new_processor;   // future GetTracer() picks this up
+    for (auto& [_, tracer] : tracers_) {
+        tracer->SwapProcessor(new_processor);
+    }
+}
+
 void TracerProvider::Reload(std::shared_ptr<const Sampler> new_sampler,
                               ProcessorOptions               new_processor_options) {
     std::shared_ptr<SpanProcessor> processor_for_reload;
@@ -65,8 +75,19 @@ void TracerProvider::Reload(std::shared_ptr<const Sampler> new_sampler,
     if (processor_for_reload) {
         if (auto* bsp = dynamic_cast<BatchSpanProcessor*>(
                 processor_for_reload.get())) {
-            bsp->Reload(new_processor_options.max_export_batch_size,
-                        new_processor_options.schedule_delay);
+            // export_timeout=0 is the "preserve construction-time
+            // timeout" sentinel — fall back to the 2-arg overload.
+            // Any positive value pushes the new deadline into the
+            // BSP's atomic so the next attempt observes the change.
+            if (new_processor_options.export_timeout
+                    > std::chrono::milliseconds{0}) {
+                bsp->Reload(new_processor_options.max_export_batch_size,
+                            new_processor_options.schedule_delay,
+                            new_processor_options.export_timeout);
+            } else {
+                bsp->Reload(new_processor_options.max_export_batch_size,
+                            new_processor_options.schedule_delay);
+            }
             bsp->ReloadRetries(
                 new_processor_options.retries_max_attempts,
                 new_processor_options.retries_initial_backoff,

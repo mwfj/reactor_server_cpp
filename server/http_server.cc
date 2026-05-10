@@ -6,9 +6,14 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/proxy_handler.h"
 #include "auth/auth_manager.h"
+#include "auth/upstream_http_client.h"
+#include "observability/batch_span_processor.h"
 #include "observability/observability_manager.h"
 #include "observability/observability_middleware.h"
 #include "observability/observability_snapshot.h"
+#include "observability/otlp_http_exporter.h"
+#include "observability/otlp_transport.h"
+#include "observability/periodic_metric_reader.h"
 #include "auth/auth_middleware.h"
 #include "circuit_breaker/circuit_breaker_manager.h"
 #include "circuit_breaker/circuit_breaker_host.h"
@@ -1254,6 +1259,110 @@ void HttpServer::MarkServerReady() {
     // programmatic HttpServer::Proxy() API). See RecomputeAsyncDeferredCap
     // for the sizing logic and opt-out sentinel.
     RecomputeAsyncDeferredCap();
+
+    // OTLP push pipeline — boot-time hot-swap from NoopSpanProcessor to
+    // BatchSpanProcessor + OtlpHttpExporter. The exporter is owned here
+    // (not via auth's UpstreamHttpClient) so OTLP traffic doesn't share
+    // auth's per-issuer cancel-token state.
+    const bool otlp_traces_on =
+        observability_manager_
+        && observability_manager_->config().enabled
+        && observability_manager_->config().traces.exporter
+            == OBSERVABILITY_NAMESPACE::kExporterOtlpHttp;
+    const bool otlp_metrics_on =
+        observability_manager_
+        && observability_manager_->config().enabled
+        && observability_manager_->config().metrics.exporter
+            == OBSERVABILITY_NAMESPACE::kExporterOtlpHttp;
+    if (otlp_traces_on || otlp_metrics_on) {
+        otlp_upstream_http_client_ =
+            std::make_shared<AUTH_NAMESPACE::UpstreamHttpClient>(
+                upstream_manager_.get(), dispatchers);
+    }
+    // Build a snapshot of pool-name -> configured-host so the OTLP
+    // transport can populate Request.host_header from the upstream's
+    // real hostname instead of letting it default to the pool alias.
+    // The map is captured by value into the transport lambdas.
+    std::map<std::string, std::string> otlp_pool_to_host;
+    for (const auto& u : upstream_configs_) {
+        otlp_pool_to_host[u.name] = u.host;
+    }
+    OBSERVABILITY_NAMESPACE::HostLookupFn otlp_host_lookup =
+        [otlp_pool_to_host](const std::string& pool) -> std::string {
+            auto it = otlp_pool_to_host.find(pool);
+            return it == otlp_pool_to_host.end() ? std::string{} : it->second;
+        };
+    if (otlp_traces_on) {
+        const auto& cfg = observability_manager_->config();
+        OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Options opts;
+        opts.traces.upstream_pool_name = cfg.traces.otlp.upstream;
+        opts.traces.headers            = cfg.traces.otlp.headers;
+        opts.traces.timeout            = cfg.traces.otlp.timeout_ms;
+        if (otlp_metrics_on) {
+            opts.metrics.upstream_pool_name = cfg.metrics.otlp.upstream;
+            opts.metrics.headers            = cfg.metrics.otlp.headers;
+            opts.metrics.timeout            = cfg.metrics.otlp.timeout_ms;
+        }
+
+        otlp_exporter_ = OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Create(
+            std::move(opts),
+            OBSERVABILITY_NAMESPACE::MakeOtlpTransport(
+                    otlp_upstream_http_client_, otlp_host_lookup));
+
+        OBSERVABILITY_NAMESPACE::BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.max_queue_size          = cfg.traces.batch.max_queue_size;
+        bsp_opts.max_export_batch_size   = cfg.traces.batch.max_export_batch_size;
+        bsp_opts.schedule_delay          = cfg.traces.batch.schedule_delay;
+        bsp_opts.export_timeout          = cfg.traces.otlp.timeout_ms;
+        bsp_opts.retries_max_attempts    = cfg.traces.batch.retries.max_attempts;
+        bsp_opts.retries_initial_backoff = cfg.traces.batch.retries.initial_backoff;
+        bsp_opts.retries_max_backoff     = cfg.traces.batch.retries.max_backoff;
+
+        auto bsp = std::make_shared<
+            OBSERVABILITY_NAMESPACE::BatchSpanProcessor>(otlp_exporter_, bsp_opts);
+        observability_manager_->SwapToBatchSpanProcessor(bsp);
+
+        logging::Get()->info(
+            "OTLP traces exporter wired (upstream={}, schedule_delay={}ms)",
+            cfg.traces.otlp.upstream,
+            static_cast<long long>(bsp_opts.schedule_delay.count()));
+    }
+    if (otlp_metrics_on) {
+        const auto& cfg = observability_manager_->config();
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::OtlpHttpExporter> metrics_exporter;
+        if (otlp_exporter_) {
+            // Trace-side block already populated `opts.metrics` SignalOptions
+            // for the exporter — reuse the same instance. The shared exporter
+            // is the contract that ObservabilityManager::BeginShutdown's
+            // coordinated-SignalShutdown path detects.
+            metrics_exporter = otlp_exporter_;
+        } else {
+            OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Options m_opts;
+            m_opts.metrics.upstream_pool_name = cfg.metrics.otlp.upstream;
+            m_opts.metrics.headers            = cfg.metrics.otlp.headers;
+            m_opts.metrics.timeout            = cfg.metrics.otlp.timeout_ms;
+            metrics_exporter = OBSERVABILITY_NAMESPACE::OtlpHttpExporter::Create(
+                std::move(m_opts),
+                OBSERVABILITY_NAMESPACE::MakeOtlpTransport(
+                    otlp_upstream_http_client_, otlp_host_lookup));
+            otlp_exporter_ = metrics_exporter;  // for lifetime ownership
+        }
+
+        OBSERVABILITY_NAMESPACE::MeterReaderOptions reader_opts;
+        reader_opts.export_interval = cfg.metrics.reader.export_interval;
+        reader_opts.export_timeout  = cfg.metrics.reader.export_timeout;
+
+        auto reader = std::make_shared<OBSERVABILITY_NAMESPACE::PeriodicMetricReader>(
+            observability_manager_->meter_provider(),
+            metrics_exporter, reader_opts);
+        observability_manager_->RegisterMetricReader(std::move(reader));
+
+        logging::Get()->info(
+            "OTLP metrics exporter wired (upstream={}, export_interval={}ms{})",
+            cfg.metrics.otlp.upstream,
+            static_cast<long long>(reader_opts.export_interval.count()),
+            otlp_traces_on ? ", shared with traces" : "");
+    }
 
     // Observability middleware — installed LAST so PrependMiddleware's
     // "last prepend runs first" places it at the HEAD of the chain.
@@ -3337,12 +3446,19 @@ bool HttpServer::WaitForAllAsyncDrain(
 
 bool HttpServer::FlushObservabilityForShutdown(
         std::chrono::milliseconds budget) {
-    bool drained = WaitForAllAsyncDrain(budget);
-    // TODO: when the OTLP push pipeline is wired, call
-    // BatchSpanProcessor::ForceFlush here. The pre-upstream-shutdown
-    // placement keeps those exporter checkouts against live pools.
-    // ForceFlush is not on the SpanProcessor base interface today —
-    // either dynamic_cast or expand the base when wiring lands.
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    auto remaining = [deadline]() {
+        const auto now = std::chrono::steady_clock::now();
+        return now >= deadline ? std::chrono::milliseconds{0}
+            : std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    };
+
+    // Drain in-flight requests first so their FinalizeIfSnapshot calls
+    // populate the processor queues BEFORE FlushAll runs.
+    const bool drained = WaitForAllAsyncDrain(remaining());
+    if (observability_manager_) {
+        observability_manager_->FlushAll(remaining());
+    }
     return drained;
 }
 
@@ -6140,6 +6256,41 @@ bool HttpServer::Reload(ServerConfig new_config) {
     }
     if (observability_manager_) {
         observability_manager_->Reload(new_config.observability);
+        // ObservabilityManager::Reload propagates sampler/batch/reader
+        // settings, but the OtlpHttpExporter is owned by HttpServer and
+        // does not see SIGHUP otherwise. Push the (live-reloadable)
+        // headers + timeouts into it so rotated auth tokens / changed
+        // export deadlines take effect without a restart.
+        //
+        // Gate the push on the exporter-identity restart-only fields
+        // (exporter type + otlp.upstream). If those changed in the
+        // staged config, we already warned the operator that a restart
+        // is required — pushing the staged headers/timeout into the
+        // live exporter would silently apply a partial change (e.g. a
+        // SIGHUP that switches metrics to prometheus_pull would clear
+        // the live OTLP auth headers, breaking exports until restart).
+        // Keep the live exporter exactly as it was.
+        const bool exporter_identity_unchanged =
+            live_config_.observability.traces.exporter
+                == new_config.observability.traces.exporter
+            && live_config_.observability.metrics.exporter
+                == new_config.observability.metrics.exporter
+            && live_config_.observability.traces.otlp.upstream
+                == new_config.observability.traces.otlp.upstream
+            && live_config_.observability.metrics.otlp.upstream
+                == new_config.observability.metrics.otlp.upstream;
+        if (otlp_exporter_ && exporter_identity_unchanged) {
+            otlp_exporter_->ReloadHeaders(
+                new_config.observability.traces.otlp.headers,
+                new_config.observability.metrics.otlp.headers,
+                new_config.observability.traces.otlp.timeout_ms,
+                new_config.observability.metrics.otlp.timeout_ms);
+        } else if (otlp_exporter_) {
+            logging::Get()->info(
+                "Reload: OTLP exporter identity changed (exporter or "
+                "otlp.upstream) — restart required; live exporter "
+                "options preserved (headers, timeout)");
+        }
         // Preserve restart-only fields in the live snapshot so that
         // /config and any subsequent in-process Reload read the values
         // actually in use at runtime, not the staged-but-not-applied

@@ -28,6 +28,14 @@ namespace OBSERVABILITY_NAMESPACE {
 struct ProcessorOptions {
     size_t max_export_batch_size = 512;
     std::chrono::milliseconds schedule_delay = std::chrono::milliseconds{5000};
+    // Per-batch export timeout — live-reloadable. Sourced from
+    // traces.otlp.timeout_ms in the manager's Reload path. A value of
+    // zero is the sentinel for "preserve construction-time timeout";
+    // any positive value is pushed into BatchSpanProcessor's
+    // export_timeout_ns_ atomic via the 3-arg BSP::Reload overload.
+    // Without this plumbing, traces.otlp.timeout_ms is documented as
+    // live-reloadable but the BSP keeps its boot-time deadline.
+    std::chrono::milliseconds export_timeout = std::chrono::milliseconds{0};
     // Retry policy — live-reloadable, applied to subsequent batch
     // exports. Defaults match BatchSpanProcessorOptions.
     int retries_max_attempts                  = 3;
@@ -59,6 +67,13 @@ public:
     // is passed onward to BatchSpanProcessor::Reload (when wired).
     void Reload(std::shared_ptr<const Sampler> new_sampler,
                 ProcessorOptions               new_processor_options);
+
+    // Fan a single new SpanProcessor out across every cached Tracer.
+    // Used during ObservabilityManager::SwapToBatchSpanProcessor (the
+    // boot-time NoopSpanProcessor → BatchSpanProcessor handoff). Stores
+    // the new processor as the provider's default so future GetTracer()
+    // calls also pick it up. Pass-through no-op if null.
+    void SwapProcessorAcrossTracers(std::shared_ptr<SpanProcessor> new_processor);
 
     const Resource& resource() const { return *resource_; }
 

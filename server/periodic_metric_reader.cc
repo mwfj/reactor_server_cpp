@@ -27,6 +27,7 @@ PeriodicMetricReader::~PeriodicMetricReader() {
 
 void PeriodicMetricReader::WorkerLoop() {
     while (true) {
+        worker_loop_iterations_.fetch_add(1, std::memory_order_relaxed);
         const auto interval_ns = interval_ns_.load(std::memory_order_acquire);
 
         std::unique_lock<std::mutex> lk(mtx_);
@@ -43,25 +44,42 @@ void PeriodicMetricReader::WorkerLoop() {
             continue;
         }
 
-        // Snapshot the provider's current series state and hand to
-        // exporter. The snapshot is a consistent point-in-time view
-        // produced under the provider's series-map lock.
-        try {
-            MetricsSnapshot snap = provider_->Snapshot();
-            const auto deadline = std::chrono::steady_clock::now() +
-                std::chrono::nanoseconds(timeout_ns_.load(std::memory_order_acquire));
-            exporter_->Export(std::move(snap), deadline);
-            exported_cycles_.fetch_add(1, std::memory_order_relaxed);
-        } catch (const std::exception& e) {
-            logging::Get()->error(
-                "PeriodicMetricReader::Export threw: {}", e.what());
-        } catch (...) {
-            logging::Get()->error(
-                "PeriodicMetricReader::Export threw unknown exception");
+        // Live emission gate. metrics.enabled=false (boot or SIGHUP)
+        // means: keep the worker ticking so flush_completed_count_
+        // continues to advance for ForceFlush waiters AND so a
+        // false→true flip resumes immediately, but skip the actual
+        // Snapshot+Export pair. MeterProvider's writers keep
+        // accumulating regardless — only the push side is gated.
+        if (enabled_.load(std::memory_order_acquire)) {
+            // Snapshot the provider's current series state and hand to
+            // exporter. The snapshot is a consistent point-in-time view
+            // produced under the provider's series-map lock.
+            try {
+                MetricsSnapshot snap = provider_->Snapshot();
+                const auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::nanoseconds(
+                        timeout_ns_.load(std::memory_order_acquire));
+                exporter_->Export(std::move(snap), deadline);
+                exported_cycles_.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::exception& e) {
+                logging::Get()->error(
+                    "PeriodicMetricReader::Export threw: {}", e.what());
+            } catch (...) {
+                logging::Get()->error(
+                    "PeriodicMetricReader::Export threw unknown exception");
+            }
         }
 
+        // Any ForceFlush waiter that captured its target before this
+        // cycle is now satisfied.
+        {
+            std::lock_guard<std::mutex> g(flush_mtx_);
+            ++flush_completed_count_;
+        }
+        flush_cv_.notify_all();
+
         if (shutdown) break;
-        (void)flush;  // forced flush already handled by the loop iteration above.
+        (void)flush;
     }
     // Final-flush already happened above (the last iteration with
     // shutdown=true exported once). Signal the exporter unless the
@@ -79,14 +97,25 @@ void PeriodicMetricReader::WorkerLoop() {
 }
 
 void PeriodicMetricReader::SignalShutdown() {
-    bool expected = false;
-    if (!shutting_down_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel)) {
-        return;
+    signal_shutdown_calls_.fetch_add(1, std::memory_order_relaxed);
+    // Hold mtx_ across the CAS so the flag publication is serialized
+    // with the worker's predicate-then-suspend window inside
+    // cv_.wait_for. Without this, notify_all() can fire between the
+    // worker reading shutting_down_=false and the worker fully
+    // entering wait — the wakeup is lost and the worker sleeps for
+    // the full export_interval (default 60s) before checking again,
+    // wedging shutdown until JoinWorkers' deadline expires.
+    //
+    // Defer exporter signal until JoinWorkers — see BatchSpanProcessor
+    // for the rationale.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        bool expected = false;
+        if (!shutting_down_.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
+            return;  // idempotent — already shut down.
+        }
     }
-    // Wake the worker so it can run one final export pass before
-    // exiting. Defer exporter signal until JoinWorkers — see
-    // BatchSpanProcessor for the rationale.
     cv_.notify_all();
 }
 
@@ -119,16 +148,51 @@ void PeriodicMetricReader::JoinWorkers(std::chrono::milliseconds deadline) {
 }
 
 void PeriodicMetricReader::Reload(MeterReaderOptions new_options) {
-    interval_ns_.store(new_options.export_interval.count() * 1'000'000,
-                        std::memory_order_release);
-    timeout_ns_.store(new_options.export_timeout.count() * 1'000'000,
-                       std::memory_order_release);
+    // Publish under mtx_ so the stores are serialized with the
+    // worker's predicate-then-suspend window inside cv_.wait_for —
+    // otherwise a lost wakeup could delay pickup of the new interval
+    // by up to 60s. Stores happen inside the lock; no separate
+    // empty-lock barrier is needed.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        interval_ns_.store(new_options.export_interval.count() * 1'000'000,
+                            std::memory_order_release);
+        timeout_ns_.store(new_options.export_timeout.count() * 1'000'000,
+                           std::memory_order_release);
+    }
     cv_.notify_all();
 }
 
-void PeriodicMetricReader::ForceFlush(std::chrono::milliseconds /*deadline*/) {
-    flush_requested_.store(true, std::memory_order_release);
+void PeriodicMetricReader::ForceFlush(std::chrono::milliseconds deadline) {
+    if (!worker_started_.load(std::memory_order_acquire)) return;
+    int64_t target;
+    {
+        std::lock_guard<std::mutex> g(flush_mtx_);
+        target = flush_completed_count_ + 1;
+    }
+    // Acquire mtx_ around the flag publication so notify_all() cannot
+    // be delivered while the worker is between its predicate check and
+    // the atomic release-and-suspend inside cv_.wait_for. Without this
+    // serialization the wakeup is lost: the worker reads
+    // flush_requested_=false, suspends, and stays asleep until the
+    // full export_interval (default 60s) expires — long after this
+    // ForceFlush call's deadline.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        flush_requested_.store(true, std::memory_order_release);
+    }
     cv_.notify_all();
+
+    // Deadline contract mirrors JoinWorkers: zero = no-wait, negative =
+    // unbounded, positive = bounded.
+    if (deadline.count() == 0) return;
+    std::unique_lock<std::mutex> lk(flush_mtx_);
+    auto pred = [this, target] {
+        return flush_completed_count_ >= target
+            || shutting_down_.load(std::memory_order_acquire);
+    };
+    if (deadline.count() < 0) flush_cv_.wait(lk, pred);
+    else                       flush_cv_.wait_for(lk, deadline, pred);
 }
 
 }  // namespace OBSERVABILITY_NAMESPACE

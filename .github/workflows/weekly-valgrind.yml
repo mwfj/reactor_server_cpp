@@ -82,6 +82,7 @@ jobs:
             obs_metrics \
             obs_mgr \
             obs_propagator \
+            obs_jaeger_propagator \
             obs_prom \
             obs_config \
             obs_shutdown \
