@@ -3450,8 +3450,7 @@ bool HttpServer::FlushObservabilityForShutdown(
     auto remaining = [deadline]() {
         const auto now = std::chrono::steady_clock::now();
         return now >= deadline ? std::chrono::milliseconds{0}
-            : std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now);
+            : std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
     };
 
     // Drain in-flight requests first so their FinalizeIfSnapshot calls

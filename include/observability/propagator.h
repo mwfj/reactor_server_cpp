@@ -71,15 +71,13 @@ public:
 
     // Extract a SpanContext from inbound headers. Returns nullopt when no
     // valid context exists for this format. Must NOT mutate `headers`.
-    virtual std::optional<SpanContext> Extract(
-        const HeadersMap& headers) const = 0;
+    virtual std::optional<SpanContext> Extract(const HeadersMap& headers) const = 0;
 
     // Inject `ctx` into outbound `headers`. Returns true when at least
     // one header was written. Strip-then-inject is the implementation
     // contract: every concrete impl strips its owned headers before
     // emitting fresh values.
-    virtual bool Inject(const SpanContext& ctx,
-                         HeadersMap& headers) const = 0;
+    virtual bool Inject(const SpanContext& ctx, HeadersMap& headers) const = 0;
 
     // Vector overload — preserves the existing W3C contract for callers
     // that work with header-pair vectors (e.g. UpstreamHttpClient on the

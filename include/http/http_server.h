@@ -575,10 +575,8 @@ private:
     // silently dropped. Production paths flush via Stop() before
     // dtor, so this guards the abnormal-path case (test fixtures,
     // exception during startup).
-    std::shared_ptr<AUTH_NAMESPACE::UpstreamHttpClient>
-        otlp_upstream_http_client_;
-    std::shared_ptr<OBSERVABILITY_NAMESPACE::OtlpHttpExporter>
-        otlp_exporter_;
+    std::shared_ptr<AUTH_NAMESPACE::UpstreamHttpClient>        otlp_upstream_http_client_;
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::OtlpHttpExporter> otlp_exporter_;
 
     // OpenTelemetry observability manager — null when observability
     // is disabled (the default deployment). When non-null, the request

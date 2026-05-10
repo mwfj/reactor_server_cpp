@@ -4,24 +4,38 @@
 #include "dispatcher.h"
 #include "log/logger.h"
 
-#include <algorithm>
-#include <chrono>
+#include "common.h"
 #include <future>
-#include <utility>
 
 namespace OBSERVABILITY_NAMESPACE {
 
+namespace {
+
+// Time conversion + clamp constants for OtlpTimeoutCeilSeconds.
+// UPPER_SNAKE_CASE static constexpr per CODE_CONVENTIONS.md — never
+// use bare numeric literals for non-obvious values.
+static constexpr int64_t MS_PER_SEC = 1000;
+static constexpr int64_t SECS_PER_HOUR = 3600;
+static constexpr int64_t HOURS_PER_DAY = 24;
+// Upper clamp: 24 h. Far beyond any sensible operator setting and
+// well below int64 millisecond saturation, so the (v + MS_PER_SEC - 1)
+// addition in the round-up formula cannot overflow.
+static constexpr int64_t MAX_TIMEOUT_MS =
+    HOURS_PER_DAY * SECS_PER_HOUR * MS_PER_SEC;
+// Minimum returned timeout. UpstreamHttpClient::Request::timeout_sec
+// only arms SetDeadline when timeout_sec > 0 — clamping to >=1
+// prevents fut.wait_for() from blocking indefinitely on stalled
+// upstreams.
+static constexpr int MIN_TIMEOUT_SEC = 1;
+
+}  // namespace
+
 int OtlpTimeoutCeilSeconds(std::chrono::milliseconds ms) noexcept {
-    // Realistic OTLP timeouts are seconds-scale; clamp the input so the
-    // (count + 999) addition below cannot overflow. 24h is far beyond
-    // any sensible operator setting and well below int64 millisecond
-    // saturation.
-    constexpr int64_t kClampMs = static_cast<int64_t>(24) * 3600 * 1000;
     int64_t v = ms.count();
-    if (v <= 0) return 1;
-    if (v > kClampMs) v = kClampMs;
-    // Round up: (count + 999) / 1000 is >=1 for any positive `v`.
-    return static_cast<int>((v + 999) / 1000);
+    if (v <= 0) return MIN_TIMEOUT_SEC;
+    if (v > MAX_TIMEOUT_MS) v = MAX_TIMEOUT_MS;
+    // Ceiling-division idiom: (v + divisor - 1) / divisor.
+    return static_cast<int>((v + MS_PER_SEC - 1) / MS_PER_SEC);
 }
 
 OtlpHttpExporter::TransportFn MakeOtlpTransport(
@@ -130,9 +144,7 @@ OtlpHttpExporter::TransportFn MakeOtlpTransport(
             std::max(payload.timeout, std::chrono::milliseconds{1000})
             + std::chrono::seconds{1};
         const auto now = std::chrono::steady_clock::now();
-        const auto until_deadline =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - now);
+        const auto until_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
         // If the caller's deadline already expired we still wait the
         // upstream-deadline + slack: the request may have already been
         // sent and a fast reply could land. But we cap at request_budget.

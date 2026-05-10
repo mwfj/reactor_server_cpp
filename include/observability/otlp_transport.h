@@ -13,10 +13,7 @@
 
 #include "observability/otlp_http_exporter.h"
 
-#include <chrono>
-#include <functional>
-#include <memory>
-#include <string>
+#include "../common.h"
 
 namespace AUTH_NAMESPACE {
 class UpstreamHttpClient;

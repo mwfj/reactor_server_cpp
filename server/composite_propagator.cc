@@ -1,16 +1,14 @@
 #include "observability/propagator.h"
 
+#include "common.h"
 #include <set>
-#include <stdexcept>
-#include <utility>
 
 namespace OBSERVABILITY_NAMESPACE {
 
-std::shared_ptr<const Propagator> CompositePropagator::Build(
-    const std::vector<std::string>& names) {
+std::shared_ptr<const Propagator> CompositePropagator::Build(const std::vector<std::string>& names) {
+
     if (names.empty()) {
-        throw std::invalid_argument(
-            "CompositePropagator: at least one propagator required");
+        throw std::invalid_argument("CompositePropagator: at least one propagator required");
     }
     // Reject duplicates. ConfigLoader does the same check, but Build is
     // a public API a programmatic caller can hit without going through
@@ -21,20 +19,17 @@ std::shared_ptr<const Propagator> CompositePropagator::Build(
     children.reserve(names.size());
     for (const auto& n : names) {
         if (!seen.insert(n).second) {
-            throw std::invalid_argument(
-                "CompositePropagator: duplicate propagator '" + n + "'");
+            throw std::invalid_argument("CompositePropagator: duplicate propagator '" + n + "'");
         }
         if (n == kPropagatorNameW3C) {
             children.emplace_back(std::make_unique<W3CPropagator>());
         } else if (n == kPropagatorNameJaeger) {
             children.emplace_back(std::make_unique<JaegerPropagator>());
         } else {
-            throw std::invalid_argument(
-                "CompositePropagator: unknown propagator '" + n + "'");
+            throw std::invalid_argument("CompositePropagator: unknown propagator '" + n + "'");
         }
     }
-    return std::shared_ptr<const Propagator>(
-        new CompositePropagator(std::move(children)));
+    return std::shared_ptr<const Propagator>(new CompositePropagator(std::move(children)));
 }
 
 std::optional<SpanContext> CompositePropagator::Extract(

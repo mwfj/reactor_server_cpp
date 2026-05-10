@@ -5,6 +5,32 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
+namespace {
+
+// RAII helper that increments an atomic counter on construction and
+// decrements on destruction. Used by WorkerLoop to wrap the entire
+// retry sequence of a single batch so ForceFlush's queue=0 AND
+// in_flight=0 invariant holds across attempts. Anonymous-namespace
+// scope keeps it private to this translation unit (it has no business
+// in the public header — purely an implementation detail of the
+// worker loop).
+class ScopedExportInFlight {
+public:
+    explicit ScopedExportInFlight(std::atomic<int>& counter) noexcept
+        : counter_(counter) {
+        counter_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~ScopedExportInFlight() {
+        counter_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    ScopedExportInFlight(const ScopedExportInFlight&) = delete;
+    ScopedExportInFlight& operator=(const ScopedExportInFlight&) = delete;
+private:
+    std::atomic<int>& counter_;
+};
+
+}  // namespace
+
 BatchSpanProcessor::BatchSpanProcessor(
     std::shared_ptr<SpanExporter> exporter,
     BatchSpanProcessorOptions    options)
@@ -139,15 +165,7 @@ void BatchSpanProcessor::WorkerLoop() {
             // four-phase shutdown drain. The counter wraps the entire
             // retry sequence (not each individual Export call) so a
             // ForceFlush poll can't slip through between attempts.
-            struct InFlightGuard {
-                std::atomic<int>& c;
-                InFlightGuard(std::atomic<int>& counter) : c(counter) {
-                    c.fetch_add(1, std::memory_order_acq_rel);
-                }
-                ~InFlightGuard() {
-                    c.fetch_sub(1, std::memory_order_acq_rel);
-                }
-            } guard{exports_in_flight_};
+            ScopedExportInFlight guard{exports_in_flight_};
             for (; attempt < max_attempts; ++attempt) {
                 const auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::nanoseconds(export_timeout_ns_.load(
@@ -250,23 +268,27 @@ void BatchSpanProcessor::WorkerLoop() {
 }
 
 void BatchSpanProcessor::SignalShutdown() {
-    bool expected = false;
-    if (!shutting_down_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel)) {
-        return;  // idempotent
-    }
-    // Wake the worker so it sees shutting_down_=true and runs its
-    // drain_all loop. Do NOT signal the exporter here: that would
-    // cause Export() inside the drain to return kFailedNotRetryable
-    // and silently drop every queued span. The exporter is signaled
-    // AFTER the worker has finished draining, in JoinWorkers().
-    // Subsequent OnEnd calls already land in dropped_on_overflow_.
+    // Hold mtx_ across the CAS so the flag publication is serialized
+    // with the worker's predicate-then-suspend window inside
+    // cv_.wait_for. An unlocked CAS followed by an empty lock-barrier
+    // would also work, but merging the CAS into the same critical
+    // section is cleaner and matches the textbook condition-variable
+    // producer pattern (mutate predicate state under the lock, then
+    // notify after release).
     //
-    // Briefly acquire mtx_ before notify so the wakeup can't be lost
-    // when the worker is between its predicate check and entering
-    // wait_for. Without this, a lost notify delays shutdown by up to
-    // schedule_delay (default 5s) while the worker sleeps.
-    { std::lock_guard<std::mutex> g(mtx_); }
+    // Do NOT signal the exporter here: that would cause Export()
+    // inside the drain to return kFailedNotRetryable and silently drop
+    // every queued span. The exporter is signaled AFTER the worker has
+    // finished draining, in WorkerLoop's post-drain block / JoinWorkers.
+    // Subsequent OnEnd calls already land in dropped_on_overflow_.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        bool expected = false;
+        if (!shutting_down_.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
+            return;  // idempotent — already shut down, no notify needed.
+        }
+    }
     cv_.notify_all();
 }
 
@@ -322,16 +344,18 @@ void BatchSpanProcessor::Reload(size_t new_max_export_batch_size,
                                  std::chrono::milliseconds new_schedule_delay,
                                  std::chrono::milliseconds new_export_timeout) {
     if (new_max_export_batch_size == 0) new_max_export_batch_size = 1;
-    max_export_batch_size_.store(new_max_export_batch_size,
-                                   std::memory_order_release);
-    schedule_delay_ns_.store(new_schedule_delay.count() * 1'000'000,
-                              std::memory_order_release);
-    export_timeout_ns_.store(new_export_timeout.count() * 1'000'000,
-                              std::memory_order_release);
-    // wake worker so the new schedule_delay applies promptly. Lock-
-    // around-notify avoids a lost wakeup (see SignalShutdown rationale).
-    { std::lock_guard<std::mutex> g(mtx_); }
-    cv_.notify_all();
+    // Publish under mtx_ so the stores are serialized with the
+    // worker's predicate check; no separate empty-lock barrier needed.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        max_export_batch_size_.store(new_max_export_batch_size,
+                                       std::memory_order_release);
+        schedule_delay_ns_.store(new_schedule_delay.count() * 1'000'000,
+                                  std::memory_order_release);
+        export_timeout_ns_.store(new_export_timeout.count() * 1'000'000,
+                                  std::memory_order_release);
+    }
+    cv_.notify_all();  // wake worker so new schedule_delay applies promptly.
 }
 
 void BatchSpanProcessor::ReloadRetries(int new_max_attempts,

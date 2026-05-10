@@ -98,22 +98,24 @@ void PeriodicMetricReader::WorkerLoop() {
 
 void PeriodicMetricReader::SignalShutdown() {
     signal_shutdown_calls_.fetch_add(1, std::memory_order_relaxed);
-    bool expected = false;
-    if (!shutting_down_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel)) {
-        return;
-    }
-    // Wake the worker so it can run one final export pass before
-    // exiting. Defer exporter signal until JoinWorkers — see
-    // BatchSpanProcessor for the rationale.
+    // Hold mtx_ across the CAS so the flag publication is serialized
+    // with the worker's predicate-then-suspend window inside
+    // cv_.wait_for. Without this, notify_all() can fire between the
+    // worker reading shutting_down_=false and the worker fully
+    // entering wait — the wakeup is lost and the worker sleeps for
+    // the full export_interval (default 60s) before checking again,
+    // wedging shutdown until JoinWorkers' deadline expires.
     //
-    // Briefly acquire mtx_ to serialize with the worker's predicate
-    // check inside cv_.wait_for. Without this, notify_all() can fire
-    // between the worker reading shutting_down_=false and the worker
-    // fully entering wait — the wakeup is lost and the worker sleeps
-    // for the full export_interval (default 60s) before checking
-    // again, wedging shutdown until JoinWorkers' deadline expires.
-    { std::lock_guard<std::mutex> g(mtx_); }
+    // Defer exporter signal until JoinWorkers — see BatchSpanProcessor
+    // for the rationale.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        bool expected = false;
+        if (!shutting_down_.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
+            return;  // idempotent — already shut down.
+        }
+    }
     cv_.notify_all();
 }
 
@@ -146,14 +148,18 @@ void PeriodicMetricReader::JoinWorkers(std::chrono::milliseconds deadline) {
 }
 
 void PeriodicMetricReader::Reload(MeterReaderOptions new_options) {
-    interval_ns_.store(new_options.export_interval.count() * 1'000'000,
-                        std::memory_order_release);
-    timeout_ns_.store(new_options.export_timeout.count() * 1'000'000,
-                       std::memory_order_release);
-    // Same lock-around-notify rationale as SignalShutdown / ForceFlush:
-    // serialize with the worker's predicate check so a lost wakeup
-    // can't delay pickup of the new interval by up to 60s.
-    { std::lock_guard<std::mutex> g(mtx_); }
+    // Publish under mtx_ so the stores are serialized with the
+    // worker's predicate-then-suspend window inside cv_.wait_for —
+    // otherwise a lost wakeup could delay pickup of the new interval
+    // by up to 60s. Stores happen inside the lock; no separate
+    // empty-lock barrier is needed.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        interval_ns_.store(new_options.export_interval.count() * 1'000'000,
+                            std::memory_order_release);
+        timeout_ns_.store(new_options.export_timeout.count() * 1'000'000,
+                           std::memory_order_release);
+    }
     cv_.notify_all();
 }
 
