@@ -261,7 +261,10 @@ Total shutdown time is bounded by `cli.shutdown_drain_timeout_sec` (default 30s)
 3. Check the Collector receives traffic from the gateway upstream IP/port (`tcpdump -i any -n port 4318`).
 4. Inspect the gateway's structured logs for `OtlpHttpExporter` failures — non-2xx responses are logged at `warn` with the response status.
 5. If the sampler is `trace_id_ratio` with low ratio, generate enough traffic — or raise the ratio temporarily.
-6. The BSP drops spans on queue overflow rather than blocking. The drop counter is exposed via the self-metrics catalog (Phase 3) — until that lands, watch for `BatchSpanProcessor::OnEnd dropped span` warnings.
+6. The BSP drops spans on queue overflow rather than blocking. Two drop counters are accessible programmatically: `BatchSpanProcessor::dropped_on_overflow()` (queue full) and `BatchSpanProcessor::dropped_on_export_failure()` (non-retryable export, retry budget exhausted, or exporter exception). Both will be exposed via the self-metrics catalog in Phase 3. Until then, watch the structured logs:
+    - `BatchSpanProcessor: non-retryable export failure; dropping batch (N spans, attempt=K)` — the collector returned 4xx (excluding 429) or rejected the payload outright.
+    - `BatchSpanProcessor: retryable export failed after N attempts; dropping batch (M spans)` — retry budget exhausted (network blips, repeated 5xx).
+    - `BatchSpanProcessor::Export threw: ... (dropping N spans)` — exporter raised; treated as a non-retryable failure.
 
 ### Metric scrapes return `404`
 
