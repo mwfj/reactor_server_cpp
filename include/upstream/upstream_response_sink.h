@@ -4,6 +4,8 @@
 
 namespace UPSTREAM_CALLBACKS_NAMESPACE {
 
+// New virtuals must have default no-op bodies to preserve embedder
+// ABI; pure-virtual additions break every existing sink subclass.
 class UpstreamResponseSink {
 public:
     virtual ~UpstreamResponseSink() = default;

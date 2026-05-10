@@ -962,10 +962,12 @@ void ProxyTransaction::DispatchH2() {
     h2_conn_weak_ = h2;
     state_ = State::SENDING_REQUEST;
     h2_response_timeout_armed_ = false;
+    h2_request_fully_sent_ = false;
 
-    const int stall_budget_ms = ComputeH2StallBudgetMs(
+    h2_stall_budget_ms_ = ComputeH2StallBudgetMs(
         config_.response_timeout_ms);
-    ArmH2SendStallDeadline(stall_budget_ms);
+    h2_send_stall_armed_at_ = std::chrono::steady_clock::now();
+    ArmH2SendStallDeadline(h2_stall_budget_ms_);
 
     // Synchronous on_frame_send (bodyless path) may run inline here,
     // bumping h2_send_stall_generation_ → kills the closure above.
@@ -984,6 +986,7 @@ void ProxyTransaction::DispatchH2() {
         ++h2_response_timeout_generation_;
         h2_path_ = false;
         h2_response_timeout_armed_ = false;
+        h2_request_fully_sent_ = false;
         h2_conn_weak_.reset();
         logging::Get()->warn(
             "ProxyTransaction H2 submit failed client_fd={} service={} "
@@ -1626,8 +1629,10 @@ void ProxyTransaction::OnRequestSubmitted() {
     if (cancelled_ || IsKilledForShutdown()) return;
     if (!h2_path_) return;  // H1 infers send completion from socket drain
 
-    // Unconditional send-stall kill — the in-flight closure no-ops on
-    // generation mismatch when its delayed task eventually fires.
+    // Set BEFORE generation bump: a late OnRequestBodyProgress
+    // dispatched in the same callback chain sees the flag and
+    // skips re-arming the just-killed closure.
+    h2_request_fully_sent_ = true;
     ++h2_send_stall_generation_;
 
     // Only arm response-timeout if we're transitioning OUT of
@@ -1649,14 +1654,19 @@ void ProxyTransaction::OnRequestSubmitted() {
 void ProxyTransaction::OnRequestBodyProgress() {
     if (cancelled_ || IsKilledForShutdown()) return;
     if (!h2_path_) return;
-    // Only refresh while the request is still being sent. Progress
-    // events that race with state transitions (state already moved
-    // to AWAITING_RESPONSE/RECEIVING_BODY) are no-ops.
-    if (state_ != State::SENDING_REQUEST) return;
+    if (h2_request_fully_sent_) return;
 
-    const int stall_budget_ms = ComputeH2StallBudgetMs(
-        config_.response_timeout_ms);
-    ArmH2SendStallDeadline(stall_budget_ms);
+    // Debounce: only re-arm if at least budget/2 has elapsed since
+    // the last arm. Without this, a large multi-frame upload would
+    // queue one EnQueueDelayed closure per DATA frame, accumulating
+    // O(num_frames) dead entries in the dispatcher's min-heap.
+    const auto now = std::chrono::steady_clock::now();
+    const auto half_budget =
+        std::chrono::milliseconds(h2_stall_budget_ms_ / 2);
+    if (now - h2_send_stall_armed_at_ < half_budget) return;
+
+    h2_send_stall_armed_at_ = now;
+    ArmH2SendStallDeadline(h2_stall_budget_ms_);
 }
 
 void ProxyTransaction::ArmH2SendStallDeadline(int budget_ms) {
@@ -1684,8 +1694,15 @@ void ProxyTransaction::ArmH2SendStallDeadline(int budget_ms) {
                 self->MaybeRetry(
                     RetryPolicy::RetryCondition::RESPONSE_TIMEOUT);
             } else {
-                self->OnError(RESULT_RESPONSE_TIMEOUT,
-                              "H2 send-stall timeout");
+                // Unreachable — Cleanup bumps the generation before
+                // any terminal-state transition. Log loud and drop
+                // rather than fire OnError on a terminal transaction.
+                logging::Get()->error(
+                    "ProxyTransaction H2 send-stall closure fired in "
+                    "unexpected state={} client_fd={} service={} — "
+                    "dropped (invariant break)",
+                    static_cast<int>(self->state_),
+                    self->client_fd_, self->service_name_);
             }
         },
         std::chrono::milliseconds(budget_ms));
@@ -2149,6 +2166,7 @@ void ProxyTransaction::Cleanup() {
         // first OnHeaders/OnRequestSubmitted would skip ArmResponseTimeout
         // because the flag is left over from the prior attempt).
         h2_response_timeout_armed_ = false;
+        h2_request_fully_sent_ = false;
         // Reset h2_path_ so a subsequent retry attempt that lands on H1
         // (e.g. ALPN renegotiated, or the H2 connection died and prefer=auto's
         // next probe selects http/1.1) goes through the H1 lease-release

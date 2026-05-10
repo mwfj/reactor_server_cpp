@@ -220,11 +220,23 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     // the in_receive_data_ guard defers the inline FlushSend; the
     // post-receive flush in HandleBytes picks up the queued frame.
     using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
-    if (stream->response_head.framing == Framing::NO_BODY && len > 0) {
-        stream->sink->OnError(
-            ProxyTransaction::RESULT_TRUNCATED_RESPONSE,
-            "body bytes on NO_BODY response");
+    // Detach the sink BEFORE calling OnError. The sink's OnError can
+    // synchronously trigger ProxyTransaction's terminal path → Cleanup
+    // → h2->ResetStream, which both detaches the sink and submits
+    // RST_STREAM. Without pre-detach, the outer self->ResetStream
+    // call below would submit a SECOND nghttp2_submit_rst_stream
+    // against a stream nghttp2 has already torn down, producing a
+    // spurious warn log for every truncation/NO_BODY firing.
+    auto reject_truncation = [&](const char* msg) {
+        auto* sink = stream->sink;
+        stream->sink = nullptr;
+        if (sink) {
+            sink->OnError(ProxyTransaction::RESULT_TRUNCATED_RESPONSE, msg);
+        }
         self->ResetStream(stream_id);
+    };
+    if (stream->response_head.framing == Framing::NO_BODY && len > 0) {
+        reject_truncation("body bytes on NO_BODY response");
         return 0;
     }
     if (stream->response_head.framing == Framing::CONTENT_LENGTH &&
@@ -232,10 +244,7 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
         static_cast<int64_t>(len) >
             stream->response_head.expected_length -
             stream->body_bytes_received) {
-        stream->sink->OnError(
-            ProxyTransaction::RESULT_TRUNCATED_RESPONSE,
-            "body exceeds Content-Length");
-        self->ResetStream(stream_id);
+        reject_truncation("body exceeds Content-Length");
         return 0;
     }
 
