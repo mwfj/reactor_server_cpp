@@ -8,6 +8,7 @@
 #include "net/dns_resolver.h"        // IsValidHostOrIpLiteral grammar
 #include "rate_limit/rate_limit_zone.h"  // RateLimitZone::SHARD_COUNT
 #include "observability/observability_config.h"
+#include "observability/propagator.h"
 #include "nlohmann/json.hpp"
 
 #include <fstream>
@@ -1089,6 +1090,39 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     throw std::runtime_error(
                         "observability.traces.exporter must be a string");
                 oc.traces.exporter = tj["exporter"].get<std::string>();
+            }
+            if (tj.contains("propagators")) {
+                if (!tj["propagators"].is_array() || tj["propagators"].empty())
+                    throw std::invalid_argument(
+                        "observability.traces.propagators must be a "
+                        "non-empty array");
+                std::vector<std::string> names;
+                names.reserve(tj["propagators"].size());
+                std::set<std::string> seen;
+                for (const auto& v : tj["propagators"]) {
+                    if (!v.is_string())
+                        throw std::invalid_argument(
+                            "observability.traces.propagators[] entries "
+                            "must be strings");
+                    auto s = v.get<std::string>();
+                    if (!OBSERVABILITY_NAMESPACE::IsKnownPropagatorName(s)) {
+                        throw std::invalid_argument(
+                            "observability.traces.propagators: unknown '"
+                            + s + "' (recognised: 'w3c', 'jaeger')");
+                    }
+                    // Reject duplicates — Build({"w3c", "w3c"}) would
+                    // otherwise construct two of the same child, which
+                    // is wasteful and obscures operator intent (extract
+                    // precedence is meaningless for duplicates and
+                    // inject would write the same headers twice).
+                    if (!seen.insert(s).second) {
+                        throw std::invalid_argument(
+                            "observability.traces.propagators: duplicate '"
+                            + s + "' — each propagator may appear at most once");
+                    }
+                    names.push_back(std::move(s));
+                }
+                oc.traces.propagators = std::move(names);
             }
             if (tj.contains("sampler")) {
                 if (!tj["sampler"].is_object())
@@ -2334,6 +2368,32 @@ static void ValidateObservabilityLive(const ServerConfig& config,
     if (oc.traces.otlp.timeout_ms.count() < 1)
         throw std::invalid_argument(
             "observability.traces.otlp.timeout_ms must be >= 1");
+
+    // traces.propagators is live-reloadable. LoadFromString validates
+    // names + non-empty + duplicates at JSON parse time, but a
+    // programmatic ServerConfig hand-built without going through the
+    // loader can still reach ObservabilityManager::Reload, where
+    // CompositePropagator::Build throws on unknown / empty names AFTER
+    // earlier subsystems (rate limit, circuit breaker, auth) have
+    // already committed — violating the atomic-reload contract.
+    // Mirror the LoadFromString checks here so the validator catches
+    // the same shapes at the staged-config gate.
+    if (oc.traces.propagators.empty())
+        throw std::invalid_argument(
+            "observability.traces.propagators must be a non-empty list");
+    {
+        std::set<std::string> seen;
+        for (const auto& name : oc.traces.propagators) {
+            if (!OBSERVABILITY_NAMESPACE::IsKnownPropagatorName(name))
+                throw std::invalid_argument(
+                    "observability.traces.propagators: unknown '"
+                    + name + "' (recognised: 'w3c', 'jaeger')");
+            if (!seen.insert(name).second)
+                throw std::invalid_argument(
+                    "observability.traces.propagators: duplicate '"
+                    + name + "' — each propagator may appear at most once");
+        }
+    }
 }
 
 // Restart-required subset — exporter selection, prometheus path,
@@ -2344,48 +2404,24 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
     const auto& oc = config.observability;
     if (!oc.enabled) return;
 
-    if (!oc.traces.exporter.empty() && oc.traces.exporter != "otlp_http")
+    if (!oc.traces.exporter.empty()
+        && oc.traces.exporter != OBSERVABILITY_NAMESPACE::kExporterOtlpHttp)
         throw std::invalid_argument(
             "observability.traces.exporter must be empty or 'otlp_http'");
     if (!oc.metrics.exporter.empty()
-        && oc.metrics.exporter != "otlp_http"
-        && oc.metrics.exporter != "prometheus_pull")
+        && oc.metrics.exporter != OBSERVABILITY_NAMESPACE::kExporterOtlpHttp
+        && oc.metrics.exporter != OBSERVABILITY_NAMESPACE::kExporterPrometheusPull)
         throw std::invalid_argument(
             "observability.metrics.exporter must be empty, 'otlp_http' or "
             "'prometheus_pull'");
 
-    // OTLP push pipeline acceptance is gated on the bootstrap path
-    // in main.cc actually wiring an OtlpHttpExporter through
-    // UpstreamHttpClient. That wiring is non-trivial because the
-    // UpstreamHttpClient needs HttpServer's live dispatchers (built
-    // during Start()) while the ObservabilityManager must be
-    // attached BEFORE Start() so the middleware fires — i.e. the
-    // processor swap has to go through a post-Start re-bind, which
-    // is a focused follow-up not yet in this PR. Until that lands,
-    // reject `otlp_http` here at validate time so `validate` /
-    // `config` / `start` give consistent answers (the alternative —
-    // accept at validate, install NoopSpanProcessor at start —
-    // silently drops every span/metric the operator configured for
-    // export).
-    if (oc.traces.exporter == "otlp_http") {
-        throw std::invalid_argument(
-            "observability.traces.exporter='otlp_http' is not yet wired "
-            "in this build; remove the exporter or wait for the OTLP "
-            "push pipeline bootstrap to land");
-    }
-    if (oc.metrics.exporter == "otlp_http") {
-        throw std::invalid_argument(
-            "observability.metrics.exporter='otlp_http' is not yet wired "
-            "in this build; use 'prometheus_pull' or remove the exporter");
-    }
-
-    if (oc.metrics.exporter == "prometheus_pull"
+    if (oc.metrics.exporter == OBSERVABILITY_NAMESPACE::kExporterPrometheusPull
         && oc.metrics.prometheus.path.empty()) {
         throw std::invalid_argument(
             "observability.metrics.prometheus.path must be non-empty when "
             "metrics.exporter='prometheus_pull'");
     }
-    if (oc.metrics.exporter == "prometheus_pull"
+    if (oc.metrics.exporter == OBSERVABILITY_NAMESPACE::kExporterPrometheusPull
         && (oc.metrics.prometheus.path.empty()
             || oc.metrics.prometheus.path[0] != '/')) {
         throw std::invalid_argument(
@@ -2394,10 +2430,7 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
 
     // Cross-references into upstreams[] — only at startup (reload_copy
     // strips upstreams to skip topology checks; the reload path warns
-    // separately on staged otlp.upstream renames). An empty `upstream`
-    // when the exporter is otlp_http is a configuration error: the
-    // pipeline has no collector to route to, so requests would be
-    // silently discarded post-startup.
+    // separately on staged otlp.upstream renames).
     if (!reload_copy) {
         auto cross_ref = [&](const std::string& name, const char* field) {
             if (name.empty()) {
@@ -2413,10 +2446,10 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
                 std::string(field) + " references unknown upstream '" +
                 name + "' — must match one of the upstreams[].name");
         };
-        if (oc.traces.exporter == "otlp_http")
+        if (oc.traces.exporter == OBSERVABILITY_NAMESPACE::kExporterOtlpHttp)
             cross_ref(oc.traces.otlp.upstream,
                       "observability.traces.otlp.upstream");
-        if (oc.metrics.exporter == "otlp_http")
+        if (oc.metrics.exporter == OBSERVABILITY_NAMESPACE::kExporterOtlpHttp)
             cross_ref(oc.metrics.otlp.upstream,
                       "observability.metrics.otlp.upstream");
     }

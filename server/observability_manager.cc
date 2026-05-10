@@ -1,5 +1,7 @@
 #include "observability/observability_manager.h"
 
+#include "observability/batch_span_processor.h"
+#include "observability/periodic_metric_reader.h"
 #include "observability/sampler.h"
 #include "observability/semantic_conventions.h"
 #include "observability/span.h"
@@ -72,13 +74,17 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
     // request and the proxy strip transparent W3C propagation —
     // pure overhead with no telemetry to show for it.
     //
-    // PRECONDITION: span_processor_ is set once at Init() and never
-    // hot-swapped. A future caller that swaps the processor at
-    // runtime (e.g. exporter pipeline rebuild on SIGHUP) MUST call
-    // PublishLiveFlags(config_) explicitly post-swap — otherwise
-    // traces_enabled_ stays cached against the stale processor and
-    // either overcommits work to a now-null pipeline or silently
-    // disables tracing on a pipeline that just came online.
+    // PRECONDITION: span_processor_ is non-null whenever
+    // PublishLiveFlags is called with c.traces.enabled=true. The
+    // boot-time placeholder is NoopSpanProcessor (always non-null);
+    // SwapToBatchSpanProcessor (called once from MarkServerReady to
+    // upgrade from Noop to BSP) only swaps Noop → real processor and
+    // therefore preserves the gate's behaviour without re-publishing.
+    // If a future code path ever installs nullptr as a processor
+    // (e.g. tear-down without dropping the manager), it MUST call
+    // PublishLiveFlags(config_) explicitly — otherwise traces_enabled_
+    // would stay true against a now-null pipeline and the inbound
+    // middleware would allocate snapshots whose spans go nowhere.
     const bool traces_pipeline_present = c.traces.enabled && span_processor_ != nullptr;
     traces_enabled_.store(traces_pipeline_present,
                             std::memory_order_release);
@@ -113,6 +119,10 @@ void ObservabilityManager::Init() {
         resource_, span_processor_, std::move(sampler), random_);
     meter_provider_ = std::make_unique<MeterProvider>(
         resource_, kDefaultMetricShards);
+
+    std::atomic_store_explicit(&propagator_,
+        CompositePropagator::Build(config_.traces.propagators),
+        std::memory_order_release);
 
     MeterReaderOptions ro;
     ro.export_interval = config_.metrics.reader.export_interval;
@@ -234,10 +244,9 @@ ObservabilityManager::EffectiveSamplerForPath(
         if (r.path_prefix.empty()) continue;
         if (path.size() < r.path_prefix.size()) continue;
 
-        // FIXME: Is this has the potential memory leak or performance issue? 
-        // We are doing memcmp for every request, and the path_prefix can be of arbitrary length. 
-        // We should consider using a more efficient data structure for route overrides, 
-        // such as a trie or prefix tree, to optimize the lookup process?
+        // Linear prefix scan. Typical operator configs carry 1-5
+        // route overrides; the per-request cost is negligible at that
+        // scale. A trie would only pay off for hundreds of overrides.
         if (std::memcmp(path.data(), r.path_prefix.data(),
                          r.path_prefix.size()) != 0) {
             continue;
@@ -473,6 +482,77 @@ void ObservabilityManager::OnFinalizeWinner(
     }
 }
 
+void ObservabilityManager::RegisterMetricReader(
+    std::shared_ptr<PeriodicMetricReader> reader) {
+    if (!reader) return;
+    if (metric_reader_) {
+        logging::Get()->warn(
+            "ObservabilityManager::RegisterMetricReader: reader already set; ignoring");
+        return;
+    }
+    metric_reader_ = std::move(reader);
+    // Sync the live emission gate into the reader. The PMR's enabled_
+    // defaults to true; if metrics.enabled started false at boot the
+    // worker would otherwise push one cycle before our first Reload.
+    metric_reader_->SetEnabled(MetricsEnabled());
+}
+
+std::shared_ptr<const Propagator> ObservabilityManager::propagator() const noexcept {
+    return std::atomic_load_explicit(&propagator_, std::memory_order_acquire);
+}
+
+void ObservabilityManager::FlushAll(std::chrono::milliseconds deadline) {
+    // Honor the per-processor deadline contract (0 = no-wait,
+    // < 0 = unbounded, > 0 = bounded). The naive `t_end = now + deadline`
+    // shape collapses a negative sentinel to t_end < now, which would
+    // strip the unbounded request to a no-wait. Preserve the sentinel
+    // by passing -1 through to both processors.
+    if (deadline.count() < 0) {
+        if (span_processor_) span_processor_->ForceFlush(deadline);
+        if (metric_reader_)  metric_reader_->ForceFlush(deadline);
+        return;
+    }
+    const auto t_end = std::chrono::steady_clock::now() + deadline;
+    auto remaining = [t_end]() {
+        const auto now = std::chrono::steady_clock::now();
+        return now >= t_end ? std::chrono::milliseconds{0}
+            : std::chrono::duration_cast<std::chrono::milliseconds>(t_end - now);
+    };
+    if (span_processor_) span_processor_->ForceFlush(remaining());
+    if (metric_reader_)  metric_reader_->ForceFlush(remaining());
+}
+
+void ObservabilityManager::SwapToBatchSpanProcessor(
+    std::shared_ptr<SpanProcessor> new_processor) {
+    if (!new_processor) return;
+    // Idempotent: only swap when we're still on the boot-time Noop. A
+    // second swap (e.g. SIGHUP-driven exporter rebuild) is a future-phase
+    // concern — today the OTLP wiring runs once at MarkServerReady.
+    if (dynamic_cast<NoopSpanProcessor*>(span_processor_.get()) == nullptr) {
+        logging::Get()->warn(
+            "SwapToBatchSpanProcessor: processor already swapped; ignoring");
+        return;
+    }
+    span_processor_ = new_processor;
+    if (tracer_provider_) {
+        tracer_provider_->SwapProcessorAcrossTracers(new_processor);
+    }
+}
+
+bool ObservabilityManager::span_processor_is_batch_for_test() const noexcept {
+    return dynamic_cast<BatchSpanProcessor*>(span_processor_.get()) != nullptr;
+}
+
+bool ObservabilityManager::exporter_is_shared_for_test() const noexcept {
+    auto bsp = std::dynamic_pointer_cast<BatchSpanProcessor>(span_processor_);
+    if (!bsp || !metric_reader_) return false;
+    auto span_exp   = bsp->exporter();
+    auto metric_exp = metric_reader_->exporter();
+    if (!span_exp || !metric_exp) return false;
+    return dynamic_cast<void*>(span_exp.get())
+        == dynamic_cast<void*>(metric_exp.get());
+}
+
 void ObservabilityManager::BeginShutdown(
     std::chrono::milliseconds timeout) {
     // The shutdown_started_ latch is one-shot — never reset. Production
@@ -485,9 +565,49 @@ void ObservabilityManager::BeginShutdown(
             std::memory_order_acq_rel)) {
         return;  // idempotent
     }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto remaining = [deadline]() {
+        const auto now = std::chrono::steady_clock::now();
+        return now >= deadline ? std::chrono::milliseconds{0}
+            : std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    };
+
+    // Detect a single exporter wired into BOTH BSP and PMR (e.g.
+    // OtlpHttpExporter inherits both interfaces). Per-worker self-signal
+    // would race: the first to finish would shut the exporter down before
+    // the other could flush. dynamic_cast<void*> yields the most-derived
+    // address, so the two interface sub-object pointers (different vtable
+    // offsets) reduce to the same pointer when they point to the same
+    // object.
+    auto bsp = std::dynamic_pointer_cast<BatchSpanProcessor>(span_processor_);
+    std::shared_ptr<SpanExporter>   shared_span_exporter;
+    std::shared_ptr<MetricExporter> shared_metric_exporter;
+    if (bsp && metric_reader_) {
+        shared_span_exporter   = bsp->exporter();
+        shared_metric_exporter = metric_reader_->exporter();
+    }
+    const bool exporter_shared =
+        shared_span_exporter && shared_metric_exporter
+        && dynamic_cast<void*>(shared_span_exporter.get())
+            == dynamic_cast<void*>(shared_metric_exporter.get());
+
+    if (exporter_shared) {
+        bsp->DisableExporterShutdownOnDrain();
+        metric_reader_->DisableExporterShutdownOnDrain();
+    }
+
     if (span_processor_) {
         span_processor_->SignalShutdown();
-        span_processor_->JoinWorkers(timeout);
+        span_processor_->JoinWorkers(remaining());
+    }
+    if (metric_reader_) {
+        metric_reader_->SignalShutdown();
+        metric_reader_->JoinWorkers(remaining());
+    }
+
+    if (exporter_shared && shared_span_exporter) {
+        shared_span_exporter->SignalShutdown();
     }
 }
 
@@ -590,6 +710,22 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
         new_config.traces.batch.max_export_batch_size;
     config_.traces.batch.schedule_delay  = new_config.traces.batch.schedule_delay;
     config_.traces.batch.retries         = new_config.traces.batch.retries;
+    if (new_config.traces.propagators != config_.traces.propagators) {
+        // Order-sensitive comparison is intentional. CompositePropagator
+        // Extract returns the FIRST child that produces a valid context,
+        // so reordering the same names changes precedence semantics.
+        // Reordering must rebuild the propagator.
+        //
+        // Build first so a Build throw (e.g. unknown name from a future
+        // programmatic caller bypassing ConfigLoader) leaves both the
+        // config snapshot and the live propagator pointer untouched.
+        // Production callers validate at LoadFromString, but the
+        // strong-exception shape costs nothing extra here.
+        auto new_p = CompositePropagator::Build(new_config.traces.propagators);
+        config_.traces.propagators = new_config.traces.propagators;
+        std::atomic_store_explicit(&propagator_, std::move(new_p),
+            std::memory_order_release);
+    }
 
     config_.metrics.enabled              = new_config.metrics.enabled;
     config_.metrics.otlp.headers         = new_config.metrics.otlp.headers;
@@ -616,6 +752,13 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
             new_config.traces.batch.retries.initial_backoff;
         po.retries_max_backoff =
             new_config.traces.batch.retries.max_backoff;
+        // Push the live OTLP export timeout into the BSP atomic so a
+        // SIGHUP that relaxes (or tightens) traces.otlp.timeout_ms
+        // takes effect without restart. The exporter side is reloaded
+        // via OtlpHttpExporter::ReloadHeaders elsewhere; without this
+        // line the BSP's outer deadline would still fire at the
+        // construction-time value and override the operator's intent.
+        po.export_timeout = new_config.traces.otlp.timeout_ms;
         tracer_provider_->Reload(new_sampler, po);
     }
 
@@ -633,6 +776,20 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
         ro.export_interval = new_config.metrics.reader.export_interval;
         ro.export_timeout  = new_config.metrics.reader.export_timeout;
         meter_provider_->Reload(ro);
+        // The MeterProvider holds the reload knobs but the PMR worker
+        // reads its own atomic snapshot — propagate explicitly so the
+        // running worker picks up the new interval/timeout on its next
+        // iteration. Without this the documented live reload is a
+        // no-op until restart.
+        //
+        // Also push the live `metrics.enabled` flag — when an operator
+        // toggles it via SIGHUP the PMR worker must stop / resume
+        // export without reallocating. PublishLiveFlags has already
+        // updated metrics_enabled_ above.
+        if (metric_reader_) {
+            metric_reader_->Reload(ro);
+            metric_reader_->SetEnabled(MetricsEnabled());
+        }
     }
 }
 

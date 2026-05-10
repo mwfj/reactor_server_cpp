@@ -12,6 +12,10 @@
 #include "observability/observability_middleware.h"
 #include "observability/observability_snapshot.h"
 #include "observability/resource.h"
+#include "observability/batch_span_processor.h"
+#include "observability/metric_exporter.h"
+#include "observability/periodic_metric_reader.h"
+#include "observability/span_exporter.h"
 #include "observability/sampler.h"
 #include "observability/span_processor.h"
 #include "observability/trace_id.h"
@@ -24,14 +28,23 @@
 namespace ObservabilityManagerTests {
 
 using OBSERVABILITY_NAMESPACE::AlwaysOnSampler;
+using OBSERVABILITY_NAMESPACE::BatchSpanProcessor;
+using OBSERVABILITY_NAMESPACE::BatchSpanProcessorOptions;
+using OBSERVABILITY_NAMESPACE::ExportResult;
 using OBSERVABILITY_NAMESPACE::InMemorySpanProcessor;
 using OBSERVABILITY_NAMESPACE::MakeObservabilityMiddleware;
+using OBSERVABILITY_NAMESPACE::MeterReaderOptions;
+using OBSERVABILITY_NAMESPACE::MetricExporter;
+using OBSERVABILITY_NAMESPACE::MetricsSnapshot;
 using OBSERVABILITY_NAMESPACE::ObservabilityConfig;
 using OBSERVABILITY_NAMESPACE::ObservabilityManager;
 using OBSERVABILITY_NAMESPACE::ObservabilitySnapshot;
+using OBSERVABILITY_NAMESPACE::PeriodicMetricReader;
 using OBSERVABILITY_NAMESPACE::RandomSource;
 using OBSERVABILITY_NAMESPACE::Resource;
 using OBSERVABILITY_NAMESPACE::SamplerType;
+using OBSERVABILITY_NAMESPACE::SpanData;
+using OBSERVABILITY_NAMESPACE::SpanExporter;
 
 namespace {
 
@@ -273,6 +286,668 @@ void TestBeginShutdownIdempotent() {
     }
 }
 
+// ---- Phase 2: PeriodicMetricReader registration + drain ----
+
+namespace {
+class CountingMetricExporter : public MetricExporter {
+public:
+    ExportResult Export(MetricsSnapshot,
+                         std::chrono::steady_clock::time_point) override {
+        export_calls_.fetch_add(1, std::memory_order_relaxed);
+        return ExportResult::kSuccess;
+    }
+    void SignalShutdown() override {}
+    void CancelAllActiveExports() override {}
+    int export_calls() const noexcept {
+        return export_calls_.load(std::memory_order_relaxed);
+    }
+private:
+    std::atomic<int> export_calls_{0};
+};
+}  // namespace
+
+void TestRegisterMetricReaderDrainedOnBeginShutdown() {
+    try {
+        auto mgr = MakeManager();
+        auto exporter = std::make_shared<CountingMetricExporter>();
+        MeterReaderOptions opts;
+        opts.export_interval = std::chrono::milliseconds(50);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(), exporter, opts);
+        mgr->RegisterMetricReader(reader);
+
+        bool has_reader = mgr->HasMetricReader();
+        // Worker auto-starts in PMR ctor; let it iterate at least once.
+        for (int i = 0; i < 50 && reader->worker_loop_iterations() == 0; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        int64_t iters_before = reader->worker_loop_iterations();
+        bool started = iters_before >= 1
+                     && reader->signal_shutdown_calls() == 0;
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool drained = reader->signal_shutdown_calls() == 1;
+        // Worker should have stopped — counter is stable.
+        int64_t iters_after = reader->worker_loop_iterations();
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        bool stable = reader->worker_loop_iterations() == iters_after;
+
+        bool pass = has_reader && started && drained && stable;
+        std::string err;
+        if (!has_reader) err = "HasMetricReader was false";
+        else if (!started) err = "worker did not iterate before BeginShutdown";
+        else if (!drained) err = "signal_shutdown_calls != 1, got "
+                                + std::to_string(reader->signal_shutdown_calls());
+        else if (!stable) err = "worker_loop_iterations still increasing post-join";
+        TestFramework::RecordTest(
+            "ObsMgr: RegisterMetricReader drained on BeginShutdown",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: RegisterMetricReader drained on BeginShutdown",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Manager.Reload must propagate the new export_interval into the live
+// PMR worker — without this, MeterProvider holds the new knob but the
+// running worker keeps using its construction-time atomic snapshot.
+//
+// Note: a single in-flight cv_.wait_for(old_interval) cannot be
+// shortened mid-wait, so this test compares per-window tick RATES
+// across a long-interval phase and a short-interval phase rather than
+// asserting an instant change.
+void TestManagerReloadPropagatesIntervalToReader() {
+    try {
+        auto mgr = MakeManager();
+        auto exporter = std::make_shared<CountingMetricExporter>();
+        // Phase 1: 200ms interval — slow enough that a 500ms window
+        // sees only ~2 ticks.
+        MeterReaderOptions opts;
+        opts.export_interval = std::chrono::milliseconds(200);
+        opts.export_timeout  = std::chrono::milliseconds(100);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(), exporter, opts);
+        mgr->RegisterMetricReader(reader);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const int64_t baseline = reader->worker_loop_iterations();
+
+        // Phase 2: Reload to 25ms — well below the pre-reload rate.
+        auto cfg = DefaultConfig();
+        cfg.metrics.reader.export_interval = std::chrono::milliseconds(25);
+        cfg.metrics.reader.export_timeout  = std::chrono::milliseconds(50);
+        mgr->Reload(cfg);
+
+        // Wait through the worst-case stale wait_for tail (200ms) plus
+        // a full 500ms of post-reload activity. With 25ms ticks, the
+        // post-reload window alone should produce >>10 ticks.
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+        const int64_t after = reader->worker_loop_iterations();
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        // Pre-reload rate: ~2.5 ticks per 500ms.
+        // Post-reload rate (at 25ms): >>10 over the trailing 500ms.
+        // Assert delta-after-reload is at least 4x the baseline rate.
+        const int64_t delta = after - baseline;
+        const bool propagated = delta >= 10;
+        TestFramework::RecordTest(
+            "ObsMgr: Reload propagates export_interval to live PMR worker",
+            propagated,
+            propagated ? "" : "delta=" + std::to_string(delta)
+                                + " over ~700ms (expected >=10 at 25ms cadence)",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: Reload propagates export_interval to live PMR worker",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// metrics.enabled=false must STOP exporter pushes without joining the
+// PMR worker. The worker keeps ticking (so flush_completed_count_
+// advances for ForceFlush), but Snapshot+Export is skipped so no
+// telemetry leaves the process. Re-enable resumes pushing.
+void TestManagerReloadGatesPmrEmission() {
+    try {
+        auto mgr = MakeManager();
+        auto exporter = std::make_shared<CountingMetricExporter>();
+        MeterReaderOptions opts;
+        opts.export_interval = std::chrono::milliseconds(30);
+        opts.export_timeout  = std::chrono::milliseconds(50);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(), exporter, opts);
+        mgr->RegisterMetricReader(reader);
+
+        // Phase 1: enabled, watch Export() get called.
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const int exports_while_enabled = exporter->export_calls();
+
+        // Phase 2: disable, Export() must stop being called even though
+        // the worker keeps ticking.
+        auto cfg = DefaultConfig();
+        cfg.metrics.enabled = false;
+        cfg.metrics.reader.export_interval = std::chrono::milliseconds(30);
+        cfg.metrics.reader.export_timeout  = std::chrono::milliseconds(50);
+        mgr->Reload(cfg);
+        const int64_t iter_at_disable = reader->worker_loop_iterations();
+        const int exports_at_disable = exporter->export_calls();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const int64_t iter_after_disable = reader->worker_loop_iterations();
+        const int exports_after_disable = exporter->export_calls();
+
+        // Phase 3: re-enable, Export() resumes.
+        cfg.metrics.enabled = true;
+        mgr->Reload(cfg);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const int exports_after_reenable = exporter->export_calls();
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        const bool exported_initially = exports_while_enabled >= 2;
+        const bool worker_kept_ticking =
+            (iter_after_disable - iter_at_disable) >= 2;
+        const bool no_exports_while_disabled =
+            exports_after_disable == exports_at_disable;
+        const bool resumed_after_reenable =
+            exports_after_reenable > exports_after_disable;
+
+        const bool pass = exported_initially
+                       && worker_kept_ticking
+                       && no_exports_while_disabled
+                       && resumed_after_reenable;
+        std::string err;
+        if (!exported_initially) err = "no exports during enabled phase";
+        else if (!worker_kept_ticking) err = "worker stopped ticking when disabled";
+        else if (!no_exports_while_disabled) err = "exporter called while disabled";
+        else if (!resumed_after_reenable) err = "exporter did not resume after re-enable";
+        TestFramework::RecordTest(
+            "ObsMgr: metrics.enabled=false halts PMR Export, true resumes",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: metrics.enabled=false halts PMR Export, true resumes",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- Phase 2: shared-exporter shutdown coordination (Task 1.1a) ----
+
+namespace {
+// Shim implementing BOTH SpanExporter AND MetricExporter — same shape
+// as OtlpHttpExporter — so a single instance can sit behind both BSP
+// and PMR. Counts SignalShutdown calls to verify the manager fires it
+// at most once when the exporter is shared.
+class SharedDualExporter
+    : public SpanExporter,
+      public MetricExporter {
+public:
+    ExportResult Export(std::vector<SpanData>,
+                         std::chrono::steady_clock::time_point) override {
+        return ExportResult::kSuccess;
+    }
+    ExportResult Export(MetricsSnapshot,
+                         std::chrono::steady_clock::time_point) override {
+        return ExportResult::kSuccess;
+    }
+    void SignalShutdown() override {
+        signal_count_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    void CancelAllActiveExports() override {}
+    int signal_count() const { return signal_count_.load(); }
+
+private:
+    std::atomic<int> signal_count_{0};
+};
+}  // namespace
+
+void TestSharedExporterSignalledOnceOnShutdown() {
+    try {
+        auto exporter = std::make_shared<SharedDualExporter>();
+        std::shared_ptr<SpanExporter>   span_exp   = exporter;
+        std::shared_ptr<MetricExporter> metric_exp = exporter;
+
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(span_exp, bsp_opts);
+
+        auto mgr = ObservabilityManager::Create(
+            DefaultConfig(),
+            std::make_shared<Resource>(),
+            bsp,
+            std::make_shared<RandomSource>(0xCAFE0002ULL));
+
+        MeterReaderOptions ropts;
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(), metric_exp, ropts);
+        mgr->RegisterMetricReader(reader);
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool pass = exporter->signal_count() == 1;
+        TestFramework::RecordTest(
+            "ObsMgr: shared exporter signalled exactly once on shutdown",
+            pass, pass ? "" : "signal_count = " + std::to_string(exporter->signal_count()),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: shared exporter signalled exactly once on shutdown",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Negative case: when traces and metrics use DIFFERENT exporter
+// instances, the manager must NOT cross-coordinate — each per-worker
+// path signals its own exporter.
+void TestSeparateExportersEachSignalledOnce() {
+    try {
+        auto trace_exp  = std::make_shared<SharedDualExporter>();
+        auto metric_exp = std::make_shared<SharedDualExporter>();
+
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(trace_exp), bsp_opts);
+
+        auto mgr = ObservabilityManager::Create(
+            DefaultConfig(),
+            std::make_shared<Resource>(),
+            bsp,
+            std::make_shared<RandomSource>(0xCAFE0003ULL));
+
+        MeterReaderOptions ropts;
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(),
+            std::shared_ptr<MetricExporter>(metric_exp), ropts);
+        mgr->RegisterMetricReader(reader);
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool pass = trace_exp->signal_count()  == 1
+                  && metric_exp->signal_count() == 1;
+        TestFramework::RecordTest(
+            "ObsMgr: separate exporters each signalled once",
+            pass, pass ? ""
+                      : "trace=" + std::to_string(trace_exp->signal_count())
+                       + ", metric=" + std::to_string(metric_exp->signal_count()),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: separate exporters each signalled once",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- Phase 2: exporter_is_shared_for_test() ----
+//
+// Mirrors how MarkServerReady wires the metrics-side PMR onto the same
+// OtlpHttpExporter the trace-side BSP holds: the manager detects the
+// shared exporter and BeginShutdown coordinates the single signal.
+
+void TestExporterIsSharedDetectsCoLocatedExporter() {
+    try {
+        auto exporter = std::make_shared<SharedDualExporter>();
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(exporter), bsp_opts);
+
+        auto mgr = ObservabilityManager::Create(
+            DefaultConfig(), std::make_shared<Resource>(), bsp,
+            std::make_shared<RandomSource>(0xCAFE0010ULL));
+
+        bool unshared_before = !mgr->exporter_is_shared_for_test();
+
+        MeterReaderOptions ropts;
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(),
+            std::shared_ptr<MetricExporter>(exporter), ropts);
+        mgr->RegisterMetricReader(reader);
+
+        bool shared_after = mgr->exporter_is_shared_for_test();
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool pass = unshared_before && shared_after;
+        TestFramework::RecordTest(
+            "ObsMgr: exporter_is_shared_for_test detects shared instance",
+            pass, pass ? ""
+                      : "before=" + std::to_string(unshared_before)
+                       + " after=" + std::to_string(shared_after),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: exporter_is_shared_for_test detects shared instance",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestExporterIsSharedFalseForSeparateInstances() {
+    try {
+        auto trace_exp  = std::make_shared<SharedDualExporter>();
+        auto metric_exp = std::make_shared<SharedDualExporter>();
+
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(trace_exp), bsp_opts);
+
+        auto mgr = ObservabilityManager::Create(
+            DefaultConfig(), std::make_shared<Resource>(), bsp,
+            std::make_shared<RandomSource>(0xCAFE0011ULL));
+
+        MeterReaderOptions ropts;
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        auto reader = std::make_shared<PeriodicMetricReader>(
+            mgr->meter_provider(),
+            std::shared_ptr<MetricExporter>(metric_exp), ropts);
+        mgr->RegisterMetricReader(reader);
+
+        bool pass = !mgr->exporter_is_shared_for_test();
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+        TestFramework::RecordTest(
+            "ObsMgr: exporter_is_shared_for_test false for separate exporters",
+            pass, pass ? "" : "incorrectly reported shared",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: exporter_is_shared_for_test false for separate exporters",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- Phase 2: traces.propagators wiring (Task 8.5) ----
+
+void TestManagerPropagatorReflectsConfig() {
+    try {
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.propagators = {"jaeger", "w3c"};
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0030ULL));
+        auto p = mgr->propagator();
+        std::map<std::string, std::string> h = {
+            {"uber-trace-id",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1"}};
+        bool pass = p && p->Extract(h).has_value();
+        TestFramework::RecordTest(
+            "ObsMgr: propagator() reflects traces.propagators config",
+            pass, pass ? "" : "jaeger extract failed",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: propagator() reflects traces.propagators config",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestManagerReloadSwapsPropagator() {
+    try {
+        // Boot with W3C only — Jaeger header should be ignored.
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.propagators = {"w3c"};
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0031ULL));
+        std::map<std::string, std::string> jaeger_only = {
+            {"uber-trace-id",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1"}};
+        bool before = !mgr->propagator()->Extract(jaeger_only).has_value();
+
+        // SIGHUP adds Jaeger to the list — propagator must swap atomically.
+        ObservabilityConfig flipped = DefaultConfig();
+        flipped.traces.propagators = {"jaeger", "w3c"};
+        mgr->Reload(flipped);
+        bool after = mgr->propagator()->Extract(jaeger_only).has_value();
+
+        bool pass = before && after;
+        TestFramework::RecordTest(
+            "ObsMgr: Reload swaps propagator atomically",
+            pass, pass ? ""
+                      : "before=" + std::to_string(before)
+                       + " after=" + std::to_string(after),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: Reload swaps propagator atomically",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// FlushAll's deadline contract must mirror the per-processor contract
+// (0 = no-wait, < 0 = unbounded, > 0 = bounded). The naive
+// `t_end = now + deadline` shape would collapse a negative sentinel
+// to t_end < now, stripping unbounded down to no-wait. The override
+// must pass the negative sentinel through unchanged so children get
+// the unbounded request they were asked for.
+class CaptureForceFlushDeadlineProcessor :
+    public OBSERVABILITY_NAMESPACE::SpanProcessor {
+public:
+    std::atomic<int64_t> last_deadline_ms_{INT64_MIN};
+    void OnEnd(SpanData) override {}
+    void ForceFlush(std::chrono::milliseconds d) override {
+        last_deadline_ms_.store(d.count(), std::memory_order_release);
+    }
+    void SignalShutdown() override {}
+    void JoinWorkers(std::chrono::milliseconds) override {}
+};
+
+void TestFlushAllPreservesNegativeDeadline() {
+    try {
+        auto sp = std::make_shared<CaptureForceFlushDeadlineProcessor>();
+        ObservabilityConfig cfg = DefaultConfig();
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            sp,
+            std::make_shared<RandomSource>(0xCAFE00A0ULL));
+
+        // Sentinel: -1 means "unbounded" per the per-processor contract.
+        mgr->FlushAll(std::chrono::milliseconds{-1});
+        const int64_t got_neg = sp->last_deadline_ms_.load(
+            std::memory_order_acquire);
+
+        // Positive deadlines still go through the t_end remaining-budget
+        // path — the captured value should be in (0, 5000].
+        sp->last_deadline_ms_.store(INT64_MIN, std::memory_order_release);
+        mgr->FlushAll(std::chrono::milliseconds{5000});
+        const int64_t got_pos = sp->last_deadline_ms_.load(
+            std::memory_order_acquire);
+
+        // Zero is "no-wait" — must pass through as 0, not get amplified.
+        sp->last_deadline_ms_.store(INT64_MIN, std::memory_order_release);
+        mgr->FlushAll(std::chrono::milliseconds{0});
+        const int64_t got_zero = sp->last_deadline_ms_.load(
+            std::memory_order_acquire);
+
+        bool pass = got_neg == -1
+                  && got_pos > 0 && got_pos <= 5000
+                  && got_zero == 0;
+        TestFramework::RecordTest(
+            "ObsMgr: FlushAll preserves negative-deadline sentinel",
+            pass, pass ? ""
+                      : "neg=" + std::to_string(got_neg)
+                       + " pos=" + std::to_string(got_pos)
+                       + " zero=" + std::to_string(got_zero),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: FlushAll preserves negative-deadline sentinel",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Reload's propagator swap must be strong-exception: a Build throw
+// (e.g. unknown propagator name from a programmatic caller bypassing
+// ConfigLoader) must leave the live propagator pointer AND the manager
+// config snapshot untouched. Otherwise the snapshot and the live
+// pointer disagree on what propagators are configured.
+void TestManagerReloadPropagatorBuildThrowsLeavesLiveUnchanged() {
+    try {
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.propagators = {"w3c"};
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0090ULL));
+
+        // Capture the live propagator pointer before the failed reload.
+        auto p_before = mgr->propagator();
+
+        // Programmatic Reload with an unknown propagator name — Build
+        // will throw invalid_argument from inside Reload.
+        ObservabilityConfig bad = DefaultConfig();
+        bad.traces.propagators = {"w3c", "garbage"};
+        bool threw = false;
+        try { mgr->Reload(bad); }
+        catch (const std::invalid_argument&) { threw = true; }
+
+        // Live propagator pointer must be unchanged (still the W3C-only
+        // composite). Verify by extracting a Jaeger header — it must
+        // STILL not extract (the bad reload would have added Jaeger if
+        // partial mutation happened).
+        auto p_after = mgr->propagator();
+        std::map<std::string, std::string> jaeger_only = {
+            {"uber-trace-id",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1"}};
+        bool pointer_unchanged = (p_before.get() == p_after.get());
+        bool still_w3c_only = !p_after->Extract(jaeger_only).has_value();
+
+        bool pass = threw && pointer_unchanged && still_w3c_only;
+        TestFramework::RecordTest(
+            "ObsMgr: Reload Build-throws leaves live propagator unchanged",
+            pass, pass ? ""
+                      : "threw=" + std::to_string(threw)
+                       + " ptr_unchanged=" + std::to_string(pointer_unchanged)
+                       + " still_w3c_only=" + std::to_string(still_w3c_only),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: Reload Build-throws leaves live propagator unchanged",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- Phase 2: live traces.enabled SIGHUP without restart (Task 1.5) ----
+//
+// Pipeline allocation in MarkServerReady is gated on `traces.exporter`
+// (restart-only), NOT on `traces.enabled` (live). A SIGHUP that flips
+// `traces.enabled` from false to true must therefore emit spans on the
+// next request without any process restart, since the BSP is already
+// installed and ready behind the live flag.
+
+void TestLiveTracesEnabledFlipKeepsBatchProcessor() {
+    try {
+        // Boot with traces.enabled=false — this is the "exporter wired,
+        // emission silenced" case Task 1.5 cares about.
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.enabled = false;
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0020ULL));
+
+        // Simulate MarkServerReady's wiring — swap in a BSP regardless
+        // of the live `enabled` flag.
+        auto exporter = std::make_shared<SharedDualExporter>();
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(exporter), bsp_opts);
+        mgr->SwapToBatchSpanProcessor(bsp);
+
+        const bool batch_installed = mgr->span_processor_is_batch_for_test();
+        const bool traces_off_before = !mgr->TracesEnabled();
+
+        // SIGHUP flips traces.enabled to true. The BSP is already there —
+        // we only flip the live flag.
+        ObservabilityConfig flipped = DefaultConfig();
+        flipped.traces.enabled = true;
+        mgr->Reload(flipped);
+
+        const bool traces_on_after = mgr->TracesEnabled();
+        // BSP must survive the reload (no processor swap on Reload).
+        const bool batch_still = mgr->span_processor_is_batch_for_test();
+
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        const bool pass = batch_installed && traces_off_before
+                       && traces_on_after && batch_still;
+        TestFramework::RecordTest(
+            "ObsMgr: traces.enabled SIGHUP flip preserves wired BSP",
+            pass, pass ? ""
+                      : "installed=" + std::to_string(batch_installed)
+                       + " off_before=" + std::to_string(traces_off_before)
+                       + " on_after=" + std::to_string(traces_on_after)
+                       + " still=" + std::to_string(batch_still),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: traces.enabled SIGHUP flip preserves wired BSP",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- Phase 2: SwapToBatchSpanProcessor (boot-time hot-swap) ----
+
+void TestSwapToBatchSpanProcessorReplacesNoop() {
+    try {
+        // Manager starts on the boot-time NoopSpanProcessor — same path
+        // production takes when traces.exporter == "otlp_http" (main.cc
+        // installs Noop; HttpServer::MarkServerReady performs the swap).
+        ObservabilityConfig cfg = DefaultConfig();
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0004ULL));
+
+        bool noop_before = !mgr->span_processor_is_batch_for_test();
+
+        auto exporter = std::make_shared<SharedDualExporter>();
+        BatchSpanProcessorOptions bsp_opts;
+        bsp_opts.schedule_delay = std::chrono::milliseconds(60'000);
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(exporter), bsp_opts);
+        mgr->SwapToBatchSpanProcessor(bsp);
+
+        bool batch_after = mgr->span_processor_is_batch_for_test();
+
+        // Idempotent: a second swap is rejected (logs a warn; manager
+        // stays on the originally-installed BSP).
+        auto bsp2 = std::make_shared<BatchSpanProcessor>(
+            std::shared_ptr<SpanExporter>(exporter), bsp_opts);
+        mgr->SwapToBatchSpanProcessor(bsp2);
+        bool batch_still = mgr->span_processor_is_batch_for_test();
+
+        // Drain so the BSP worker exits cleanly before destruction.
+        mgr->BeginShutdown(std::chrono::milliseconds(500));
+
+        bool pass = noop_before && batch_after && batch_still;
+        TestFramework::RecordTest(
+            "ObsMgr: SwapToBatchSpanProcessor replaces Noop (idempotent)",
+            pass, pass ? ""
+                      : "noop_before=" + std::to_string(noop_before)
+                       + " after=" + std::to_string(batch_after)
+                       + " still=" + std::to_string(batch_still),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: SwapToBatchSpanProcessor replaces Noop (idempotent)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- Middleware end-to-end ----
 void TestMiddlewareBuildsSnapshotAndSpan() {
     try {
@@ -318,6 +993,52 @@ void TestMiddlewareBuildsSnapshotAndSpan() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "ObsMgr: middleware populates snapshot + span; finalize closes",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// End-to-end: a Jaeger uber-trace-id header on an inbound request
+// must produce a populated remote_parent when the manager's composite
+// includes the Jaeger propagator. This locks in Task 8.6's swap from
+// the static W3C-only Extract to the manager-provided composite.
+void TestMiddlewareHonorsCompositePropagator() {
+    try {
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.propagators = {"jaeger", "w3c"};
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<InMemorySpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0040ULL));
+        auto mw = MakeObservabilityMiddleware(mgr);
+
+        HttpRequest req;
+        req.method = "GET";
+        req.path   = "/test";
+        req.headers["uber-trace-id"] =
+            "1234567890abcdef1234567890abcdef:0011223344556677:0:1";
+        req.route_match.pattern = "/test";
+        req.route_match.kind = RouteKind::Sync;
+        req.route_match.method_for_dispatch = "GET";
+
+        HttpResponse resp;
+        bool ok = mw(req, resp);
+
+        bool pass = ok && req.trace_ctx.has_value()
+                       && req.trace_ctx->remote_parent.IsValid()
+                       && req.trace_ctx->remote_parent.trace_id().ToHex()
+                           == "1234567890abcdef1234567890abcdef";
+
+        if (req.obs_snapshot) {
+            mgr->FinalizeFromSnapshot(*req.obs_snapshot, 200, 0, "");
+        }
+        TestFramework::RecordTest(
+            "ObsMgr: middleware extract honors composite propagator (Jaeger)",
+            pass, pass ? "" : "remote_parent not extracted from uber-trace-id",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: middleware extract honors composite propagator (Jaeger)",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -395,7 +1116,21 @@ void RunAllTests() {
     TestReloadFlipsTracesEnabled();
     TestReloadFlipsMetricsEnabled();
     TestBeginShutdownIdempotent();
+    TestRegisterMetricReaderDrainedOnBeginShutdown();
+    TestManagerReloadPropagatesIntervalToReader();
+    TestManagerReloadGatesPmrEmission();
+    TestSharedExporterSignalledOnceOnShutdown();
+    TestSeparateExportersEachSignalledOnce();
+    TestSwapToBatchSpanProcessorReplacesNoop();
+    TestExporterIsSharedDetectsCoLocatedExporter();
+    TestExporterIsSharedFalseForSeparateInstances();
+    TestManagerPropagatorReflectsConfig();
+    TestManagerReloadSwapsPropagator();
+    TestManagerReloadPropagatorBuildThrowsLeavesLiveUnchanged();
+    TestFlushAllPreservesNegativeDeadline();
+    TestLiveTracesEnabledFlipKeepsBatchProcessor();
     TestMiddlewareBuildsSnapshotAndSpan();
+    TestMiddlewareHonorsCompositePropagator();
     TestMiddlewareTracesDisabledStillBuildsSnapshot();
     TestMiddlewareNullManagerNoOp();
 }

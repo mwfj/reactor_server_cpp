@@ -22,12 +22,17 @@ namespace {
 // scope name lets operators filter "all gateway-emitted server spans".
 constexpr const char* kInboundTracerName = "reactor.http.server";
 
-// Extract the inbound W3C traceparent. Missing or malformed → invalid
+// Extract the inbound trace context. Missing or malformed → invalid
 // remote_parent (the SERVER span becomes a root). current_local is
-// filled by the caller after StartSpan returns.
-RequestTraceContext BuildRequestTraceContext(const HttpRequest& request) {
+// filled by the caller after StartSpan returns. The propagator is the
+// manager-provided composite, so any wire format the operator
+// configured (W3C, Jaeger) is honoured.
+RequestTraceContext BuildRequestTraceContext(
+    const HttpRequest& request,
+    const Propagator* propagator) {
     RequestTraceContext rtx;
-    auto parent = W3CPropagator::Extract(request.headers);
+    if (!propagator) return rtx;
+    auto parent = propagator->Extract(request.headers);
     if (parent.has_value()) {
         rtx.remote_parent = std::move(*parent);
     }
@@ -60,8 +65,10 @@ HttpRouter::Middleware MakeObservabilityMiddleware(
         // paths can finalize, but no header lookup or context copy
         // needs to happen.
         RequestTraceContext rtx;
+        std::shared_ptr<const Propagator> live_propagator;
         if (traces_enabled) {
-            rtx = BuildRequestTraceContext(request);
+            live_propagator = mgr_sp->propagator();
+            rtx = BuildRequestTraceContext(request, live_propagator.get());
         }
 
         std::shared_ptr<Span> server_span;

@@ -425,6 +425,47 @@ void TestProviderReloadSwapsSampler() {
     }
 }
 
+// SwapProcessorAcrossTracers — Phase 2 single-shot swap that the manager
+// uses during the boot-time NoopSpanProcessor → BatchSpanProcessor handoff.
+// Every previously-cached tracer must route to the new processor, and any
+// tracer obtained AFTER the swap must also see the new one.
+void TestSwapProcessorAcrossTracersFanout() {
+    try {
+        Bench b(std::make_shared<AlwaysOnSampler>());
+        Tracer* a = b.provider->GetTracer("scope_a", "1");
+        Tracer* c = b.provider->GetTracer("scope_b", "1");
+
+        // Establish that the old InMemoryProcessor is wired.
+        a->StartSpan("warm")->End();
+        size_t warm_size = b.processor->Size();
+        b.processor->Drain();
+
+        auto in_memory = std::make_shared<InMemorySpanProcessor>();
+        b.provider->SwapProcessorAcrossTracers(in_memory);
+
+        a->StartSpan("op_a")->End();
+        c->StartSpan("op_b")->End();
+        bool prior_routed = in_memory->Size() == 2;
+
+        Tracer* d = b.provider->GetTracer("scope_c", "1");
+        d->StartSpan("op_c")->End();
+        bool fresh_routed = in_memory->Size() == 3;
+
+        bool pass = warm_size == 1 && prior_routed && fresh_routed;
+        TestFramework::RecordTest(
+            "ObsTracer: SwapProcessorAcrossTracers fans out to cached + new tracers",
+            pass, pass ? ""
+                      : "size=" + std::to_string(in_memory->Size())
+                       + " prior=" + std::to_string(prior_routed)
+                       + " fresh=" + std::to_string(fresh_routed),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsTracer: SwapProcessorAcrossTracers fans out to cached + new tracers",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "OBSERVABILITY TRACER / SAMPLER / SPAN UNIT TESTS" << std::endl;
@@ -444,6 +485,7 @@ void RunAllTests() {
     TestSpanStatusTransition();
     TestProviderCachesTracers();
     TestProviderReloadSwapsSampler();
+    TestSwapProcessorAcrossTracersFanout();
 }
 
 }  // namespace ObservabilityTracerTests

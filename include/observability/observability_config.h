@@ -36,6 +36,10 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
+// Canonical exporter id values for `traces.exporter` / `metrics.exporter`.
+inline constexpr const char* kExporterOtlpHttp      = "otlp_http";
+inline constexpr const char* kExporterPrometheusPull = "prometheus_pull";
+
 enum class SamplerType {
     AlwaysOn       = 0,
     AlwaysOff      = 1,
@@ -85,6 +89,11 @@ struct TracesConfig {
     SamplerConfig sampler;             // live-reloadable
     OtlpTransportConfig otlp;          // upstream RESTART; headers/timeout live
     BatchSpanConfig batch;             // live-reloadable except max_queue_size
+    // Ordered list of trace-context propagator names; first match wins
+    // on Extract, every entry is invoked on Inject. Live-reloadable.
+    // Recognised names: "w3c", "jaeger". Default {"w3c"} keeps the
+    // single-format W3C-only behaviour for callers that don't override.
+    std::vector<std::string> propagators = {"w3c"};
     // Restart-required equality. ADDING A FIELD:
     //   - restart-only ⇒ include here AND classify in the field-by-
     //     field assignment in ObservabilityManager::Reload (omit it

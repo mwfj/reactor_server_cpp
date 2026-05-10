@@ -54,6 +54,11 @@ class InstrumentationScope;
 struct SpanData;
 struct MetricsSnapshot;
 
+// OTLP push pipeline.
+class OtlpHttpExporter;
+class BatchSpanProcessor;
+class PeriodicMetricReader;
+
 // Per-request observability bookkeeping.
 struct ObservabilitySnapshot;
 class ObservabilityManager;

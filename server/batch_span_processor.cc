@@ -5,6 +5,32 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
+namespace {
+
+// RAII helper that increments an atomic counter on construction and
+// decrements on destruction. Used by WorkerLoop to wrap the entire
+// retry sequence of a single batch so ForceFlush's queue=0 AND
+// in_flight=0 invariant holds across attempts. Anonymous-namespace
+// scope keeps it private to this translation unit (it has no business
+// in the public header — purely an implementation detail of the
+// worker loop).
+class ScopedExportInFlight {
+public:
+    explicit ScopedExportInFlight(std::atomic<int>& counter) noexcept
+        : counter_(counter) {
+        counter_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~ScopedExportInFlight() {
+        counter_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    ScopedExportInFlight(const ScopedExportInFlight&) = delete;
+    ScopedExportInFlight& operator=(const ScopedExportInFlight&) = delete;
+private:
+    std::atomic<int>& counter_;
+};
+
+}  // namespace
+
 BatchSpanProcessor::BatchSpanProcessor(
     std::shared_ptr<SpanExporter> exporter,
     BatchSpanProcessorOptions    options)
@@ -110,14 +136,17 @@ void BatchSpanProcessor::WorkerLoop() {
         while (true) {
             auto batch = DrainBatch(batch_cap);
             if (batch.empty()) break;
+            // Capture size up-front: the last attempt moves the batch
+            // into Export, leaving the local empty by the time we
+            // log a non-retryable failure.
+            const size_t batch_size = batch.size();
             // Retry loop: on kFailedRetryable back off and try again
-            // up to retries_max_attempts. kSuccess stops; any other
-            // result (kFailedNotRetryable / kInvalidArgument) drops
-            // the batch — those are non-retryable per the exporter
-            // contract. Backoff doubles each attempt, capped at
-            // retries_max_backoff. The first exception path counts
-            // as a failure but isn't retried (preserves the original
-            // best-effort drop on programmer errors / bad payloads).
+            // up to retries_max_attempts. kSuccess stops; kFailedNotRetryable
+            // drops the batch (4xx, transport short-circuit, post-shutdown).
+            // Backoff doubles each attempt, capped at retries_max_backoff.
+            // The first exception path counts as a failure but isn't
+            // retried (preserves the original best-effort drop on
+            // programmer errors / bad payloads).
             //
             // Read the live atomics (set by ReloadRetries) once per
             // batch so a SIGHUP affects subsequent attempts without
@@ -131,6 +160,12 @@ void BatchSpanProcessor::WorkerLoop() {
                 retries_max_backoff_ns_.load(
                     std::memory_order_acquire) / 1'000'000);
             int attempt = 0;
+            // RAII bracket: ForceFlush waits for queue=0 AND in_flight=0
+            // so the upstream pool isn't torn down mid-POST during the
+            // four-phase shutdown drain. The counter wraps the entire
+            // retry sequence (not each individual Export call) so a
+            // ForceFlush poll can't slip through between attempts.
+            ScopedExportInFlight guard{exports_in_flight_};
             for (; attempt < max_attempts; ++attempt) {
                 const auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::nanoseconds(export_timeout_ns_.load(
@@ -149,11 +184,19 @@ void BatchSpanProcessor::WorkerLoop() {
                                                   deadline);
                 } catch (const std::exception& e) {
                     logging::Get()->error(
-                        "BatchSpanProcessor::Export threw: {}", e.what());
+                        "BatchSpanProcessor::Export threw: {} (dropping {} spans)",
+                        e.what(), batch_size);
+                    dropped_on_export_failure_.fetch_add(
+                        static_cast<int64_t>(batch_size),
+                        std::memory_order_relaxed);
                     break;
                 } catch (...) {
                     logging::Get()->error(
-                        "BatchSpanProcessor::Export threw unknown exception");
+                        "BatchSpanProcessor::Export threw unknown exception "
+                        "(dropping {} spans)", batch_size);
+                    dropped_on_export_failure_.fetch_add(
+                        static_cast<int64_t>(batch_size),
+                        std::memory_order_relaxed);
                     break;
                 }
                 if (result == ExportResult::kSuccess) {
@@ -161,12 +204,27 @@ void BatchSpanProcessor::WorkerLoop() {
                     break;
                 }
                 if (result != ExportResult::kFailedRetryable) {
-                    break;  // non-retryable — drop and move on.
+                    // Non-retryable: 4xx, transport short-circuit on
+                    // peer disconnect, post-shutdown drop. Without a log
+                    // here operators have no diagnostic signal for a
+                    // permanently discarded batch.
+                    logging::Get()->warn(
+                        "BatchSpanProcessor: non-retryable export failure; "
+                        "dropping batch ({} spans, attempt={})",
+                        batch_size, attempt + 1);
+                    dropped_on_export_failure_.fetch_add(
+                        static_cast<int64_t>(batch_size),
+                        std::memory_order_relaxed);
+                    break;
                 }
                 if (attempt + 1 >= max_attempts) {
                     logging::Get()->warn(
                         "BatchSpanProcessor: retryable export failed after "
-                        "{} attempts; dropping batch", max_attempts);
+                        "{} attempts; dropping batch ({} spans)",
+                        max_attempts, batch_size);
+                    dropped_on_export_failure_.fetch_add(
+                        static_cast<int64_t>(batch_size),
+                        std::memory_order_relaxed);
                     break;
                 }
                 // Exponential backoff with cap. cv_-aware sleep so a
@@ -210,17 +268,27 @@ void BatchSpanProcessor::WorkerLoop() {
 }
 
 void BatchSpanProcessor::SignalShutdown() {
-    bool expected = false;
-    if (!shutting_down_.compare_exchange_strong(expected, true,
-            std::memory_order_acq_rel)) {
-        return;  // idempotent
-    }
-    // Wake the worker so it sees shutting_down_=true and runs its
-    // drain_all loop. Do NOT signal the exporter here: that would
-    // cause Export() inside the drain to return kFailedNotRetryable
-    // and silently drop every queued span. The exporter is signaled
-    // AFTER the worker has finished draining, in JoinWorkers().
+    // Hold mtx_ across the CAS so the flag publication is serialized
+    // with the worker's predicate-then-suspend window inside
+    // cv_.wait_for. An unlocked CAS followed by an empty lock-barrier
+    // would also work, but merging the CAS into the same critical
+    // section is cleaner and matches the textbook condition-variable
+    // producer pattern (mutate predicate state under the lock, then
+    // notify after release).
+    //
+    // Do NOT signal the exporter here: that would cause Export()
+    // inside the drain to return kFailedNotRetryable and silently drop
+    // every queued span. The exporter is signaled AFTER the worker has
+    // finished draining, in WorkerLoop's post-drain block / JoinWorkers.
     // Subsequent OnEnd calls already land in dropped_on_overflow_.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        bool expected = false;
+        if (!shutting_down_.compare_exchange_strong(expected, true,
+                std::memory_order_acq_rel)) {
+            return;  // idempotent — already shut down, no notify needed.
+        }
+    }
     cv_.notify_all();
 }
 
@@ -276,13 +344,18 @@ void BatchSpanProcessor::Reload(size_t new_max_export_batch_size,
                                  std::chrono::milliseconds new_schedule_delay,
                                  std::chrono::milliseconds new_export_timeout) {
     if (new_max_export_batch_size == 0) new_max_export_batch_size = 1;
-    max_export_batch_size_.store(new_max_export_batch_size,
-                                   std::memory_order_release);
-    schedule_delay_ns_.store(new_schedule_delay.count() * 1'000'000,
-                              std::memory_order_release);
-    export_timeout_ns_.store(new_export_timeout.count() * 1'000'000,
-                              std::memory_order_release);
-    cv_.notify_all();  // wake worker so the new schedule_delay applies promptly.
+    // Publish under mtx_ so the stores are serialized with the
+    // worker's predicate check; no separate empty-lock barrier needed.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        max_export_batch_size_.store(new_max_export_batch_size,
+                                       std::memory_order_release);
+        schedule_delay_ns_.store(new_schedule_delay.count() * 1'000'000,
+                                  std::memory_order_release);
+        export_timeout_ns_.store(new_export_timeout.count() * 1'000'000,
+                                  std::memory_order_release);
+    }
+    cv_.notify_all();  // wake worker so new schedule_delay applies promptly.
 }
 
 void BatchSpanProcessor::ReloadRetries(int new_max_attempts,
@@ -303,14 +376,40 @@ void BatchSpanProcessor::ReloadRetries(int new_max_attempts,
 }
 
 void BatchSpanProcessor::ForceFlush(std::chrono::milliseconds deadline) {
-    flush_requested_.store(true, std::memory_order_release);
+    // Lock-around-notify so the wakeup can't be lost between the
+    // worker's predicate check and its atomic release-and-suspend
+    // inside cv_.wait_for. The polling loop below tolerates a missed
+    // wakeup (worker eventually wakes via schedule_delay), but the
+    // serialization keeps flush latency in the millisecond range
+    // instead of paying up to 5s of schedule_delay before progress.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        flush_requested_.store(true, std::memory_order_release);
+    }
     cv_.notify_all();
-    // Poll until queue empties or deadline expires. We do NOT block the
-    // calling thread on a cv-wait because the worker thread holds the
-    // mtx during Export() — a cv-wait here would just spin on the cv.
+    // Deadline contract mirrors PeriodicMetricReader::ForceFlush /
+    // JoinWorkers: 0 = no-wait, < 0 = unbounded, > 0 = bounded. Polling
+    // (rather than a cv-wait) because the worker thread holds mtx_
+    // during Export() — a cv-wait here would just spin on the cv.
+    //
+    // Both queue=0 AND in_flight=0 must hold: the worker may have just
+    // dequeued the last batch and be inside the exporter's HTTP POST.
+    // Returning then would let the shutdown proceed to pool teardown,
+    // killing the in-flight POST.
+    auto poll_done = [&] {
+        return queue_depth() == 0 &&
+               exports_in_flight_.load(std::memory_order_acquire) == 0;
+    };
+    if (deadline.count() == 0) return;
+    if (deadline.count() < 0) {
+        while (!poll_done()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        return;
+    }
     const auto t_end = std::chrono::steady_clock::now() + deadline;
     while (std::chrono::steady_clock::now() < t_end) {
-        if (queue_depth() == 0) return;
+        if (poll_done()) return;
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     }
 }

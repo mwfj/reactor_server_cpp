@@ -1072,30 +1072,12 @@ static int HandleStart(const CliOptions& options) {
     }
 
     // Observability bootstrap — only when the master switch is on.
-    // Resource carries service.name/version/instance.id.
-    //
-    // Refuse otlp_http exporters until the production push pipeline is
-    // wired through this bootstrap. Defense-in-depth — ConfigLoader::
-    // Validate already rejects otlp_http via ValidateObservabilityRestart
-    // for the normal startup path, but a code path that bypasses
-    // Validate (test fixtures, future programmatic config) would
-    // otherwise silently build the manager with a NoopSpanProcessor and
-    // lose all traces. Fail closed at startup so misconfigurations
-    // surface immediately regardless of how config arrived here.
-    if (config.observability.enabled) {
-        if (config.observability.traces.exporter == "otlp_http") {
-            throw std::runtime_error(
-                "observability.traces.exporter='otlp_http' is not yet "
-                "wired in this bootstrap; remove the exporter or rebuild "
-                "after the OTLP push pipeline lands");
-        }
-        if (config.observability.metrics.exporter == "otlp_http") {
-            throw std::runtime_error(
-                "observability.metrics.exporter='otlp_http' is not yet "
-                "wired in this bootstrap; use 'prometheus_pull' or remove "
-                "the exporter until the OTLP push pipeline lands");
-        }
-    }
+    // Resource carries service.name/version/instance.id. The OTLP push
+    // pipeline (BatchSpanProcessor + PeriodicMetricReader fed by
+    // OtlpHttpExporter) is wired downstream in HttpServer::MarkServerReady
+    // once the upstream pool is alive — boot here installs the
+    // NoopSpanProcessor placeholder, which MarkServerReady atomically
+    // swaps via ObservabilityManager::SwapToBatchSpanProcessor.
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
         observability_manager;
     if (config.observability.enabled) {
@@ -1131,13 +1113,14 @@ static int HandleStart(const CliOptions& options) {
         // trace_flags. The traces.enabled live flag governs whether
         // PublishLiveFlags lets spans record once a processor exists.
         //
-        // FIXME (Phase 2): NoopSpanProcessor is free, but the same
-        // allocation site will pick up BatchSpanProcessor when the OTLP
-        // push pipeline lands — at which point `traces.enabled=false
-        // exporter="otlp_http"` will spin up a worker thread + bounded
-        // queue at boot. Either gate this on a separate
-        // `traces.reload_ready` knob or accept the worker cost as the
-        // price of live-reloadable traces.enabled.
+        // Boot picks NoopSpanProcessor here; HttpServer::MarkServerReady
+        // swaps in BatchSpanProcessor when `traces.exporter` is set. That
+        // means `traces.enabled=false exporter="otlp_http"` does spin up
+        // the BSP worker thread + bounded queue at boot — accepted as
+        // the price of keeping `traces.enabled` live-reloadable
+        // (otherwise the false→true SIGHUP flip would be a permanent
+        // no-op). The emission gate at Tracer::StartSpan keeps spans
+        // non-recording while disabled, so the queue stays empty.
         std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor> processor;
         if (!config.observability.traces.exporter.empty()) {
             processor =

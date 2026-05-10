@@ -5,12 +5,14 @@
 // retain serialized OTLP/JSON for inspection.
 
 #include "test_framework.h"
+#include "auth/upstream_http_client.h"
 #include "nlohmann/json.hpp"
 #include "observability/batch_span_processor.h"
 #include "observability/instrumentation_scope.h"
 #include "observability/meter_provider.h"
 #include "observability/metric_label_registry.h"
 #include "observability/otlp_http_exporter.h"
+#include "observability/otlp_transport.h"
 #include "observability/periodic_metric_reader.h"
 #include "observability/resource.h"
 #include "observability/sampler.h"
@@ -88,6 +90,29 @@ private:
     int calls_ = 0;
     std::atomic<int> signal_count_{0};
     std::atomic<int> cancel_count_{0};
+};
+
+// Slow MetricExporter — sleeps inside Export() so tests can assert
+// ForceFlush actually blocked through the export round-trip.
+class SlowMetricExporter : public MetricExporter {
+public:
+    explicit SlowMetricExporter(std::chrono::milliseconds latency)
+        : latency_(latency) {}
+    ExportResult Export(MetricsSnapshot,
+                         std::chrono::steady_clock::time_point) override {
+        std::this_thread::sleep_for(latency_);
+        export_calls_.fetch_add(1, std::memory_order_relaxed);
+        return ExportResult::kSuccess;
+    }
+    void SignalShutdown() override {}
+    void CancelAllActiveExports() override {}
+    int export_calls() const {
+        return export_calls_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::chrono::milliseconds latency_;
+    std::atomic<int> export_calls_{0};
 };
 
 // Capture-style MetricExporter.
@@ -257,6 +282,74 @@ void TestBatchSpanProcessorClampsZeroBatchSize() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "ObsExport: BatchSpanProcessor constructor clamps zero batch size",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Non-retryable export failures must be observable. The worker
+// previously broke out of the retry loop silently on
+// kFailedNotRetryable — operators had no signal that a batch was
+// permanently discarded. The fix is a warn log + a dedicated counter
+// (dropped_on_export_failure) parallel to dropped_on_overflow.
+void TestBatchSpanProcessorNonRetryableFailureCountedAndLogged() {
+    try {
+        // Exporter returns kFailedNotRetryable on every call.
+        class NotRetryableExporter : public SpanExporter {
+        public:
+            ExportResult Export(std::vector<SpanData>,
+                                 std::chrono::steady_clock::time_point) override {
+                ++calls_;
+                return ExportResult::kFailedNotRetryable;
+            }
+            void SignalShutdown() override {}
+            void CancelAllActiveExports() override {}
+            int calls() const { return calls_; }
+        private:
+            std::atomic<int> calls_{0};
+        };
+        auto exporter = std::make_shared<NotRetryableExporter>();
+        BatchSpanProcessorOptions opts;
+        opts.max_export_batch_size = 4;
+        opts.schedule_delay = std::chrono::milliseconds{60'000};
+        BatchSpanProcessor bsp(exporter, opts);
+
+        auto resource = std::make_shared<Resource>();
+        auto random   = std::make_shared<RandomSource>(0xBADBEEFULL);
+        TracerProvider provider(
+            resource,
+            std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
+                &bsp, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
+            std::make_shared<AlwaysOnSampler>(), random);
+        Tracer* t = provider.GetTracer("notretryable_test");
+
+        // Submit a batch of 4 spans. Worker drains, exporter returns
+        // kFailedNotRetryable, batch is dropped. Counter must reflect
+        // the dropped span count; exported_batches stays 0.
+        for (int i = 0; i < 4; ++i) { t->StartSpan("op", {})->End(); }
+        bsp.ForceFlush(std::chrono::milliseconds{1000});
+
+        // Wait for the worker to advance past the export attempt.
+        for (int i = 0; i < 50 && exporter->calls() < 1; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        // Counter should be == batch size; non-retryable means no retry.
+        const int64_t dropped = bsp.dropped_on_export_failure();
+        const int64_t exported = bsp.exported_batches();
+        bool pass = exporter->calls() == 1 &&
+                    dropped == 4 &&
+                    exported == 0;
+        TestFramework::RecordTest(
+            "ObsExport: BSP counts spans dropped on non-retryable failure",
+            pass, pass ? ""
+                      : "calls=" + std::to_string(exporter->calls())
+                       + " dropped=" + std::to_string(dropped)
+                       + " exported=" + std::to_string(exported),
+            TestFramework::TestCategory::OTHER);
+        bsp.SignalShutdown();
+        bsp.JoinWorkers(std::chrono::milliseconds{500});
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: BSP counts spans dropped on non-retryable failure",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -543,6 +636,310 @@ void TestOtlpExporterSerializesMetricsToJson() {
     }
 }
 
+// ---- ForceFlush base virtual (Phase 2 Task 1.0) ----
+// HttpServer::FlushObservabilityForShutdown calls ForceFlush
+// polymorphically via the base interface (no dynamic_cast). Verify the
+// virtual exists and that the no-op processors compile + return cleanly.
+void TestNoopProcessorForceFlushIsNoop() {
+    try {
+        OBSERVABILITY_NAMESPACE::NoopSpanProcessor p;
+        p.ForceFlush(std::chrono::milliseconds(0));
+        TestFramework::RecordTest(
+            "ObsExport: NoopSpanProcessor ForceFlush is no-op",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: NoopSpanProcessor ForceFlush is no-op",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestInMemoryProcessorForceFlushIsNoop() {
+    try {
+        OBSERVABILITY_NAMESPACE::InMemorySpanProcessor p;
+        p.ForceFlush(std::chrono::milliseconds(0));
+        TestFramework::RecordTest(
+            "ObsExport: InMemorySpanProcessor ForceFlush is no-op",
+            true, "", TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: InMemorySpanProcessor ForceFlush is no-op",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BatchSpanProcessor's override drains buffered spans into the exporter.
+void TestBatchSpanProcessorOverridesForceFlush() {
+    try {
+        auto exporter = std::make_shared<CaptureSpanExporter>();
+        BatchSpanProcessorOptions opts;
+        opts.max_export_batch_size = 16;
+        opts.schedule_delay = std::chrono::milliseconds{60'000};  // long; flush is the trigger
+        BatchSpanProcessor bsp(exporter, opts);
+
+        auto resource = std::make_shared<Resource>();
+        auto random   = std::make_shared<RandomSource>(0x1ULL);
+        TracerProvider provider(
+            resource,
+            std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
+                &bsp, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
+            std::make_shared<AlwaysOnSampler>(), random);
+        Tracer* t = provider.GetTracer("flush_test");
+        for (int i = 0; i < 3; ++i) { t->StartSpan("op", {})->End(); }
+
+        bsp.ForceFlush(std::chrono::milliseconds(500));
+        // ForceFlush returns when the in-memory queue empties; Export()
+        // may still be running on the worker. Poll until the captured
+        // count catches up (small bounded wait).
+        for (int i = 0; i < 50 && exporter->Size() < 3; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        bool pass = exporter->Size() == 3;
+        TestFramework::RecordTest(
+            "ObsExport: BatchSpanProcessor::ForceFlush drains queue via base virtual",
+            pass, pass ? "" : "got " + std::to_string(exporter->Size()) + "/3",
+            TestFramework::TestCategory::OTHER);
+        bsp.SignalShutdown();
+        bsp.JoinWorkers(std::chrono::milliseconds(500));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: BatchSpanProcessor::ForceFlush drains queue via base virtual",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// PeriodicMetricReader::ForceFlush blocks until the worker completes
+// at least one export cycle (or the deadline expires). Without the
+// blocking handshake, ForceFlush would return near-instantly and the
+// shutdown drain would race the in-flight export.
+void TestPeriodicMetricReaderForceFlushBlocks() {
+    try {
+        MeterProvider provider(std::make_shared<Resource>(), 1);
+        auto exporter = std::make_shared<SlowMetricExporter>(
+            std::chrono::milliseconds(150));
+        MeterReaderOptions ropts;
+        // Long interval so the periodic tick can't satisfy ForceFlush
+        // on its own — the export MUST be flush-driven.
+        ropts.export_interval = std::chrono::milliseconds(60'000);
+        PeriodicMetricReader reader(&provider, exporter, ropts);
+
+        // Deadline + bounds chosen for sanitizer headroom. The test
+        // proves two invariants:
+        //   (1) ForceFlush waits AT LEAST through the slow export
+        //       (lower bound > 140ms — the artificial 150ms sleep,
+        //       slack for sanitizer skew on the sleep itself).
+        //   (2) ForceFlush returns BEFORE the deadline, i.e. the cv
+        //       handshake fires (upper bound < deadline). The cv
+        //       handshake plus TSan instrumentation can add several
+        //       hundred ms of overhead, so the gap between upper
+        //       bound and deadline must be generous.
+        const auto kDeadline    = std::chrono::milliseconds{3000};
+        const auto kLowerBound  = std::chrono::milliseconds{140};
+        const auto kUpperBound  = std::chrono::milliseconds{2500};
+
+        const auto t0 = std::chrono::steady_clock::now();
+        reader.ForceFlush(kDeadline);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        const bool waited = elapsed >= kLowerBound;
+        const bool bounded = elapsed <= kUpperBound;
+        const bool exported = exporter->export_calls() >= 1;
+        const bool pass = waited && bounded && exported;
+
+        reader.SignalShutdown();
+        reader.JoinWorkers(std::chrono::milliseconds(500));
+
+        TestFramework::RecordTest(
+            "ObsExport: PeriodicMetricReader::ForceFlush blocks for export",
+            pass, pass ? ""
+                      : "elapsed_ms=" + std::to_string(
+                          std::chrono::duration_cast<
+                              std::chrono::milliseconds>(elapsed).count())
+                       + " exports=" + std::to_string(exporter->export_calls()),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: PeriodicMetricReader::ForceFlush blocks for export",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// BSP::ForceFlush deadline contract — must mirror PMR/JoinWorkers:
+//   deadline == 0  : no-wait, return immediately.
+//   deadline <  0  : unbounded wait until queue empty + no in-flight.
+//   deadline >  0  : bounded wait.
+// Unbounded must NOT silently truncate to no-wait — a future caller
+// passing -1ms as a sentinel for "wait until done" would otherwise get
+// the export-in-flight torn down by shutdown drain.
+void TestBatchSpanProcessorForceFlushDeadlineContract() {
+    try {
+        // Slow exporter — sleeps 200ms inside Export so the queue
+        // doesn't drain instantly. We can then assert BSP::ForceFlush
+        // honors the deadline shape.
+        class SlowSpanExporter : public SpanExporter {
+        public:
+            ExportResult Export(std::vector<SpanData>,
+                                 std::chrono::steady_clock::time_point) override {
+                std::this_thread::sleep_for(std::chrono::milliseconds{200});
+                exports_.fetch_add(1, std::memory_order_acq_rel);
+                return ExportResult::kSuccess;
+            }
+            void SignalShutdown() override {}
+            void CancelAllActiveExports() override {}
+            int exports() const { return exports_.load(); }
+        private:
+            std::atomic<int> exports_{0};
+        };
+
+        auto exporter = std::make_shared<SlowSpanExporter>();
+        BatchSpanProcessorOptions opts;
+        opts.max_export_batch_size = 16;
+        opts.schedule_delay = std::chrono::milliseconds{60'000};
+        BatchSpanProcessor bsp(exporter, opts);
+
+        auto resource = std::make_shared<Resource>();
+        auto random   = std::make_shared<RandomSource>(0x9ULL);
+        TracerProvider provider(
+            resource,
+            std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
+                &bsp, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
+            std::make_shared<AlwaysOnSampler>(), random);
+        Tracer* t = provider.GetTracer("ff_contract");
+
+        // Case 1: deadline=0 returns immediately even with a queued span.
+        t->StartSpan("op", {})->End();
+        const auto t0 = std::chrono::steady_clock::now();
+        bsp.ForceFlush(std::chrono::milliseconds{0});
+        const auto e0 = std::chrono::steady_clock::now() - t0;
+        const bool zero_returns_fast =
+            e0 < std::chrono::milliseconds{50};
+
+        // Drain anything still pending under a generous deadline so
+        // case 3 starts from a clean state.
+        bsp.ForceFlush(std::chrono::milliseconds{2000});
+
+        // Case 2: deadline=-1 waits unbounded — must observe the slow
+        // export complete (queue empty + no in-flight).
+        t->StartSpan("op2", {})->End();
+        const auto t1 = std::chrono::steady_clock::now();
+        bsp.ForceFlush(std::chrono::milliseconds{-1});
+        const auto e1 = std::chrono::steady_clock::now() - t1;
+        const auto e1_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(e1);
+        // Slow exporter is 200ms; allow generous lower bound (150ms,
+        // sanitizer slack) and upper bound (3000ms, scheduler skew).
+        const bool unbounded_waits =
+            e1_ms >= std::chrono::milliseconds{150} &&
+            e1_ms <= std::chrono::milliseconds{3000};
+
+        const bool pass = zero_returns_fast && unbounded_waits;
+        TestFramework::RecordTest(
+            "ObsExport: BSP::ForceFlush deadline contract (0=no-wait, -1=unbounded)",
+            pass, pass ? ""
+                      : ("zero_fast=" + std::to_string(zero_returns_fast)
+                       + " unbounded=" + std::to_string(unbounded_waits)
+                       + " e0_ms=" + std::to_string(
+                             std::chrono::duration_cast<
+                                 std::chrono::milliseconds>(e0).count())
+                       + " e1_ms=" + std::to_string(e1_ms.count())),
+            TestFramework::TestCategory::OTHER);
+
+        bsp.SignalShutdown();
+        bsp.JoinWorkers(std::chrono::milliseconds{500});
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: BSP::ForceFlush deadline contract (0=no-wait, -1=unbounded)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// MakeOtlpTransport must short-circuit to kFailedNotRetryable when
+// the captured weak_ptr<UpstreamHttpClient> has expired (e.g. abnormal
+// shutdown ordering tears down the client before the BSP/PMR worker's
+// final export). Without the lock-and-bail check, the transport would
+// dereference a null shared_ptr and crash inside the worker thread.
+// An empty weak_ptr is the simplest way to drive that path: lock()
+// returns null without needing a real client construction.
+void TestMakeOtlpTransportNullClientShortCircuits() {
+    try {
+        std::weak_ptr<AUTH_NAMESPACE::UpstreamHttpClient> empty;
+        auto transport = OBSERVABILITY_NAMESPACE::MakeOtlpTransport(empty);
+
+        OtlpHttpExporter::ExportPayload payload;
+        payload.upstream_pool_name = "otel-collector";
+        payload.path               = "/v1/traces";
+        payload.body               = "{}";
+        payload.timeout            = std::chrono::milliseconds{1000};
+
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::seconds{1};
+        const auto result = transport(std::move(payload), deadline);
+
+        bool pass = (result == ExportResult::kFailedNotRetryable);
+        TestFramework::RecordTest(
+            "ObsExport: MakeOtlpTransport short-circuits when client weak_ptr expired",
+            pass, pass ? "" : "expected kFailedNotRetryable",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: MakeOtlpTransport short-circuits when client weak_ptr expired",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Sub-second OTLP timeouts must NOT truncate to zero. timeout_sec=0
+// disables UpstreamHttpClient::SetDeadline; fut.get() then blocks
+// indefinitely on a stalled upstream and wedges the BSP/PMR worker.
+// Round-up-to-1s is the contract OtlpTimeoutCeilSeconds enforces.
+void TestOtlpTimeoutCeilSeconds() {
+    try {
+        using ms = std::chrono::milliseconds;
+        struct Case {
+            const char* name;
+            int64_t input_ms;
+            int     expected_secs;
+        };
+        const Case cases[] = {
+            {"zero",                0,        1},
+            {"one_ms",              1,        1},
+            {"sub_second_500",    500,        1},
+            {"sub_second_999",    999,        1},
+            {"exact_1s",         1000,        1},
+            {"1001ms_rounds_up", 1001,        2},
+            {"5500ms_rounds_up", 5500,        6},
+            {"60s",             60000,       60},
+            {"negative_clamped",   -5,        1},
+        };
+        bool pass = true;
+        std::string err;
+        for (const auto& c : cases) {
+            const int got = OBSERVABILITY_NAMESPACE::OtlpTimeoutCeilSeconds(
+                ms{c.input_ms});
+            if (got != c.expected_secs) {
+                pass = false;
+                err = std::string{c.name} + ": expected "
+                    + std::to_string(c.expected_secs)
+                    + ", got " + std::to_string(got);
+                break;
+            }
+            // Critical invariant: never zero — that disables SetDeadline.
+            if (got <= 0) {
+                pass = false;
+                err = std::string{c.name} + ": timeout_sec <= 0 "
+                                            "(would disable deadline)";
+                break;
+            }
+        }
+        TestFramework::RecordTest(
+            "ObsExport: OtlpTimeoutCeilSeconds rounds up sub-second to >=1",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: OtlpTimeoutCeilSeconds rounds up sub-second to >=1",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "OBSERVABILITY EXPORT PIPELINE TESTS" << std::endl;
@@ -551,6 +948,7 @@ void RunAllTests() {
     TestBatchSpanProcessorBatchesAndExports();
     TestBatchSpanProcessorDropsOnOverflow();
     TestBatchSpanProcessorClampsZeroBatchSize();
+    TestBatchSpanProcessorNonRetryableFailureCountedAndLogged();
     TestBatchSpanProcessorShutdownPropagates();
     TestBatchSpanProcessorJoinWorkersZeroIsNoWait();
     TestPeriodicMetricReaderExportsCycles();
@@ -558,6 +956,13 @@ void RunAllTests() {
     TestOtlpExporterShutdownRefusesExport();
     TestOtlpExporterReloadHeaders();
     TestOtlpExporterSerializesMetricsToJson();
+    TestNoopProcessorForceFlushIsNoop();
+    TestInMemoryProcessorForceFlushIsNoop();
+    TestBatchSpanProcessorOverridesForceFlush();
+    TestPeriodicMetricReaderForceFlushBlocks();
+    TestBatchSpanProcessorForceFlushDeadlineContract();
+    TestMakeOtlpTransportNullClientShortCircuits();
+    TestOtlpTimeoutCeilSeconds();
 }
 
 }  // namespace ObservabilityExportPipelineTests
