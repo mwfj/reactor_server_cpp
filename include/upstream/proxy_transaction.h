@@ -187,12 +187,21 @@ public:
     static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
 
 private:
-    // Bump h2_send_stall_generation_ and queue a fresh delayed
-    // closure that fires after `budget_ms` if not invalidated. Used
-    // both from DispatchH2 to arm the initial stall and from
-    // OnRequestBodyProgress to refresh on each request-body DATA
-    // flush, mirroring H1's per-write SetWriteProgressCb refresh.
+    // Bump h2_send_stall_generation_ and queue a fresh send-stall
+    // closure for the full budget. Called from DispatchH2 at attempt
+    // start. OnRequestBodyProgress does NOT call this directly —
+    // refreshes flow through h2_last_progress_at_ + the closure's
+    // self-rescheduling check.
     void ArmH2SendStallDeadline(int budget_ms);
+
+    // Queue (or re-queue) the send-stall closure with the given
+    // generation and delay. Called by ArmH2SendStallDeadline (initial
+    // arm with a fresh generation) and by the closure itself on
+    // observed progress (re-queue with the current generation for the
+    // remaining budget). Same-generation re-queue is correct because
+    // Cleanup / OnRequestSubmitted bump the generation, invalidating
+    // any in-flight closure regardless of who queued it.
+    void QueueH2SendStallClosure(uint64_t generation, int delay_ms);
 
     // State machine states
     enum class State {
@@ -383,21 +392,17 @@ private:
     // Reset by DispatchH2 init + Cleanup.
     bool h2_request_fully_sent_ = false;
 
-    // Last time the H2 send-stall closure was armed. Used by
-    // OnRequestBodyProgress to debounce re-arming: closures are
-    // queued via EnQueueDelayed and live in the dispatcher's
-    // min-heap until their deadline expires. A naive per-DATA-frame
-    // re-arm produces O(num_data_frames) live closures (e.g. ~6400
-    // dead entries for a 100 MB upload at 16 KB/frame). The
-    // debounce skips re-arm when less than budget/2 has elapsed,
-    // bounding the heap to at most 2 in-flight closures per
-    // transaction. Worst-case stall-detection latency: 1.5 * budget.
-    std::chrono::steady_clock::time_point h2_send_stall_armed_at_{};
+    // Last time the H2 codec emitted a request-side DATA frame.
+    // Updated by OnRequestBodyProgress; inspected by the single
+    // in-flight send-stall closure on fire. The closure re-queues
+    // itself for the remaining budget if progress was observed,
+    // otherwise it fires the timeout. This keeps the dispatcher's
+    // min-heap bounded to one closure per request regardless of
+    // upload size, while preserving refresh-on-every-DATA semantics.
+    std::chrono::steady_clock::time_point h2_last_progress_at_{};
 
     // Cached send-stall budget for this attempt. Computed once in
-    // DispatchH2 from response_timeout_ms (with the zero-disable
-    // fallback) so OnRequestBodyProgress doesn't recompute per DATA
-    // frame.
+    // DispatchH2 so the closure's progress check doesn't recompute.
     int h2_stall_budget_ms_ = 0;
 
     // H2 response timeout uses a dispatcher-scheduled task instead of a

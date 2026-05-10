@@ -220,13 +220,12 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     // the in_receive_data_ guard defers the inline FlushSend; the
     // post-receive flush in HandleBytes picks up the queued frame.
     using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
-    // Detach the sink BEFORE calling OnError. The sink's OnError can
-    // synchronously trigger ProxyTransaction's terminal path → Cleanup
-    // → h2->ResetStream, which both detaches the sink and submits
-    // RST_STREAM. Without pre-detach, the outer self->ResetStream
-    // call below would submit a SECOND nghttp2_submit_rst_stream
-    // against a stream nghttp2 has already torn down, producing a
-    // spurious warn log for every truncation/NO_BODY firing.
+    // Detach the sink BEFORE calling OnError so the synchronous
+    // teardown chain (ProxyTransaction OnError → Cleanup → h2->
+    // ResetStream) does not re-dispatch sink->OnError on an
+    // already-failed path. The outer self->ResetStream below is the
+    // safety net for paths where Cleanup doesn't run; nghttp2 dedups
+    // the duplicate RST submission silently in production.
     auto reject_truncation = [&](const char* msg) {
         auto* sink = stream->sink;
         stream->sink = nullptr;

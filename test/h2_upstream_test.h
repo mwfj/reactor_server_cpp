@@ -4657,14 +4657,17 @@ void TestN7cSendStallFallbackBudget() {
 }
 
 // ---------------------------------------------------------------------------
-// TestN7e — Send-stall keeps refreshing on intermediate DATA frames
-// after an early peer-final-headers transition. Submits a 30000-byte
-// body (≥2 DATA frames) and feeds a 413+END_STREAM mid-upload;
-// asserts the codec still dispatches OnRequestBodyProgress for
-// intermediate DATA frames regardless of response-side state_.
+// TestN7e — Wire-driven smoke test that early-peer-final-headers does
+// not GOAWAY/RST the connection nor stop intermediate-DATA codec
+// dispatch on the request side. Locks the codec wiring; the deeper
+// "no false stall after early headers" semantic is enforced at the
+// production layer by gating OnRequestBodyProgress on
+// h2_request_fully_sent_ rather than response-side state_, and by
+// the timestamp-driven self-rescheduling closure (no test in this
+// file exercises the timing under wall-clock load).
 // ---------------------------------------------------------------------------
-void TestN7eRefreshContinuesAfterEarlyHeaders() {
-    std::cout << "\n[TEST] H2Upstream N7e: refresh continues after early-final-headers..." << std::endl;
+void TestN7eWiringEarlyHeadersThenIntermediateDataDispatch() {
+    std::cout << "\n[TEST] H2Upstream N7e: wire-level dispatch after early peer-final-headers..." << std::endl;
     struct ObservingSink : public RecordingSink {
         int progress_calls_total = 0;
         int progress_calls_post_headers = 0;
@@ -4690,7 +4693,7 @@ void TestN7eRefreshContinuesAfterEarlyHeaders() {
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
-                "H2Upstream N7e: refresh continues after early-final-headers",
+                "H2Upstream N7e: wire-level dispatch after early peer-final-headers",
                 false, "Init failed");
             return;
         }
@@ -4700,7 +4703,7 @@ void TestN7eRefreshContinuesAfterEarlyHeaders() {
             "POST", "http", "example.com", "/upload", {}, body, &sink);
         if (sid <= 0) {
             TestFramework::RecordTest(
-                "H2Upstream N7e: refresh continues after early-final-headers",
+                "H2Upstream N7e: wire-level dispatch after early peer-final-headers",
                 false, "submit failed sid=" + std::to_string(sid));
             return;
         }
@@ -4725,14 +4728,14 @@ void TestN7eRefreshContinuesAfterEarlyHeaders() {
         bool pass = (consumed > 0) && sink.headers_seen &&
                     (sink.progress_calls_total >= 1);
         TestFramework::RecordTest(
-            "H2Upstream N7e: refresh continues after early-final-headers",
+            "H2Upstream N7e: wire-level dispatch after early peer-final-headers",
             pass,
             pass ? "" : "consumed=" + std::to_string(consumed) +
                         " headers_seen=" + std::to_string(sink.headers_seen) +
                         " progress_total=" + std::to_string(sink.progress_calls_total));
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2Upstream N7e: refresh continues after early-final-headers",
+            "H2Upstream N7e: wire-level dispatch after early peer-final-headers",
             false, e.what());
     }
 }
@@ -4865,7 +4868,7 @@ void RunAllH2UpstreamTests() {
     TestN8cNoPoisonOnEarlyHeadersSiblingReuse();
     TestN9bRequestBodyProgressFiresFromCodec();
     TestN9cDefaultSinkSurvivesNewVirtual();
-    TestN7eRefreshContinuesAfterEarlyHeaders();
+    TestN7eWiringEarlyHeadersThenIntermediateDataDispatch();
 
     // TestB-series additions — wire-level
     TestB15TrailersAfterDataEndStream();

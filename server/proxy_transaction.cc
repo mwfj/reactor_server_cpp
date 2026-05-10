@@ -966,7 +966,7 @@ void ProxyTransaction::DispatchH2() {
 
     h2_stall_budget_ms_ = ComputeH2StallBudgetMs(
         config_.response_timeout_ms);
-    h2_send_stall_armed_at_ = std::chrono::steady_clock::now();
+    h2_last_progress_at_ = std::chrono::steady_clock::now();
     ArmH2SendStallDeadline(h2_stall_budget_ms_);
 
     // Synchronous on_frame_send (bodyless path) may run inline here,
@@ -1655,38 +1655,56 @@ void ProxyTransaction::OnRequestBodyProgress() {
     if (cancelled_ || IsKilledForShutdown()) return;
     if (!h2_path_) return;
     if (h2_request_fully_sent_) return;
-
-    // Debounce: only re-arm if at least budget/2 has elapsed since
-    // the last arm. Without this, a large multi-frame upload would
-    // queue one EnQueueDelayed closure per DATA frame, accumulating
-    // O(num_frames) dead entries in the dispatcher's min-heap.
-    const auto now = std::chrono::steady_clock::now();
-    const auto half_budget =
-        std::chrono::milliseconds(h2_stall_budget_ms_ / 2);
-    if (now - h2_send_stall_armed_at_ < half_budget) return;
-
-    h2_send_stall_armed_at_ = now;
-    ArmH2SendStallDeadline(h2_stall_budget_ms_);
+    // Pure-timestamp refresh: the in-flight send-stall closure
+    // inspects this on fire and re-queues itself if progress was
+    // observed. No EnQueueDelayed call here — the heap stays at
+    // one closure per request regardless of upload size.
+    h2_last_progress_at_ = std::chrono::steady_clock::now();
 }
 
 void ProxyTransaction::ArmH2SendStallDeadline(int budget_ms) {
-    if (!dispatcher_) return;
     const uint64_t send_stall_gen = ++h2_send_stall_generation_;
+    QueueH2SendStallClosure(send_stall_gen, budget_ms);
+}
+
+void ProxyTransaction::QueueH2SendStallClosure(uint64_t generation,
+                                                int delay_ms) {
+    if (!dispatcher_) return;
     std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
     dispatcher_->EnQueueDelayed(
-        [weak_self, send_stall_gen]() {
+        [weak_self, generation]() {
             auto self = weak_self.lock();
             if (!self) return;
             if (self->cancelled_) return;
-            if (send_stall_gen != self->h2_send_stall_generation_) return;
-            // H2 send-stall is a TIMEOUT, not a disconnect: the peer
-            // is still connected but isn't draining our request body.
-            // Mirrors H1's send-stall semantics (ArmResponseTimeout
-            // with stall_budget; transport SetDeadlineTimeoutCb fires
-            // RESULT_RESPONSE_TIMEOUT on miss). Route through the
-            // retryable-timeout path so retry_on_timeout policies
-            // apply and the client sees 504 (not 502) on retry-
-            // exhausted.
+            if (generation != self->h2_send_stall_generation_) return;
+
+            // Progress check: if we've seen a DATA flush within the
+            // budget, the upload is healthy — re-queue ourselves
+            // for the remaining time without bumping the generation.
+            // Cleanup / OnRequestSubmitted will still invalidate us
+            // by bumping the generation; the same-generation re-
+            // queue stays valid until they do.
+            const auto now = std::chrono::steady_clock::now();
+            const auto budget = std::chrono::milliseconds(
+                self->h2_stall_budget_ms_);
+            const auto since_progress = now - self->h2_last_progress_at_;
+            if (since_progress < budget) {
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        budget - since_progress);
+                // Clamp to at least 1ms so we don't busy-loop on
+                // floating-point edge cases (since_progress == 0).
+                const int remaining_ms = std::max<int>(
+                    1, static_cast<int>(remaining.count()));
+                self->QueueH2SendStallClosure(generation, remaining_ms);
+                return;
+            }
+
+            // Real stall: peer connected but not draining body.
+            // Surface as RESULT_RESPONSE_TIMEOUT to mirror H1's
+            // SetDeadline-driven semantic; route through the
+            // retryable-timeout path so retry_on_timeout applies and
+            // the client sees 504, not 502.
             if (self->state_ == State::SENDING_REQUEST ||
                 self->state_ == State::AWAITING_RESPONSE ||
                 self->state_ == State::RECEIVING_BODY) {
@@ -1705,7 +1723,7 @@ void ProxyTransaction::ArmH2SendStallDeadline(int budget_ms) {
                     self->client_fd_, self->service_name_);
             }
         },
-        std::chrono::milliseconds(budget_ms));
+        std::chrono::milliseconds(delay_ms));
 }
 
 void ProxyTransaction::DeliverTerminalError(int result_code,
