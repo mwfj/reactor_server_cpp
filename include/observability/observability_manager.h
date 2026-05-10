@@ -91,6 +91,12 @@ public:
     bool MetricsEnabled() const noexcept {
         return metrics_enabled_.load(std::memory_order_acquire);
     }
+    // Live-reloadable. AuthManager reads this once per deferred-dispatch
+    // entry to decide between allocating `auth.idp_check` (true) vs
+    // emitting `auth.pending_*` events on the SERVER span (false).
+    bool AuthIdpSpanEnabled() const noexcept {
+        return auth_idp_span_enabled_.load(std::memory_order_acquire);
+    }
     // Live read of metrics.prometheus.include_target_info — flipped by
     // SIGHUP through Reload(). The /metrics handler consults this on
     // every scrape.
@@ -275,6 +281,11 @@ private:
     std::atomic<bool> traces_enabled_{true};
     std::atomic<bool> metrics_enabled_{true};
     std::atomic<bool> include_target_info_{true};
+    // Mirror of `traces.auth_idp_span`. Read on the auth dispatch
+    // hot path to decide between allocating an `auth.idp_check`
+    // INTERNAL span vs emitting `auth.pending_*` events on the
+    // SERVER span.
+    std::atomic<bool> auth_idp_span_enabled_{true};
 
     // Tracks whether PublishLiveFlags has already warned about the
     // "traces.enabled=true but no SpanProcessor" misconfig in this

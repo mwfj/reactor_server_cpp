@@ -39,12 +39,14 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
-// Forward declarations — defined in span.h / tracer.h respectively.
-// shared_ptr<Span> AND Tracer* only need the pointee's complete type at
-// `.cc` call sites; the header declaration point is satisfied by the
-// forward declaration alone.
+// Forward declarations — defined in span.h / tracer.h / propagator.h
+// respectively. Pulling the full headers would create cycles through the
+// wider observability tree; the forward declarations are sufficient
+// because every use here is through pointers / shared_ptr that only
+// need the pointee's complete type at `.cc` call sites.
 class Span;
 class Tracer;
+class Propagator;
 
 // Per-request inbound trace context.
 //
@@ -106,6 +108,14 @@ struct IssueTraceContext {
     SpanContext local;
     SpanContext parent;
     Tracer*     tracer = nullptr;
+    // Live trace-context propagator (composite of the operator's
+    // `traces.propagators`). Populated by the auth caller from
+    // `ObservabilityManager::propagator().get()`; `const` matches the
+    // accessor's `shared_ptr<const Propagator>` return. When null,
+    // `ApplyOutboundTraceContext` falls back to a stack-local
+    // `W3CPropagator{}` so outbound is always W3C even when no
+    // propagator is bound.
+    const Propagator* propagator = nullptr;
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

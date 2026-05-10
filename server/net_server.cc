@@ -610,6 +610,12 @@ bool NetServer::IsOnDispatcherThread() const {
     return false;
 }
 
+void NetServer::EnQueueOnConnDispatcher(std::function<void()> fn) {
+    if (conn_dispatcher_) {
+        conn_dispatcher_->EnQueue(std::move(fn));
+    }
+}
+
 void NetServer::SetConnectionTimeout(std::chrono::seconds timeout) {
     connection_timeout_sec_.store(static_cast<int>(timeout.count()),
                                  std::memory_order_relaxed);

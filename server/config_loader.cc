@@ -1124,6 +1124,12 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 }
                 oc.traces.propagators = std::move(names);
             }
+            if (tj.contains("auth_idp_span")) {
+                if (!tj["auth_idp_span"].is_boolean())
+                    throw std::invalid_argument(
+                        "observability.traces.auth_idp_span must be boolean");
+                oc.traces.auth_idp_span = tj["auth_idp_span"].get<bool>();
+            }
             if (tj.contains("sampler")) {
                 if (!tj["sampler"].is_object())
                     throw std::runtime_error(

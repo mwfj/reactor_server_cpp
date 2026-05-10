@@ -17,6 +17,10 @@ class Dispatcher;
 struct HttpRequest;
 class HttpResponse;
 
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+}  // namespace OBSERVABILITY_NAMESPACE
+
 namespace AUTH_NAMESPACE {
 
 class UpstreamHttpClient;
@@ -87,9 +91,20 @@ class AuthManager {
         std::vector<PerPolicyCountersView> per_policy;
     };
 
+    // Construct an AuthManager.
+    //
+    // `obs_manager` is optional and defaults to nullptr — auth-only
+    // deployments without observability wired pass nullptr. When set,
+    // `InvokeAsyncMiddleware` builds an `IssueTraceContext` for every
+    // introspection POST so the IdP receives `traceparent` / `tracestate`
+    // / `uber-trace-id` headers continuing the inbound trace, and
+    // (when `traces.auth_idp_span` is enabled) allocates an
+    // `auth.idp_check` INTERNAL span over the deferred dispatch.
     AuthManager(const AuthConfig& config,
                 UpstreamManager* upstream_manager,
-                std::vector<std::shared_ptr<Dispatcher>> dispatchers);
+                std::vector<std::shared_ptr<Dispatcher>> dispatchers,
+                OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager
+                    = nullptr);
     ~AuthManager();
 
     AuthManager(const AuthManager&) = delete;
@@ -378,6 +393,11 @@ class AuthManager {
 
     UpstreamManager* upstream_manager_;                    // non-owning
     std::vector<std::shared_ptr<Dispatcher>> dispatchers_;
+    // Non-owning observability manager. Nullable. When set, the async
+    // dispatch path builds an `IssueTraceContext` for every introspection
+    // POST and (gated on `traces.auth_idp_span`) allocates an
+    // `auth.idp_check` INTERNAL span over the deferred resolution.
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
     std::string hmac_key_;                                 // process-local
 
     std::atomic<uint64_t> generation_{1};

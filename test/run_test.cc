@@ -57,6 +57,9 @@
 #include "observability_issue_inject_test.h"
 #include "observability_stress_test.h"
 #include "observability_e2e_test.h"
+#include "observability_self_handler_test.h"
+#include "observability_proxy_client_test.h"
+#include "observability_auth_trace_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -266,6 +269,21 @@ void RunAllTest(){
     // requests, assert spans are captured by the InMemorySpanProcessor.
     ObservabilityE2ETests::RunAllTests();
 
+    // Self-handler shutdown helper — `ScheduleStopAfterCurrentResponse`
+    // delivers the response then schedules `Stop()` on the conn dispatcher
+    // without deadlocking the calling handler.
+    ObservabilitySelfHandlerTests::RunAllTests();
+
+    // Per-attempt CLIENT span on the proxy path — fresh span_id per
+    // attempt, status_code attribute, error.type on retry-rejecting
+    // outcomes, observability-disabled passthrough.
+    ObservabilityProxyClientTests::RunAllTests();
+
+    // Auth-path observability — `traceparent` injection on the IdP
+    // hop and `auth.idp_check` INTERNAL span (or `auth.pending_*`
+    // events on the SERVER span when the feature flag is off).
+    ObservabilityAuthTraceTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -344,6 +362,12 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     (JWKS / OIDC / introspection / OTLP traceparent strip+inject)" << std::endl;
     std::cout << "  obs_stress         Cross-cutting stress / race / lifecycle tests" << std::endl;
     std::cout << "                     (concurrent finalize CAS, churn drain, reload+read)" << std::endl;
+    std::cout << "  obs_self_handler   Self-handler shutdown — `ScheduleStopAfterCurrentResponse`" << std::endl;
+    std::cout << "                     delivers response then defers `Stop()` to conn dispatcher" << std::endl;
+    std::cout << "  obs_proxy_client   Per-attempt CLIENT span on the proxy path —" << std::endl;
+    std::cout << "                     fresh span_id per attempt, status / error.type, retry tree" << std::endl;
+    std::cout << "  obs_auth_trace     Auth-path observability — traceparent injected on IdP" << std::endl;
+    std::cout << "                     hop, auth.idp_check INTERNAL span (or pending_* events)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -551,6 +575,15 @@ int main(int argc, char* argv[]) {
         // Run observability cross-cutting stress / race tests.
         }else if(mode == "obs_stress"){
             ObservabilityStressTests::RunAllTests();
+        // Self-handler shutdown helper tests.
+        }else if(mode == "obs_self_handler"){
+            ObservabilitySelfHandlerTests::RunAllTests();
+        // Per-attempt CLIENT span on the proxy path.
+        }else if(mode == "obs_proxy_client"){
+            ObservabilityProxyClientTests::RunAllTests();
+        // Auth-path observability — traceparent + auth.idp_check span.
+        }else if(mode == "obs_auth_trace"){
+            ObservabilityAuthTraceTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

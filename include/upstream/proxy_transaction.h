@@ -14,6 +14,7 @@
 #include "http/http_callbacks.h"
 #include "http/http_response.h"
 #include "observability/observability_snapshot.h"  // UpstreamTransactionLink
+#include "observability/trace_context.h"            // AttemptTraceContext / RequestTraceContext
 #include <optional>
 // <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono> provided by common.h
 
@@ -22,6 +23,11 @@ class UpstreamManager;
 class ConnectionHandler;
 class Dispatcher;
 class UpstreamH2Connection;
+
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+class Span;
+}  // namespace OBSERVABILITY_NAMESPACE
 
 namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerSlice;
@@ -198,6 +204,14 @@ private:
     // references kept. Empty when no policy matched inbound.
     std::optional<AUTH_NAMESPACE::AuthContext> auth_ctx_;
 
+    // Inbound RequestTraceContext copied at construction. Same lifetime
+    // contract as auth_ctx_: storing a reference into the original
+    // HttpRequest is unsafe because parser_.Reset() invalidates it.
+    // Empty when the inbound had no trace context (observability
+    // disabled or DROP path with no ObservabilitySnapshot).
+    std::optional<OBSERVABILITY_NAMESPACE::RequestTraceContext>
+        inbound_trace_ctx_;
+
     // Dependencies
     UpstreamManager* upstream_manager_;   // non-owning, outlives the transaction
     AUTH_NAMESPACE::AuthManager* auth_manager_ = nullptr;  // non-owning, nullable
@@ -312,6 +326,35 @@ private:
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>
         obs_snapshot_;
     std::atomic<bool> kill_for_shutdown_{false};
+
+    // Per-attempt mutable trace context. Reset on every AttemptCheckout
+    // call before propagator strip+inject + re-serialization. Carries the
+    // freshly-generated span_id for THIS attempt's outbound `traceparent`
+    // (so retries get a fresh CLIENT span rather than reusing the prior
+    // attempt's span_id) plus the optional CLIENT span allocated when
+    // the inbound is recording. Empty when observability is disabled
+    // (`obs_snapshot_` null) — the verbatim-forward path then preserves
+    // any client-supplied trace headers.
+    OBSERVABILITY_NAMESPACE::AttemptTraceContext current_attempt_;
+
+    // Lock the manager weak_ptr through the snapshot. Returns nullptr
+    // when observability is disabled or the manager has been destroyed.
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager() const noexcept;
+    // Read inbound SERVER span for parent linkage. Null when DROP path
+    // OR observability disabled.
+    OBSERVABILITY_NAMESPACE::Span* inbound_span() const noexcept;
+    // Per-attempt strip-and-inject of `traceparent` / `tracestate` /
+    // `uber-trace-id` onto `rewritten_headers_` followed by invalidation
+    // of `serialized_request_`. Called from `AttemptCheckout` after
+    // `current_attempt_.attempt_local` is built. No-op when
+    // observability is disabled or the attempt context is invalid.
+    void RebuildOutboundTraceHeaders();
+    // Allocate / finalize the per-attempt CLIENT span. End-of-attempt
+    // sites (OnComplete / OnError / Cancel / MaybeRetry) call
+    // FinalizeAttemptSpan; survivor spans are dropped without End() when
+    // shutdown won the kill race.
+    void FinalizeAttemptSpan(int status_code,
+                              const std::string& error_type);
 
     // Latch — Start() bumps inflight_transactions_ exactly once and
     // the destructor decrements iff this is set. Atomic because Start

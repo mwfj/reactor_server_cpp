@@ -5,7 +5,13 @@
 #include "auth/auth_context.h"
 #include "auth/auth_result.h"
 #include "auth/upstream_http_client.h"
+#include "observability/trace_context.h"  // IssueTraceContext (optional<>)
+#include <optional>
 // <string>, <vector>, <memory>, <functional>, <atomic>, <cstdint> via common.h
+
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+}  // namespace OBSERVABILITY_NAMESPACE
 
 namespace AUTH_NAMESPACE {
 
@@ -25,7 +31,14 @@ class Issuer;
 // by `dispatcher_index` (same envelope as UpstreamHttpClient::Issue).
 class IntrospectionClient {
  public:
-    explicit IntrospectionClient(std::shared_ptr<UpstreamHttpClient> client);
+    // `obs_manager` is non-owning and nullable. Reserved for future
+    // direct use (e.g. emitting introspection self-metrics from the
+    // client itself). Verify() does not consume it today — the caller
+    // builds the IssueTraceContext and passes it via the optional
+    // last parameter, so the client only forwards.
+    explicit IntrospectionClient(
+        std::shared_ptr<UpstreamHttpClient> client,
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager = nullptr);
     ~IntrospectionClient() = default;
 
     IntrospectionClient(const IntrospectionClient&) = delete;
@@ -80,7 +93,17 @@ class IntrospectionClient {
                 const std::vector<std::string>& claim_keys,
                 uint64_t generation,
                 DoneCallback cb,
-                std::shared_ptr<std::atomic<bool>> cancel_token);
+                std::shared_ptr<std::atomic<bool>> cancel_token,
+                // When present, plugged onto the synthesized
+                // UpstreamHttpClient::Request::issue_ctx so the static
+                // ApplyOutboundTraceContext can strip + inject
+                // `traceparent` / `uber-trace-id` for the IdP hop. Built
+                // by AuthManager::InvokeAsyncMiddleware. Default
+                // `std::nullopt` keeps non-observability callers
+                // (existing tests, auth-only deployments) compiling
+                // unchanged.
+                std::optional<OBSERVABILITY_NAMESPACE::IssueTraceContext>
+                    issue_ctx = std::nullopt);
 
     // Test-visible helpers. Static so unit tests can exercise them without
     // standing up an UpstreamHttpClient. None of these touch the network.
@@ -110,6 +133,11 @@ class IntrospectionClient {
 
  private:
     std::shared_ptr<UpstreamHttpClient> client_;
+    // Non-owning. Nullable. RESERVED for future direct use (e.g.
+    // introspection self-metrics keyed on issuer / outcome). The Verify
+    // path today forwards `issue_ctx` from its caller without consulting
+    // the manager directly.
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
 };
 
 }  // namespace AUTH_NAMESPACE

@@ -92,6 +92,8 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
     include_target_info_.store(
         c.metrics.prometheus.include_target_info,
         std::memory_order_release);
+    auth_idp_span_enabled_.store(c.traces.auth_idp_span,
+                                  std::memory_order_release);
     // Operator visibility — traces.enabled is documented as live-
     // reloadable, but with no SpanProcessor attached (e.g. boot-time
     // exporter empty) the flip is silently no-op. Warn the
@@ -703,6 +705,7 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
     //   metrics.exporter, metrics.otlp.upstream, metrics.prometheus.path,
     //   metrics.histogram_buckets.
     config_.traces.enabled               = new_config.traces.enabled;
+    config_.traces.auth_idp_span         = new_config.traces.auth_idp_span;
     config_.traces.sampler               = new_config.traces.sampler;
     config_.traces.otlp.headers          = new_config.traces.otlp.headers;
     config_.traces.otlp.timeout_ms       = new_config.traces.otlp.timeout_ms;

@@ -90,8 +90,10 @@ std::map<std::string, std::string> BuildHeaders(
 }  // namespace
 
 IntrospectionClient::IntrospectionClient(
-        std::shared_ptr<UpstreamHttpClient> client)
-    : client_(std::move(client)) {
+        std::shared_ptr<UpstreamHttpClient> client,
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager)
+    : client_(std::move(client)),
+      obs_manager_(obs_manager) {
     logging::Get()->debug(
         "IntrospectionClient constructed client={}",
         static_cast<const void*>(client_.get()));
@@ -399,7 +401,8 @@ void IntrospectionClient::Verify(
         const std::vector<std::string>& claim_keys,
         uint64_t generation,
         DoneCallback cb,
-        std::shared_ptr<std::atomic<bool>> cancel_token) {
+        std::shared_ptr<std::atomic<bool>> cancel_token,
+        std::optional<OBSERVABILITY_NAMESPACE::IssueTraceContext> issue_ctx) {
     // Programmer-error guard: the AsyncPendingState always-Complete contract
     // depends on cb invoking state->Complete; a null cb would orphan the
     // suspended request until the heartbeat safety-cap fires. Fail loudly
@@ -491,6 +494,13 @@ void IntrospectionClient::Verify(
     req.body = std::move(body_str);
     req.timeout_sec = timeout_sec;
     req.max_response_body = kIntrospectionMaxBodyBytes;
+    // Forward the prebuilt outbound trace context. ApplyOutboundTraceContext
+    // (called inside UpstreamHttpClient::Issue) strips client-supplied
+    // trace headers and injects from this context when both `tracer` and
+    // a valid `local` SpanContext are present.
+    if (issue_ctx.has_value()) {
+        req.issue_ctx = std::move(issue_ctx);
+    }
 
     // Drop the strong ref BEFORE Issue so the closure is the sole live
     // reference path. The closure captures weak_issuer + generation by

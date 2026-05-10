@@ -4,10 +4,16 @@
 #include "http/http_response.h"
 #include "http/http_callbacks.h"
 #include "http/route_trie.h"
+#include "observability/trace_context.h"   // IssueTraceContext (optional<>)
+#include <optional>
 #include <unordered_set>
 #include <mutex>
 // <string>, <vector>, <functional>, <memory>, <unordered_map>, <atomic>
 // provided by common.h (via http_request.h) and route_trie.h
+
+namespace OBSERVABILITY_NAMESPACE {
+class Span;
+}  // namespace OBSERVABILITY_NAMESPACE
 
 // Forward declaration
 class HttpConnectionHandler;
@@ -104,6 +110,41 @@ private:
     std::atomic<bool> cancel_fired_{false};
     std::atomic<bool> cancelled_{false};
     bool decrement_owed_ = false;  // protected by mu_
+
+public:
+    // Observability carrier slots populated by `AuthManager::
+    // InvokeAsyncMiddleware` when an `ObservabilityManager` is attached
+    // and the inbound request is being recorded.
+    //
+    // `auth_idp_check_span` is the INTERNAL span allocated over the
+    // deferred IdP introspection POST; ended by the resume callback (or
+    // dropped without End() on the kill path). Null when
+    // `traces.auth_idp_span` is disabled or the inbound is non-recording.
+    //
+    // `emit_pending_end_event` is the fall-through signal: when
+    // `traces.auth_idp_span=false` but observability is otherwise on,
+    // the deferred dispatch emits `auth.pending_start` on the SERVER
+    // span and sets this flag; the resume callback then emits the
+    // matching `auth.pending_end` event.
+    //
+    // `issue_ctx` is the prebuilt outbound trace context for the
+    // introspection POST. Both `InvokeAsyncIntrospection` and
+    // `InvokeIntrospectionUncached` read it at the
+    // `IntrospectionClient::Verify(...)` call site and forward it
+    // unchanged. `nullopt` when observability is off OR the inbound
+    // has no trace context. Single-author / single-consumer — no
+    // synchronization needed.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::Span>          auth_idp_check_span;
+    bool                                                     emit_pending_end_event = false;
+    std::optional<OBSERVABILITY_NAMESPACE::IssueTraceContext> issue_ctx;
+    // Held strong-ref to the inbound SERVER span so the introspection
+    // done callback can emit `auth.pending_end` on the events-fallback
+    // path without requiring access to `HttpRequest::obs_snapshot`
+    // (which the resume site doesn't always have in scope). Mirrors the
+    // shared_ptr already held by `obs_snapshot->inbound_span`; the
+    // double-ref is safe — `Span::End` is idempotent on the producer
+    // side via the snapshot's finalize CAS.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::Span>          inbound_server_span;
 };
 
 // Async middleware. `state` is constructed inside RunAsyncMiddleware and

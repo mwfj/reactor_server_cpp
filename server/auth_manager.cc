@@ -14,6 +14,14 @@
 #include "http/trailer_policy.h"  // TrimOptionalWhitespace (RFC 7230 §3.2.3)
 #include "log/log_utils.h"
 #include "log/logger.h"
+#include "observability/observability_manager.h"
+#include "observability/observability_snapshot.h"
+#include "observability/span.h"
+#include "observability/tracer.h"
+#include "observability/attr_value.h"
+#include "observability/span_kind.h"
+#include "observability/span_status.h"
+#include "observability/propagator.h"
 
 namespace AUTH_NAMESPACE {
 
@@ -136,13 +144,42 @@ const char* CacheLabel(AuthCache cache) {
     return "";
 }
 
+// Granular outcome label for trace-attribute / event payloads. Distinct
+// from `DecisionLabel` (which collapses 401/403 into "deny") because the
+// span attribute benefits from the full distinction; same reasoning for
+// `OutcomeCacheAttrLabel` returning "none" for AuthCache::None instead
+// of empty (attribute values shouldn't be empty strings).
+const char* OutcomeAttrLabel(VerifyOutcome outcome) {
+    switch (outcome) {
+      case VerifyOutcome::ALLOW:        return "allow";
+      case VerifyOutcome::DENY_401:     return "deny_401";
+      case VerifyOutcome::DENY_403:     return "deny_403";
+      case VerifyOutcome::UNDETERMINED: return "undetermined";
+    }
+    return "undetermined";
+}
+
+const char* OutcomeCacheAttrLabel(AuthCache cache) {
+    switch (cache) {
+      case AuthCache::None:     return "none";
+      case AuthCache::Hit:      return "hit";
+      case AuthCache::Miss:     return "miss";
+      case AuthCache::Stale:    return "stale";
+      case AuthCache::Negative: return "negative";
+      case AuthCache::Uncached: return "uncached";
+    }
+    return "none";
+}
+
 }  // namespace
 
 AuthManager::AuthManager(const AuthConfig& config,
                           UpstreamManager* upstream_manager,
-                          std::vector<std::shared_ptr<Dispatcher>> dispatchers)
+                          std::vector<std::shared_ptr<Dispatcher>> dispatchers,
+                          OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager)
     : upstream_manager_(upstream_manager),
-      dispatchers_(std::move(dispatchers)) {
+      dispatchers_(std::move(dispatchers)),
+      obs_manager_(obs_manager) {
     // Master switch — mirrored from AuthConfig::enabled and live-reloadable.
     master_enabled_.store(config.enabled, std::memory_order_release);
     debug_response_headers_.store(config.debug_response_headers,
@@ -207,7 +244,8 @@ void AuthManager::Start() {
     }
 
     introspection_client_ =
-        std::make_unique<IntrospectionClient>(upstream_http_client_);
+        std::make_unique<IntrospectionClient>(upstream_http_client_,
+                                                obs_manager_);
 
     for (auto& [name, issuer] : issuers_) {
         issuer->Start();
@@ -1383,6 +1421,68 @@ void AuthManager::InvokeAsyncMiddleware(
         sync_pass();
         return;
     }
+    // Observability wiring for the deferred dispatch — single author of
+    // the per-call IssueTraceContext + (optional) `auth.idp_check`
+    // INTERNAL span. Both pieces hang off the AsyncPendingState so the
+    // resume callback site (MakeIntrospectionDoneCallback) can read them
+    // without a separate parameter. Order matters: allocate the span
+    // FIRST so the IssueTraceContext build below uses it as the parent.
+    if (obs_manager_ && req.trace_ctx.has_value() &&
+        req.trace_ctx->is_recording) {
+        if (req.obs_snapshot) {
+            state->inbound_server_span = req.obs_snapshot->inbound_span;
+        }
+        if (obs_manager_->AuthIdpSpanEnabled()) {
+            OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
+            opts.kind = OBSERVABILITY_NAMESPACE::SpanKind::INTERNAL;
+            if (state->inbound_server_span) {
+                opts.parent = state->inbound_server_span->Context();
+                opts.has_parent = true;
+            }
+            state->auth_idp_check_span =
+                obs_manager_->GetTracer("reactor.gateway.auth", "1")
+                    ->StartSpan("auth.idp_check", opts);
+            if (state->auth_idp_check_span) {
+                state->auth_idp_check_span->SetAttribute(
+                    "auth.issuer",
+                    OBSERVABILITY_NAMESPACE::AttrValue(chosen->name()));
+            }
+        } else if (state->inbound_server_span) {
+            std::vector<OBSERVABILITY_NAMESPACE::Attribute> ev_attrs;
+            ev_attrs.emplace_back(
+                "auth.issuer",
+                OBSERVABILITY_NAMESPACE::AttrValue(chosen->name()));
+            state->inbound_server_span->AddEvent("auth.pending_start",
+                                                   std::move(ev_attrs));
+            state->emit_pending_end_event = true;
+        }
+        // Build the per-call outbound trace context: trace_id / flags /
+        // state inherit from the inbound `current_local`; span_id is
+        // freshly generated. Parent precedence:
+        //   1. auth.idp_check span (when allocated)
+        //   2. inbound SERVER span
+        //   3. default-constructed (no parent)
+        const auto& parent_local = req.trace_ctx->current_local;
+        if (parent_local.IsValid()) {
+            OBSERVABILITY_NAMESPACE::IssueTraceContext call_ctx;
+            call_ctx.local = OBSERVABILITY_NAMESPACE::SpanContext(
+                parent_local.trace_id(),
+                obs_manager_->random()->NewSpanId(),
+                parent_local.flags(),
+                parent_local.state(),
+                /*is_remote=*/false);
+            call_ctx.tracer = obs_manager_->GetTracer(
+                "reactor.gateway.auth", "1");
+            call_ctx.propagator = obs_manager_->propagator().get();
+            if (state->auth_idp_check_span) {
+                call_ctx.parent = state->auth_idp_check_span->Context();
+            } else if (state->inbound_server_span) {
+                call_ctx.parent = state->inbound_server_span->Context();
+            }
+            state->issue_ctx = std::move(call_ctx);
+        }
+    }
+
     // Pass `ap->incarnation` rather than calling PolicyIncarnation()
     // separately — the AppliedPolicy was selected from policies_snap, so
     // its embedded incarnation is atomic with the policy match. A
@@ -1779,6 +1879,38 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
               build_undetermined(result.vr.log_reason);
               break;
         }
+        // Finalize the optional `auth.idp_check` INTERNAL span — closed-
+        // enum labels keep metric cardinality bounded.
+        if (c.state->auth_idp_check_span) {
+            c.state->auth_idp_check_span->SetAttribute(
+                "auth.outcome",
+                OBSERVABILITY_NAMESPACE::AttrValue(
+                    std::string(OutcomeAttrLabel(result.vr.outcome))));
+            c.state->auth_idp_check_span->SetAttribute(
+                "auth.cache_outcome",
+                OBSERVABILITY_NAMESPACE::AttrValue(
+                    std::string(OutcomeCacheAttrLabel(c.cache))));
+            if (result.vr.outcome == VerifyOutcome::UNDETERMINED) {
+                c.state->auth_idp_check_span->SetStatus(
+                    OBSERVABILITY_NAMESPACE::SpanStatusCode::ERROR,
+                    result.vr.log_reason);
+            }
+            c.state->auth_idp_check_span->End();
+            c.state->auth_idp_check_span.reset();
+        }
+        // Events-fallback: when `auth.idp_check` is disabled, emit
+        // `auth.pending_end` on the inbound SERVER span paired with
+        // the `auth.pending_start` written at allocation time.
+        if (c.state->emit_pending_end_event && c.state->inbound_server_span) {
+            std::vector<OBSERVABILITY_NAMESPACE::Attribute> end_attrs;
+            end_attrs.emplace_back(
+                "auth.outcome",
+                OBSERVABILITY_NAMESPACE::AttrValue(
+                    std::string(OutcomeAttrLabel(result.vr.outcome))));
+            c.state->inbound_server_span->AddEvent("auth.pending_end",
+                                                     std::move(end_attrs));
+            c.state->emit_pending_end_event = false;
+        }
         c.state->Complete(std::move(payload));
     };
 }
@@ -2038,7 +2170,8 @@ void AuthManager::InvokeAsyncIntrospection(
         claim_keys,
         gen,
         std::move(on_verify_done),
-        cancel_token);
+        cancel_token,
+        std::move(state->issue_ctx));
 }
 
 void AuthManager::InvokeIntrospectionUncached(
@@ -2167,7 +2300,8 @@ void AuthManager::InvokeIntrospectionUncached(
         claim_keys,
         gen,
         std::move(on_verify_done),
-        cancel_token);
+        cancel_token,
+        std::move(state->issue_ctx));
 }
 
 }  // namespace AUTH_NAMESPACE

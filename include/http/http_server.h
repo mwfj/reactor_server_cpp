@@ -162,6 +162,22 @@ public:
     void Start();  // Blocks in event loop
     void Stop();
 
+    // Schedule `Stop()` to run on `conn_dispatcher_` (NOT on any socket
+    // dispatcher). Safe to call from any route handler. The helper does NOT
+    // send the response — the handler populates `resp` normally and returns;
+    // the dispatcher's existing post-handler send path delivers it.
+    //
+    // Threading: enqueues a `Stop()` task on `conn_dispatcher_`'s own thread
+    // (separate from every socket dispatcher). When that task runs,
+    // `IsOnDispatcherThread()` returns false → the drain barrier engages
+    // normally and waits on `active_requests_` / `inflight_finalizations_`
+    // through atomics — including for the calling handler's response if it
+    // hasn't finalized yet.
+    //
+    // Idempotent: concurrent / repeat calls collapse to a single deferred
+    // `Stop()` via `stop_scheduled_` CAS.
+    void ScheduleStopAfterCurrentResponse();
+
     // Apply reload-safe config fields at runtime. Called from the main
     // (signal) thread on SIGHUP. Thread-safe: uses atomic stores for limit
     // fields and EnQueue for dispatcher-thread-affine updates.
@@ -488,6 +504,11 @@ private:
     // reporting valid uptime during the drain phase. Acts as a release
     // barrier for the non-atomic start_time_ field.
     std::atomic<bool> shutting_down_started_{false};
+
+    // Idempotency gate for `ScheduleStopAfterCurrentResponse()`. CAS-set
+    // on first call; concurrent and repeated callers see `true` and skip
+    // re-enqueuing `Stop()`.
+    std::atomic<bool> stop_scheduled_{false};
     struct DrainingH2Conn {
         std::shared_ptr<Http2ConnectionHandler> handler;
         std::shared_ptr<ConnectionHandler> conn;

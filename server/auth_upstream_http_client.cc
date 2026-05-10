@@ -244,31 +244,27 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     // across gateway-internal hops, then inject from issue_ctx when
     // the caller has populated it with a valid local SpanContext.
     //
-    // Header keys are documented as "lowercase preferred" — not
-    // required. A caller passing a mixed-case key like "TraceParent"
-    // would otherwise survive an exact-key erase and be serialized
-    // alongside the freshly injected lowercase header, leaking the
-    // caller's context. Walk the map and remove every key that
-    // case-insensitively matches any propagator-owned header. Today's
-    // strip set is the union of W3CPropagator and JaegerPropagator
-    // owned keys — keep it in sync with `IsKnownPropagatorName` /
-    // each propagator's `StripOwnedHeaders` impl.
-    auto ieq = [](const std::string& a, std::string_view b) {
-        if (a.size() != b.size()) return false;
-        for (size_t i = 0; i < b.size(); ++i) {
-            unsigned char ca = static_cast<unsigned char>(a[i]);
-            unsigned char cb = static_cast<unsigned char>(b[i]);
-            if (std::tolower(ca) != std::tolower(cb)) return false;
-        }
-        return true;
-    };
-    for (auto it = req.headers.begin(); it != req.headers.end(); ) {
-        if (ieq(it->first, "traceparent") ||
-            ieq(it->first, "tracestate") ||
-            ieq(it->first, "uber-trace-id")) {
-            it = req.headers.erase(it);
-        } else {
-            ++it;
+    // Strip semantics: when `req.issue_ctx->propagator` is bound, route
+    // through that composite's `StripOwnedHeaders` so the strip set
+    // tracks operator-configured `propagators` automatically. Without a
+    // bound propagator we fall back to the hard-coded union of every
+    // shipped format (W3C + Jaeger) so client-supplied trace headers are
+    // ALWAYS stripped regardless of whether injection happens.
+    const OBSERVABILITY_NAMESPACE::Propagator* propagator =
+        (req.issue_ctx.has_value() && req.issue_ctx->propagator)
+            ? req.issue_ctx->propagator
+            : nullptr;
+    if (propagator) {
+        propagator->StripOwnedHeaders(req.headers);
+    } else {
+        for (auto it = req.headers.begin(); it != req.headers.end(); ) {
+            if (OBSERVABILITY_NAMESPACE::EqualsLowerAscii(it->first, "traceparent") ||
+                OBSERVABILITY_NAMESPACE::EqualsLowerAscii(it->first, "tracestate") ||
+                OBSERVABILITY_NAMESPACE::EqualsLowerAscii(it->first, "uber-trace-id")) {
+                it = req.headers.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
     // Only inject when the caller has bound a Tracer in issue_ctx.
@@ -277,27 +273,19 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     // precomputed_context as `issue_ctx.local`. Injecting without
     // that emission produces a downstream parent span_id the gateway
     // never reports, leaving the upstream's parent reference dangling
-    // in the trace tree. Today no production caller populates
-    // issue_ctx — leaving this gate in place documents the contract
-    // for future wiring without leaking phantom span_ids in the
-    // meantime.
+    // in the trace tree.
     if (req.issue_ctx.has_value()
         && req.issue_ctx->local.IsValid()
         && req.issue_ctx->tracer != nullptr) {
-        // TODO: route both the strip block above AND the inject below
-        // through ObservabilityManager::propagator() (
-        // StripOwnedHeaders + Inject) so the outbound format honors
-        // operator-configured `propagators` (composite-aware). The
-        // hardcoded W3C inject + hand-rolled strip list are safe today
-        // because no production caller populates issue_ctx — but when
-        // per-attempt CLIENT spans are wired, an operator running
-        // propagators: ["jaeger"] would otherwise silently emit
-        // W3C-only outbound headers, AND a future propagator add (e.g.
-        // b3) would require updating the hand-rolled strip list in
-        // lockstep. Inbound side already routes through propagator() in
-        // observability_middleware.cc.
-        OBSERVABILITY_NAMESPACE::W3CPropagator{}.Inject(
-            req.issue_ctx->local, req.headers);
+        if (propagator) {
+            propagator->Inject(req.issue_ctx->local, req.headers);
+        } else {
+            // Stack-local W3C instance is stateless — vtable pointer
+            // assignment, no allocation. Falls back to W3C-only when
+            // no propagator is bound on `issue_ctx`.
+            OBSERVABILITY_NAMESPACE::W3CPropagator{}.Inject(
+                req.issue_ctx->local, req.headers);
+        }
     }
 }
 

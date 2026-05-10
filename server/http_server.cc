@@ -1155,7 +1155,8 @@ void HttpServer::MarkServerReady() {
     // silent-no-op gap.
     try {
         auth_manager_ = std::make_unique<AUTH_NAMESPACE::AuthManager>(
-            auth_config_, upstream_manager_.get(), dispatchers);
+            auth_config_, upstream_manager_.get(), dispatchers,
+            observability_manager_.get());
     } catch (const std::exception& e) {
         if (auth_config_.enabled) {
             logging::Get()->error(
@@ -2735,6 +2736,21 @@ HttpServer::GetBindResolved() const {
     // "has Start() reached the commit point" take the std::optional
     // check as the answer (absent = not yet / aborted).
     return bind_resolved_;
+}
+
+void HttpServer::ScheduleStopAfterCurrentResponse() {
+    bool expected = false;
+    if (!stop_scheduled_.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    // Route through NetServer's public accessor — `conn_dispatcher_` is
+    // private to NetServer. Stop() runs on conn_dispatcher_'s thread (NOT
+    // a socket dispatcher), so the drain barrier engages cleanly and
+    // waits on `active_requests_` / `inflight_finalizations_` atomics for
+    // the calling handler's still-in-flight response if necessary.
+    net_server_.EnQueueOnConnDispatcher([this]() { Stop(); });
 }
 
 void HttpServer::Stop() {
