@@ -45,6 +45,20 @@ struct UpstreamH2Stream {
     // read_callback. Empty for bodyless requests.
     std::unique_ptr<UpstreamH2BodySource> body_source;
 
+    // Set at submit time so frame callbacks can detect HEAD-on-NO_BODY
+    // (RFC 9110 §9.3.2) without reaching back into the codec or proxy
+    // transaction. Populated between make_shared and the streams_ insert
+    // in UpstreamH2Connection::SubmitRequest — race-free because frame
+    // callbacks for the new stream cannot fire until peer bytes arrive
+    // via HandleBytes.
+    std::string request_method;
+
+    // Cumulative response body bytes delivered to the sink (or rejected
+    // synchronously by Step 1.5 NO_BODY/CL validation). Validated against
+    // response_head.expected_length on each chunk and at clean close to
+    // catch peers that lie about Content-Length.
+    int64_t body_bytes_received = 0;
+
     UpstreamH2Stream() = default;
     UpstreamH2Stream(const UpstreamH2Stream&) = delete;
     UpstreamH2Stream& operator=(const UpstreamH2Stream&) = delete;

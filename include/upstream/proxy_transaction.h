@@ -53,6 +53,19 @@ public:
     // X-Retry-Budget-Exhausted so operators can tell the two 503s apart
     // from circuit-open rejects.
     static constexpr int RESULT_RETRY_BUDGET_EXHAUSTED = -8;
+    // Upstream response did not match its declared length. Two cases:
+    //   - Content-Length declared, peer delivered fewer bytes before clean
+    //     close, or more bytes than declared.
+    //   - Response classified NO_BODY (status 204/304 or HEAD method) but
+    //     peer sent body bytes anyway.
+    // Terminal — partial body has already been streamed downstream so retry
+    // would double-deliver bytes. Maps to 502 BadGateway in MakeErrorResponse.
+    static constexpr int RESULT_TRUNCATED_RESPONSE  = -10;
+    // CONNECT method on an H2 upstream. RFC 9113 §8.5 forbids :scheme and
+    // :path on CONNECT pseudo-headers, but our H2 codec always emits both;
+    // serving CONNECT here would emit a malformed request. Terminal —
+    // deterministic policy reject (502 BadGateway + X-H2-Limitation header).
+    static constexpr int RESULT_H2_METHOD_NOT_SUPPORTED = -11;
 
     // Constructor copies all needed fields from client_request (method, path,
     // query, headers, body, params, dispatcher_index, client_ip, client_tls,
@@ -137,8 +150,17 @@ public:
         const std::vector<std::pair<std::string, std::string>>& trailers) override;
     void OnComplete() override;
     void OnError(int error_code, const std::string& message) override;
+    void OnRequestSubmitted() override;
 
 private:
+    // Send-phase stall fallback budget when config_.response_timeout_ms == 0.
+    // The response-wait timeout is operator-disable-able (set to 0), but the
+    // stall-phase hang protection is always on — without it a wedged upstream
+    // that stops reading our request body would pin both the client and the
+    // pooled connection indefinitely. Used by both the H1 send loop and the
+    // H2 send-stall closure.
+    static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
+
     // State machine states
     enum class State {
         INIT,                // Created, not yet started
@@ -289,6 +311,34 @@ private:
     std::weak_ptr<UpstreamH2Connection> h2_conn_weak_;
     int32_t h2_stream_id_ = -1;
     bool h2_path_ = false;
+
+    // True iff the inbound request carried `te: trailers` (RFC 7230 §4.3
+    // / RFC 9113 §8.2.2 — required by gRPC clients to negotiate trailer
+    // support). Captured at construction BEFORE HeaderRewriter strips
+    // all te values per RFC 7230 hop-by-hop rules. The H2 outbound nv
+    // build re-emits a synthetic `te: trailers` based on this flag; H1
+    // path is unchanged (rewriter strips, no re-emit).
+    bool client_te_trailers_ = false;
+
+    // H2 send-stall generation counter. Bounds the time spent in
+    // SENDING_REQUEST waiting for END_STREAM to flush — without this, a
+    // wedged peer that stops reading our DATA frames would pin the H2
+    // stream until the peer's PING timeout (or forever, if PING is
+    // disabled). Armed BEFORE SubmitRequest so the synchronous
+    // on_frame_send_callback path (bodyless requests where nghttp2
+    // inline-flushes HEADERS+END_STREAM) can kill it via generation
+    // bump. Cleanup also bumps to invalidate any in-flight closure.
+    uint64_t h2_send_stall_generation_ = 0;
+
+    // H2 response-timeout arm-once flag. Coordinates the response timer
+    // arming between OnHeaders and OnRequestSubmitted: whichever fires
+    // first arms ArmResponseTimeout and sets this flag, and the other
+    // skips re-arming. Required because the existing H1 OnHeaders path
+    // calls ClearResponseTimeout (semantic doesn't apply to H2's
+    // two-deadline model) and DispatchH2 cannot arm response-timeout
+    // upfront without leaking the budget into the body-write phase.
+    // Reset by Cleanup so retry attempts arm fresh.
+    bool h2_response_timeout_armed_ = false;
 
     // H2 response timeout uses a dispatcher-scheduled task instead of a
     // transport-level deadline: the transport is shared across every

@@ -208,7 +208,67 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     auto* self = static_cast<UpstreamH2Connection*>(user_data);
     auto* stream = self->GetStream(stream_id);
     if (!stream || !stream->sink) return 0;
+
+    // Defense-in-depth pre-dispatch validation. In production this code
+    // is unreachable: nghttp2's HTTP messaging enforcement (default-on)
+    // intercepts NO_BODY and Content-Length violations before this
+    // callback fires, routing them through OnStreamClose with a
+    // non-NO_ERROR code. These checks remain active as a backstop for
+    // future code paths that opt out of enforcement (e.g.
+    // nghttp2_option_set_no_http_messaging for streaming protocols).
+    // RST through ResetStream (not nghttp2_submit_rst_stream directly) so
+    // the in_receive_data_ guard defers the inline FlushSend; the
+    // post-receive flush in HandleBytes picks up the queued frame.
+    using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
+    if (stream->response_head.framing == Framing::NO_BODY && len > 0) {
+        stream->sink->OnError(
+            ProxyTransaction::RESULT_TRUNCATED_RESPONSE,
+            "body bytes on NO_BODY response");
+        self->ResetStream(stream_id);
+        return 0;
+    }
+    if (stream->response_head.framing == Framing::CONTENT_LENGTH &&
+        stream->response_head.expected_length >= 0 &&
+        static_cast<int64_t>(len) >
+            stream->response_head.expected_length -
+            stream->body_bytes_received) {
+        stream->sink->OnError(
+            ProxyTransaction::RESULT_TRUNCATED_RESPONSE,
+            "body exceeds Content-Length");
+        self->ResetStream(stream_id);
+        return 0;
+    }
+
+    stream->body_bytes_received += static_cast<int64_t>(len);
     stream->sink->OnBodyChunk(reinterpret_cast<const char*>(data), len);
+    return 0;
+}
+
+// Fired when nghttp2 actually puts a frame on the wire (via
+// FlushSend → nghttp2_session_mem_send2). For our purposes we care
+// about request-side END_STREAM only — that flag rides on either the
+// final HEADERS (bodyless requests) or the final DATA frame (bodied
+// requests). The single check covers both shapes.
+//
+// May fire SYNCHRONOUSLY inside SubmitRequest when nghttp2 inline-
+// flushes a bodyless HEADERS+END_STREAM frame; the sink contract
+// (OnRequestSubmitted docstring on UpstreamResponseSink) requires
+// callers to be safe under that ordering. ProxyTransaction handles
+// the synchronous case by initializing all H2 state BEFORE invoking
+// h2->SubmitRequest.
+int OnFrameSendCallback(nghttp2_session* /*session*/,
+                        const nghttp2_frame* frame, void* user_data)
+{
+    if (!frame) return 0;
+    if ((frame->hd.type != NGHTTP2_HEADERS &&
+         frame->hd.type != NGHTTP2_DATA) ||
+        !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+        return 0;
+    }
+    auto* self = static_cast<UpstreamH2Connection*>(user_data);
+    auto* stream = self->GetStream(frame->hd.stream_id);
+    if (!stream || !stream->sink) return 0;
+    stream->sink->OnRequestSubmitted();
     return 0;
 }
 
@@ -282,6 +342,8 @@ bool UpstreamH2Connection::Init() {
     nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, &OnBeginHeadersCallback);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
         cbs, &OnDataChunkRecvCallback);
+    nghttp2_session_callbacks_set_on_frame_send_callback(
+        cbs, &OnFrameSendCallback);
 
     int rv = nghttp2_session_client_new(&session_, cbs, this);
     nghttp2_session_callbacks_del(cbs);
@@ -478,8 +540,35 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
         auto stream = it->second;
         streams_.erase(it);
         if (stream && stream->sink) {
+            using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
             if (error_code == NGHTTP2_NO_ERROR) {
-                stream->sink->OnComplete();
+                // Content-Length short-read: peer ended the stream cleanly
+                // but delivered fewer bytes than declared. Surface a
+                // truncation error in place of the OnComplete dispatch so
+                // downstream consumers see RESULT_TRUNCATED_RESPONSE rather
+                // than a successful response with a short body.
+                //
+                // In production this branch is also a defense-in-depth
+                // backstop: nghttp2's HTTP messaging enforcement
+                // (default-on) intercepts CL/NO_BODY violations and
+                // delivers them via the non-NO_ERROR fan-out above
+                // (OnDataChunkRecvCallback's Step 1.5 is a parallel
+                // backstop for the same enforcement-disabled future).
+                // The active value of THIS branch is the silent-short-
+                // close case where the peer respects framing on the wire
+                // but lies about Content-Length — neither nghttp2 nor
+                // Step 1.5 can detect that until the clean END_STREAM
+                // arrives short.
+                if (stream->response_head.framing == Framing::CONTENT_LENGTH &&
+                    stream->response_head.expected_length >= 0 &&
+                    stream->body_bytes_received <
+                        stream->response_head.expected_length) {
+                    stream->sink->OnError(
+                        ProxyTransaction::RESULT_TRUNCATED_RESPONSE,
+                        "Content-Length short read");
+                } else {
+                    stream->sink->OnComplete();
+                }
             } else if (error_code == NGHTTP2_HTTP_1_1_REQUIRED) {
                 // RFC 9113 §13 (error code 0xd): peer indicates THIS
                 // request must be retried over HTTP/1.1. Retrying on H2
@@ -541,6 +630,14 @@ void UpstreamH2Connection::OnHeadersComplete(int32_t stream_id,
     // CHUNKED-equivalent; check for Content-Length to prefer exact framing.
     using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
     if (end_stream) {
+        stream->response_head.framing = Framing::NO_BODY;
+    } else if (stream->response_head.status_code == 204 ||
+               stream->response_head.status_code == 304 ||
+               stream->request_method == "HEAD") {
+        // RFC 9110 §15.4 / §15.4.5 / §9.3.2: 204 / 304 / HEAD responses
+        // MUST NOT carry a body. Classify as NO_BODY so Step 1.5 in
+        // OnDataChunkRecvCallback rejects any subsequent body bytes from
+        // a misbehaving peer with RESULT_TRUNCATED_RESPONSE.
         stream->response_head.framing = Framing::NO_BODY;
     } else {
         // Scan accumulated headers for content-length. Cap at the H1
@@ -687,9 +784,31 @@ int32_t UpstreamH2Connection::SubmitRequest(
     const std::string& path,
     const std::map<std::string, std::string>& headers,
     const std::string& body,
-    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink)
+    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink,
+    bool client_te_trailers)
 {
     if (!IsUsable()) return -1;
+
+    // Secondary CONNECT-rejection gate. The primary gate in
+    // ProxyTransaction::DispatchH2 catches CONNECT before it reaches the
+    // codec, but a future code path bypassing DispatchH2 (or a unit test
+    // exercising this method directly) would otherwise emit a malformed
+    // H2 request. nghttp2 is left untouched: no stream allocation, no
+    // submit, no frame queue. Sink receives the deterministic policy
+    // reject so the caller's MaybeRetry sees a terminal code.
+    if (method == "CONNECT") {
+        const std::string host = transport_ ? transport_->upstream_host()
+                                            : std::string("?");
+        logging::Get()->warn(
+            "UpstreamH2Connection: rejecting CONNECT secondary gate "
+            "(primary gate bypassed?) host={}", host);
+        if (sink) {
+            sink->OnError(
+                ProxyTransaction::RESULT_H2_METHOD_NOT_SUPPORTED,
+                "CONNECT not supported on H2 upstream");
+        }
+        return -1;
+    }
 
     // Build lowercased header-name backing store FIRST so the nghttp2_nv
     // pointers we build next stay valid for the synchronous submit call.
@@ -743,8 +862,17 @@ int32_t UpstreamH2Connection::SubmitRequest(
                 kv.second.data(), kv.second.size());
     }
 
+    // Re-emit te: trailers after the rewriter's strip pass. RFC 9113
+    // §8.2.2 permits exactly this token; gRPC clients require it for
+    // trailer support negotiation. Static literals have program-lifetime
+    // storage, safe to reference for the synchronous submit call.
+    if (client_te_trailers) {
+        push_nv("te", 2, "trailers", 8);
+    }
+
     auto stream = std::make_shared<UpstreamH2Stream>();
     stream->sink = sink;
+    stream->request_method = method;
 
     nghttp2_data_provider2 provider = {};
     nghttp2_data_provider2* data_prd = nullptr;

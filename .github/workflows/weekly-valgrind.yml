@@ -71,6 +71,7 @@ jobs:
             cli \
             route \
             upstream \
+            h2_upstream \
             proxy \
             rate_limit \
             circuit_breaker \

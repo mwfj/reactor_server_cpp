@@ -19,6 +19,23 @@ public:
         const std::vector<std::pair<std::string, std::string>>&) {}
     virtual void OnComplete() = 0;
     virtual void OnError(int error_code, const std::string& message) = 0;
+
+    // Fired when the upstream stream's request side is fully sent
+    // (END_STREAM flag observed on either DATA or HEADERS — bodyless
+    // requests trigger END_STREAM on HEADERS). Sinks use this to swap
+    // a per-stream send-stall deadline for a response-completion
+    // deadline.
+    //
+    // H2 path only. The H1 path infers send completion from socket
+    // buffer drain and does not call this. Default no-op so non-H2
+    // sinks can ignore.
+    //
+    // Invocation timing: may fire SYNCHRONOUSLY from within
+    // UpstreamH2Connection::SubmitRequest for bodyless requests where
+    // nghttp2 inline-flushes the HEADERS+END_STREAM frame. Sinks MUST
+    // be safe to receive this callback before SubmitRequest returns
+    // control to the caller.
+    virtual void OnRequestSubmitted() {}
 };
 
 }  // namespace UPSTREAM_CALLBACKS_NAMESPACE

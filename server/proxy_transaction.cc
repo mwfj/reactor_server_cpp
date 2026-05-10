@@ -246,6 +246,46 @@ ProxyTransaction::ProxyTransaction(
       stream_sender_(std::move(stream_sender))
 {
     stream_sender_.ConfigureWatermarks(config_.relay_buffer_limit_bytes);
+
+    // Capture client `te: trailers` BEFORE HeaderRewriter::RewriteRequest
+    // strips all te values per RFC 7230 §4.3 hop-by-hop rules. gRPC clients
+    // send `te: trailers` to negotiate trailer support; the H2 outbound nv
+    // build re-emits the token from this flag (RFC 9113 §8.2.2). Inline
+    // tokenizer instead of std::tolower because the latter is locale-
+    // dependent (Turkish locale lowercases 'I' to 'ı', producing non-ASCII
+    // bytes). client_headers_ keys are guaranteed lowercase by HttpParser.
+    auto te_it = client_headers_.find("te");
+    if (te_it != client_headers_.end()) {
+        std::string buf;
+        buf.reserve(te_it->second.size());
+        for (char c : te_it->second) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c | 0x20);
+            buf.push_back(c);
+        }
+        size_t pos = 0;
+        while (pos < buf.size()) {
+            size_t comma = buf.find(',', pos);
+            size_t end = (comma == std::string::npos) ? buf.size() : comma;
+            size_t token_start = pos;
+            size_t token_end = end;
+            // Trim ASCII whitespace per RFC 7230 OWS (SP and HTAB only).
+            while (token_start < token_end &&
+                   (buf[token_start] == ' ' || buf[token_start] == '\t')) {
+                ++token_start;
+            }
+            while (token_end > token_start &&
+                   (buf[token_end - 1] == ' ' || buf[token_end - 1] == '\t')) {
+                --token_end;
+            }
+            if (buf.compare(token_start, token_end - token_start,
+                            "trailers") == 0) {
+                client_te_trailers_ = true;
+                break;
+            }
+            pos = (comma == std::string::npos) ? buf.size() : comma + 1;
+        }
+    }
+
     logging::Get()->debug("ProxyTransaction created client_fd={} service={} "
                           "{} {}", client_fd_, service_name_, method_, path_);
 }
@@ -801,6 +841,24 @@ void ProxyTransaction::DispatchH1() {
 }
 
 void ProxyTransaction::DispatchH2() {
+    // Primary CONNECT-rejection gate. RFC 9113 §8.5 forbids :scheme and
+    // :path on CONNECT pseudo-headers, but our H2 codec always emits
+    // both — serving CONNECT through this path would emit a malformed
+    // request. Reject deterministically with 502 + X-H2-Limitation
+    // header. The neutral breaker release is run BEFORE OnError so the
+    // admission slot doesn't leak when OnError's pre-routing hook (which
+    // is idempotent) double-handles the same code.
+    if (method_ == "CONNECT") {
+        logging::Get()->warn(
+            "H2 upstream rejecting CONNECT: not supported in this gateway "
+            "fd={} service={}",
+            client_fd_, service_name_);
+        ReleaseBreakerAdmissionNeutral();
+        OnError(RESULT_H2_METHOD_NOT_SUPPORTED,
+                "CONNECT not supported on H2 upstream");
+        return;
+    }
+
     PoolPartition* partition = nullptr;
     if (upstream_manager_ && dispatcher_index_ >= 0) {
         partition = upstream_manager_->GetPoolPartition(
@@ -873,10 +931,60 @@ void ProxyTransaction::DispatchH2() {
         path_with_query.append(query_);
     }
 
+    // Initialize H2 state BEFORE h2->SubmitRequest. SubmitRequest may
+    // synchronously fire on_frame_send_callback (via FlushSend) for
+    // bodyless requests where nghttp2 inline-flushes HEADERS+END_STREAM,
+    // dispatching OnRequestSubmitted INSIDE the call. If we deferred
+    // h2_path_/state_/generation init to after the call, the
+    // OnRequestSubmitted override's `if (!h2_path_) return;` guard
+    // would silently drop the kill of the send-stall closure → spurious
+    // OnError(UPSTREAM_DISCONNECT) ~30s later.
+    //
+    // Send-stall budget mirrors the H1 zero-disable semantic in the
+    // H1 send loop above: response_timeout_ms == 0 opts out of the
+    // response-wait timer but the stall protection stays on, falling
+    // back to SEND_STALL_FALLBACK_MS.
+    h2_path_ = true;
+    h2_conn_weak_ = h2;
+    state_ = State::SENDING_REQUEST;
+    h2_response_timeout_armed_ = false;
+
+    const int stall_budget_ms = config_.response_timeout_ms > 0
+                              ? config_.response_timeout_ms
+                              : SEND_STALL_FALLBACK_MS;
+    const uint64_t send_stall_gen = ++h2_send_stall_generation_;
+    if (dispatcher_) {
+        std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+        dispatcher_->EnQueueDelayed(
+            [weak_self, send_stall_gen]() {
+                auto self = weak_self.lock();
+                if (!self) return;
+                if (self->cancelled_) return;
+                if (send_stall_gen != self->h2_send_stall_generation_) return;
+                self->OnError(RESULT_UPSTREAM_DISCONNECT,
+                              "H2 send-stall (END_STREAM not flushed)");
+            },
+            std::chrono::milliseconds(stall_budget_ms));
+    }
+
+    // Synchronous on_frame_send (bodyless path) may run inline here,
+    // bumping h2_send_stall_generation_ → kills the closure above.
     int32_t stream_id = h2->SubmitRequest(
         method_, scheme, authority, path_with_query,
-        rewritten_headers_, request_body_, this);
+        rewritten_headers_, request_body_, this, client_te_trailers_);
     if (stream_id < 0) {
+        // Submit failed. Roll back H2 bookkeeping; state_ stays
+        // untouched — AttemptCheckout (called by MaybeRetry's
+        // deferred-retry timer and immediate-retry branch) resets
+        // state_ before the next attempt. Bump BOTH generations:
+        // send-stall closure was just queued; response-timeout
+        // closure may have been queued synchronously by an inline
+        // on_frame_send fire for a bodyless HEADERS+END_STREAM.
+        ++h2_send_stall_generation_;
+        ++h2_response_timeout_generation_;
+        h2_path_ = false;
+        h2_response_timeout_armed_ = false;
+        h2_conn_weak_.reset();
         logging::Get()->warn(
             "ProxyTransaction H2 submit failed client_fd={} service={} "
             "attempt={}", client_fd_, service_name_, attempt_);
@@ -884,11 +992,7 @@ void ProxyTransaction::DispatchH2() {
         return;
     }
 
-    h2_path_ = true;
     h2_stream_id_ = stream_id;
-    h2_conn_weak_ = h2;
-    state_ = State::AWAITING_RESPONSE;
-    ArmResponseTimeout();
 }
 
 void ProxyTransaction::OnCheckoutError(int error_code) {
@@ -1046,13 +1150,13 @@ void ProxyTransaction::SendUpstreamRequest() {
     // deadline never trips.
     //
     // The stall budget uses response_timeout_ms when configured, else
-    // a hardcoded fallback. Unlike the response-wait phase, the stall
-    // phase is ALWAYS protected — the refresh-on-progress callback
-    // prevents false positives on large uploads making steady progress,
-    // so using a fallback here doesn't penalize any legitimate traffic.
-    // Config "disabled" (response_timeout_ms == 0) opts out of the
-    // response-wait timeout, NOT the hang protection.
-    static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
+    // the class-level SEND_STALL_FALLBACK_MS fallback. Unlike the
+    // response-wait phase, the stall phase is ALWAYS protected — the
+    // refresh-on-progress callback prevents false positives on large
+    // uploads making steady progress, so using a fallback here doesn't
+    // penalize any legitimate traffic. Config "disabled"
+    // (response_timeout_ms == 0) opts out of the response-wait timeout,
+    // NOT the hang protection.
     const int stall_budget_ms = config_.response_timeout_ms > 0
                               ? config_.response_timeout_ms
                               : SEND_STALL_FALLBACK_MS;
@@ -1215,18 +1319,43 @@ bool ProxyTransaction::OnHeaders(
     if (!head.keep_alive) {
         poison_connection_ = true;
     }
-    if (state_ == State::SENDING_REQUEST) {
-        // Early response: the request write is no longer the active phase. If
-        // the upstream later finishes flushing the request bytes, that callback
-        // must not re-arm the response-header timer or move us back into the
-        // pre-headers state machine.
-        state_ = State::AWAITING_RESPONSE;
-        poison_connection_ = true;
-    }
 
-    // T1 is complete once the response head arrives. Body-phase timing uses
-    // the dedicated T2/T3 stream timers.
-    ClearResponseTimeout();
+    if (h2_path_) {
+        // H2 final-headers branch. The send-stall closure stays armed
+        // until OnRequestSubmitted (or Cleanup) bumps the generation —
+        // an early peer-final-headers (e.g. 413) before our END_STREAM
+        // is sent does not cancel the stall protection. Response timer
+        // is armed at the FIRST of {OnHeaders, OnRequestSubmitted} via
+        // the arm-once flag; whichever fires later sees armed=true and
+        // skips the redundant arm.
+        //
+        // No poison_connection_=true here on the early-final-headers
+        // path: H1 poisons because its transport-sharing model
+        // contaminates subsequent keep-alive use, but H2 multiplexes
+        // streams over a single transport — an early 413 on one stream
+        // is not a fatal upstream signal and should not block sibling
+        // stream reuse.
+        if (state_ == State::SENDING_REQUEST) {
+            state_ = State::AWAITING_RESPONSE;
+        }
+        if (!h2_response_timeout_armed_) {
+            ArmResponseTimeout();
+            h2_response_timeout_armed_ = true;
+        }
+    } else {
+        // H1 path: existing behavior preserved verbatim.
+        if (state_ == State::SENDING_REQUEST) {
+            // Early response: the request write is no longer the active
+            // phase. If the upstream later finishes flushing the request
+            // bytes, that callback must not re-arm the response-header
+            // timer or move us back into the pre-headers state machine.
+            state_ = State::AWAITING_RESPONSE;
+            poison_connection_ = true;
+        }
+        // T1 is complete once the response head arrives. Body-phase
+        // timing uses the dedicated T2/T3 stream timers.
+        ClearResponseTimeout();
+    }
 
     if (head.status_code >= HttpStatus::INTERNAL_SERVER_ERROR &&
         head.status_code < 600) {
@@ -1451,6 +1580,15 @@ void ProxyTransaction::OnError(int result_code,
                                 const std::string& log_message) {
     if (cancelled_ || IsKilledForShutdown()) return;
 
+    // Centralized neutral breaker release for deterministic policy
+    // rejects. Idempotent — ReleaseBreakerAdmissionNeutral is a no-op
+    // when no admission is held. Runs BEFORE the H2 retryable-
+    // disconnect routing below so RESULT_H2_METHOD_NOT_SUPPORTED
+    // doesn't leak into MaybeRetry.
+    if (result_code == RESULT_H2_METHOD_NOT_SUPPORTED) {
+        ReleaseBreakerAdmissionNeutral();
+    }
+
     // H2 transport-level failures arrive here through sink->OnError —
     // unlike H1, which detects transport failure inside OnUpstreamData
     // and calls MaybeRetry(UPSTREAM_DISCONNECT) directly before the sink
@@ -1475,6 +1613,35 @@ void ProxyTransaction::OnError(int result_code,
     }
 
     DeliverTerminalError(result_code, log_message);
+}
+
+void ProxyTransaction::OnRequestSubmitted() {
+    if (cancelled_ || IsKilledForShutdown()) return;
+    if (!h2_path_) return;  // H1 infers send completion from socket drain
+
+    // Unconditional send-stall kill — the in-flight closure no-ops on
+    // generation mismatch when its delayed task eventually fires. Both
+    // the normal path (END_STREAM flushed) and the early-headers path
+    // (peer responded before our END_STREAM, but END_STREAM eventually
+    // went out) clear send-stall via this generation bump.
+    ++h2_send_stall_generation_;
+
+    // Transition state if not already advanced by an early-final-
+    // headers OnHeaders. Send-stall stayed armed across that early
+    // arrival; clearing it here is idempotent and safe.
+    if (state_ == State::SENDING_REQUEST) {
+        state_ = State::AWAITING_RESPONSE;
+    }
+
+    // Arm response-timeout if OnHeaders hasn't already armed it.
+    // Whichever of {OnHeaders, OnRequestSubmitted} fires first arms
+    // the timer; the other sees armed=true and skips the redundant
+    // arm. Coordinated via h2_response_timeout_armed_ to avoid
+    // double-arming and the resulting deadline shift.
+    if (!h2_response_timeout_armed_) {
+        ArmResponseTimeout();
+        h2_response_timeout_armed_ = true;
+    }
 }
 
 void ProxyTransaction::DeliverTerminalError(int result_code,
@@ -1918,6 +2085,10 @@ void ProxyTransaction::Cleanup() {
         }
         h2_stream_id_ = -1;
         h2_conn_weak_.reset();
+        // Bump send-stall generation BEFORE the h2_path_ flip so any
+        // in-flight send-stall closure no-ops on its eventual fire.
+        // Same pattern as h2_response_timeout_generation_ below.
+        ++h2_send_stall_generation_;
         // ClearResponseTimeout MUST run while h2_path_ is still true:
         // its H2 branch keys on h2_path_ to bump
         // h2_response_timeout_generation_, which invalidates any queued
@@ -1926,6 +2097,11 @@ void ProxyTransaction::Cleanup() {
         // possibly mid-retry on the H1 path or already destructed) and
         // produce a spurious RESPONSE_TIMEOUT against the wrong attempt.
         ClearResponseTimeout();
+        // Reset the arm-once flag so a subsequent retry attempt that
+        // lands back on H2 arms response-timeout fresh (otherwise the
+        // first OnHeaders/OnRequestSubmitted would skip ArmResponseTimeout
+        // because the flag is left over from the prior attempt).
+        h2_response_timeout_armed_ = false;
         // Reset h2_path_ so a subsequent retry attempt that lands on H1
         // (e.g. ALPN renegotiated, or the H2 connection died and prefer=auto's
         // next probe selects http/1.1) goes through the H1 lease-release
@@ -2667,10 +2843,21 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         resp.Header("Connection", "close");
         return resp;
     }
+    if (result_code == RESULT_H2_METHOD_NOT_SUPPORTED) {
+        // RFC 9113 §8.5: CONNECT pseudo-headers forbid :scheme and :path,
+        // but our H2 codec always emits both. Surface the limitation in
+        // a dedicated header so operators can detect the rejection
+        // without parsing the body. Self-identifying response analogous
+        // to X-Circuit-Breaker / X-Retry-Budget-Exhausted.
+        HttpResponse resp = HttpResponse::BadGateway();
+        resp.Header("X-H2-Limitation", "connect-not-supported");
+        return resp;
+    }
     if (result_code == RESULT_CHECKOUT_FAILED ||
         result_code == RESULT_SEND_FAILED ||
         result_code == RESULT_PARSE_ERROR ||
-        result_code == RESULT_UPSTREAM_DISCONNECT) {
+        result_code == RESULT_UPSTREAM_DISCONNECT ||
+        result_code == RESULT_TRUNCATED_RESPONSE) {
         return HttpResponse::BadGateway();
     }
     return HttpResponse::InternalError();

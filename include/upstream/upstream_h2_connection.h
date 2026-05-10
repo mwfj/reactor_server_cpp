@@ -90,6 +90,10 @@ public:
     // Submit an outbound HTTP request as a new H2 stream. Returns the
     // nghttp2 stream_id on success (>= 1), or -1 on submit failure or
     // when this connection is no longer usable.
+    //
+    // `client_te_trailers`: if true, the nv-array build appends a
+    // synthetic `te: trailers` entry after the rewriter's strip pass.
+    // Defaulted false to keep existing test callers compiling unchanged.
     int32_t SubmitRequest(
         const std::string& method,
         const std::string& scheme,
@@ -97,7 +101,8 @@ public:
         const std::string& path,
         const std::map<std::string, std::string>& headers,
         const std::string& body,
-        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink);
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink,
+        bool client_te_trailers = false);
 
     // Cancel an in-flight stream. Submits RST_STREAM with NGHTTP2_CANCEL
     // and flushes; defers the flush when called from inside HandleBytes

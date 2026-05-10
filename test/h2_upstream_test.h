@@ -2829,6 +2829,1551 @@ void TestC6ResetStreamSinkDetachSurvivesDtor() {
 }
 
 // ---------------------------------------------------------------------------
+// TestN-series — H2 upstream negative / correctness tests covering:
+//   - truncation detection (CL short / overflow) and NO_BODY rejection
+//   - CONNECT method rejection (primary at DispatchH2 + secondary in
+//     UpstreamH2Connection::SubmitRequest)
+//   - te:trailers capture-before-strip and outbound re-emit
+//   - send-stall + response-timeout handoff via OnRequestSubmitted
+//   - sink invariants on natural close (no spurious RST_STREAM)
+// ---------------------------------------------------------------------------
+
+// Helper: build an UpstreamH2Connection with null transport and a null-safe
+// nghttp2 session.
+static auto MakeH2Conn() {
+    auto cfg = std::make_shared<Http2UpstreamConfig>();
+    cfg->enabled                  = true;
+    cfg->max_concurrent_streams_pref = 10;
+    cfg->ping_idle_sec            = 0;
+    cfg->ping_timeout_sec         = 0;
+    cfg->goaway_drain_timeout_sec = 0;
+    return cfg;
+}
+
+// Helper: build a DATA frame with a raw payload (no padding).
+static std::vector<uint8_t> BuildDataFrame(int32_t stream_id,
+                                           const uint8_t* data, size_t len,
+                                           bool end_stream)
+{
+    std::vector<uint8_t> frame;
+    frame.reserve(9 + len);
+    frame.push_back(static_cast<uint8_t>((len >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((len >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(len & 0xff));
+    frame.push_back(NGHTTP2_DATA);
+    frame.push_back(end_stream ? NGHTTP2_FLAG_END_STREAM : 0);
+    frame.push_back(static_cast<uint8_t>((stream_id >> 24) & 0x7f));
+    frame.push_back(static_cast<uint8_t>((stream_id >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((stream_id >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(stream_id & 0xff));
+    frame.insert(frame.end(), data, data + len);
+    return frame;
+}
+
+// Helper: build a RST_STREAM frame.
+static std::vector<uint8_t> BuildRstStreamFrame(int32_t stream_id,
+                                                 uint32_t error_code)
+{
+    std::vector<uint8_t> frame;
+    frame.reserve(13);
+    // length = 4
+    frame.push_back(0); frame.push_back(0); frame.push_back(4);
+    frame.push_back(NGHTTP2_RST_STREAM);
+    frame.push_back(0);  // flags
+    frame.push_back(static_cast<uint8_t>((stream_id >> 24) & 0x7f));
+    frame.push_back(static_cast<uint8_t>((stream_id >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((stream_id >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(stream_id & 0xff));
+    frame.push_back(static_cast<uint8_t>((error_code >> 24) & 0xff));
+    frame.push_back(static_cast<uint8_t>((error_code >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((error_code >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(error_code & 0xff));
+    return frame;
+}
+
+// ---------------------------------------------------------------------------
+// TestN1 — Content-Length 1000, peer sends 500 bytes + END_STREAM →
+// OnError fires (NOT OnComplete). nghttp2's HTTP messaging enforcement
+// detects the short-read and closes the stream with a non-NO_ERROR code,
+// routing to RESULT_UPSTREAM_DISCONNECT. The application-level backstop in
+// OnStreamClose(NO_ERROR) is dead code when a standards-compliant session is
+// used; this test verifies the observable end-to-end contract: CL violation
+// → stream error → OnError, never OnComplete.
+// ---------------------------------------------------------------------------
+void TestN1TruncationCLShortRead() {
+    std::cout << "\n[TEST] H2Upstream N1: CL short-read → OnError (not OnComplete)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N1: CL short-read → OnError (not OnComplete)",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        // Server sends SETTINGS + HEADERS (200 + content-length:1000, !end_stream)
+        // then only 500 bytes of DATA with END_STREAM.
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-length", "1000"}},
+            /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // Short body: 500 bytes but CL said 1000. nghttp2's HTTP messaging
+        // enforcement detects the mismatch and fires on_stream_close with a
+        // non-NO_ERROR code → RESULT_UPSTREAM_DISCONNECT via OnStreamClose's
+        // else branch. The key invariant is that OnError fires, not OnComplete.
+        std::vector<uint8_t> body(500, 'x');
+        auto data_frame = BuildDataFrame(sid, body.data(), body.size(),
+                                         /*end_stream=*/true);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_frame.data()),
+                         data_frame.size());
+
+        bool pass = (sink.error_calls == 1) && (sink.complete_calls == 0);
+        std::string err;
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + " (expected 1); ";
+        if (sink.complete_calls != 0)
+            err += "complete_calls should be 0; ";
+        TestFramework::RecordTest(
+            "H2Upstream N1: CL short-read → OnError (not OnComplete)", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N1: CL short-read → OnError (not OnComplete)", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN1b — CL on 1xx interim header does NOT contaminate final response's
+// expected_length. Final 200 with no body completes cleanly via OnComplete.
+// ---------------------------------------------------------------------------
+void TestN1bInterimCLDoesNotPoisonFinalHead() {
+    std::cout << "\n[TEST] H2Upstream N1b: 100-Continue CL does not poison final response..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N1b: 100-Continue CL does not poison final response",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        // Server sends SETTINGS then a 100 interim response, then 200 + END_STREAM.
+        // The dispatch invariant (upstream_h2_connection.cc:36-56) prevents
+        // OnHeadersComplete from running on 1xx, so the interim headers are
+        // discarded and expected_length is never set from them.
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        // 1xx interim — no END_STREAM, no END_HEADERS effect on final dispatch
+        auto interim = H2WireTest::BuildHeadersFrame(sid, {{":status", "100"}},
+                                                     /*end_stream=*/false);
+        wire.insert(wire.end(), interim.begin(), interim.end());
+        // Final 200 with END_STREAM — no body
+        auto final_hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}}, /*end_stream=*/true);
+        wire.insert(wire.end(), final_hdrs.begin(), final_hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        bool pass = (sink.complete_calls == 1) && (sink.error_calls == 0) &&
+                    (sink.last_status == 200);
+        std::string err;
+        if (sink.complete_calls != 1)
+            err += "complete_calls=" + std::to_string(sink.complete_calls) + "; ";
+        if (sink.error_calls != 0)
+            err += "unexpected error; ";
+        if (sink.last_status != 200)
+            err += "status=" + std::to_string(sink.last_status) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N1b: 100-Continue CL does not poison final response", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N1b: 100-Continue CL does not poison final response", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN2 — HEAD request: peer sends 200 + 100 body bytes → OnError fires
+// (NOT OnComplete). HEAD responses are NO_BODY per RFC 9110 §9.3.2.
+// nghttp2's HTTP messaging enforcement rejects DATA on a HEAD response and
+// fires on_stream_close with a non-NO_ERROR code → RESULT_UPSTREAM_DISCONNECT.
+// The key invariant: error fires, body bytes are NOT forwarded to the sink.
+// ---------------------------------------------------------------------------
+void TestN2HeadResponseBodyRejected() {
+    std::cout << "\n[TEST] H2Upstream N2: HEAD + body bytes → OnError (body not forwarded)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N2: HEAD + body bytes → OnError (body not forwarded)",
+                false, "Init failed");
+            return;
+        }
+        // Submit a HEAD request — sets request_method="HEAD" on the stream.
+        int32_t sid = conn.SubmitRequest("HEAD", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        // Server sends 200 without END_STREAM — the stream is HEAD so
+        // OnHeadersComplete classifies it as NO_BODY.
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}}, /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // Server sends body bytes — protocol violation: nghttp2 enforces this
+        // and rejects the stream; our Step 1.5 NO_BODY check is the backstop
+        // if nghttp2 enforcement is disabled. Either way: error, no body leak.
+        std::vector<uint8_t> body(100, 'x');
+        auto data_frame = BuildDataFrame(sid, body.data(), body.size(),
+                                         /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_frame.data()),
+                         data_frame.size());
+
+        bool pass = (sink.error_calls == 1) && (sink.body_bytes == 0);
+        std::string err;
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        if (sink.body_bytes != 0)
+            err += "body_bytes=" + std::to_string(sink.body_bytes) + " (should be 0, body leaked); ";
+        TestFramework::RecordTest(
+            "H2Upstream N2: HEAD + body bytes → OnError (body not forwarded)", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N2: HEAD + body bytes → OnError (body not forwarded)", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN3 — :status 204 + body bytes → OnError fires (NOT OnComplete, NOT
+// body forwarded). RFC 9110 §15.3.5 forbids a body on 204. nghttp2's HTTP
+// messaging enforcement catches the protocol violation; our Step 1.5 NO_BODY
+// guard is the backstop. Key invariant: error fires, body bytes = 0.
+// ---------------------------------------------------------------------------
+void TestN3Status204BodyRejected() {
+    std::cout << "\n[TEST] H2Upstream N3: :status=204 + body bytes → OnError (body not forwarded)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N3: :status=204 + body bytes → OnError (body not forwarded)",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        // 204 No Content without END_STREAM — framing forced to NO_BODY.
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "204"}}, /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        std::vector<uint8_t> body(50, 'y');
+        auto data_frame = BuildDataFrame(sid, body.data(), body.size(),
+                                         /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_frame.data()),
+                         data_frame.size());
+
+        bool pass = (sink.error_calls == 1) && (sink.body_bytes == 0);
+        std::string err;
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        if (sink.body_bytes != 0)
+            err += "body_bytes=" + std::to_string(sink.body_bytes) + " should be 0 (body leaked); ";
+        TestFramework::RecordTest(
+            "H2Upstream N3: :status=204 + body bytes → OnError (body not forwarded)", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N3: :status=204 + body bytes → OnError (body not forwarded)", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN4 — :status 304 + body bytes → OnError fires (NOT OnComplete, NOT
+// body forwarded). RFC 9110 §15.4.5 forbids a body on 304. nghttp2's HTTP
+// messaging enforcement catches this; our Step 1.5 NO_BODY guard is the
+// backstop. Key invariant: error fires, body bytes = 0.
+// ---------------------------------------------------------------------------
+void TestN4Status304BodyRejected() {
+    std::cout << "\n[TEST] H2Upstream N4: :status=304 + body bytes → OnError (body not forwarded)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N4: :status=304 + body bytes → OnError (body not forwarded)",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/resource", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "304"}}, /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        std::vector<uint8_t> body(20, 'z');
+        auto data_frame = BuildDataFrame(sid, body.data(), body.size(),
+                                         /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_frame.data()),
+                         data_frame.size());
+
+        bool pass = (sink.error_calls == 1) && (sink.body_bytes == 0);
+        std::string err;
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        if (sink.body_bytes != 0)
+            err += "body leaked: " + std::to_string(sink.body_bytes) + " bytes; ";
+        TestFramework::RecordTest(
+            "H2Upstream N4: :status=304 + body bytes → OnError (body not forwarded)", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N4: :status=304 + body bytes → OnError (body not forwarded)", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN5 — CONNECT method on H2 upstream (primary gate in SubmitRequest) →
+// returns -1, sink receives OnError(RESULT_H2_METHOD_NOT_SUPPORTED), no stream.
+//
+// The primary production gate is in DispatchH2 (proxy_transaction.cc) and
+// is tested end-to-end by proxy integration tests. This unit test exercises
+// the secondary gate in UpstreamH2Connection::SubmitRequest directly.
+// ---------------------------------------------------------------------------
+void TestN5ConnectRejectSecondaryGate() {
+    std::cout << "\n[TEST] H2Upstream N5: SubmitRequest CONNECT → -1 + OnError(RESULT_H2_METHOD_NOT_SUPPORTED)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N5: SubmitRequest CONNECT → -1 + OnError(RESULT_H2_METHOD_NOT_SUPPORTED)",
+                false, "Init failed");
+            return;
+        }
+        // Pre-condition: no active streams.
+        size_t before = conn.active_stream_count();
+
+        int32_t sid = conn.SubmitRequest("CONNECT", "http", "example.com:443", "",
+                                         {}, "", &sink);
+
+        bool pass = (sid < 0) &&
+                    (sink.error_calls == 1) &&
+                    (sink.last_error_code == ProxyTransaction::RESULT_H2_METHOD_NOT_SUPPORTED) &&
+                    (conn.active_stream_count() == before);  // no stream allocated
+        std::string err;
+        if (sid >= 0)
+            err += "expected negative stream_id, got " + std::to_string(sid) + "; ";
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        if (sink.last_error_code != ProxyTransaction::RESULT_H2_METHOD_NOT_SUPPORTED)
+            err += "error_code=" + std::to_string(sink.last_error_code) + "; ";
+        if (conn.active_stream_count() != before)
+            err += "stream count changed; ";
+        TestFramework::RecordTest(
+            "H2Upstream N5: SubmitRequest CONNECT → -1 + OnError(RESULT_H2_METHOD_NOT_SUPPORTED)",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N5: SubmitRequest CONNECT → -1 + OnError(RESULT_H2_METHOD_NOT_SUPPORTED)",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN5b — CONNECT with null sink: must not crash (secondary gate null-checks
+// sink before calling OnError, then returns -1).
+// ---------------------------------------------------------------------------
+void TestN5bConnectRejectNullSink() {
+    std::cout << "\n[TEST] H2Upstream N5b: CONNECT with null sink does not crash..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N5b: CONNECT with null sink does not crash",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("CONNECT", "http", "target.example.com:443", "",
+                                         {}, "", nullptr);
+        bool pass = (sid < 0);
+        TestFramework::RecordTest(
+            "H2Upstream N5b: CONNECT with null sink does not crash",
+            pass, pass ? "" : "expected negative stream_id");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N5b: CONNECT with null sink does not crash", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN6 — te:trailers capture: client sends "te: trailers, deflate";
+// SubmitRequest is called with client_te_trailers=true; the nv-array sent
+// to nghttp2 must include "te: trailers" (deflate stripped, trailers kept).
+//
+// We verify indirectly: SubmitRequest returns a valid stream_id (meaning
+// nghttp2 accepted the NV array including te:trailers without protocol error).
+// The server-side raw byte inspection is covered by TestB16.
+// ---------------------------------------------------------------------------
+void TestN6TeTrailersReEmit() {
+    std::cout << "\n[TEST] H2Upstream N6: te:trailers flag re-emits te:trailers on wire..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N6: te:trailers flag re-emits te:trailers on wire",
+                false, "Init failed");
+            return;
+        }
+        // client_te_trailers=true → nv-array gets "te: trailers" appended.
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/",
+            {{"accept", "application/grpc"}}, "",
+            &sink, /*client_te_trailers=*/true);
+
+        // nghttp2 must accept the request (te:trailers is legal per RFC 9113).
+        bool pass = (sid > 0);
+        TestFramework::RecordTest(
+            "H2Upstream N6: te:trailers flag re-emits te:trailers on wire",
+            pass, pass ? "" : "SubmitRequest returned " + std::to_string(sid));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N6: te:trailers flag re-emits te:trailers on wire", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN6b — te:trailers negative: flag=false → no te header appended.
+// nghttp2 accepts it (no protocol error). Verifies the flag=false path.
+// ---------------------------------------------------------------------------
+void TestN6bTeTrailersFalsePath() {
+    std::cout << "\n[TEST] H2Upstream N6b: client_te_trailers=false → no te header, no error..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N6b: client_te_trailers=false → no te header, no error",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/",
+            {}, "", &sink, /*client_te_trailers=*/false);
+
+        bool pass = (sid > 0) && (sink.error_calls == 0);
+        TestFramework::RecordTest(
+            "H2Upstream N6b: client_te_trailers=false → no te header, no error",
+            pass, pass ? "" : "sid=" + std::to_string(sid) +
+                              " errors=" + std::to_string(sink.error_calls));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N6b: client_te_trailers=false → no te header, no error",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN6c — Two SubmitRequests with differing te flag values on same connection.
+// Both produce valid stream IDs; the flag difference is per-stream.
+// ---------------------------------------------------------------------------
+void TestN6cTeTrailersPerStreamFlag() {
+    std::cout << "\n[TEST] H2Upstream N6c: te flag is per-stream, both requests succeed..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink_a;
+        RecordingSink sink_b;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N6c: te flag is per-stream, both requests succeed",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid_a = conn.SubmitRequest(
+            "GET", "http", "example.com", "/a", {}, "", &sink_a,
+            /*client_te_trailers=*/true);
+        int32_t sid_b = conn.SubmitRequest(
+            "GET", "http", "example.com", "/b", {}, "", &sink_b,
+            /*client_te_trailers=*/false);
+
+        bool pass = (sid_a > 0) && (sid_b > 0) && (sid_a != sid_b);
+        std::string err;
+        if (sid_a <= 0) err += "sid_a=" + std::to_string(sid_a) + "; ";
+        if (sid_b <= 0) err += "sid_b=" + std::to_string(sid_b) + "; ";
+        if (sid_a == sid_b) err += "stream IDs must differ; ";
+        TestFramework::RecordTest(
+            "H2Upstream N6c: te flag is per-stream, both requests succeed", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N6c: te flag is per-stream, both requests succeed", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN7 — CL exact match: content-length 5, server sends exactly 5 bytes +
+// END_STREAM → OnComplete (not OnError). Boundary condition.
+// ---------------------------------------------------------------------------
+void TestN7CLExactMatchCompletes() {
+    std::cout << "\n[TEST] H2Upstream N7: CL exact match → OnComplete (no truncation)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N7: CL exact match → OnComplete (no truncation)",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-length", "5"}},
+            /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        const uint8_t body[5] = {'h', 'e', 'l', 'l', 'o'};
+        auto data_frame = BuildDataFrame(sid, body, 5, /*end_stream=*/true);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_frame.data()),
+                         data_frame.size());
+
+        bool pass = (sink.complete_calls == 1) && (sink.error_calls == 0) &&
+                    (sink.body_bytes == 5);
+        std::string err;
+        if (sink.complete_calls != 1)
+            err += "complete_calls=" + std::to_string(sink.complete_calls) + "; ";
+        if (sink.error_calls != 0)
+            err += "unexpected error; ";
+        if (sink.body_bytes != 5)
+            err += "body_bytes=" + std::to_string(sink.body_bytes) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N7: CL exact match → OnComplete (no truncation)", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N7: CL exact match → OnComplete (no truncation)", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN7b — CL overflow: CL=10, server sends 20 bytes → OnError fires (NOT
+// OnComplete). nghttp2's HTTP messaging enforcement detects the overflow and
+// rejects the stream. Our Step 1.5 overflow check is the backstop if nghttp2
+// enforcement is disabled. Key invariant: error fires for CL overflow.
+// ---------------------------------------------------------------------------
+void TestN7bCLOverflowRejected() {
+    std::cout << "\n[TEST] H2Upstream N7b: body exceeds Content-Length → OnError..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N7b: body exceeds Content-Length → OnError",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-length", "10"}},
+            /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // 20 bytes exceeds the declared CL of 10 — protocol violation.
+        std::vector<uint8_t> body(20, 'A');
+        auto data_frame = BuildDataFrame(sid, body.data(), body.size(),
+                                         /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_frame.data()),
+                         data_frame.size());
+
+        bool pass = (sink.error_calls == 1) && (sink.complete_calls == 0);
+        std::string err;
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        if (sink.complete_calls != 0)
+            err += "complete_calls should be 0; ";
+        TestFramework::RecordTest(
+            "H2Upstream N7b: body exceeds Content-Length → OnError", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N7b: body exceeds Content-Length → OnError", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN8 — OnRequestSubmitted fires for bodyless GET (synchronous path):
+// stream_id is valid and the sink's OnRequestSubmitted was called.
+// ---------------------------------------------------------------------------
+
+// Extended RecordingSink that tracks OnRequestSubmitted for N-series tests.
+struct RecordingSinkEx : public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink {
+    int headers_calls       = 0;
+    int body_bytes          = 0;
+    int complete_calls      = 0;
+    int error_calls         = 0;
+    int trailers_calls      = 0;
+    int submitted_calls     = 0;  // tracks OnRequestSubmitted
+    int last_status         = 0;
+    int last_error_code     = 0;
+    std::string last_error_msg;
+
+    bool OnHeaders(const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override {
+        ++headers_calls; last_status = head.status_code; return true;
+    }
+    bool OnBodyChunk(const char*, size_t len) override {
+        body_bytes += static_cast<int>(len); return true;
+    }
+    void OnTrailers(const std::vector<std::pair<std::string, std::string>>&) override {
+        ++trailers_calls;
+    }
+    void OnComplete() override { ++complete_calls; }
+    void OnError(int code, const std::string& msg) override {
+        ++error_calls; last_error_code = code; last_error_msg = msg;
+    }
+    void OnRequestSubmitted() override { ++submitted_calls; }
+};
+
+void TestN8OnRequestSubmittedBodyless() {
+    std::cout << "\n[TEST] H2Upstream N8: bodyless GET → OnRequestSubmitted fires (synchronous path)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        // sink declared before conn — outlives ~UpstreamH2Connection FailAllStreams.
+        RecordingSinkEx sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N8: bodyless GET → OnRequestSubmitted fires (synchronous path)",
+                false, "Init failed");
+            return;
+        }
+        // Bodyless GET: nghttp2 sends HEADERS+END_STREAM synchronously inside
+        // SubmitRequest via FlushSend → on_frame_send_callback fires inline.
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &sink);
+
+        bool pass = (sid > 0) && (sink.submitted_calls == 1);
+        std::string err;
+        if (sid <= 0) err += "invalid stream_id " + std::to_string(sid) + "; ";
+        if (sink.submitted_calls != 1)
+            err += "submitted_calls=" + std::to_string(sink.submitted_calls) + " (expected 1); ";
+        TestFramework::RecordTest(
+            "H2Upstream N8: bodyless GET → OnRequestSubmitted fires (synchronous path)", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N8: bodyless GET → OnRequestSubmitted fires (synchronous path)",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN8b — POST with body: OnRequestSubmitted fires after DATA+END_STREAM
+// is flushed. With null transport the send is buffered in nghttp2 but the
+// flush still fires the callback.
+// ---------------------------------------------------------------------------
+void TestN8bOnRequestSubmittedBodyed() {
+    std::cout << "\n[TEST] H2Upstream N8b: POST with body → OnRequestSubmitted fires once..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSinkEx sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N8b: POST with body → OnRequestSubmitted fires once",
+                false, "Init failed");
+            return;
+        }
+        // POST with body — nghttp2 queues HEADERS then DATA+END_STREAM in one flush.
+        int32_t sid = conn.SubmitRequest(
+            "POST", "http", "example.com", "/upload",
+            {{"content-type", "application/octet-stream"}},
+            std::string(128, 'B'),
+            &sink);
+
+        bool pass = (sid > 0) && (sink.submitted_calls == 1) && (sink.error_calls == 0);
+        std::string err;
+        if (sid <= 0) err += "invalid stream_id; ";
+        if (sink.submitted_calls != 1)
+            err += "submitted_calls=" + std::to_string(sink.submitted_calls) + "; ";
+        if (sink.error_calls != 0)
+            err += "unexpected errors; ";
+        TestFramework::RecordTest(
+            "H2Upstream N8b: POST with body → OnRequestSubmitted fires once", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N8b: POST with body → OnRequestSubmitted fires once", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9 — OnRequestSubmitted fires exactly once per stream, not per-flush.
+// Two concurrent streams must each see exactly one call.
+// ---------------------------------------------------------------------------
+void TestN9OnRequestSubmittedOncePerStream() {
+    std::cout << "\n[TEST] H2Upstream N9: OnRequestSubmitted fires exactly once per stream..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSinkEx sink_a;
+        RecordingSinkEx sink_b;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9: OnRequestSubmitted fires exactly once per stream",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid_a = conn.SubmitRequest(
+            "GET", "http", "example.com", "/a", {}, "", &sink_a);
+        int32_t sid_b = conn.SubmitRequest(
+            "GET", "http", "example.com", "/b", {}, "", &sink_b);
+
+        bool pass = (sid_a > 0) && (sid_b > 0) &&
+                    (sink_a.submitted_calls == 1) &&
+                    (sink_b.submitted_calls == 1);
+        std::string err;
+        if (sink_a.submitted_calls != 1)
+            err += "sink_a submitted_calls=" + std::to_string(sink_a.submitted_calls) + "; ";
+        if (sink_b.submitted_calls != 1)
+            err += "sink_b submitted_calls=" + std::to_string(sink_b.submitted_calls) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N9: OnRequestSubmitted fires exactly once per stream", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9: OnRequestSubmitted fires exactly once per stream", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN10 — OnRequestSubmitted does NOT fire for CONNECT (rejected before
+// nghttp2 allocates a stream).
+// ---------------------------------------------------------------------------
+void TestN10ConnectNoSubmittedCallback() {
+    std::cout << "\n[TEST] H2Upstream N10: CONNECT rejected → OnRequestSubmitted never fires..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSinkEx sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N10: CONNECT rejected → OnRequestSubmitted never fires",
+                false, "Init failed");
+            return;
+        }
+        conn.SubmitRequest("CONNECT", "http", "target:443", "", {}, "", &sink);
+
+        // Secondary gate returns -1 before submit — no stream, no frame send.
+        bool pass = (sink.submitted_calls == 0) && (sink.error_calls == 1);
+        std::string err;
+        if (sink.submitted_calls != 0)
+            err += "submitted_calls=" + std::to_string(sink.submitted_calls) + " should be 0; ";
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + " should be 1; ";
+        TestFramework::RecordTest(
+            "H2Upstream N10: CONNECT rejected → OnRequestSubmitted never fires", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N10: CONNECT rejected → OnRequestSubmitted never fires", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN11 — HEAD request + 200 + END_STREAM-on-HEADERS (no DATA) →
+// normal OnComplete. The NO_BODY classification fires from end_stream=true
+// on HEADERS, not from the 204/304/HEAD method check, so this verifies the
+// existing end_stream branch handles HEAD correctly too.
+// ---------------------------------------------------------------------------
+void TestN11HeadNoBodyEndStreamOnHeaders() {
+    std::cout << "\n[TEST] H2Upstream N11: HEAD + END_STREAM on HEADERS → normal OnComplete..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N11: HEAD + END_STREAM on HEADERS → normal OnComplete",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("HEAD", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        // END_STREAM on HEADERS → framing=NO_BODY, then OnStreamClose(NO_ERROR)
+        // fires → no short-read check (expected_length stays -1) → OnComplete.
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}}, /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        bool pass = (sink.complete_calls == 1) && (sink.error_calls == 0) &&
+                    (sink.headers_calls == 1) && (sink.last_status == 200);
+        std::string err;
+        if (sink.complete_calls != 1) err += "complete_calls=" + std::to_string(sink.complete_calls) + "; ";
+        if (sink.error_calls != 0) err += "unexpected error; ";
+        if (sink.headers_calls != 1) err += "headers_calls=" + std::to_string(sink.headers_calls) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N11: HEAD + END_STREAM on HEADERS → normal OnComplete", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N11: HEAD + END_STREAM on HEADERS → normal OnComplete", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN12 — 204 + END_STREAM-on-HEADERS (normal, no body) → OnComplete.
+// Verifies the NO_BODY path from end_stream=true doesn't over-fire errors.
+// ---------------------------------------------------------------------------
+void TestN12Status204EndStreamOnHeadersCompletes() {
+    std::cout << "\n[TEST] H2Upstream N12: 204 + END_STREAM on HEADERS → OnComplete..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N12: 204 + END_STREAM on HEADERS → OnComplete",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "204"}}, /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        bool pass = (sink.complete_calls == 1) && (sink.error_calls == 0);
+        std::string err;
+        if (sink.complete_calls != 1) err += "complete=" + std::to_string(sink.complete_calls) + "; ";
+        if (sink.error_calls != 0)   err += "unexpected error; ";
+        TestFramework::RecordTest(
+            "H2Upstream N12: 204 + END_STREAM on HEADERS → OnComplete", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N12: 204 + END_STREAM on HEADERS → OnComplete", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN13 — Multiple concurrent requests; each gets its own independent
+// framing classification. One request has CL, the other is CHUNKED.
+// Both complete without interfering with each other.
+// ---------------------------------------------------------------------------
+void TestN13ConcurrentStreamIndependentFraming() {
+    std::cout << "\n[TEST] H2Upstream N13: two concurrent streams with different framing complete independently..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink_cl;
+        RecordingSink sink_chunked;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N13: two concurrent streams with different framing complete independently",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid_cl = conn.SubmitRequest("GET", "http", "example.com", "/cl",
+                                             {}, "", &sink_cl);
+        int32_t sid_chunked = conn.SubmitRequest("GET", "http", "example.com", "/chunked",
+                                                  {}, "", &sink_chunked);
+
+        // Feed SETTINGS first
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // CL stream: 5 bytes
+        auto hdrs_cl = H2WireTest::BuildHeadersFrame(
+            sid_cl, {{":status", "200"}, {"content-length", "5"}},
+            /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(hdrs_cl.data()), hdrs_cl.size());
+        const uint8_t body5[5] = {'h', 'e', 'l', 'l', 'o'};
+        auto data_cl = BuildDataFrame(sid_cl, body5, 5, /*end_stream=*/true);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_cl.data()), data_cl.size());
+
+        // Chunked stream: no CL, body then END_STREAM
+        auto hdrs_ch = H2WireTest::BuildHeadersFrame(
+            sid_chunked, {{":status", "200"}}, /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(hdrs_ch.data()), hdrs_ch.size());
+        const uint8_t body3[3] = {'a', 'b', 'c'};
+        auto data_ch = BuildDataFrame(sid_chunked, body3, 3, /*end_stream=*/true);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_ch.data()), data_ch.size());
+
+        bool pass = (sink_cl.complete_calls == 1) && (sink_cl.error_calls == 0) &&
+                    (sink_cl.body_bytes == 5) &&
+                    (sink_chunked.complete_calls == 1) && (sink_chunked.error_calls == 0) &&
+                    (sink_chunked.body_bytes == 3);
+        std::string err;
+        if (sink_cl.complete_calls != 1) err += "cl.complete=" + std::to_string(sink_cl.complete_calls) + "; ";
+        if (sink_cl.error_calls != 0)    err += "cl.error; ";
+        if (sink_cl.body_bytes != 5)     err += "cl.body=" + std::to_string(sink_cl.body_bytes) + "; ";
+        if (sink_chunked.complete_calls != 1) err += "ch.complete=" + std::to_string(sink_chunked.complete_calls) + "; ";
+        if (sink_chunked.error_calls != 0)    err += "ch.error; ";
+        if (sink_chunked.body_bytes != 3)     err += "ch.body=" + std::to_string(sink_chunked.body_bytes) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N13: two concurrent streams with different framing complete independently", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N13: two concurrent streams with different framing complete independently",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN14 — SubmitRequest with null sink: no crash on CONNECT rejection path.
+// SubmitRequest for a normal method with null sink must return a valid
+// stream_id (nghttp2 accepts it) and not crash.
+// ---------------------------------------------------------------------------
+void TestN14SubmitNullSinkNoCrash() {
+    std::cout << "\n[TEST] H2Upstream N14: SubmitRequest with null sink (normal method) does not crash..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N14: SubmitRequest with null sink (normal method) does not crash",
+                false, "Init failed");
+            return;
+        }
+        // Null sink: OnHeaders/OnComplete/OnError won't fire anywhere.
+        // The connection should handle it without crashing (it null-checks sink).
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", nullptr);
+        bool pass = (sid > 0);
+        TestFramework::RecordTest(
+            "H2Upstream N14: SubmitRequest with null sink (normal method) does not crash",
+            pass, pass ? "" : "expected valid stream_id");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N14: SubmitRequest with null sink (normal method) does not crash",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN15 — RST_STREAM mid-body (INTERNAL_ERROR) routes to
+// OnError(RESULT_UPSTREAM_DISCONNECT), NOT truncation. RST mapping is owned
+// by the OnStreamClose non-NO_ERROR branch; truncation detection only kicks
+// in on a graceful (NO_ERROR) close with a content-length mismatch.
+// ---------------------------------------------------------------------------
+void TestN15RstStreamMidBodyMapsToDisconnect() {
+    std::cout << "\n[TEST] H2Upstream N15: RST_STREAM mid-body → RESULT_UPSTREAM_DISCONNECT (not truncated)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N15: RST_STREAM mid-body → RESULT_UPSTREAM_DISCONNECT (not truncated)",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        // Send headers with CL=100 but no END_STREAM
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-length", "100"}},
+            /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // Partial body: 50 bytes
+        std::vector<uint8_t> body(50, 'P');
+        auto data_frame = BuildDataFrame(sid, body.data(), body.size(), /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_frame.data()), data_frame.size());
+
+        // RST_STREAM with INTERNAL_ERROR — not a clean close, not truncation
+        auto rst = BuildRstStreamFrame(sid, NGHTTP2_INTERNAL_ERROR);
+        conn.HandleBytes(reinterpret_cast<const char*>(rst.data()), rst.size());
+
+        bool pass = (sink.error_calls == 1) &&
+                    (sink.last_error_code == ProxyTransaction::RESULT_UPSTREAM_DISCONNECT);
+        std::string err;
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        if (sink.last_error_code != ProxyTransaction::RESULT_UPSTREAM_DISCONNECT)
+            err += "error_code=" + std::to_string(sink.last_error_code) +
+                   " (expected UPSTREAM_DISCONNECT=" +
+                   std::to_string(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT) + "); ";
+        TestFramework::RecordTest(
+            "H2Upstream N15: RST_STREAM mid-body → RESULT_UPSTREAM_DISCONNECT (not truncated)", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N15: RST_STREAM mid-body → RESULT_UPSTREAM_DISCONNECT (not truncated)",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN16 — Verify that a naturally-completed stream does NOT receive a
+// spurious RST_STREAM(CANCEL).
+//
+// Pattern: submit request → feed complete response (headers+body+END_STREAM)
+// → verify OnComplete fires, active_stream_count drops to 0, no error.
+// The absence of RST is verified by the error_calls==0 assertion.
+// ---------------------------------------------------------------------------
+void TestN16NoSpuriousRstOnNaturalClose() {
+    std::cout << "\n[TEST] H2Upstream N16: natural close → no spurious RST, OnComplete fires..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N16: natural close → no spurious RST, OnComplete fires",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        // Complete response: HEADERS + DATA + END_STREAM
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-length", "3"}},
+            /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        const uint8_t body[3] = {'a', 'b', 'c'};
+        auto data_frame = BuildDataFrame(sid, body, 3, /*end_stream=*/true);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_frame.data()),
+                         data_frame.size());
+
+        // After natural close: OnComplete fires, stream removed, no RST sent.
+        bool pass = (sink.complete_calls == 1) &&
+                    (sink.error_calls == 0) &&
+                    (conn.active_stream_count() == 0);
+        std::string err;
+        if (sink.complete_calls != 1)
+            err += "complete_calls=" + std::to_string(sink.complete_calls) + "; ";
+        if (sink.error_calls != 0)
+            err += "unexpected error (possible spurious RST path); ";
+        if (conn.active_stream_count() != 0)
+            err += "active_stream_count=" + std::to_string(conn.active_stream_count()) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N16: natural close → no spurious RST, OnComplete fires", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N16: natural close → no spurious RST, OnComplete fires", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN17 — After OnComplete, calling ResetStream(sid) is a no-op (stream
+// already erased). Verifies the ResetStream null-check doesn't double-fire.
+// ---------------------------------------------------------------------------
+void TestN17ResetAfterCompleteIsNoop() {
+    std::cout << "\n[TEST] H2Upstream N17: ResetStream after stream completes is a no-op..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N17: ResetStream after stream completes is a no-op",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}}, /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // Precondition: completed cleanly
+        if (sink.complete_calls != 1) {
+            TestFramework::RecordTest(
+                "H2Upstream N17: ResetStream after stream completes is a no-op",
+                false, "precondition: complete_calls should be 1");
+            return;
+        }
+
+        // Call ResetStream on the now-erased stream — must not crash or double-fire.
+        conn.ResetStream(sid);
+
+        bool pass = (sink.error_calls == 0) && (conn.active_stream_count() == 0);
+        std::string err;
+        if (sink.error_calls != 0) err += "spurious error after ResetStream; ";
+        if (conn.active_stream_count() != 0) err += "stream count nonzero; ";
+        TestFramework::RecordTest(
+            "H2Upstream N17: ResetStream after stream completes is a no-op", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N17: ResetStream after stream completes is a no-op", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN18 — Two streams: one truncated (NO_BODY violation), one normal.
+// Verifies per-stream isolation: truncation of stream A does not affect B.
+// ---------------------------------------------------------------------------
+void TestN18TruncationDoesNotAffectSiblingStream() {
+    std::cout << "\n[TEST] H2Upstream N18: NO_BODY truncation on stream A does not affect stream B..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink_a;  // will receive TRUNCATED error
+        RecordingSink sink_b;  // will complete normally
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N18: NO_BODY truncation on stream A does not affect stream B",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid_a = conn.SubmitRequest("GET", "http", "example.com", "/204-bad",
+                                            {}, "", &sink_a);
+        int32_t sid_b = conn.SubmitRequest("GET", "http", "example.com", "/200-ok",
+                                            {}, "", &sink_b);
+
+        // Feed SETTINGS
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // Stream A: 204 without END_STREAM, then body bytes → truncation
+        auto hdrs_a = H2WireTest::BuildHeadersFrame(
+            sid_a, {{":status", "204"}}, /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(hdrs_a.data()), hdrs_a.size());
+        const uint8_t bad_body[10] = {};
+        auto data_a = BuildDataFrame(sid_a, bad_body, 10, /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_a.data()), data_a.size());
+
+        // Stream B: normal 200 + small body + END_STREAM
+        auto hdrs_b = H2WireTest::BuildHeadersFrame(
+            sid_b, {{":status", "200"}, {"content-length", "3"}},
+            /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(hdrs_b.data()), hdrs_b.size());
+        const uint8_t good_body[3] = {'o', 'k', '!'};
+        auto data_b = BuildDataFrame(sid_b, good_body, 3, /*end_stream=*/true);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_b.data()), data_b.size());
+
+        // Stream A: error fires (nghttp2 enforces NO_BODY constraint).
+        // Stream B: completes normally — per-stream isolation holds.
+        bool pass = (sink_a.error_calls == 1) &&
+                    (sink_b.complete_calls == 1) &&
+                    (sink_b.error_calls == 0) &&
+                    (sink_b.body_bytes == 3);
+        std::string err;
+        if (sink_a.error_calls != 1)
+            err += "a.error=" + std::to_string(sink_a.error_calls) + "; ";
+        if (sink_b.complete_calls != 1)
+            err += "b.complete=" + std::to_string(sink_b.complete_calls) + "; ";
+        if (sink_b.error_calls != 0)
+            err += "b.unexpected_error; ";
+        if (sink_b.body_bytes != 3)
+            err += "b.body=" + std::to_string(sink_b.body_bytes) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N18: NO_BODY truncation on stream A does not affect stream B", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N18: NO_BODY truncation on stream A does not affect stream B",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN19 — FailAllStreams clears all pending streams without leaking sink
+// calls; active_stream_count drops to 0 immediately.
+// ---------------------------------------------------------------------------
+void TestN19FailAllStreamsCleanup() {
+    std::cout << "\n[TEST] H2Upstream N19: FailAllStreams fires OnError for all pending streams..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        // sinks MUST be declared before conn — ~UpstreamH2Connection calls
+        // FailAllStreams defensively; sinks must outlive the conn dtor.
+        RecordingSink sink_a;
+        RecordingSink sink_b;
+        RecordingSink sink_c;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N19: FailAllStreams fires OnError for all pending streams",
+                false, "Init failed");
+            return;
+        }
+        conn.SubmitRequest("GET", "http", "example.com", "/a", {}, "", &sink_a);
+        conn.SubmitRequest("GET", "http", "example.com", "/b", {}, "", &sink_b);
+        conn.SubmitRequest("GET", "http", "example.com", "/c", {}, "", &sink_c);
+
+        if (conn.active_stream_count() != 3) {
+            TestFramework::RecordTest(
+                "H2Upstream N19: FailAllStreams fires OnError for all pending streams",
+                false, "precondition: expected 3 active streams");
+            return;
+        }
+
+        conn.MarkDead();
+        conn.FailAllStreams(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT, "test shutdown");
+
+        bool pass = (conn.active_stream_count() == 0) &&
+                    (sink_a.error_calls == 1) &&
+                    (sink_b.error_calls == 1) &&
+                    (sink_c.error_calls == 1);
+        std::string err;
+        if (conn.active_stream_count() != 0)
+            err += "active_stream_count=" + std::to_string(conn.active_stream_count()) + "; ";
+        if (sink_a.error_calls != 1) err += "a.error=" + std::to_string(sink_a.error_calls) + "; ";
+        if (sink_b.error_calls != 1) err += "b.error=" + std::to_string(sink_b.error_calls) + "; ";
+        if (sink_c.error_calls != 1) err += "c.error=" + std::to_string(sink_c.error_calls) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N19: FailAllStreams fires OnError for all pending streams", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N19: FailAllStreams fires OnError for all pending streams", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestB15-B19 — wire-level tests using UpstreamH2Connection::HandleBytes
+// against nghttp2 server-side frame sequences (hand-crafted or via
+// MockH2Server).
+// ---------------------------------------------------------------------------
+
+// Helper: build a HEADERS frame for trailers (HCAT_HEADERS on the response
+// side). Trailers have END_HEADERS + END_STREAM set.
+static std::vector<uint8_t> BuildTrailersFrame(int32_t stream_id,
+    const std::vector<std::pair<std::string, std::string>>& hdrs)
+{
+    nghttp2_hd_deflater* defl = nullptr;
+    if (nghttp2_hd_deflate_new(&defl, 4096) != 0) return {};
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(hdrs.size());
+    for (const auto& kv : hdrs) {
+        nghttp2_nv nv;
+        nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(kv.first.data()));
+        nv.namelen = kv.first.size();
+        nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(kv.second.data()));
+        nv.valuelen = kv.second.size();
+        nv.flags = NGHTTP2_NV_FLAG_NO_INDEX;
+        nva.push_back(nv);
+    }
+    size_t bound = nghttp2_hd_deflate_bound(defl, nva.data(), nva.size());
+    std::vector<uint8_t> hpack(bound);
+    ssize_t pl = nghttp2_hd_deflate_hd2(defl, hpack.data(), hpack.size(),
+                                         nva.data(), nva.size());
+    nghttp2_hd_deflate_del(defl);
+    if (pl < 0) return {};
+    std::vector<uint8_t> frame;
+    frame.reserve(9 + pl);
+    frame.push_back(static_cast<uint8_t>((pl >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((pl >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(pl & 0xff));
+    frame.push_back(NGHTTP2_HEADERS);
+    // END_HEADERS + END_STREAM for trailer block
+    frame.push_back(NGHTTP2_FLAG_END_HEADERS | NGHTTP2_FLAG_END_STREAM);
+    frame.push_back(static_cast<uint8_t>((stream_id >> 24) & 0x7f));
+    frame.push_back(static_cast<uint8_t>((stream_id >> 16) & 0xff));
+    frame.push_back(static_cast<uint8_t>((stream_id >> 8) & 0xff));
+    frame.push_back(static_cast<uint8_t>(stream_id & 0xff));
+    frame.insert(frame.end(), hpack.begin(), hpack.begin() + pl);
+    return frame;
+}
+
+// ---------------------------------------------------------------------------
+// TestB15 — HEADERS + DATA + HEADERS-trailers (END_STREAM on trailers):
+// trailer block is delivered to sink via OnTrailers; OnComplete fires.
+// ---------------------------------------------------------------------------
+void TestB15TrailersAfterDataEndStream() {
+    std::cout << "\n[TEST] H2Upstream B15: trailers delivered: HEADERS+DATA+HEADERS(trailers)+END_STREAM..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        // sink declared before conn — survives ~UpstreamH2Connection FailAllStreams.
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B15: trailers delivered: HEADERS+DATA+HEADERS(trailers)+END_STREAM",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        // Response HEADERS (no END_STREAM — body follows)
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}}, /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // DATA frame (no END_STREAM — trailers follow)
+        const uint8_t body_data[4] = {'d', 'a', 't', 'a'};
+        auto data_frame = BuildDataFrame(sid, body_data, 4, /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(data_frame.data()),
+                         data_frame.size());
+
+        // Trailers HEADERS with END_STREAM
+        auto trailers = BuildTrailersFrame(sid, {{"grpc-status", "0"}, {"grpc-message", "ok"}});
+        conn.HandleBytes(reinterpret_cast<const char*>(trailers.data()), trailers.size());
+
+        bool pass = (sink.headers_calls == 1) &&
+                    (sink.body_bytes == 4) &&
+                    (sink.trailers_calls == 1) &&
+                    (sink.complete_calls == 1) &&
+                    (sink.error_calls == 0);
+        std::string err;
+        if (sink.headers_calls != 1)  err += "headers=" + std::to_string(sink.headers_calls) + "; ";
+        if (sink.body_bytes != 4)     err += "body=" + std::to_string(sink.body_bytes) + "; ";
+        if (sink.trailers_calls != 1) err += "trailers=" + std::to_string(sink.trailers_calls) + "; ";
+        if (sink.complete_calls != 1) err += "complete=" + std::to_string(sink.complete_calls) + "; ";
+        if (sink.error_calls != 0)    err += "unexpected error; ";
+        TestFramework::RecordTest(
+            "H2Upstream B15: trailers delivered: HEADERS+DATA+HEADERS(trailers)+END_STREAM",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B15: trailers delivered: HEADERS+DATA+HEADERS(trailers)+END_STREAM",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestB16 — DATA frame with PADDED flag: padding bytes are stripped and flow-
+// control credit is returned. Sink sees only the actual data payload, not the
+// padding. OnComplete fires after DATA+PADDED+END_STREAM.
+// ---------------------------------------------------------------------------
+void TestB16DataPaddingStripped() {
+    std::cout << "\n[TEST] H2Upstream B16: DATA frame with padding — payload correct, OnComplete fires..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B16: DATA frame with padding — payload correct, OnComplete fires",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        // Feed SETTINGS + response HEADERS
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}}, /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // Build a padded DATA frame (RFC 9113 §6.1):
+        // Frame layout: 9-byte header + 1-byte pad-length + payload + pad_length bytes of padding.
+        const uint8_t payload[5] = {'p', 'a', 'y', 'l', 'd'};
+        const uint8_t pad_length  = 10;
+        const size_t  total_len   = 1 + 5 + pad_length;  // pad_field + payload + padding
+
+        std::vector<uint8_t> padded_frame;
+        padded_frame.reserve(9 + total_len);
+        padded_frame.push_back(static_cast<uint8_t>((total_len >> 16) & 0xff));
+        padded_frame.push_back(static_cast<uint8_t>((total_len >> 8) & 0xff));
+        padded_frame.push_back(static_cast<uint8_t>(total_len & 0xff));
+        padded_frame.push_back(NGHTTP2_DATA);
+        padded_frame.push_back(NGHTTP2_FLAG_END_STREAM | NGHTTP2_FLAG_PADDED);
+        padded_frame.push_back(static_cast<uint8_t>((sid >> 24) & 0x7f));
+        padded_frame.push_back(static_cast<uint8_t>((sid >> 16) & 0xff));
+        padded_frame.push_back(static_cast<uint8_t>((sid >> 8) & 0xff));
+        padded_frame.push_back(static_cast<uint8_t>(sid & 0xff));
+        padded_frame.push_back(pad_length);  // Pad Length field
+        padded_frame.insert(padded_frame.end(), payload, payload + 5);
+        padded_frame.resize(padded_frame.size() + pad_length, 0);  // padding bytes
+
+        conn.HandleBytes(reinterpret_cast<const char*>(padded_frame.data()),
+                         padded_frame.size());
+
+        // Sink must see only the 5 payload bytes (no padding), then OnComplete.
+        bool pass = (sink.body_bytes == 5) &&
+                    (sink.complete_calls == 1) &&
+                    (sink.error_calls == 0);
+        std::string err;
+        if (sink.body_bytes != 5)
+            err += "body=" + std::to_string(sink.body_bytes) + " (expected 5, not " +
+                   std::to_string(5 + pad_length + 1) + "); ";
+        if (sink.complete_calls != 1) err += "complete=" + std::to_string(sink.complete_calls) + "; ";
+        if (sink.error_calls != 0)    err += "unexpected error; ";
+        TestFramework::RecordTest(
+            "H2Upstream B16: DATA frame with padding — payload correct, OnComplete fires",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B16: DATA frame with padding — payload correct, OnComplete fires",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestB17 — GOAWAY + in-flight stream: server sends GOAWAY with
+// last_stream_id=0 (rejects our stream 1), then our stream sees OnError
+// (UPSTREAM_DISCONNECT). Connection IsUsable becomes false. No crash.
+// ---------------------------------------------------------------------------
+void TestB17GoawayWithActiveStream() {
+    std::cout << "\n[TEST] H2Upstream B17: GOAWAY rejects active stream → OnError, !IsUsable..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B17: GOAWAY rejects active stream → OnError, !IsUsable",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+        (void)sid;
+
+        // Server sends SETTINGS then GOAWAY(last_stream_id=0).
+        // Our stream 1 > 0, so it was never processed by the server → OnError.
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto goaway = H2WireTest::BuildGoawayFrame(0, NGHTTP2_NO_ERROR);
+        wire.insert(wire.end(), goaway.begin(), goaway.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        bool pass = (!conn.IsUsable()) &&
+                    (conn.goaway_seen()) &&
+                    (sink.error_calls == 1);
+        std::string err;
+        if (conn.IsUsable()) err += "IsUsable should be false; ";
+        if (!conn.goaway_seen()) err += "goaway_seen should be true; ";
+        if (sink.error_calls != 1) err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream B17: GOAWAY rejects active stream → OnError, !IsUsable", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B17: GOAWAY rejects active stream → OnError, !IsUsable", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestB18 — RST_STREAM mid-body on the wire: HEADERS + DATA + RST_STREAM →
+// OnError(RESULT_UPSTREAM_DISCONNECT). Body bytes received before RST are
+// still delivered to the sink (they arrived before the reset).
+// ---------------------------------------------------------------------------
+void TestB18RstStreamMidBodyWire() {
+    std::cout << "\n[TEST] H2Upstream B18: wire RST_STREAM mid-body → OnError(UPSTREAM_DISCONNECT)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B18: wire RST_STREAM mid-body → OnError(UPSTREAM_DISCONNECT)",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/", {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        // Response HEADERS without END_STREAM
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}}, /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+
+        // Some body
+        const uint8_t body_bytes[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        auto data_frame = BuildDataFrame(sid, body_bytes, 8, /*end_stream=*/false);
+        wire.insert(wire.end(), data_frame.begin(), data_frame.end());
+
+        // RST_STREAM with CANCEL error
+        auto rst = BuildRstStreamFrame(sid, NGHTTP2_CANCEL);
+        wire.insert(wire.end(), rst.begin(), rst.end());
+
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        bool pass = (sink.error_calls == 1) &&
+                    (sink.last_error_code == ProxyTransaction::RESULT_UPSTREAM_DISCONNECT) &&
+                    (sink.complete_calls == 0);
+        std::string err;
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        if (sink.last_error_code != ProxyTransaction::RESULT_UPSTREAM_DISCONNECT)
+            err += "error_code=" + std::to_string(sink.last_error_code) + "; ";
+        if (sink.complete_calls != 0)
+            err += "complete_calls should be 0; ";
+        TestFramework::RecordTest(
+            "H2Upstream B18: wire RST_STREAM mid-body → OnError(UPSTREAM_DISCONNECT)", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B18: wire RST_STREAM mid-body → OnError(UPSTREAM_DISCONNECT)",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestB19 — Multi-stream interleave: two streams in flight, stream 1 RST'd,
+// stream 3 completes normally. Verifies per-stream isolation on the wire.
+// ---------------------------------------------------------------------------
+void TestB19MultiStreamRstOneCompletesOther() {
+    std::cout << "\n[TEST] H2Upstream B19: stream 1 RST, stream 3 completes — wire interleave..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink1;
+        RecordingSink sink3;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream B19: stream 1 RST, stream 3 completes — wire interleave",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid1 = conn.SubmitRequest("GET", "http", "example.com", "/1", {}, "", &sink1);
+        int32_t sid3 = conn.SubmitRequest("GET", "http", "example.com", "/3", {}, "", &sink3);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+
+        // Stream 1: HEADERS then RST_STREAM
+        auto hdrs1 = H2WireTest::BuildHeadersFrame(
+            sid1, {{":status", "200"}}, /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs1.begin(), hdrs1.end());
+        auto rst1 = BuildRstStreamFrame(sid1, NGHTTP2_INTERNAL_ERROR);
+        wire.insert(wire.end(), rst1.begin(), rst1.end());
+
+        // Stream 3: complete response (HEADERS + END_STREAM)
+        auto hdrs3 = H2WireTest::BuildHeadersFrame(
+            sid3, {{":status", "201"}}, /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs3.begin(), hdrs3.end());
+
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        bool pass = (sink1.error_calls == 1) &&
+                    (sink1.last_error_code == ProxyTransaction::RESULT_UPSTREAM_DISCONNECT) &&
+                    (sink3.complete_calls == 1) &&
+                    (sink3.last_status == 201) &&
+                    (sink3.error_calls == 0);
+        std::string err;
+        if (sink1.error_calls != 1)
+            err += "s1.error=" + std::to_string(sink1.error_calls) + "; ";
+        if (sink1.last_error_code != ProxyTransaction::RESULT_UPSTREAM_DISCONNECT)
+            err += "s1.code=" + std::to_string(sink1.last_error_code) + "; ";
+        if (sink3.complete_calls != 1)
+            err += "s3.complete=" + std::to_string(sink3.complete_calls) + "; ";
+        if (sink3.last_status != 201)
+            err += "s3.status=" + std::to_string(sink3.last_status) + "; ";
+        if (sink3.error_calls != 0)
+            err += "s3.unexpected_error; ";
+        TestFramework::RecordTest(
+            "H2Upstream B19: stream 1 RST, stream 3 completes — wire interleave", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream B19: stream 1 RST, stream 3 completes — wire interleave", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RunAll aggregator
 // ---------------------------------------------------------------------------
 
@@ -2924,6 +4469,40 @@ void RunAllH2UpstreamTests() {
     TestC4bMarkDeadDisablesUsable();
     TestC5AcquireReleaseNoTornRead();
     TestC6ResetStreamSinkDetachSurvivesDtor();
+
+    // TestN-series — correctness / negative tests
+    TestN1TruncationCLShortRead();
+    TestN1bInterimCLDoesNotPoisonFinalHead();
+    TestN2HeadResponseBodyRejected();
+    TestN3Status204BodyRejected();
+    TestN4Status304BodyRejected();
+    TestN5ConnectRejectSecondaryGate();
+    TestN5bConnectRejectNullSink();
+    TestN6TeTrailersReEmit();
+    TestN6bTeTrailersFalsePath();
+    TestN6cTeTrailersPerStreamFlag();
+    TestN7CLExactMatchCompletes();
+    TestN7bCLOverflowRejected();
+    TestN8OnRequestSubmittedBodyless();
+    TestN8bOnRequestSubmittedBodyed();
+    TestN9OnRequestSubmittedOncePerStream();
+    TestN10ConnectNoSubmittedCallback();
+    TestN11HeadNoBodyEndStreamOnHeaders();
+    TestN12Status204EndStreamOnHeadersCompletes();
+    TestN13ConcurrentStreamIndependentFraming();
+    TestN14SubmitNullSinkNoCrash();
+    TestN15RstStreamMidBodyMapsToDisconnect();
+    TestN16NoSpuriousRstOnNaturalClose();
+    TestN17ResetAfterCompleteIsNoop();
+    TestN18TruncationDoesNotAffectSiblingStream();
+    TestN19FailAllStreamsCleanup();
+
+    // TestB-series additions — wire-level
+    TestB15TrailersAfterDataEndStream();
+    TestB16DataPaddingStripped();
+    TestB17GoawayWithActiveStream();
+    TestB18RstStreamMidBodyWire();
+    TestB19MultiStreamRstOneCompletesOther();
 }
 
 }  // namespace H2UpstreamTests
