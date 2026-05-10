@@ -192,6 +192,43 @@ Retryable5xxBodySnapshot SnapshotRetryable5xxBody(
 
 }  // namespace
 
+// Public + static so test code can verify the contract. See header
+// for full docstring.
+bool ProxyTransaction::ContainsTeTrailersToken(const std::string& value) {
+    std::string buf;
+    buf.reserve(value.size());
+    for (char c : value) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c | 0x20);
+        buf.push_back(c);
+    }
+    size_t pos = 0;
+    while (pos < buf.size()) {
+        const size_t comma = buf.find(',', pos);
+        const size_t entry_end = (comma == std::string::npos) ? buf.size() : comma;
+        // Within an entry, the bare token name ends at the first ';'
+        // (start of parameters per ABNF: `t-codings = "trailers" /
+        // ( transfer-coding [ t-ranking ] )`).
+        const size_t semi = buf.find(';', pos);
+        const size_t token_end_raw = (semi == std::string::npos || semi > entry_end)
+                                   ? entry_end : semi;
+        size_t token_start = pos;
+        size_t token_end = token_end_raw;
+        while (token_start < token_end &&
+               (buf[token_start] == ' ' || buf[token_start] == '\t')) {
+            ++token_start;
+        }
+        while (token_end > token_start &&
+               (buf[token_end - 1] == ' ' || buf[token_end - 1] == '\t')) {
+            --token_end;
+        }
+        if (buf.compare(token_start, token_end - token_start, "trailers") == 0) {
+            return true;
+        }
+        pos = (comma == std::string::npos) ? buf.size() : comma + 1;
+    }
+    return false;
+}
+
 ProxyTransaction::ProxyTransaction(
     const std::string& service_name,
     const HttpRequest& client_request,
@@ -250,40 +287,12 @@ ProxyTransaction::ProxyTransaction(
     // Capture client `te: trailers` BEFORE HeaderRewriter::RewriteRequest
     // strips all te values per RFC 7230 §4.3 hop-by-hop rules. gRPC clients
     // send `te: trailers` to negotiate trailer support; the H2 outbound nv
-    // build re-emits the token from this flag (RFC 9113 §8.2.2). Inline
-    // tokenizer instead of std::tolower because the latter is locale-
-    // dependent (Turkish locale lowercases 'I' to 'ı', producing non-ASCII
-    // bytes). client_headers_ keys are guaranteed lowercase by HttpParser.
-    auto te_it = client_headers_.find("te");
-    if (te_it != client_headers_.end()) {
-        std::string buf;
-        buf.reserve(te_it->second.size());
-        for (char c : te_it->second) {
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c | 0x20);
-            buf.push_back(c);
-        }
-        size_t pos = 0;
-        while (pos < buf.size()) {
-            size_t comma = buf.find(',', pos);
-            size_t end = (comma == std::string::npos) ? buf.size() : comma;
-            size_t token_start = pos;
-            size_t token_end = end;
-            // Trim ASCII whitespace per RFC 7230 OWS (SP and HTAB only).
-            while (token_start < token_end &&
-                   (buf[token_start] == ' ' || buf[token_start] == '\t')) {
-                ++token_start;
-            }
-            while (token_end > token_start &&
-                   (buf[token_end - 1] == ' ' || buf[token_end - 1] == '\t')) {
-                --token_end;
-            }
-            if (buf.compare(token_start, token_end - token_start,
-                            "trailers") == 0) {
-                client_te_trailers_ = true;
-                break;
-            }
-            pos = (comma == std::string::npos) ? buf.size() : comma + 1;
-        }
+    // build re-emits the token from this flag (RFC 9113 §8.2.2). The
+    // helper handles `te: trailers`, case variants, and `te: trailers;q=...`
+    // weight parameters. client_headers_ keys are guaranteed lowercase by
+    // HttpParser.
+    if (auto te_it = client_headers_.find("te"); te_it != client_headers_.end()) {
+        client_te_trailers_ = ProxyTransaction::ContainsTeTrailersToken(te_it->second);
     }
 
     logging::Get()->debug("ProxyTransaction created client_fd={} service={} "
@@ -952,20 +961,7 @@ void ProxyTransaction::DispatchH2() {
     const int stall_budget_ms = config_.response_timeout_ms > 0
                               ? config_.response_timeout_ms
                               : SEND_STALL_FALLBACK_MS;
-    const uint64_t send_stall_gen = ++h2_send_stall_generation_;
-    if (dispatcher_) {
-        std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
-        dispatcher_->EnQueueDelayed(
-            [weak_self, send_stall_gen]() {
-                auto self = weak_self.lock();
-                if (!self) return;
-                if (self->cancelled_) return;
-                if (send_stall_gen != self->h2_send_stall_generation_) return;
-                self->OnError(RESULT_UPSTREAM_DISCONNECT,
-                              "H2 send-stall (END_STREAM not flushed)");
-            },
-            std::chrono::milliseconds(stall_budget_ms));
-    }
+    ArmH2SendStallDeadline(stall_budget_ms);
 
     // Synchronous on_frame_send (bodyless path) may run inline here,
     // bumping h2_send_stall_generation_ → kills the closure above.
@@ -1338,10 +1334,15 @@ bool ProxyTransaction::OnHeaders(
         if (state_ == State::SENDING_REQUEST) {
             state_ = State::AWAITING_RESPONSE;
         }
-        if (!h2_response_timeout_armed_) {
-            ArmResponseTimeout();
-            h2_response_timeout_armed_ = true;
-        }
+        // Final headers in hand → header-phase timer (T1) is done.
+        // Body-phase timing is governed by stream_idle_timeout_sec /
+        // stream_max_duration_sec, NOT by response_timeout_ms. Clear
+        // any armed closure (no-op if OnRequestSubmitted hasn't run
+        // yet) and reset the arm-once flag so a later
+        // OnRequestSubmitted's was_sending guard correctly skips
+        // re-arming. Mirrors H1's ClearResponseTimeout below.
+        ClearResponseTimeout();
+        h2_response_timeout_armed_ = false;
     } else {
         // H1 path: existing behavior preserved verbatim.
         if (state_ == State::SENDING_REQUEST) {
@@ -1620,28 +1621,69 @@ void ProxyTransaction::OnRequestSubmitted() {
     if (!h2_path_) return;  // H1 infers send completion from socket drain
 
     // Unconditional send-stall kill — the in-flight closure no-ops on
-    // generation mismatch when its delayed task eventually fires. Both
-    // the normal path (END_STREAM flushed) and the early-headers path
-    // (peer responded before our END_STREAM, but END_STREAM eventually
-    // went out) clear send-stall via this generation bump.
+    // generation mismatch when its delayed task eventually fires.
     ++h2_send_stall_generation_;
 
-    // Transition state if not already advanced by an early-final-
-    // headers OnHeaders. Send-stall stayed armed across that early
-    // arrival; clearing it here is idempotent and safe.
-    if (state_ == State::SENDING_REQUEST) {
+    // Only arm response-timeout if we're transitioning OUT of
+    // SENDING_REQUEST here. If OnHeaders already fired (early-headers
+    // case: peer responded before our END_STREAM), state has already
+    // advanced past SENDING_REQUEST and headers are in hand — the
+    // wait-for-headers phase is over. Arming a fresh response-timeout
+    // here would resurrect a header-phase timer in the body phase.
+    const bool was_sending = (state_ == State::SENDING_REQUEST);
+    if (was_sending) {
         state_ = State::AWAITING_RESPONSE;
     }
-
-    // Arm response-timeout if OnHeaders hasn't already armed it.
-    // Whichever of {OnHeaders, OnRequestSubmitted} fires first arms
-    // the timer; the other sees armed=true and skips the redundant
-    // arm. Coordinated via h2_response_timeout_armed_ to avoid
-    // double-arming and the resulting deadline shift.
-    if (!h2_response_timeout_armed_) {
+    if (was_sending && !h2_response_timeout_armed_) {
         ArmResponseTimeout();
         h2_response_timeout_armed_ = true;
     }
+}
+
+void ProxyTransaction::OnRequestBodyProgress() {
+    if (cancelled_ || IsKilledForShutdown()) return;
+    if (!h2_path_) return;
+    // Only refresh while the request is still being sent. Progress
+    // events that race with state transitions (state already moved
+    // to AWAITING_RESPONSE/RECEIVING_BODY) are no-ops.
+    if (state_ != State::SENDING_REQUEST) return;
+
+    const int stall_budget_ms = config_.response_timeout_ms > 0
+                              ? config_.response_timeout_ms
+                              : SEND_STALL_FALLBACK_MS;
+    ArmH2SendStallDeadline(stall_budget_ms);
+}
+
+void ProxyTransaction::ArmH2SendStallDeadline(int budget_ms) {
+    if (!dispatcher_) return;
+    const uint64_t send_stall_gen = ++h2_send_stall_generation_;
+    std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+    dispatcher_->EnQueueDelayed(
+        [weak_self, send_stall_gen]() {
+            auto self = weak_self.lock();
+            if (!self) return;
+            if (self->cancelled_) return;
+            if (send_stall_gen != self->h2_send_stall_generation_) return;
+            // H2 send-stall is a TIMEOUT, not a disconnect: the peer
+            // is still connected but isn't draining our request body.
+            // Mirrors H1's send-stall semantics (ArmResponseTimeout
+            // with stall_budget; transport SetDeadlineTimeoutCb fires
+            // RESULT_RESPONSE_TIMEOUT on miss). Route through the
+            // retryable-timeout path so retry_on_timeout policies
+            // apply and the client sees 504 (not 502) on retry-
+            // exhausted.
+            if (self->state_ == State::SENDING_REQUEST ||
+                self->state_ == State::AWAITING_RESPONSE ||
+                self->state_ == State::RECEIVING_BODY) {
+                self->ReportBreakerOutcome(RESULT_RESPONSE_TIMEOUT);
+                self->MaybeRetry(
+                    RetryPolicy::RetryCondition::RESPONSE_TIMEOUT);
+            } else {
+                self->OnError(RESULT_RESPONSE_TIMEOUT,
+                              "H2 send-stall timeout");
+            }
+        },
+        std::chrono::milliseconds(budget_ms));
 }
 
 void ProxyTransaction::DeliverTerminalError(int result_code,
@@ -3064,7 +3106,21 @@ void ProxyTransaction::ReportBreakerOutcome(int result_code) {
         case RESULT_UPSTREAM_DISCONNECT:
         case RESULT_SEND_FAILED:
         case RESULT_PARSE_ERROR:
+        case RESULT_TRUNCATED_RESPONSE:
+            // Truncation (peer ended early or violated framing) is an
+            // upstream health signal — repeated truncated bodies must
+            // contribute to circuit-open just like disconnects and
+            // parse errors do. Folds into UPSTREAM_DISCONNECT bucket.
             slice_->ReportFailure(FailureKind::UPSTREAM_DISCONNECT, probe, gen);
+            return;
+
+        case RESULT_H2_METHOD_NOT_SUPPORTED:
+            // Deterministic policy reject (CONNECT on H2 upstream) —
+            // no upstream contact, so no health signal. The OnError
+            // pre-routing hook already calls
+            // ReleaseBreakerAdmissionNeutral; this case is the
+            // defensive fallback if a code path slips past the hook.
+            slice_->ReportNeutral(probe, gen);
             return;
 
         case RESULT_POOL_EXHAUSTED:

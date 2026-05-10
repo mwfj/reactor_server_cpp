@@ -36,6 +36,16 @@ public:
     // be safe to receive this callback before SubmitRequest returns
     // control to the caller.
     virtual void OnRequestSubmitted() {}
+
+    // Fired when an intermediate request-side DATA frame is flushed
+    // to the wire (END_STREAM not yet set). Sinks use this to refresh
+    // the per-stream send-stall deadline so a slow-but-progressing
+    // upload — body larger than the stall budget but the peer is still
+    // consuming — is not falsely classified as a stall. Mirrors the
+    // H1 transport-level SetWriteProgressCb refresh.
+    //
+    // H2 path only. Default no-op.
+    virtual void OnRequestBodyProgress() {}
 };
 
 }  // namespace UPSTREAM_CALLBACKS_NAMESPACE

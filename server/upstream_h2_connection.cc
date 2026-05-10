@@ -245,10 +245,14 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
 }
 
 // Fired when nghttp2 actually puts a frame on the wire (via
-// FlushSend → nghttp2_session_mem_send2). For our purposes we care
-// about request-side END_STREAM only — that flag rides on either the
-// final HEADERS (bodyless requests) or the final DATA frame (bodied
-// requests). The single check covers both shapes.
+// FlushSend → nghttp2_session_mem_send2). Two request-side signals
+// matter to the sink:
+//   * END_STREAM on HEADERS (bodyless) or DATA (final frame) →
+//     OnRequestSubmitted: request fully sent, swap send-stall for
+//     response-completion deadline.
+//   * Intermediate DATA frame (no END_STREAM) → OnRequestBodyProgress:
+//     refresh the send-stall budget so a slow-but-progressing upload
+//     mirrors H1's transport-level SetWriteProgressCb behavior.
 //
 // May fire SYNCHRONOUSLY inside SubmitRequest when nghttp2 inline-
 // flushes a bodyless HEADERS+END_STREAM frame; the sink contract
@@ -260,15 +264,21 @@ int OnFrameSendCallback(nghttp2_session* /*session*/,
                         const nghttp2_frame* frame, void* user_data)
 {
     if (!frame) return 0;
-    if ((frame->hd.type != NGHTTP2_HEADERS &&
-         frame->hd.type != NGHTTP2_DATA) ||
-        !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+    if (frame->hd.type != NGHTTP2_HEADERS &&
+        frame->hd.type != NGHTTP2_DATA) {
         return 0;
     }
     auto* self = static_cast<UpstreamH2Connection*>(user_data);
     auto* stream = self->GetStream(frame->hd.stream_id);
     if (!stream || !stream->sink) return 0;
-    stream->sink->OnRequestSubmitted();
+    if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+        stream->sink->OnRequestSubmitted();
+    } else if (frame->hd.type == NGHTTP2_DATA) {
+        // HEADERS without END_STREAM is the request-headers frame for
+        // a bodied request; the upcoming DATA frames are the progress
+        // signal, not the HEADERS itself. Only DATA frames refresh.
+        stream->sink->OnRequestBodyProgress();
+    }
     return 0;
 }
 

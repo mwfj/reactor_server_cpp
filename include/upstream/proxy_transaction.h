@@ -143,6 +143,15 @@ public:
         return kill_for_shutdown_.load(std::memory_order_acquire);
     }
 
+    // Returns true iff the comma-separated TE header value contains the
+    // `trailers` token. Handles RFC 9110 §10.1.4 syntax: each entry MAY
+    // carry `;q=...` weight parameters (e.g. `te: trailers;q=1.0`); the
+    // matcher splits on the bare token name (substring before the first
+    // ';' in each comma-segment), trimmed of OWS. Locale-safe ASCII
+    // lowercase via explicit `c | 0x20` branch (NOT std::tolower).
+    // Public + static so test code can verify the contract directly.
+    static bool ContainsTeTrailersToken(const std::string& value);
+
     bool OnHeaders(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override;
     bool OnBodyChunk(const char* data, size_t len) override;
@@ -151,8 +160,16 @@ public:
     void OnComplete() override;
     void OnError(int error_code, const std::string& message) override;
     void OnRequestSubmitted() override;
+    void OnRequestBodyProgress() override;
 
 private:
+    // Bump h2_send_stall_generation_ and queue a fresh delayed
+    // closure that fires after `budget_ms` if not invalidated. Used
+    // both from DispatchH2 to arm the initial stall and from
+    // OnRequestBodyProgress to refresh on each request-body DATA
+    // flush, mirroring H1's per-write SetWriteProgressCb refresh.
+    void ArmH2SendStallDeadline(int budget_ms);
+
     // Send-phase stall fallback budget when config_.response_timeout_ms == 0.
     // The response-wait timeout is operator-disable-able (set to 0), but the
     // stall-phase hang protection is always on — without it a wedged upstream
