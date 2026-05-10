@@ -854,9 +854,14 @@ void ProxyTransaction::DispatchH2() {
     // :path on CONNECT pseudo-headers, but our H2 codec always emits
     // both — serving CONNECT through this path would emit a malformed
     // request. Reject deterministically with 502 + X-H2-Limitation
-    // header. The neutral breaker release is run BEFORE OnError so the
-    // admission slot doesn't leak when OnError's pre-routing hook (which
-    // is idempotent) double-handles the same code.
+    // header.
+    //
+    // Released here so the H2-method-not-supported path doesn't leave
+    // an admission slot held when OnError fires below. OnError's
+    // pre-routing hook also calls ReleaseBreakerAdmissionNeutral on
+    // RESULT_H2_METHOD_NOT_SUPPORTED, but that helper is idempotent
+    // (no-op when no admission is held — admission_generation_ == 0
+    // short-circuit) so the second call is safe.
     if (method_ == "CONNECT") {
         logging::Get()->warn(
             "H2 upstream rejecting CONNECT: not supported in this gateway "
@@ -958,9 +963,8 @@ void ProxyTransaction::DispatchH2() {
     state_ = State::SENDING_REQUEST;
     h2_response_timeout_armed_ = false;
 
-    const int stall_budget_ms = config_.response_timeout_ms > 0
-                              ? config_.response_timeout_ms
-                              : SEND_STALL_FALLBACK_MS;
+    const int stall_budget_ms = ComputeH2StallBudgetMs(
+        config_.response_timeout_ms);
     ArmH2SendStallDeadline(stall_budget_ms);
 
     // Synchronous on_frame_send (bodyless path) may run inline here,
@@ -1153,9 +1157,8 @@ void ProxyTransaction::SendUpstreamRequest() {
     // penalize any legitimate traffic. Config "disabled"
     // (response_timeout_ms == 0) opts out of the response-wait timeout,
     // NOT the hang protection.
-    const int stall_budget_ms = config_.response_timeout_ms > 0
-                              ? config_.response_timeout_ms
-                              : SEND_STALL_FALLBACK_MS;
+    const int stall_budget_ms = ComputeH2StallBudgetMs(
+        config_.response_timeout_ms);
     ArmResponseTimeout(stall_budget_ms);
 
     // Install write-progress callback to refresh the stall deadline on
@@ -1355,6 +1358,9 @@ bool ProxyTransaction::OnHeaders(
         }
         // T1 is complete once the response head arrives. Body-phase
         // timing uses the dedicated T2/T3 stream timers.
+        // Note: H1 has no `h2_response_timeout_armed_` reset because
+        // the flag is H2-only — the H1 path uses transport-level
+        // SetDeadline cleared by ClearResponseTimeout itself.
         ClearResponseTimeout();
     }
 
@@ -1648,9 +1654,8 @@ void ProxyTransaction::OnRequestBodyProgress() {
     // to AWAITING_RESPONSE/RECEIVING_BODY) are no-ops.
     if (state_ != State::SENDING_REQUEST) return;
 
-    const int stall_budget_ms = config_.response_timeout_ms > 0
-                              ? config_.response_timeout_ms
-                              : SEND_STALL_FALLBACK_MS;
+    const int stall_budget_ms = ComputeH2StallBudgetMs(
+        config_.response_timeout_ms);
     ArmH2SendStallDeadline(stall_budget_ms);
 }
 

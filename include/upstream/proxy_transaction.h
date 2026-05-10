@@ -152,6 +152,19 @@ public:
     // Public + static so test code can verify the contract directly.
     static bool ContainsTeTrailersToken(const std::string& value);
 
+    // Computes the H2 send-stall budget. Mirrors H1's zero-disable
+    // semantic: response_timeout_ms == 0 opts out of the response-wait
+    // timer but the stall-phase hang protection stays on, falling back
+    // to SEND_STALL_FALLBACK_MS. Negative values are treated the same
+    // as zero (defensive — config validation enforces non-negative,
+    // but a future bug must not produce a zero or negative budget that
+    // would either fire instantly or never).
+    // Public + static so tests verify the contract directly.
+    static int ComputeH2StallBudgetMs(int response_timeout_ms) {
+        return (response_timeout_ms > 0) ? response_timeout_ms
+                                         : SEND_STALL_FALLBACK_MS;
+    }
+
     bool OnHeaders(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override;
     bool OnBodyChunk(const char* data, size_t len) override;
@@ -162,6 +175,17 @@ public:
     void OnRequestSubmitted() override;
     void OnRequestBodyProgress() override;
 
+    // Send-phase stall fallback budget when config_.response_timeout_ms == 0.
+    // The response-wait timeout is operator-disable-able (set to 0), but the
+    // stall-phase hang protection is always on — without it a wedged upstream
+    // that stops reading our request body would pin both the client and the
+    // pooled connection indefinitely. Used by both the H1 send loop and the
+    // H2 send-stall closure (via ComputeH2StallBudgetMs).
+    //
+    // Public so test code can verify the contract directly. Leaking a
+    // static-constexpr int is harmless — no ABI surface, no mutable state.
+    static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
+
 private:
     // Bump h2_send_stall_generation_ and queue a fresh delayed
     // closure that fires after `budget_ms` if not invalidated. Used
@@ -169,14 +193,6 @@ private:
     // OnRequestBodyProgress to refresh on each request-body DATA
     // flush, mirroring H1's per-write SetWriteProgressCb refresh.
     void ArmH2SendStallDeadline(int budget_ms);
-
-    // Send-phase stall fallback budget when config_.response_timeout_ms == 0.
-    // The response-wait timeout is operator-disable-able (set to 0), but the
-    // stall-phase hang protection is always on — without it a wedged upstream
-    // that stops reading our request body would pin both the client and the
-    // pooled connection indefinitely. Used by both the H1 send loop and the
-    // H2 send-stall closure.
-    static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
 
     // State machine states
     enum class State {

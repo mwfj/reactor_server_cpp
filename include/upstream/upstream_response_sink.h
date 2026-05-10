@@ -45,6 +45,26 @@ public:
     // H1 transport-level SetWriteProgressCb refresh.
     //
     // H2 path only. Default no-op.
+    //
+    // Contract details for sink implementers:
+    //   * Fires once per intermediate DATA frame the codec actually
+    //     emits to the wire. If nghttp2 coalesces two writes into one
+    //     DATA frame, only one callback fires; if the body is large
+    //     enough to span multiple DATA frames at MAX_FRAME_SIZE, one
+    //     callback fires per frame.
+    //   * NOT a 1:1 byte-progress signal — do not use it for byte
+    //     accounting (use OnBodyChunk's len for that on the response
+    //     side; the request side has no analogous accounting hook).
+    //   * Ordering relative to OnHeaders/OnRequestSubmitted is the
+    //     wire order: progress events on stream N can fire before or
+    //     after response-side callbacks for stream N depending on
+    //     peer scheduling.
+    //   * Production sinks (ProxyTransaction) gate refresh logic on
+    //     their own state machine — progress events outside the
+    //     SENDING_REQUEST phase are silently dropped at the sink. The
+    //     C-shim DOES dispatch unconditionally, so other sinks must
+    //     gate similarly OR be safe under arrival of progress events
+    //     at any time relative to other callbacks.
     virtual void OnRequestBodyProgress() {}
 };
 

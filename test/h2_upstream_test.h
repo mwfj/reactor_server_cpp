@@ -4423,134 +4423,237 @@ void TestN6dTeTokenizerAcceptsParametersAndCases() {
 }
 
 // ---------------------------------------------------------------------------
-// TestN8c — H2 OnHeaders no-poison invariant (sibling-stream isolation).
-// Regression-lock for the deliberate H1 vs H2 delta: H1 OnHeaders sets
-// poison_connection_=true on early-final-headers because its transport-
-// sharing model contaminates subsequent keep-alive use; H2 multiplexes
-// streams over a single transport, so an early 4xx on one stream MUST
-// NOT poison the H2 connection (siblings must continue to be reused).
+// TestN8c — H2 connection survives a wire-frame early-final-headers and
+// continues to host sibling streams. Regression-lock for the deliberate
+// H1-vs-H2 OnHeaders delta: H1 poisons the connection on early headers
+// (transport-sharing contamination); H2 must NOT, because streams are
+// multiplexed and a single peer-final-headers signal on stream A is not
+// a fatal upstream signal for streams B+.
 //
-// We can't easily reach poison_connection_ from a unit test (it's
-// private and lives on ProxyTransaction). Instead, we exercise the
-// observable contract: after an early-headers response on stream A,
-// the H2 connection is still usable for a fresh stream B (IsUsable()
-// stays true, MarkDead/goaway_seen_ stay false, SubmitRequest succeeds
-// for sibling B).
+// The connection-level invariant is observable: after stream A receives
+// 200 + END_STREAM (a synthetic early-final-headers response delivered
+// via HandleBytes), conn.IsUsable() must stay true, no GOAWAY emitted,
+// no MarkDead, and a fresh SubmitRequest for stream B must succeed and
+// be assigned the next odd id.
 // ---------------------------------------------------------------------------
 void TestN8cNoPoisonOnEarlyHeadersSiblingReuse() {
-    std::cout << "\n[TEST] H2Upstream N8c: early peer headers on stream A → connection still usable for sibling B..." << std::endl;
+    std::cout << "\n[TEST] H2Upstream N8c: peer-final-headers on stream A → connection still hosts sibling B..." << std::endl;
     try {
         auto cfg = MakeH2Conn();
         RecordingSink sink_a, sink_b;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
-                "H2Upstream N8c: early peer headers — sibling stream still usable",
+                "H2Upstream N8c: peer-final-headers — sibling stream still usable",
                 false, "Init failed");
             return;
         }
         int32_t sid_a = conn.SubmitRequest("POST", "http", "example.com",
                                             "/upload", {}, "x", &sink_a);
-        if (sid_a <= 0) {
+        if (sid_a != 1) {
             TestFramework::RecordTest(
-                "H2Upstream N8c: early peer headers — sibling stream still usable",
-                false, "stream A submit failed");
+                "H2Upstream N8c: peer-final-headers — sibling stream still usable",
+                false, "expected sid_a=1, got " + std::to_string(sid_a));
             return;
         }
-        // Drive a synthetic early-final-headers response on stream A —
-        // a 413 Payload Too Large is the canonical case where the peer
-        // rejects mid-upload. nghttp2's enforcement will route this to
-        // OnError as part of the messaging-enforcement contract; what
-        // matters is the connection state AFTER.
-        // (We don't actually need to feed a real frame here — the test
-        // exercises the post-error connection-usability invariant
-        // directly, which is what no-poison protects.)
-        const bool was_usable = conn.IsUsable();
-        const bool no_goaway = !conn.goaway_seen();
-        const bool no_dead = !conn.IsDead();
 
-        // Submit a sibling stream on the same connection.
+        // Drive a synthetic peer-final-headers response on stream A.
+        // 200 + END_STREAM is the canonical "peer responded before our
+        // body finished" wire pattern. nghttp2 will dispatch OnHeaders
+        // (no poison on H2 path) then OnComplete via OnStreamClose.
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid_a, {{":status", "200"}, {"content-length", "0"}},
+            /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        ssize_t consumed = conn.HandleBytes(
+            reinterpret_cast<const char*>(wire.data()), wire.size());
+
+        // Stream A's sink saw the response cleanly (the wire path
+        // exercises the H2 OnHeaders branch end-to-end).
+        const bool a_got_headers = (sink_a.headers_calls == 1) &&
+                                   (sink_a.last_status == 200);
+        const bool a_completed   = (sink_a.complete_calls == 1) &&
+                                   (sink_a.error_calls == 0);
+        // Connection-level invariants: NOT poisoned at the connection
+        // layer (no GOAWAY, no MarkDead, IsUsable stays true).
+        const bool conn_usable   = conn.IsUsable();
+        const bool no_goaway     = !conn.goaway_seen();
+        const bool no_dead       = !conn.IsDead();
+
+        // Sibling stream B must succeed AND get the next odd id (3) —
+        // proves the connection is still accepting new streams.
         int32_t sid_b = conn.SubmitRequest("GET", "http", "example.com",
                                             "/sibling", {}, "", &sink_b);
-        bool pass = was_usable && no_goaway && no_dead && (sid_b > 0);
+        const bool b_assigned    = (sid_b == 3);
+
+        bool pass = (consumed > 0) && a_got_headers && a_completed &&
+                    conn_usable && no_goaway && no_dead && b_assigned;
         TestFramework::RecordTest(
-            "H2Upstream N8c: early peer headers — sibling stream still usable",
+            "H2Upstream N8c: peer-final-headers — sibling stream still usable",
             pass,
-            pass ? "" : "usable=" + std::to_string(was_usable) +
+            pass ? "" : "consumed=" + std::to_string(consumed) +
+                        " a_hdrs=" + std::to_string(a_got_headers) +
+                        " a_complete=" + std::to_string(a_completed) +
+                        " usable=" + std::to_string(conn_usable) +
                         " no_goaway=" + std::to_string(no_goaway) +
                         " no_dead=" + std::to_string(no_dead) +
                         " sid_b=" + std::to_string(sid_b));
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2Upstream N8c: early peer headers — sibling stream still usable",
+            "H2Upstream N8c: peer-final-headers — sibling stream still usable",
             false, e.what());
     }
 }
 
 // ---------------------------------------------------------------------------
-// TestN9b — OnRequestBodyProgress refreshes the send-stall closure on
-// intermediate DATA frames. Verifies the regression fix for "send-stall
-// becomes a fixed hard cap on H2": progress events bump
-// h2_send_stall_generation_, invalidating any in-flight closure.
+// TestN9b — OnRequestBodyProgress fires through the production
+// OnFrameSendCallback wiring on intermediate DATA frames, NOT just by
+// direct call on the sink. Drives a real SubmitRequest with a body
+// large enough to span multiple DATA frames so nghttp2 emits at least
+// one DATA frame WITHOUT END_STREAM (intermediate) plus one DATA frame
+// WITH END_STREAM (terminal).
 //
-// The sink contract is verified via override observation — calling
-// OnRequestBodyProgress on a sink that doesn't override is a no-op
-// (default impl). Production routes through ProxyTransaction; here
-// we exercise the sink-level invariant: the new virtual is a no-op
-// for unrelated sinks, AND the override is observable.
+// Default MAX_FRAME_SIZE is 16384 (RFC 9113 §6.5.2). Use a 20000-byte
+// body to guarantee at least 2 DATA frames: the first 16384 bytes
+// without END_STREAM (→ OnRequestBodyProgress), the remaining 3616
+// bytes with END_STREAM (→ OnRequestSubmitted).
 // ---------------------------------------------------------------------------
-void TestN9bRequestBodyProgressIsObservable() {
-    std::cout << "\n[TEST] H2Upstream N9b: OnRequestBodyProgress is dispatched (override observable)..." << std::endl;
+void TestN9bRequestBodyProgressFiresFromCodec() {
+    std::cout << "\n[TEST] H2Upstream N9b: large-body submit fires OnRequestBodyProgress via codec..." << std::endl;
     struct ObservingSink : public RecordingSink {
         int progress_calls = 0;
         int submitted_calls = 0;
         void OnRequestBodyProgress() override { ++progress_calls; }
         void OnRequestSubmitted() override { ++submitted_calls; }
     };
-    ObservingSink sink;
-    // Default-impl invocations are no-ops; overrides should be reachable.
-    sink.OnRequestBodyProgress();   // simulated DATA without END_STREAM
-    sink.OnRequestBodyProgress();   // another partial DATA
-    sink.OnRequestSubmitted();      // final DATA+END_STREAM
-    bool pass = (sink.progress_calls == 2) && (sink.submitted_calls == 1);
-    TestFramework::RecordTest(
-        "H2Upstream N9b: OnRequestBodyProgress is dispatched (override observable)",
-        pass, pass ? "" : "progress=" + std::to_string(sink.progress_calls) +
-                          " submitted=" + std::to_string(sink.submitted_calls));
+    try {
+        auto cfg = MakeH2Conn();
+        ObservingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9b: codec dispatches OnRequestBodyProgress on large body",
+                false, "Init failed");
+            return;
+        }
+        // 20000 bytes > 1 frame (MAX_FRAME_SIZE=16384) — guarantees
+        // at least one intermediate DATA frame.
+        std::string body(20000, 'x');
+        int32_t sid = conn.SubmitRequest(
+            "POST", "http", "example.com", "/upload", {}, body, &sink);
+        if (sid <= 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N9b: codec dispatches OnRequestBodyProgress on large body",
+                false, "submit failed");
+            return;
+        }
+        // After SubmitRequest's inline FlushSend, nghttp2 has emitted
+        // the HEADERS + DATA chunks. With a 20KB body, expect at
+        // least one OnRequestBodyProgress (intermediate DATA without
+        // END_STREAM) and exactly one OnRequestSubmitted (final DATA
+        // with END_STREAM).
+        bool pass = (sink.progress_calls >= 1) &&
+                    (sink.submitted_calls == 1);
+        TestFramework::RecordTest(
+            "H2Upstream N9b: codec dispatches OnRequestBodyProgress on large body",
+            pass, pass ? "" : "progress=" + std::to_string(sink.progress_calls) +
+                              " submitted=" + std::to_string(sink.submitted_calls));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9b: codec dispatches OnRequestBodyProgress on large body",
+            false, e.what());
+    }
 }
 
 // ---------------------------------------------------------------------------
-// TestN9c — Default sink does NOT need to override the new virtuals.
-// Locks the ABI guarantee that adding OnRequestBodyProgress with a
-// default no-op body did not break sink consumers that pre-date the
-// virtual.
+// TestN9c — Default sink ABI: a sink that does NOT override
+// OnRequestBodyProgress must still compile and operate — locks the
+// no-op default contract that prevents binary-compat breakage for
+// pre-existing sink consumers. Drives a real submit-with-large-body
+// so the codec's OnFrameSendCallback dispatches the new virtual
+// against the unmodified RecordingSink (no override).
 // ---------------------------------------------------------------------------
 void TestN9cDefaultSinkSurvivesNewVirtual() {
-    std::cout << "\n[TEST] H2Upstream N9c: sink without OnRequestBodyProgress override compiles + runs..." << std::endl;
-    RecordingSink sink;  // does NOT override OnRequestBodyProgress
-    // Must compile and run without crashing — default no-op virtual.
-    sink.OnRequestBodyProgress();
-    sink.OnRequestSubmitted();
-    bool pass = (sink.error_calls == 0) && (sink.complete_calls == 0);
-    TestFramework::RecordTest(
-        "H2Upstream N9c: sink without OnRequestBodyProgress override compiles + runs",
-        pass, "");
+    std::cout << "\n[TEST] H2Upstream N9c: pre-existing sink survives codec firing OnRequestBodyProgress..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;  // does NOT override OnRequestBodyProgress
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9c: pre-existing sink survives codec firing OnRequestBodyProgress",
+                false, "Init failed");
+            return;
+        }
+        std::string body(20000, 'y');
+        int32_t sid = conn.SubmitRequest(
+            "POST", "http", "example.com", "/upload", {}, body, &sink);
+        // The sink doesn't override OnRequestBodyProgress; the default
+        // no-op runs. Submit must succeed AND no spurious OnError must
+        // fire (the new virtual must not have side effects on the
+        // base implementation).
+        bool pass = (sid > 0) && (sink.error_calls == 0) &&
+                    (sink.complete_calls == 0);
+        TestFramework::RecordTest(
+            "H2Upstream N9c: pre-existing sink survives codec firing OnRequestBodyProgress",
+            pass, pass ? "" : "sid=" + std::to_string(sid) +
+                              " errors=" + std::to_string(sink.error_calls));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9c: pre-existing sink survives codec firing OnRequestBodyProgress",
+            false, e.what());
+    }
 }
 
 // ---------------------------------------------------------------------------
-// TestN7c — Send-stall budget when response_timeout_ms is disabled.
-// Locks the SEND_STALL_FALLBACK_MS contract: response_timeout_ms == 0
-// opts out of the response-wait timer but the stall-phase hang
-// protection stays on at SEND_STALL_FALLBACK_MS.
+// TestN7c — H2 send-stall budget computation. Locks the public
+// ProxyTransaction::ComputeH2StallBudgetMs contract: response_timeout_ms
+// == 0 (operator-disabled) opts out of the response-wait timer but
+// the stall-phase hang protection stays on at SEND_STALL_FALLBACK_MS.
+// Negative values defensively fall through to the same fallback —
+// config validation enforces non-negative, but a bug producing zero
+// or negative must not produce a zero-or-negative budget that would
+// either fire instantly or never.
 // ---------------------------------------------------------------------------
 void TestN7cSendStallFallbackBudget() {
-    std::cout << "\n[TEST] H2Upstream N7c: response_timeout_ms=0 → stall protection still on at SEND_STALL_FALLBACK_MS..." << std::endl;
-    // SEND_STALL_FALLBACK_MS is a public class-level constant.
-    bool pass = (ProxyTransaction::SEND_STALL_FALLBACK_MS == 30000);
+    std::cout << "\n[TEST] H2Upstream N7c: ComputeH2StallBudgetMs zero-disable contract..." << std::endl;
+    struct Case { int input; int expected; const char* label; };
+    const Case cases[] = {
+        // Operator-disabled response timeout: stall protection STAYS
+        // on at fallback budget. This is the original P1-bug case.
+        {0,     ProxyTransaction::SEND_STALL_FALLBACK_MS, "0 (disabled)"},
+        // Defensive: negative values must not fire-instantly or
+        // never-fire — fall through to fallback.
+        {-1,    ProxyTransaction::SEND_STALL_FALLBACK_MS, "-1 (defensive)"},
+        {-1000, ProxyTransaction::SEND_STALL_FALLBACK_MS, "-1000 (defensive)"},
+        // Positive: pass-through.
+        {1,                                            1, "1 (pass-through)"},
+        {1000,                                      1000, "1000ms"},
+        {30000,                                    30000, "30s explicit"},
+        {120000,                                  120000, "120s explicit"},
+    };
+    int pass = 0, total = 0;
+    for (const Case& c : cases) {
+        const int got = ProxyTransaction::ComputeH2StallBudgetMs(c.input);
+        ++total;
+        if (got == c.expected) {
+            ++pass;
+        } else {
+            std::cerr << "  FAIL[" << c.label << "]: input=" << c.input
+                      << " got=" << got << " expected=" << c.expected
+                      << std::endl;
+        }
+    }
+    // Constant-shape lock as the secondary check.
+    const bool fallback_correct =
+        (ProxyTransaction::SEND_STALL_FALLBACK_MS == 30000);
+    bool ok = (pass == total) && fallback_correct;
     TestFramework::RecordTest(
-        "H2Upstream N7c: SEND_STALL_FALLBACK_MS is 30000ms",
-        pass, pass ? "" : "actual=" +
-              std::to_string(ProxyTransaction::SEND_STALL_FALLBACK_MS));
+        "H2Upstream N7c: ComputeH2StallBudgetMs zero-disable + fallback constant",
+        ok, ok ? "" : "passed " + std::to_string(pass) + "/" +
+                       std::to_string(total) + ", fallback=" +
+                       std::to_string(ProxyTransaction::SEND_STALL_FALLBACK_MS));
 }
 
 // ---------------------------------------------------------------------------
@@ -4679,7 +4782,7 @@ void RunAllH2UpstreamTests() {
     TestN6dTeTokenizerAcceptsParametersAndCases();
     TestN7cSendStallFallbackBudget();
     TestN8cNoPoisonOnEarlyHeadersSiblingReuse();
-    TestN9bRequestBodyProgressIsObservable();
+    TestN9bRequestBodyProgressFiresFromCodec();
     TestN9cDefaultSinkSurvivesNewVirtual();
 
     // TestB-series additions — wire-level
