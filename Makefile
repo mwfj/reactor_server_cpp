@@ -397,8 +397,8 @@ test_h2_upstream: $(TARGET)
 # target (the runner doesn't ship an umbrella flag — unknown flags
 # exit through the unknown-option path).
 test_obs: test_obs_foundation test_obs_tracer test_obs_metrics \
-          test_obs_mgr test_obs_propagator test_obs_export \
-          test_obs_prom test_obs_config test_obs_shutdown \
+          test_obs_mgr test_obs_propagator test_obs_jaeger_propagator \
+          test_obs_export test_obs_prom test_obs_config test_obs_shutdown \
           test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e
 	@echo "All observability suites passed."
 
@@ -560,4 +560,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_auth_foundation test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dns test_dual_stack test_dual_stack_tsan test_dns_resolver test_auth_observability test_h2_upstream test_obs test_obs_foundation test_obs_tracer test_obs_metrics test_obs_mgr test_obs_propagator test_obs_export test_obs_prom test_obs_config test_obs_shutdown test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_auth_foundation test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dns test_dual_stack test_dual_stack_tsan test_dns_resolver test_auth_observability test_h2_upstream test_obs test_obs_foundation test_obs_tracer test_obs_metrics test_obs_mgr test_obs_propagator test_obs_jaeger_propagator test_obs_export test_obs_prom test_obs_config test_obs_shutdown test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e help

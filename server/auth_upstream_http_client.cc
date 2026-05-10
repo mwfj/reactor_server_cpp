@@ -280,6 +280,14 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     if (req.issue_ctx.has_value()
         && req.issue_ctx->local.IsValid()
         && req.issue_ctx->tracer != nullptr) {
+        // TODO: route through ObservabilityManager::propagator() so the
+        // outbound format honors operator-configured `propagators`
+        // (composite-aware). Hardcoded W3C is safe today because no
+        // production caller populates issue_ctx — but when per-attempt
+        // CLIENT spans are wired, an operator running propagators:
+        // ["jaeger"] would otherwise silently emit W3C-only outbound
+        // headers. Inbound side already routes through propagator() in
+        // observability_middleware.cc.
         OBSERVABILITY_NAMESPACE::W3CPropagator{}.Inject(
             req.issue_ctx->local, req.headers);
     }

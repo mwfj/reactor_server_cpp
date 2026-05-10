@@ -295,6 +295,52 @@ void TestHotReloadableForcesLiveValidationWhenLive() {
     }
 }
 
+// ValidateHotReloadable must mirror LoadFromString's checks on
+// `traces.propagators` (live-reloadable). LoadFromString validates at
+// JSON parse time, but a hand-built ServerConfig that bypasses the
+// loader would otherwise reach ObservabilityManager::Reload, where
+// CompositePropagator::Build throws AFTER earlier subsystems already
+// committed — violating the atomic-reload contract. The validator
+// must hard-reject empty / unknown / duplicate names at the gate.
+void TestHotReloadableRejectsBadPropagators() {
+    try {
+        // Hand-built config bypasses LoadFromString's validation.
+        ServerConfig empty_cfg;
+        empty_cfg.observability.enabled = true;
+        empty_cfg.observability.traces.propagators = {};
+        bool threw_empty = false;
+        try { ConfigLoader::ValidateHotReloadable(empty_cfg, {}); }
+        catch (const std::invalid_argument&) { threw_empty = true; }
+
+        ServerConfig unknown_cfg;
+        unknown_cfg.observability.enabled = true;
+        unknown_cfg.observability.traces.propagators = {"w3c", "garbage"};
+        bool threw_unknown = false;
+        try { ConfigLoader::ValidateHotReloadable(unknown_cfg, {}); }
+        catch (const std::invalid_argument&) { threw_unknown = true; }
+
+        ServerConfig dup_cfg;
+        dup_cfg.observability.enabled = true;
+        dup_cfg.observability.traces.propagators = {"w3c", "w3c"};
+        bool threw_dup = false;
+        try { ConfigLoader::ValidateHotReloadable(dup_cfg, {}); }
+        catch (const std::invalid_argument&) { threw_dup = true; }
+
+        bool pass = threw_empty && threw_unknown && threw_dup;
+        TestFramework::RecordTest(
+            "ObsCfg: ValidateHotReloadable rejects empty/unknown/duplicate propagators",
+            pass, pass ? ""
+                      : "empty=" + std::to_string(threw_empty)
+                       + " unknown=" + std::to_string(threw_unknown)
+                       + " dup=" + std::to_string(threw_dup),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: ValidateHotReloadable rejects empty/unknown/duplicate propagators",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // HotReloadable should NOT reject restart-required-only fields (those
 // are surfaced by HttpServer::Reload's outer warn).
 void TestHotReloadableSkipsRestartFields() {
@@ -667,6 +713,7 @@ void RunAllTests() {
     TestHotReloadableRejectsBadLiveValue();
     TestHotReloadableSkipsBadLiveValueWhenNotLive();
     TestHotReloadableForcesLiveValidationWhenLive();
+    TestHotReloadableRejectsBadPropagators();
     TestHotReloadableSkipsRestartFields();
     TestOperatorEqIgnoresLiveFields();
     TestOperatorEqDetectsRestartChange();

@@ -2368,6 +2368,32 @@ static void ValidateObservabilityLive(const ServerConfig& config,
     if (oc.traces.otlp.timeout_ms.count() < 1)
         throw std::invalid_argument(
             "observability.traces.otlp.timeout_ms must be >= 1");
+
+    // traces.propagators is live-reloadable. LoadFromString validates
+    // names + non-empty + duplicates at JSON parse time, but a
+    // programmatic ServerConfig hand-built without going through the
+    // loader can still reach ObservabilityManager::Reload, where
+    // CompositePropagator::Build throws on unknown / empty names AFTER
+    // earlier subsystems (rate limit, circuit breaker, auth) have
+    // already committed — violating the atomic-reload contract.
+    // Mirror the LoadFromString checks here so the validator catches
+    // the same shapes at the staged-config gate.
+    if (oc.traces.propagators.empty())
+        throw std::invalid_argument(
+            "observability.traces.propagators must be a non-empty list");
+    {
+        std::set<std::string> seen;
+        for (const auto& name : oc.traces.propagators) {
+            if (!OBSERVABILITY_NAMESPACE::IsKnownPropagatorName(name))
+                throw std::invalid_argument(
+                    "observability.traces.propagators: unknown '"
+                    + name + "' (recognised: 'w3c', 'jaeger')");
+            if (!seen.insert(name).second)
+                throw std::invalid_argument(
+                    "observability.traces.propagators: duplicate '"
+                    + name + "' — each propagator may appear at most once");
+        }
+    }
 }
 
 // Restart-required subset — exporter selection, prometheus path,

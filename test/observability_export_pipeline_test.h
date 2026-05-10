@@ -5,6 +5,7 @@
 // retain serialized OTLP/JSON for inspection.
 
 #include "test_framework.h"
+#include "auth/upstream_http_client.h"
 #include "nlohmann/json.hpp"
 #include "observability/batch_span_processor.h"
 #include "observability/instrumentation_scope.h"
@@ -852,6 +853,40 @@ void TestBatchSpanProcessorForceFlushDeadlineContract() {
     }
 }
 
+// MakeOtlpTransport must short-circuit to kFailedNotRetryable when
+// the captured weak_ptr<UpstreamHttpClient> has expired (e.g. abnormal
+// shutdown ordering tears down the client before the BSP/PMR worker's
+// final export). Without the lock-and-bail check, the transport would
+// dereference a null shared_ptr and crash inside the worker thread.
+// An empty weak_ptr is the simplest way to drive that path: lock()
+// returns null without needing a real client construction.
+void TestMakeOtlpTransportNullClientShortCircuits() {
+    try {
+        std::weak_ptr<AUTH_NAMESPACE::UpstreamHttpClient> empty;
+        auto transport = OBSERVABILITY_NAMESPACE::MakeOtlpTransport(empty);
+
+        OtlpHttpExporter::ExportPayload payload;
+        payload.upstream_pool_name = "otel-collector";
+        payload.path               = "/v1/traces";
+        payload.body               = "{}";
+        payload.timeout            = std::chrono::milliseconds{1000};
+
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::seconds{1};
+        const auto result = transport(std::move(payload), deadline);
+
+        bool pass = (result == ExportResult::kFailedNotRetryable);
+        TestFramework::RecordTest(
+            "ObsExport: MakeOtlpTransport short-circuits when client weak_ptr expired",
+            pass, pass ? "" : "expected kFailedNotRetryable",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: MakeOtlpTransport short-circuits when client weak_ptr expired",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Sub-second OTLP timeouts must NOT truncate to zero. timeout_sec=0
 // disables UpstreamHttpClient::SetDeadline; fut.get() then blocks
 // indefinitely on a stalled upstream and wedges the BSP/PMR worker.
@@ -926,6 +961,7 @@ void RunAllTests() {
     TestBatchSpanProcessorOverridesForceFlush();
     TestPeriodicMetricReaderForceFlushBlocks();
     TestBatchSpanProcessorForceFlushDeadlineContract();
+    TestMakeOtlpTransportNullClientShortCircuits();
     TestOtlpTimeoutCeilSeconds();
 }
 

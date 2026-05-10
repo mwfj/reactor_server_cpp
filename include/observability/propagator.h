@@ -191,13 +191,14 @@ public:
         const HeadersMap& headers) const override;
     bool Inject(const SpanContext& ctx,
                  HeadersMap& headers) const override;
-    // Vector-form Inject must override the base default. The base
-    // default writes via a temporary HeadersMap and then erases keys
-    // present in that temp from the vector — which leaves stale
-    // pre-existing entries behind whenever a child intentionally omits
-    // a header (e.g. W3C with empty tracestate). Delegate to each
-    // child's Inject(HeadersVec&) so per-child strip-then-inject runs
-    // directly against the real vector.
+    // Vector-form Inject is overridden so each child writes directly
+    // into the real vector. The base default works through a temp
+    // HeadersMap and one StripOwnedHeaders sweep — for the composite
+    // that strip would only touch the composite's own owned set
+    // (children-iterated), not give each child a chance to use its own
+    // hot-path Vec form (W3C overrides Inject(HeadersVec&)). Direct
+    // per-child fan-out is both faster and preserves the contract that
+    // a child's Vec override is the authoritative serializer.
     bool Inject(const SpanContext& ctx,
                  HeadersVec& headers) const override;
     void StripOwnedHeaders(HeadersMap& headers) const override;
