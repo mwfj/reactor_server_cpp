@@ -484,6 +484,63 @@ void TestCompositeStripsAllOwnedHeaders() {
     }
 }
 
+// Vec-form Strip override on Composite delegates to each child's Vec
+// StripOwnedHeaders. Verifies (a) every child-owned name is stripped,
+// (b) case-insensitive sweep covers mixed-case duplicates, (c)
+// non-trace headers are preserved, (d) order of remaining entries is
+// preserved (Vec semantics, no map reordering).
+void TestCompositeStripsAllOwnedHeadersVec() {
+    try {
+        auto comp = CompositePropagator::Build({"w3c", "jaeger"});
+        std::vector<std::pair<std::string, std::string>> headers;
+        headers.emplace_back("traceparent", "x");
+        headers.emplace_back("TraceState",  "y");          // mixed case
+        headers.emplace_back("Uber-Trace-Id", "z");        // mixed case
+        headers.emplace_back("host", "example.com");
+        headers.emplace_back("x-other", "keep");
+
+        comp->StripOwnedHeaders(headers);
+
+        size_t tp_count = 0, ts_count = 0, ut_count = 0;
+        bool host_kept = false, other_kept = false;
+        std::vector<std::string> remaining_order;
+        for (const auto& [k, v] : headers) {
+            (void)v;
+            std::string lk;
+            for (char c : k) lk.push_back(
+                static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            if (lk == "traceparent")        ++tp_count;
+            else if (lk == "tracestate")     ++ts_count;
+            else if (lk == "uber-trace-id")  ++ut_count;
+            else if (lk == "host")           host_kept = true;
+            else if (lk == "x-other")        other_kept = true;
+            remaining_order.push_back(k);
+        }
+        // Surviving entries must be host then x-other (declaration
+        // order); strip must not reorder unrelated headers.
+        bool order_preserved = remaining_order.size() == 2 &&
+                                remaining_order[0] == "host" &&
+                                remaining_order[1] == "x-other";
+
+        bool pass = tp_count == 0 && ts_count == 0 && ut_count == 0 &&
+                    host_kept && other_kept && order_preserved;
+        TestFramework::RecordTest(
+            "ObsJaeger: composite strips every child-owned header (vec form)",
+            pass, pass ? ""
+                      : "tp=" + std::to_string(tp_count)
+                       + " ts=" + std::to_string(ts_count)
+                       + " ut=" + std::to_string(ut_count)
+                       + " host=" + std::to_string(host_kept)
+                       + " other=" + std::to_string(other_kept)
+                       + " order_preserved=" + std::to_string(order_preserved),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsJaeger: composite strips every child-owned header (vec form)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestCompositeBuildEmptyRejected() {
     try {
         bool threw_empty = false;
@@ -624,6 +681,7 @@ void RunAllTests() {
     TestCompositeExtractFallthrough();
     TestCompositeInjectAll();
     TestCompositeStripsAllOwnedHeaders();
+    TestCompositeStripsAllOwnedHeadersVec();
     TestCompositeBuildEmptyRejected();
     TestCompositeBuildRejectsDuplicates();
     TestCompositeVecInjectStripsStaleTracestate();

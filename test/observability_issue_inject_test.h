@@ -185,6 +185,41 @@ void TestTracestateRoundTrip() {
     }
 }
 
+// The strip block is the union of W3C and Jaeger owned headers — a
+// client-supplied uber-trace-id must not leak across gateway-internal
+// hops to JWKS / OIDC / introspection upstreams either, even when no
+// issue_ctx is set. Defends against header-spoofing on jaeger-format
+// inbound traffic when the upstream auth call doesn't carry trace
+// context of its own.
+void TestStripUberTraceIdAlwaysAndCaseInsensitive() {
+    try {
+        UpstreamHttpClient::Request req;
+        // Lowercase and mixed-case copies of the Jaeger header — both
+        // must be removed by the case-insensitive sweep.
+        req.headers["uber-trace-id"]   = "spoofed-lowercase";
+        req.headers["Uber-Trace-Id"]   = "spoofed-mixedcase";
+        req.headers["x-keep"]          = "preserved";
+
+        UpstreamHttpClient::ApplyOutboundTraceContext(req);
+
+        bool ut_lower_gone  = req.headers.count("uber-trace-id") == 0;
+        bool ut_mixed_gone  = req.headers.count("Uber-Trace-Id") == 0;
+        bool keep_preserved = req.headers.count("x-keep") == 1;
+        bool pass = ut_lower_gone && ut_mixed_gone && keep_preserved;
+        TestFramework::RecordTest(
+            "ObsIssue: strips uber-trace-id (case-insensitive) when no issue_ctx",
+            pass, pass ? ""
+                      : ("ut_lower=" + std::to_string(ut_lower_gone)
+                       + " ut_mixed=" + std::to_string(ut_mixed_gone)
+                       + " keep=" + std::to_string(keep_preserved)),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsIssue: strips uber-trace-id (case-insensitive) when no issue_ctx",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "OBSERVABILITY ISSUE-INJECT TESTS" << std::endl;
@@ -194,6 +229,7 @@ void RunAllTests() {
     TestInjectFromIssueContext();
     TestInvalidIssueContextStripsOnly();
     TestTracestateRoundTrip();
+    TestStripUberTraceIdAlwaysAndCaseInsensitive();
 }
 
 }  // namespace ObservabilityIssueInjectTests

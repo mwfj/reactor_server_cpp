@@ -249,7 +249,10 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     // would otherwise survive an exact-key erase and be serialized
     // alongside the freshly injected lowercase header, leaking the
     // caller's context. Walk the map and remove every key that
-    // case-insensitively matches "traceparent" or "tracestate".
+    // case-insensitively matches any propagator-owned header. Today's
+    // strip set is the union of W3CPropagator and JaegerPropagator
+    // owned keys — keep it in sync with `IsKnownPropagatorName` /
+    // each propagator's `StripOwnedHeaders` impl.
     auto ieq = [](const std::string& a, std::string_view b) {
         if (a.size() != b.size()) return false;
         for (size_t i = 0; i < b.size(); ++i) {
@@ -261,7 +264,8 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     };
     for (auto it = req.headers.begin(); it != req.headers.end(); ) {
         if (ieq(it->first, "traceparent") ||
-            ieq(it->first, "tracestate")) {
+            ieq(it->first, "tracestate") ||
+            ieq(it->first, "uber-trace-id")) {
             it = req.headers.erase(it);
         } else {
             ++it;
@@ -280,13 +284,17 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     if (req.issue_ctx.has_value()
         && req.issue_ctx->local.IsValid()
         && req.issue_ctx->tracer != nullptr) {
-        // TODO: route through ObservabilityManager::propagator() so the
-        // outbound format honors operator-configured `propagators`
-        // (composite-aware). Hardcoded W3C is safe today because no
-        // production caller populates issue_ctx — but when per-attempt
-        // CLIENT spans are wired, an operator running propagators:
-        // ["jaeger"] would otherwise silently emit W3C-only outbound
-        // headers. Inbound side already routes through propagator() in
+        // TODO: route both the strip block above AND the inject below
+        // through ObservabilityManager::propagator() (
+        // StripOwnedHeaders + Inject) so the outbound format honors
+        // operator-configured `propagators` (composite-aware). The
+        // hardcoded W3C inject + hand-rolled strip list are safe today
+        // because no production caller populates issue_ctx — but when
+        // per-attempt CLIENT spans are wired, an operator running
+        // propagators: ["jaeger"] would otherwise silently emit
+        // W3C-only outbound headers, AND a future propagator add (e.g.
+        // b3) would require updating the hand-rolled strip list in
+        // lockstep. Inbound side already routes through propagator() in
         // observability_middleware.cc.
         OBSERVABILITY_NAMESPACE::W3CPropagator{}.Inject(
             req.issue_ctx->local, req.headers);

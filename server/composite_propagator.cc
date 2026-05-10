@@ -69,4 +69,10 @@ void CompositePropagator::StripOwnedHeaders(HeadersMap& headers) const {
     }
 }
 
+void CompositePropagator::StripOwnedHeaders(HeadersVec& headers) const {
+    for (const auto& child : children_) {
+        child->StripOwnedHeaders(headers);
+    }
+}
+
 }  // namespace OBSERVABILITY_NAMESPACE

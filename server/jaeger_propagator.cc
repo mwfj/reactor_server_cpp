@@ -72,7 +72,10 @@ std::optional<SpanContext> JaegerPropagator::Parse(std::string_view value) {
     SpanId span_id = SpanId::FromHex(parts[1]);
     if (!span_id.IsValid()) return std::nullopt;
 
-    if (parts[3].size() < 1 || parts[3].size() > 2) return std::nullopt;
+    // size > 2 is the only useful check here — size==0 already
+    // returned nullopt at the IsHexLowercase(parts[3]) gate above
+    // (its trailing !s.empty() rejects empties).
+    if (parts[3].size() > 2) return std::nullopt;
     char flag_buf[3] = {0};
     std::copy(parts[3].begin(), parts[3].end(), flag_buf);
     const auto flag_byte = static_cast<uint8_t>(

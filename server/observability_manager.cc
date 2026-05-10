@@ -712,6 +712,11 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
     config_.traces.batch.schedule_delay  = new_config.traces.batch.schedule_delay;
     config_.traces.batch.retries         = new_config.traces.batch.retries;
     if (new_config.traces.propagators != config_.traces.propagators) {
+        // Order-sensitive comparison is intentional. CompositePropagator
+        // Extract returns the FIRST child that produces a valid context,
+        // so reordering the same names changes precedence semantics.
+        // Reordering must rebuild the propagator.
+        //
         // Build first so a Build throw (e.g. unknown name from a future
         // programmatic caller bypassing ConfigLoader) leaves both the
         // config snapshot and the live propagator pointer untouched.

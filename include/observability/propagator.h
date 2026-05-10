@@ -202,6 +202,11 @@ public:
     bool Inject(const SpanContext& ctx,
                  HeadersVec& headers) const override;
     void StripOwnedHeaders(HeadersMap& headers) const override;
+    // Vector-form Strip mirrors the Inject(HeadersVec&) override —
+    // delegate to each child's Vec form so W3C's hot-path Vec strip is
+    // used directly. Falls back to the base default per child for
+    // children that don't override the Vec form.
+    void StripOwnedHeaders(HeadersVec& headers) const override;
     const char* Name() const noexcept override { return "composite"; }
 
 private:
