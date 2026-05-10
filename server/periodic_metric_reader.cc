@@ -106,6 +106,14 @@ void PeriodicMetricReader::SignalShutdown() {
     // Wake the worker so it can run one final export pass before
     // exiting. Defer exporter signal until JoinWorkers — see
     // BatchSpanProcessor for the rationale.
+    //
+    // Briefly acquire mtx_ to serialize with the worker's predicate
+    // check inside cv_.wait_for. Without this, notify_all() can fire
+    // between the worker reading shutting_down_=false and the worker
+    // fully entering wait — the wakeup is lost and the worker sleeps
+    // for the full export_interval (default 60s) before checking
+    // again, wedging shutdown until JoinWorkers' deadline expires.
+    { std::lock_guard<std::mutex> g(mtx_); }
     cv_.notify_all();
 }
 
@@ -142,6 +150,10 @@ void PeriodicMetricReader::Reload(MeterReaderOptions new_options) {
                         std::memory_order_release);
     timeout_ns_.store(new_options.export_timeout.count() * 1'000'000,
                        std::memory_order_release);
+    // Same lock-around-notify rationale as SignalShutdown / ForceFlush:
+    // serialize with the worker's predicate check so a lost wakeup
+    // can't delay pickup of the new interval by up to 60s.
+    { std::lock_guard<std::mutex> g(mtx_); }
     cv_.notify_all();
 }
 
@@ -152,7 +164,17 @@ void PeriodicMetricReader::ForceFlush(std::chrono::milliseconds deadline) {
         std::lock_guard<std::mutex> g(flush_mtx_);
         target = flush_completed_count_ + 1;
     }
-    flush_requested_.store(true, std::memory_order_release);
+    // Acquire mtx_ around the flag publication so notify_all() cannot
+    // be delivered while the worker is between its predicate check and
+    // the atomic release-and-suspend inside cv_.wait_for. Without this
+    // serialization the wakeup is lost: the worker reads
+    // flush_requested_=false, suspends, and stays asleep until the
+    // full export_interval (default 60s) expires — long after this
+    // ForceFlush call's deadline.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        flush_requested_.store(true, std::memory_order_release);
+    }
     cv_.notify_all();
 
     // Deadline contract mirrors JoinWorkers: zero = no-wait, negative =

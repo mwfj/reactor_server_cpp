@@ -235,6 +235,12 @@ void BatchSpanProcessor::SignalShutdown() {
     // and silently drop every queued span. The exporter is signaled
     // AFTER the worker has finished draining, in JoinWorkers().
     // Subsequent OnEnd calls already land in dropped_on_overflow_.
+    //
+    // Briefly acquire mtx_ before notify so the wakeup can't be lost
+    // when the worker is between its predicate check and entering
+    // wait_for. Without this, a lost notify delays shutdown by up to
+    // schedule_delay (default 5s) while the worker sleeps.
+    { std::lock_guard<std::mutex> g(mtx_); }
     cv_.notify_all();
 }
 
@@ -296,7 +302,10 @@ void BatchSpanProcessor::Reload(size_t new_max_export_batch_size,
                               std::memory_order_release);
     export_timeout_ns_.store(new_export_timeout.count() * 1'000'000,
                               std::memory_order_release);
-    cv_.notify_all();  // wake worker so the new schedule_delay applies promptly.
+    // wake worker so the new schedule_delay applies promptly. Lock-
+    // around-notify avoids a lost wakeup (see SignalShutdown rationale).
+    { std::lock_guard<std::mutex> g(mtx_); }
+    cv_.notify_all();
 }
 
 void BatchSpanProcessor::ReloadRetries(int new_max_attempts,
@@ -317,7 +326,16 @@ void BatchSpanProcessor::ReloadRetries(int new_max_attempts,
 }
 
 void BatchSpanProcessor::ForceFlush(std::chrono::milliseconds deadline) {
-    flush_requested_.store(true, std::memory_order_release);
+    // Lock-around-notify so the wakeup can't be lost between the
+    // worker's predicate check and its atomic release-and-suspend
+    // inside cv_.wait_for. The polling loop below tolerates a missed
+    // wakeup (worker eventually wakes via schedule_delay), but the
+    // serialization keeps flush latency in the millisecond range
+    // instead of paying up to 5s of schedule_delay before progress.
+    {
+        std::lock_guard<std::mutex> g(mtx_);
+        flush_requested_.store(true, std::memory_order_release);
+    }
     cv_.notify_all();
     // Poll until queue empties AND no Export is in flight, or deadline
     // expires. We do NOT block the calling thread on a cv-wait because
