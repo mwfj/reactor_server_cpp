@@ -46,10 +46,16 @@ public:
     virtual void SignalShutdown() {}
     virtual void JoinWorkers(std::chrono::milliseconds /*deadline*/) {}
 
-    // Drain any buffered spans into the exporter. Bounded by `deadline`.
-    // Default no-op for processors with no buffer (Noop, InMemory).
-    // BatchSpanProcessor overrides with a real flush so callers can drive
-    // shutdown drains polymorphically through the base interface.
+    // Drain any buffered spans into the exporter. Default no-op for
+    // processors with no buffer (Noop, InMemory). BatchSpanProcessor
+    // overrides with a real flush so callers can drive shutdown drains
+    // polymorphically through the base interface.
+    //
+    // Deadline contract (matches PeriodicMetricReader::ForceFlush and
+    // JoinWorkers across the observability stack):
+    //   - deadline == 0: no-wait, return immediately.
+    //   - deadline <  0: unbounded wait until the drain completes.
+    //   - deadline >  0: bounded wait, return when drained or expired.
     virtual void ForceFlush(std::chrono::milliseconds /*deadline*/) {}
 };
 

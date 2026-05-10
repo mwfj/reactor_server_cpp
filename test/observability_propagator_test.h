@@ -305,6 +305,48 @@ void TestInjectStripsTracestateOnEmptyState() {
     }
 }
 
+// Inject(HeadersMap&) honors strip-then-inject for mixed-case
+// duplicates. The map upsert below would otherwise leave a
+// client-supplied "Traceparent" entry alongside the canonical
+// lowercase one — the upstream would see two trace headers and the
+// spoofing-defense documented in the design would fail.
+void TestInjectMapStripsMixedCaseDuplicates() {
+    try {
+        SpanContext ctx;
+        ctx.SetTraceId(TraceId::FromHex("0af7651916cd43dd8448eb211c80319c"));
+        ctx.SetSpanId(SpanId::FromHex("00f067aa0ba902b7"));
+        ctx.SetFlags(TraceFlags{0x01});
+
+        std::map<std::string, std::string> headers;
+        // Pre-existing client-supplied mixed-case copies (a forging
+        // client would write these to escape the lowercase upsert).
+        headers["Traceparent"] = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00";
+        headers["TraceState"] = "vendorA=stale";
+        headers["host"] = "example.com";
+
+        bool ok = W3CPropagator{}.Inject(ctx, headers);
+        // After Inject: only canonical lowercase entries should remain
+        // for the propagator-owned keys.
+        bool pass = ok &&
+                    headers.count("Traceparent") == 0 &&
+                    headers.count("TraceState") == 0 &&
+                    headers.count("traceparent") == 1 &&
+                    // Empty tracestate => no canonical entry either.
+                    headers.count("tracestate") == 0 &&
+                    headers["traceparent"] ==
+                        "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01" &&
+                    headers["host"] == "example.com";
+        TestFramework::RecordTest(
+            "ObsProp: Inject(map) strips mixed-case Traceparent/TraceState",
+            pass, pass ? "" : "mixed-case duplicate survived inject",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsProp: Inject(map) strips mixed-case Traceparent/TraceState",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Inject with invalid context returns false + does not mutate headers.
 void TestInjectInvalidContextNoOp() {
     try {
@@ -408,6 +450,7 @@ void RunAllTests() {
     TestInjectIntoMap();
     TestInjectStripsExistingHeaderInVector();
     TestInjectStripsTracestateOnEmptyState();
+    TestInjectMapStripsMixedCaseDuplicates();
     TestInjectInvalidContextNoOp();
     TestW3CPropagatorImplementsInterface();
     TestW3CStripCaseInsensitive();

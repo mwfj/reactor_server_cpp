@@ -1113,13 +1113,14 @@ static int HandleStart(const CliOptions& options) {
         // trace_flags. The traces.enabled live flag governs whether
         // PublishLiveFlags lets spans record once a processor exists.
         //
-        // FIXME (Phase 2): NoopSpanProcessor is free, but the same
-        // allocation site will pick up BatchSpanProcessor when the OTLP
-        // push pipeline lands — at which point `traces.enabled=false
-        // exporter="otlp_http"` will spin up a worker thread + bounded
-        // queue at boot. Either gate this on a separate
-        // `traces.reload_ready` knob or accept the worker cost as the
-        // price of live-reloadable traces.enabled.
+        // Boot picks NoopSpanProcessor here; HttpServer::MarkServerReady
+        // swaps in BatchSpanProcessor when `traces.exporter` is set. That
+        // means `traces.enabled=false exporter="otlp_http"` does spin up
+        // the BSP worker thread + bounded queue at boot — accepted as
+        // the price of keeping `traces.enabled` live-reloadable
+        // (otherwise the false→true SIGHUP flip would be a permanent
+        // no-op). The emission gate at Tracer::StartSpan keeps spans
+        // non-recording while disabled, so the queue stays empty.
         std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor> processor;
         if (!config.observability.traces.exporter.empty()) {
             processor =

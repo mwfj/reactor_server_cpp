@@ -695,6 +695,95 @@ void TestPeriodicMetricReaderForceFlushBlocks() {
     }
 }
 
+// BSP::ForceFlush deadline contract — must mirror PMR/JoinWorkers:
+//   deadline == 0  : no-wait, return immediately.
+//   deadline <  0  : unbounded wait until queue empty + no in-flight.
+//   deadline >  0  : bounded wait.
+// Unbounded must NOT silently truncate to no-wait — a future caller
+// passing -1ms as a sentinel for "wait until done" would otherwise get
+// the export-in-flight torn down by shutdown drain.
+void TestBatchSpanProcessorForceFlushDeadlineContract() {
+    try {
+        // Slow exporter — sleeps 200ms inside Export so the queue
+        // doesn't drain instantly. We can then assert BSP::ForceFlush
+        // honors the deadline shape.
+        class SlowSpanExporter : public SpanExporter {
+        public:
+            ExportResult Export(std::vector<SpanData>,
+                                 std::chrono::steady_clock::time_point) override {
+                std::this_thread::sleep_for(std::chrono::milliseconds{200});
+                exports_.fetch_add(1, std::memory_order_acq_rel);
+                return ExportResult::kSuccess;
+            }
+            void SignalShutdown() override {}
+            void CancelAllActiveExports() override {}
+            int exports() const { return exports_.load(); }
+        private:
+            std::atomic<int> exports_{0};
+        };
+
+        auto exporter = std::make_shared<SlowSpanExporter>();
+        BatchSpanProcessorOptions opts;
+        opts.max_export_batch_size = 16;
+        opts.schedule_delay = std::chrono::milliseconds{60'000};
+        BatchSpanProcessor bsp(exporter, opts);
+
+        auto resource = std::make_shared<Resource>();
+        auto random   = std::make_shared<RandomSource>(0x9ULL);
+        TracerProvider provider(
+            resource,
+            std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
+                &bsp, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
+            std::make_shared<AlwaysOnSampler>(), random);
+        Tracer* t = provider.GetTracer("ff_contract");
+
+        // Case 1: deadline=0 returns immediately even with a queued span.
+        t->StartSpan("op", {})->End();
+        const auto t0 = std::chrono::steady_clock::now();
+        bsp.ForceFlush(std::chrono::milliseconds{0});
+        const auto e0 = std::chrono::steady_clock::now() - t0;
+        const bool zero_returns_fast =
+            e0 < std::chrono::milliseconds{50};
+
+        // Drain anything still pending under a generous deadline so
+        // case 3 starts from a clean state.
+        bsp.ForceFlush(std::chrono::milliseconds{2000});
+
+        // Case 2: deadline=-1 waits unbounded — must observe the slow
+        // export complete (queue empty + no in-flight).
+        t->StartSpan("op2", {})->End();
+        const auto t1 = std::chrono::steady_clock::now();
+        bsp.ForceFlush(std::chrono::milliseconds{-1});
+        const auto e1 = std::chrono::steady_clock::now() - t1;
+        const auto e1_ms = std::chrono::duration_cast<
+            std::chrono::milliseconds>(e1);
+        // Slow exporter is 200ms; allow generous lower bound (150ms,
+        // sanitizer slack) and upper bound (3000ms, scheduler skew).
+        const bool unbounded_waits =
+            e1_ms >= std::chrono::milliseconds{150} &&
+            e1_ms <= std::chrono::milliseconds{3000};
+
+        const bool pass = zero_returns_fast && unbounded_waits;
+        TestFramework::RecordTest(
+            "ObsExport: BSP::ForceFlush deadline contract (0=no-wait, -1=unbounded)",
+            pass, pass ? ""
+                      : ("zero_fast=" + std::to_string(zero_returns_fast)
+                       + " unbounded=" + std::to_string(unbounded_waits)
+                       + " e0_ms=" + std::to_string(
+                             std::chrono::duration_cast<
+                                 std::chrono::milliseconds>(e0).count())
+                       + " e1_ms=" + std::to_string(e1_ms.count())),
+            TestFramework::TestCategory::OTHER);
+
+        bsp.SignalShutdown();
+        bsp.JoinWorkers(std::chrono::milliseconds{500});
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: BSP::ForceFlush deadline contract (0=no-wait, -1=unbounded)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Sub-second OTLP timeouts must NOT truncate to zero. timeout_sec=0
 // disables UpstreamHttpClient::SetDeadline; fut.get() then blocks
 // indefinitely on a stalled upstream and wedges the BSP/PMR worker.
@@ -767,6 +856,7 @@ void RunAllTests() {
     TestInMemoryProcessorForceFlushIsNoop();
     TestBatchSpanProcessorOverridesForceFlush();
     TestPeriodicMetricReaderForceFlushBlocks();
+    TestBatchSpanProcessorForceFlushDeadlineContract();
     TestOtlpTimeoutCeilSeconds();
 }
 

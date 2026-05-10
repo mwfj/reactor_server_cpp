@@ -358,6 +358,41 @@ void TestInjectStripReplace() {
     }
 }
 
+// Inject(HeadersMap&) honors strip-then-inject for mixed-case
+// duplicates. Without the explicit StripOwnedHeaders call inside
+// Inject, a client-supplied "Uber-Trace-Id" would survive the
+// canonical lowercase upsert, and the upstream would see two trace
+// headers. Mirrors the W3C Map-form strip test.
+void TestInjectMapStripsMixedCaseDuplicate() {
+    try {
+        JaegerPropagator p;
+        Propagator::HeadersMap out;
+        out["Uber-Trace-Id"] =
+            "deadbeefdeadbeefdeadbeefdeadbeef:0000000000000001:0:01";
+        out["host"] = "example.com";
+
+        SpanContext ctx(TraceId::FromHex(std::string(32, 'a')),
+                         SpanId::FromHex("1234567890abcdef"),
+                         TraceFlags{TraceFlags::kSampled},
+                         TraceState{}, /*is_remote=*/false);
+        p.Inject(ctx, out);
+
+        bool pass = out.count("Uber-Trace-Id") == 0 &&
+                    out.count(JaegerPropagator::kHeader) == 1 &&
+                    out[JaegerPropagator::kHeader].find(
+                        std::string(32, 'a')) == 0 &&
+                    out["host"] == "example.com";
+        TestFramework::RecordTest(
+            "ObsJaeger: Inject(map) strips mixed-case Uber-Trace-Id",
+            pass, pass ? "" : "mixed-case duplicate survived inject",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsJaeger: Inject(map) strips mixed-case Uber-Trace-Id",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- CompositePropagator (Task 8.4) ----
 
 void TestCompositeExtractPrecedence() {
@@ -473,6 +508,98 @@ void TestCompositeBuildEmptyRejected() {
     }
 }
 
+// Build is a public API and ConfigLoader is not its only caller. A
+// programmatic / test caller passing ["w3c", "w3c"] would otherwise
+// silently produce two W3C children — duplicate header writes and
+// ambiguous Extract precedence. Build must reject duplicates itself.
+void TestCompositeBuildRejectsDuplicates() {
+    try {
+        bool threw_dup_w3c = false;
+        try { CompositePropagator::Build({"w3c", "w3c"}); }
+        catch (const std::invalid_argument&) { threw_dup_w3c = true; }
+
+        bool threw_dup_jaeger = false;
+        try { CompositePropagator::Build({"jaeger", "w3c", "jaeger"}); }
+        catch (const std::invalid_argument&) { threw_dup_jaeger = true; }
+
+        bool pass = threw_dup_w3c && threw_dup_jaeger;
+        TestFramework::RecordTest(
+            "ObsJaeger: composite Build rejects duplicate names",
+            pass, pass ? ""
+                      : "dup_w3c=" + std::to_string(threw_dup_w3c)
+                       + " dup_jaeger=" + std::to_string(threw_dup_jaeger),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsJaeger: composite Build rejects duplicate names",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Composite Inject(HeadersVec&) must honor the strip-then-inject
+// contract on the vector form. The previous base-default fallback
+// only stripped vec keys present in the temp map after each child
+// wrote — but a child that intentionally OMITS a header (e.g. W3C
+// with empty tracestate) leaves any pre-existing entry of that name
+// behind. Pairing fresh traceparent with stale vendor tracestate
+// corrupts the trace context for downstream services.
+void TestCompositeVecInjectStripsStaleTracestate() {
+    try {
+        auto comp = CompositePropagator::Build({"w3c", "jaeger"});
+
+        SpanContext ctx;
+        ctx.SetTraceId(TraceId::FromHex("0af7651916cd43dd8448eb211c80319c"));
+        ctx.SetSpanId(SpanId::FromHex("00f067aa0ba902b7"));
+        ctx.SetFlags(TraceFlags{0x01});
+        // ctx.state() is default — Empty() == true, so W3C must STRIP
+        // tracestate without writing a fresh one.
+
+        std::vector<std::pair<std::string, std::string>> headers;
+        headers.emplace_back("traceparent",
+            "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-00");
+        headers.emplace_back("tracestate", "vendorA=stale,vendorB=alsostale");
+        headers.emplace_back("uber-trace-id",
+            "ffffffffffffffffffffffffffffffff:0000000000000001:0:00");
+        headers.emplace_back("host", "example.com");
+
+        bool ok = comp->Inject(ctx, headers);
+
+        size_t ts_count = 0;
+        size_t tp_count = 0;
+        size_t ut_count = 0;
+        bool has_host = false;
+        for (const auto& [k, v] : headers) {
+            (void)v;
+            std::string lk;
+            for (char c : k) lk.push_back(
+                static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            if (lk == "tracestate")          ++ts_count;
+            else if (lk == "traceparent")     ++tp_count;
+            else if (lk == "uber-trace-id")   ++ut_count;
+            else if (lk == "host")            has_host = true;
+        }
+        // Stale tracestate must be gone. Fresh traceparent and fresh
+        // uber-trace-id each appear exactly once.
+        bool pass = ok &&
+                    ts_count == 0 &&
+                    tp_count == 1 &&
+                    ut_count == 1 &&
+                    has_host;
+        TestFramework::RecordTest(
+            "ObsJaeger: composite Inject(vec) strips stale tracestate when ctx.state empty",
+            pass, pass ? ""
+                      : "ts=" + std::to_string(ts_count)
+                       + " tp=" + std::to_string(tp_count)
+                       + " ut=" + std::to_string(ut_count)
+                       + " host=" + std::to_string(has_host),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsJaeger: composite Inject(vec) strips stale tracestate when ctx.state empty",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "OBSERVABILITY JAEGER PROPAGATOR TESTS" << std::endl;
@@ -492,11 +619,14 @@ void RunAllTests() {
     TestInjectUnsampledFlagsZero();
     TestInjectInvalidContextNoOp();
     TestInjectStripReplace();
+    TestInjectMapStripsMixedCaseDuplicate();
     TestCompositeExtractPrecedence();
     TestCompositeExtractFallthrough();
     TestCompositeInjectAll();
     TestCompositeStripsAllOwnedHeaders();
     TestCompositeBuildEmptyRejected();
+    TestCompositeBuildRejectsDuplicates();
+    TestCompositeVecInjectStripsStaleTracestate();
 }
 
 }  // namespace ObservabilityJaegerPropagatorTests

@@ -113,6 +113,10 @@ bool JaegerPropagator::Inject(const SpanContext& ctx,
         tid_hex.c_str(), sid_hex.c_str(),
         static_cast<unsigned>(sampled_bit));
     if (n < 0 || static_cast<size_t>(n) >= sizeof(buf)) return false;
+    // Strip-then-inject contract: the case-sensitive upsert below would
+    // leave a mixed-case duplicate ("Uber-Trace-Id") behind. Sweep all
+    // case variants before emitting the canonical lowercase entry.
+    StripOwnedHeaders(headers);
     headers[kHeader] = std::string(buf, static_cast<size_t>(n));
     return true;
 }

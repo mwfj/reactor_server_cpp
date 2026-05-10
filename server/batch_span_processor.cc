@@ -337,21 +337,29 @@ void BatchSpanProcessor::ForceFlush(std::chrono::milliseconds deadline) {
         flush_requested_.store(true, std::memory_order_release);
     }
     cv_.notify_all();
-    // Poll until queue empties AND no Export is in flight, or deadline
-    // expires. We do NOT block the calling thread on a cv-wait because
-    // the worker thread holds the mtx during Export() — a cv-wait here
-    // would just spin on the cv.
+    // Deadline contract mirrors PeriodicMetricReader::ForceFlush /
+    // JoinWorkers: 0 = no-wait, < 0 = unbounded, > 0 = bounded. Polling
+    // (rather than a cv-wait) because the worker thread holds mtx_
+    // during Export() — a cv-wait here would just spin on the cv.
     //
-    // Both conditions matter: queue=0 alone is insufficient because the
-    // worker may have just dequeued the last batch and be inside the
-    // exporter's HTTP POST. Returning then would let the shutdown
-    // proceed to pool teardown, killing the in-flight POST.
+    // Both queue=0 AND in_flight=0 must hold: the worker may have just
+    // dequeued the last batch and be inside the exporter's HTTP POST.
+    // Returning then would let the shutdown proceed to pool teardown,
+    // killing the in-flight POST.
+    auto poll_done = [&] {
+        return queue_depth() == 0 &&
+               exports_in_flight_.load(std::memory_order_acquire) == 0;
+    };
+    if (deadline.count() == 0) return;
+    if (deadline.count() < 0) {
+        while (!poll_done()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        return;
+    }
     const auto t_end = std::chrono::steady_clock::now() + deadline;
     while (std::chrono::steady_clock::now() < t_end) {
-        const bool queue_empty = (queue_depth() == 0);
-        const bool no_export = exports_in_flight_.load(
-            std::memory_order_acquire) == 0;
-        if (queue_empty && no_export) return;
+        if (poll_done()) return;
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
     }
 }

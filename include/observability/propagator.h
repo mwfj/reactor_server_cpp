@@ -11,9 +11,6 @@
 //
 //   W3CPropagator    — W3C Trace Context Level 1 §3 implementation.
 //                       Stateless; instance methods are the contract.
-//                       Existing static call sites are preserved via
-//                       *Static deprecated forwarders during the
-//                       migration window.
 //
 // Split-context model: `Extract` returns the REMOTE PARENT (immutable
 // snapshot of the inbound header), and `Inject` writes a LOCAL
@@ -144,35 +141,6 @@ public:
     // callers MUST NOT inject an invalid context.
     std::optional<std::string> SerializeTraceparent(
         const SpanContext& ctx) const;
-
-    // ---- Deprecated static forwarders (Phase 1 → Phase 2 migration) ----
-    [[deprecated("use Propagator instance API via ObservabilityManager::propagator()")]]
-    static std::optional<SpanContext> ExtractStatic(const HeadersMap& h) {
-        return W3CPropagator{}.Extract(h);
-    }
-    [[deprecated("use Propagator instance API")]]
-    static bool InjectStatic(const SpanContext& ctx, HeadersMap& h) {
-        return W3CPropagator{}.Inject(ctx, h);
-    }
-    [[deprecated("use Propagator instance API")]]
-    static bool InjectStatic(const SpanContext& ctx, HeadersVec& h) {
-        return W3CPropagator{}.Inject(ctx, h);
-    }
-    [[deprecated("use Propagator instance API")]]
-    static std::optional<SpanContext> ParseTraceparentStatic(
-        std::string_view v) noexcept {
-        return W3CPropagator{}.ParseTraceparent(v);
-    }
-    [[deprecated("use Propagator instance API")]]
-    static std::optional<TraceState> ParseTracestateStatic(
-        std::string_view v) {
-        return W3CPropagator{}.ParseTracestate(v);
-    }
-    [[deprecated("use Propagator instance API")]]
-    static std::optional<std::string> SerializeTraceparentStatic(
-        const SpanContext& ctx) {
-        return W3CPropagator{}.SerializeTraceparent(ctx);
-    }
 };
 
 // Jaeger native propagator — `uber-trace-id` header.
@@ -223,6 +191,15 @@ public:
         const HeadersMap& headers) const override;
     bool Inject(const SpanContext& ctx,
                  HeadersMap& headers) const override;
+    // Vector-form Inject must override the base default. The base
+    // default writes via a temporary HeadersMap and then erases keys
+    // present in that temp from the vector — which leaves stale
+    // pre-existing entries behind whenever a child intentionally omits
+    // a header (e.g. W3C with empty tracestate). Delegate to each
+    // child's Inject(HeadersVec&) so per-child strip-then-inject runs
+    // directly against the real vector.
+    bool Inject(const SpanContext& ctx,
+                 HeadersVec& headers) const override;
     void StripOwnedHeaders(HeadersMap& headers) const override;
     const char* Name() const noexcept override { return "composite"; }
 

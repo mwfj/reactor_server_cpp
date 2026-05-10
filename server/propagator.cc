@@ -176,11 +176,15 @@ bool W3CPropagator::Inject(const SpanContext& ctx,
                               HeadersMap& headers) const {
     auto tp = SerializeTraceparent(ctx);
     if (!tp) return false;
+    // Strip-then-inject is the documented contract. The case-sensitive
+    // upserts below would leave any non-canonical-case duplicate
+    // ("Traceparent", "TraceParent") behind — defeating the spoofing
+    // defense the design relies on. StripOwnedHeaders sweeps both
+    // canonical lowercase and any mixed-case copy in one pass.
+    StripOwnedHeaders(headers);
     headers["traceparent"] = std::move(*tp);
     if (!ctx.state().Empty()) {
         headers["tracestate"] = ctx.state().Serialize();
-    } else {
-        headers.erase("tracestate");
     }
     return true;
 }
