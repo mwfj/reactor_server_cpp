@@ -63,11 +63,9 @@ OtlpHttpExporter::TransportFn MakeOtlpTransport(
         // ~5s for traces / ~10s for metrics); (2) the BSP/PMR worker
         // threads are NOT dispatcher threads, so they don't block the
         // dispatcher they enqueue to; (3) HttpServer::Stop() runs from
-        // the main thread (not dispatcher 0). Phase 3's
-        // ScheduleStopAfterCurrentResponse() runs on conn_dispatcher_,
-        // which is also distinct from the socket dispatchers. If a
-        // future caller ever invokes the FlushObservability path on
-        // socket dispatcher 0 while this transport is mid-Issue, the
+        // the main thread (not socket dispatcher 0). If a future
+        // caller ever invokes the FlushObservability path FROM socket
+        // dispatcher 0 while this transport is mid-Issue, the
         // dispatcher would block its own queued export task and
         // deadlock — review that constraint before adding such a path.
         client->Issue(

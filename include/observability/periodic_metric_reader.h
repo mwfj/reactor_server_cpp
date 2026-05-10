@@ -71,8 +71,8 @@ public:
         return enabled_.load(std::memory_order_acquire);
     }
 
-    // Phase 2 — exposed so ObservabilityManager::BeginShutdown can detect
-    // a MetricExporter shared with the BatchSpanProcessor and coordinate
+    // Exposed so ObservabilityManager::BeginShutdown can detect a
+    // MetricExporter shared with the BatchSpanProcessor and coordinate
     // the single SignalShutdown call after both workers have joined.
     std::shared_ptr<MetricExporter> exporter() const noexcept {
         return exporter_;

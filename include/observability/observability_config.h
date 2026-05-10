@@ -91,8 +91,8 @@ struct TracesConfig {
     BatchSpanConfig batch;             // live-reloadable except max_queue_size
     // Ordered list of trace-context propagator names; first match wins
     // on Extract, every entry is invoked on Inject. Live-reloadable.
-    // Recognised names: "w3c", "jaeger". Default {"w3c"} preserves the
-    // Phase 1 single-format behaviour.
+    // Recognised names: "w3c", "jaeger". Default {"w3c"} keeps the
+    // single-format W3C-only behaviour for callers that don't override.
     std::vector<std::string> propagators = {"w3c"};
     // Restart-required equality. ADDING A FIELD:
     //   - restart-only ⇒ include here AND classify in the field-by-

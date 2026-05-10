@@ -88,8 +88,8 @@ public:
         exporter_shutdown_disabled_.store(true, std::memory_order_release);
     }
 
-    // Phase 2 — exposed so ObservabilityManager::BeginShutdown can detect
-    // a SpanExporter shared with the metric reader and coordinate the
+    // Exposed so ObservabilityManager::BeginShutdown can detect a
+    // SpanExporter shared with the metric reader and coordinate the
     // single SignalShutdown call after both workers have joined.
     std::shared_ptr<SpanExporter> exporter() const noexcept {
         return exporter_;
@@ -103,6 +103,12 @@ public:
     size_t  queue_depth() const noexcept;
     int64_t dropped_on_overflow() const noexcept {
         return dropped_on_overflow_.load(std::memory_order_acquire);
+    }
+    // Spans dropped because the exporter returned a non-retryable
+    // failure (or a retryable failure exhausted retries_max_attempts).
+    // Counted at SpanData granularity, mirroring dropped_on_overflow.
+    int64_t dropped_on_export_failure() const noexcept {
+        return dropped_on_export_failure_.load(std::memory_order_acquire);
     }
     int64_t exported_batches() const noexcept {
         return exported_batches_.load(std::memory_order_acquire);
@@ -132,6 +138,7 @@ private:
     std::atomic<bool>              shutting_down_{false};
     std::atomic<bool>              flush_requested_{false};
     std::atomic<int64_t>           dropped_on_overflow_{0};
+    std::atomic<int64_t>           dropped_on_export_failure_{0};
     std::atomic<int64_t>           exported_batches_{0};
     // Set to N>0 while the worker is mid-export-cycle (a single batch's
     // entire retry sequence increments once and decrements once on

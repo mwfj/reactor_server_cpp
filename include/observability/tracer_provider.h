@@ -68,11 +68,11 @@ public:
     void Reload(std::shared_ptr<const Sampler> new_sampler,
                 ProcessorOptions               new_processor_options);
 
-    // Phase 2 — fan a single new SpanProcessor out across every cached
-    // Tracer. Used during ObservabilityManager::SwapToBatchSpanProcessor
-    // (the boot-time NoopSpanProcessor → BatchSpanProcessor handoff).
-    // Stores the new processor as the provider's default so future
-    // GetTracer() calls also pick it up. Pass-through no-op if null.
+    // Fan a single new SpanProcessor out across every cached Tracer.
+    // Used during ObservabilityManager::SwapToBatchSpanProcessor (the
+    // boot-time NoopSpanProcessor → BatchSpanProcessor handoff). Stores
+    // the new processor as the provider's default so future GetTracer()
+    // calls also pick it up. Pass-through no-op if null.
     void SwapProcessorAcrossTracers(std::shared_ptr<SpanProcessor> new_processor);
 
     const Resource& resource() const { return *resource_; }

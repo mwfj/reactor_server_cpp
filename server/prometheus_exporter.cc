@@ -366,8 +366,8 @@ std::string ComputeEmitName(const InstrumentSnapshot& inst) {
     return base;
 }
 
-// Process-lifetime warned set, capped to bound memory growth from
-// dynamic instrument registration (Phase 2+).
+// Process-lifetime warned set, capped to bound memory growth when
+// instruments are registered dynamically rather than at boot.
 std::mutex& CollisionWarnedMtx() {
     static std::mutex m;
     return m;

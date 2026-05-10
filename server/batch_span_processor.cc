@@ -110,14 +110,17 @@ void BatchSpanProcessor::WorkerLoop() {
         while (true) {
             auto batch = DrainBatch(batch_cap);
             if (batch.empty()) break;
+            // Capture size up-front: the last attempt moves the batch
+            // into Export, leaving the local empty by the time we
+            // log a non-retryable failure.
+            const size_t batch_size = batch.size();
             // Retry loop: on kFailedRetryable back off and try again
-            // up to retries_max_attempts. kSuccess stops; any other
-            // result (kFailedNotRetryable / kInvalidArgument) drops
-            // the batch — those are non-retryable per the exporter
-            // contract. Backoff doubles each attempt, capped at
-            // retries_max_backoff. The first exception path counts
-            // as a failure but isn't retried (preserves the original
-            // best-effort drop on programmer errors / bad payloads).
+            // up to retries_max_attempts. kSuccess stops; kFailedNotRetryable
+            // drops the batch (4xx, transport short-circuit, post-shutdown).
+            // Backoff doubles each attempt, capped at retries_max_backoff.
+            // The first exception path counts as a failure but isn't
+            // retried (preserves the original best-effort drop on
+            // programmer errors / bad payloads).
             //
             // Read the live atomics (set by ReloadRetries) once per
             // batch so a SIGHUP affects subsequent attempts without
@@ -163,11 +166,19 @@ void BatchSpanProcessor::WorkerLoop() {
                                                   deadline);
                 } catch (const std::exception& e) {
                     logging::Get()->error(
-                        "BatchSpanProcessor::Export threw: {}", e.what());
+                        "BatchSpanProcessor::Export threw: {} (dropping {} spans)",
+                        e.what(), batch_size);
+                    dropped_on_export_failure_.fetch_add(
+                        static_cast<int64_t>(batch_size),
+                        std::memory_order_relaxed);
                     break;
                 } catch (...) {
                     logging::Get()->error(
-                        "BatchSpanProcessor::Export threw unknown exception");
+                        "BatchSpanProcessor::Export threw unknown exception "
+                        "(dropping {} spans)", batch_size);
+                    dropped_on_export_failure_.fetch_add(
+                        static_cast<int64_t>(batch_size),
+                        std::memory_order_relaxed);
                     break;
                 }
                 if (result == ExportResult::kSuccess) {
@@ -175,12 +186,27 @@ void BatchSpanProcessor::WorkerLoop() {
                     break;
                 }
                 if (result != ExportResult::kFailedRetryable) {
-                    break;  // non-retryable — drop and move on.
+                    // Non-retryable: 4xx, transport short-circuit on
+                    // peer disconnect, post-shutdown drop. Without a log
+                    // here operators have no diagnostic signal for a
+                    // permanently discarded batch.
+                    logging::Get()->warn(
+                        "BatchSpanProcessor: non-retryable export failure; "
+                        "dropping batch ({} spans, attempt={})",
+                        batch_size, attempt + 1);
+                    dropped_on_export_failure_.fetch_add(
+                        static_cast<int64_t>(batch_size),
+                        std::memory_order_relaxed);
+                    break;
                 }
                 if (attempt + 1 >= max_attempts) {
                     logging::Get()->warn(
                         "BatchSpanProcessor: retryable export failed after "
-                        "{} attempts; dropping batch", max_attempts);
+                        "{} attempts; dropping batch ({} spans)",
+                        max_attempts, batch_size);
+                    dropped_on_export_failure_.fetch_add(
+                        static_cast<int64_t>(batch_size),
+                        std::memory_order_relaxed);
                     break;
                 }
                 // Exponential backoff with cap. cv_-aware sleep so a

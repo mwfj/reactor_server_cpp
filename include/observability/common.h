@@ -54,7 +54,7 @@ class InstrumentationScope;
 struct SpanData;
 struct MetricsSnapshot;
 
-// Phase 2 OTLP push pipeline.
+// OTLP push pipeline.
 class OtlpHttpExporter;
 class BatchSpanProcessor;
 class PeriodicMetricReader;

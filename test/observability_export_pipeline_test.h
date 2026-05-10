@@ -285,6 +285,74 @@ void TestBatchSpanProcessorClampsZeroBatchSize() {
     }
 }
 
+// Non-retryable export failures must be observable. The worker
+// previously broke out of the retry loop silently on
+// kFailedNotRetryable — operators had no signal that a batch was
+// permanently discarded. The fix is a warn log + a dedicated counter
+// (dropped_on_export_failure) parallel to dropped_on_overflow.
+void TestBatchSpanProcessorNonRetryableFailureCountedAndLogged() {
+    try {
+        // Exporter returns kFailedNotRetryable on every call.
+        class NotRetryableExporter : public SpanExporter {
+        public:
+            ExportResult Export(std::vector<SpanData>,
+                                 std::chrono::steady_clock::time_point) override {
+                ++calls_;
+                return ExportResult::kFailedNotRetryable;
+            }
+            void SignalShutdown() override {}
+            void CancelAllActiveExports() override {}
+            int calls() const { return calls_; }
+        private:
+            std::atomic<int> calls_{0};
+        };
+        auto exporter = std::make_shared<NotRetryableExporter>();
+        BatchSpanProcessorOptions opts;
+        opts.max_export_batch_size = 4;
+        opts.schedule_delay = std::chrono::milliseconds{60'000};
+        BatchSpanProcessor bsp(exporter, opts);
+
+        auto resource = std::make_shared<Resource>();
+        auto random   = std::make_shared<RandomSource>(0xBADBEEFULL);
+        TracerProvider provider(
+            resource,
+            std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
+                &bsp, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
+            std::make_shared<AlwaysOnSampler>(), random);
+        Tracer* t = provider.GetTracer("notretryable_test");
+
+        // Submit a batch of 4 spans. Worker drains, exporter returns
+        // kFailedNotRetryable, batch is dropped. Counter must reflect
+        // the dropped span count; exported_batches stays 0.
+        for (int i = 0; i < 4; ++i) { t->StartSpan("op", {})->End(); }
+        bsp.ForceFlush(std::chrono::milliseconds{1000});
+
+        // Wait for the worker to advance past the export attempt.
+        for (int i = 0; i < 50 && exporter->calls() < 1; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+        // Counter should be == batch size; non-retryable means no retry.
+        const int64_t dropped = bsp.dropped_on_export_failure();
+        const int64_t exported = bsp.exported_batches();
+        bool pass = exporter->calls() == 1 &&
+                    dropped == 4 &&
+                    exported == 0;
+        TestFramework::RecordTest(
+            "ObsExport: BSP counts spans dropped on non-retryable failure",
+            pass, pass ? ""
+                      : "calls=" + std::to_string(exporter->calls())
+                       + " dropped=" + std::to_string(dropped)
+                       + " exported=" + std::to_string(exported),
+            TestFramework::TestCategory::OTHER);
+        bsp.SignalShutdown();
+        bsp.JoinWorkers(std::chrono::milliseconds{500});
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsExport: BSP counts spans dropped on non-retryable failure",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestBatchSpanProcessorShutdownPropagates() {
     try {
         auto exporter = std::make_shared<CaptureSpanExporter>();
@@ -845,6 +913,7 @@ void RunAllTests() {
     TestBatchSpanProcessorBatchesAndExports();
     TestBatchSpanProcessorDropsOnOverflow();
     TestBatchSpanProcessorClampsZeroBatchSize();
+    TestBatchSpanProcessorNonRetryableFailureCountedAndLogged();
     TestBatchSpanProcessorShutdownPropagates();
     TestBatchSpanProcessorJoinWorkersZeroIsNoWait();
     TestPeriodicMetricReaderExportsCycles();
