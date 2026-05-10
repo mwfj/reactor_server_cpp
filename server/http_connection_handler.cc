@@ -2122,6 +2122,7 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
             ws_conn_->SetMaxMessageSize(max_ws_message_size_);
             conn_->SetMaxInputSize(max_ws_message_size_);
         }
+        ws_conn_->SetObservabilitySnapshot(req.obs_snapshot);
         // Install user-registered WebSocket handlers (OnMessage / OnClose
         // / etc.) BEFORE CompleteAsyncResponse fires the deferred-buf
         // flush. CompleteAsyncResponse routes deferred_pending_buf_
@@ -2204,6 +2205,7 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
         ws_conn_->SetMaxMessageSize(max_ws_message_size_);
         conn_->SetMaxInputSize(max_ws_message_size_);
     }
+    ws_conn_->SetObservabilitySnapshot(req.obs_snapshot);
 
     if (callbacks_.upgrade_callback) {
         callbacks_.upgrade_callback(shared_from_this(), req);

@@ -1,6 +1,10 @@
 #include "ws/websocket_connection.h"
 #include "ws/utf8_validate.h"
 #include "log/logger.h"
+#include "observability/observability_manager.h"
+#include "observability/observability_snapshot.h"
+#include "observability/span.h"
+#include "observability/tracer.h"
 
 WebSocketConnection::WebSocketConnection(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
@@ -21,12 +25,14 @@ void WebSocketConnection::SendText(const std::string& message) {
         if (callbacks_.error_callback) callbacks_.error_callback(*this, "Outbound text message is not valid UTF-8");
         return;
     }
+    MaybeEmitMessageSpan("ws.send", WebSocketOpcode::Text, message.size());
     SendFrame(WebSocketFrame::TextFrame(message));
 }
 
 void WebSocketConnection::SendBinary(const std::string& data) {
     std::lock_guard<std::recursive_mutex> lck(send_mtx_);
     if (close_sent_ || !is_open_) return;  // No data frames after close
+    MaybeEmitMessageSpan("ws.send", WebSocketOpcode::Binary, data.size());
     SendFrame(WebSocketFrame::BinaryFrame(data));
 }
 
@@ -151,6 +157,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                     SendClose(1007, "Invalid UTF-8");
                     return;
                 }
+                MaybeEmitMessageSpan("ws.recv", frame.opcode, frame.payload.size());
                 if (callbacks_.message_callback) {
                     callbacks_.message_callback(*this, frame.payload,
                                      frame.opcode == WebSocketOpcode::Binary);
@@ -198,6 +205,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                     fragment_buffer_.clear();
                     return;
                 }
+                MaybeEmitMessageSpan("ws.recv", fragment_opcode_, fragment_buffer_.size());
                 if (callbacks_.message_callback) {
                     callbacks_.message_callback(*this, fragment_buffer_,
                                      fragment_opcode_ == WebSocketOpcode::Binary);
@@ -325,4 +333,36 @@ void WebSocketConnection::SendFrame(const WebSocketFrame& frame) {
     if (!conn_) return;
     std::string wire = frame.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
+}
+
+namespace {
+const char* OpcodeToString(WebSocketOpcode op) {
+    switch (op) {
+        case WebSocketOpcode::Text:   return "text";
+        case WebSocketOpcode::Binary: return "binary";
+        case WebSocketOpcode::Continuation: return "continuation";
+        default: return "other";
+    }
+}
+}  // namespace
+
+void WebSocketConnection::MaybeEmitMessageSpan(
+    const char* name, WebSocketOpcode opcode, size_t payload_size) {
+    if (!obs_snapshot_) return;
+    auto mgr = obs_snapshot_->manager.lock();
+    if (!mgr || !mgr->WebSocketMessagesEnabled()) return;
+    auto& parent = obs_snapshot_->inbound_span;
+    if (!parent) return;
+    OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
+    opts.kind       = OBSERVABILITY_NAMESPACE::SpanKind::INTERNAL;
+    opts.parent     = parent->Context();
+    opts.has_parent = true;
+    auto span = mgr->GetTracer("reactor.gateway.ws", "1")
+                    ->StartSpan(name, opts);
+    if (!span) return;
+    span->SetAttribute("ws.opcode",
+        OBSERVABILITY_NAMESPACE::AttrValue(std::string(OpcodeToString(opcode))));
+    span->SetAttribute("ws.payload_size",
+        OBSERVABILITY_NAMESPACE::AttrValue(static_cast<int64_t>(payload_size)));
+    span->End();
 }

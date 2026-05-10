@@ -94,6 +94,8 @@ void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
         std::memory_order_release);
     auth_idp_span_enabled_.store(c.traces.auth_idp_span,
                                   std::memory_order_release);
+    websocket_messages_enabled_.store(c.traces.websocket_messages,
+                                       std::memory_order_release);
     // Operator visibility — traces.enabled is documented as live-
     // reloadable, but with no SpanProcessor attached (e.g. boot-time
     // exporter empty) the flip is silently no-op. Warn the
@@ -161,6 +163,11 @@ void ObservabilityManager::Init() {
         "s",
         std::move(duration_buckets),
         std::move(duration_catalog));
+
+    // Register every §7 catalogued instrument once meter_provider_ is
+    // ready. Subsequent get-or-create calls from emit sites are O(1)
+    // map lookups.
+    MetricsCatalog::Build(*this, catalog_);
 }
 
 std::shared_ptr<const Sampler>
@@ -440,6 +447,37 @@ void ObservabilityManager::OnFinalizeWinner(
         http_server_request_duration_->Record(duration_s, labels);
     }
 
+    // §7.1 server body-size histograms. Same gate as the duration
+    // histogram above — the instruments are null only when Init()
+    // never ran. Labels follow the catalog's allowed_keys.
+    if (catalog_.http_server_response_body_size != nullptr) {
+        std::vector<std::pair<std::string, std::string>> body_labels;
+        body_labels.reserve(3);
+        if (!snap.method.empty()) {
+            body_labels.emplace_back("http.request.method", snap.method);
+        }
+        if (!snap.route_pattern.empty()) {
+            body_labels.emplace_back("http.route", snap.route_pattern);
+        }
+        if (status_code > 0) {
+            body_labels.emplace_back("http.response.status_code",
+                                       std::to_string(status_code));
+        }
+        catalog_.http_server_response_body_size->Record(
+            static_cast<double>(wire_body_size), body_labels);
+    }
+    if (catalog_.http_server_active_requests != nullptr) {
+        std::vector<std::pair<std::string, std::string>> ar_labels;
+        ar_labels.reserve(2);
+        if (!snap.method.empty()) {
+            ar_labels.emplace_back("http.request.method", snap.method);
+        }
+        if (!snap.route_pattern.empty()) {
+            ar_labels.emplace_back("http.route", snap.route_pattern);
+        }
+        catalog_.http_server_active_requests->Add(-1.0, ar_labels);
+    }
+
     // Attach response-side attributes before ending:
     //   http.response.status_code, http.server.response.body.size,
     //   error.type. 5xx maps to SpanStatusCode::ERROR; 4xx stays UNSET
@@ -673,6 +711,10 @@ void ObservabilityManager::KillOutstandingSnapshots(
 
         DeregisterAndDecrement(snap);
         snapshots_killed_on_timeout_.fetch_add(1, std::memory_order_relaxed);
+        // §7.4 self-metric — surface kill-loop activity at /metrics.
+        if (catalog_.reactor_otel_snapshots_killed_on_timeout != nullptr) {
+            catalog_.reactor_otel_snapshots_killed_on_timeout->Add(1.0, {});
+        }
     }
 }
 
@@ -704,8 +746,16 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
     //   traces.exporter, traces.otlp.upstream, traces.batch.max_queue_size,
     //   metrics.exporter, metrics.otlp.upstream, metrics.prometheus.path,
     //   metrics.histogram_buckets.
+    if (config_.metrics.prometheus.path != new_config.metrics.prometheus.path) {
+        logging::Get()->warn(
+            "observability.metrics.prometheus.path is restart-only; live={} "
+            "staged={}; restart to apply",
+            config_.metrics.prometheus.path,
+            new_config.metrics.prometheus.path);
+    }
     config_.traces.enabled               = new_config.traces.enabled;
     config_.traces.auth_idp_span         = new_config.traces.auth_idp_span;
+    config_.traces.websocket_messages    = new_config.traces.websocket_messages;
     config_.traces.sampler               = new_config.traces.sampler;
     config_.traces.otlp.headers          = new_config.traces.otlp.headers;
     config_.traces.otlp.timeout_ms       = new_config.traces.otlp.timeout_ms;

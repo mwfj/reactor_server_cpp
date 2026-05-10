@@ -7,6 +7,10 @@
 
 // <memory>, <functional>, <string>, <unordered_map> provided by common.h (via connection_handler.h)
 
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilitySnapshot;
+}
+
 class WebSocketConnection {
 public:
     explicit WebSocketConnection(std::shared_ptr<ConnectionHandler> conn);
@@ -48,6 +52,17 @@ public:
     // Feed raw data from the reactor
     void OnRawData(const std::string& data);
 
+    // Optional observability hook — when set, every text/binary frame
+    // (inbound and outbound) allocates a short `ws.recv` / `ws.send`
+    // INTERNAL span parented at the upgrade SERVER span. Gated at the
+    // emission site by `ObservabilityManager::WebSocketMessagesEnabled`
+    // (default false). Setting null (or never calling) keeps the WS
+    // path completely free of observability cost.
+    void SetObservabilitySnapshot(
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap) {
+        obs_snapshot_ = std::move(snap);
+    }
+
     // Called when the transport (TCP/TLS) disconnects without a WebSocket Close frame.
     // Fires the close handler so applications can clean up session state.
     void NotifyTransportClose();
@@ -76,6 +91,15 @@ private:
     // Route parameters extracted during WebSocket upgrade
     std::unordered_map<std::string, std::string> params_;
 
+    // Optional observability snapshot — provides parent SERVER span
+    // and ObservabilityManager handle for per-message child spans.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>
+        obs_snapshot_;
+
     void ProcessFrame(const WebSocketFrame& frame);
     void SendFrame(const WebSocketFrame& frame);
+    // Emit a short-lived ws.recv / ws.send INTERNAL span if the live
+    // websocket_messages flag is on. No-op when manager / parent missing.
+    void MaybeEmitMessageSpan(const char* name, WebSocketOpcode opcode,
+                              size_t payload_size);
 };

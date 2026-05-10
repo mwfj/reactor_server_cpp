@@ -37,6 +37,7 @@
 #include "observability/common.h"
 #include "observability/histogram.h"
 #include "observability/meter_provider.h"
+#include "observability/metrics_catalog.h"
 #include "observability/observability_config.h"
 #include "observability/observability_snapshot.h"
 #include "observability/propagator.h"
@@ -97,6 +98,12 @@ public:
     bool AuthIdpSpanEnabled() const noexcept {
         return auth_idp_span_enabled_.load(std::memory_order_acquire);
     }
+    // Live-reloadable. WebSocketConnection reads this on every text /
+    // binary frame to decide whether to allocate a per-message
+    // `ws.recv` / `ws.send` INTERNAL span.
+    bool WebSocketMessagesEnabled() const noexcept {
+        return websocket_messages_enabled_.load(std::memory_order_acquire);
+    }
     // Live read of metrics.prometheus.include_target_info — flipped by
     // SIGHUP through Reload(). The /metrics handler consults this on
     // every scrape.
@@ -128,6 +135,13 @@ public:
     // HttpServer::MarkServerReady). Idempotent: subsequent calls are
     // warn-logged no-ops. Fans the swap across every cached Tracer.
     void SwapToBatchSpanProcessor(std::shared_ptr<SpanProcessor> new_processor);
+
+    // §7 metrics catalog — single home for every operator-facing
+    // instrument exposed at `/metrics` and OTLP. Built at `Init()`
+    // after `meter_provider_` is ready; subsystems read pointers via
+    // this accessor and emit through them. Pointers are owned by the
+    // MeterProvider and are valid for the manager's lifetime.
+    const MetricsCatalog& catalog() const noexcept { return catalog_; }
 
     // Test-only — production code uses TracesEnabled() instead.
     bool span_processor_is_batch_for_test() const noexcept;
@@ -277,6 +291,10 @@ private:
     // the full HTTP server semconv catalog is wired.
     Histogram*                                http_server_request_duration_ = nullptr;
 
+    // §7 instrument handles (pointers owned by MeterProvider). Built
+    // by `MetricsCatalog::Build` at the end of `Init()`.
+    MetricsCatalog                            catalog_;
+
     // Live-flag snapshots (atomic; updated on Reload).
     std::atomic<bool> traces_enabled_{true};
     std::atomic<bool> metrics_enabled_{true};
@@ -286,6 +304,10 @@ private:
     // INTERNAL span vs emitting `auth.pending_*` events on the
     // SERVER span.
     std::atomic<bool> auth_idp_span_enabled_{true};
+    // Mirror of `traces.websocket_messages`. WebSocketConnection reads
+    // this per-frame to decide whether to allocate a `ws.recv` /
+    // `ws.send` INTERNAL span. Default false (off).
+    std::atomic<bool> websocket_messages_enabled_{false};
 
     // Tracks whether PublishLiveFlags has already warned about the
     // "traces.enabled=true but no SpanProcessor" misconfig in this
@@ -313,11 +335,22 @@ private:
                         std::weak_ptr<ObservabilitySnapshot>>
                                                  live_snapshots_;
     std::atomic<int64_t> inflight_finalizations_{0};
-    // RESERVED — no incrementer/decrementer exists today. Permanently
-    // zero; consulted by HttpServer::WaitForAllAsyncDrain so the
-    // predicate is forward-compatible with a future per-dispatcher kill
-    // marshal that bumps it before EnQueue and decrements when the
-    // closure runs. See class header docstring for the full rationale.
+    // RESERVED — no incrementer/decrementer in production code today.
+    //
+    // `KillOutstandingSnapshots` invokes `Span::DropWithoutEnd` inline
+    // from the stopper thread regardless of the snapshot's
+    // `owning_dispatcher`. This is safe by design: `DropWithoutEnd`
+    // only flips the dropped_ atomic and never reads or writes the
+    // Span's non-atomic state. The CAS-under-`link_mtx_` +
+    // `MarkKilledForShutdown` + `DeregisterAndDecrement` sequence is
+    // invariant-safe across any dispatcher topology.
+    //
+    // The counter is consulted by `HttpServer::WaitForAllAsyncDrain` so
+    // the predicate is forward-compatible with a future per-dispatcher
+    // marshal step (e.g. if `Span::DropWithoutEnd` ever gains non-atomic
+    // mutation that requires owning-dispatcher serialisation). Such a
+    // marshal would bump the counter before `EnQueue` and decrement
+    // when the closure runs.
     std::atomic<int64_t> kill_marshals_in_flight_{0};
     std::atomic<int64_t> finalizers_in_progress_{0};
 

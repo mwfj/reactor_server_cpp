@@ -102,6 +102,13 @@ struct TracesConfig {
     // the explicit child span is the operator-visible default.
     // Live-reloadable.
     bool          auth_idp_span = true;
+    // When true, every text/binary WebSocket message produces a short-
+    // lived INTERNAL span (`ws.recv` / `ws.send`) parented at the
+    // upgrade SERVER span. Default false — high-throughput WS
+    // connections produce far more messages than HTTP requests, and
+    // operators who don't explicitly want per-message visibility
+    // should not pay the span-allocation cost. Live-reloadable.
+    bool          websocket_messages = false;
     // Restart-required equality. ADDING A FIELD:
     //   - restart-only ⇒ include here AND classify in the field-by-
     //     field assignment in ObservabilityManager::Reload (omit it

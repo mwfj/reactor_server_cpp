@@ -503,6 +503,31 @@ constexpr uint32_t kMaxStreamIdleTimeoutSec = 3600;
 constexpr uint32_t kMaxStreamDurationSec = 86400;
 constexpr int kMaxProxyRetryCount = 10;
 
+// Auto-append always_off sampler routes for gateway self-noise paths
+// (`/metrics`, `/health`, `/stats`) so the operator's own probes never
+// pollute traces. Operator-supplied entries with the same path are
+// preserved verbatim — only paths the operator hasn't already chosen
+// to override get the always_off default.
+void ApplySamplerSelfNoiseDefaults(
+    OBSERVABILITY_NAMESPACE::ObservabilityConfig& obs) {
+    auto auto_append = [&](const std::string& path) {
+        if (path.empty() || path[0] != '/') return;
+        for (const auto& existing : obs.traces.sampler.routes) {
+            if (existing.path == path) return;
+        }
+        OBSERVABILITY_NAMESPACE::SamplerRouteOverride o;
+        o.path    = path;
+        o.sampler = OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOff;
+        obs.traces.sampler.routes.push_back(std::move(o));
+    };
+    if (obs.metrics.exporter ==
+        OBSERVABILITY_NAMESPACE::kExporterPrometheusPull) {
+        auto_append(obs.metrics.prometheus.path);
+    }
+    auto_append("/health");
+    auto_append("/stats");
+}
+
 }  // namespace
 
 ServerConfig ConfigLoader::LoadFromFile(const std::string& path) {
@@ -1130,6 +1155,13 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                         "observability.traces.auth_idp_span must be boolean");
                 oc.traces.auth_idp_span = tj["auth_idp_span"].get<bool>();
             }
+            if (tj.contains("websocket_messages")) {
+                if (!tj["websocket_messages"].is_boolean())
+                    throw std::invalid_argument(
+                        "observability.traces.websocket_messages must be boolean");
+                oc.traces.websocket_messages =
+                    tj["websocket_messages"].get<bool>();
+            }
             if (tj.contains("sampler")) {
                 if (!tj["sampler"].is_object())
                     throw std::runtime_error(
@@ -1407,6 +1439,8 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
             }
         }
     }
+
+    ApplySamplerSelfNoiseDefaults(config.observability);
 
     return config;
 }

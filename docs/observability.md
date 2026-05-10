@@ -261,7 +261,7 @@ Total shutdown time is bounded by `cli.shutdown_drain_timeout_sec` (default 30s)
 3. Check the Collector receives traffic from the gateway upstream IP/port (`tcpdump -i any -n port 4318`).
 4. Inspect the gateway's structured logs for `OtlpHttpExporter` failures — non-2xx responses are logged at `warn` with the response status.
 5. If the sampler is `trace_id_ratio` with low ratio, generate enough traffic — or raise the ratio temporarily.
-6. The BSP drops spans on queue overflow rather than blocking. Two drop counters are accessible programmatically: `BatchSpanProcessor::dropped_on_overflow()` (queue full) and `BatchSpanProcessor::dropped_on_export_failure()` (non-retryable export, retry budget exhausted, or exporter exception). Both will be exposed via the self-metrics catalog in Phase 3. Until then, watch the structured logs:
+6. The BSP drops spans on queue overflow rather than blocking. Two drop counters are accessible programmatically: `BatchSpanProcessor::dropped_on_overflow()` (queue full) and `BatchSpanProcessor::dropped_on_export_failure()` (non-retryable export, retry budget exhausted, or exporter exception). Until they're surfaced via Prometheus, watch the structured logs:
     - `BatchSpanProcessor: non-retryable export failure; dropping batch (N spans, attempt=K)` — the collector returned 4xx (excluding 429) or rejected the payload outright.
     - `BatchSpanProcessor: retryable export failed after N attempts; dropping batch (M spans)` — retry budget exhausted (network blips, repeated 5xx).
     - `BatchSpanProcessor::Export threw: ... (dropping N spans)` — exporter raised; treated as a non-retryable failure.
@@ -324,6 +324,8 @@ The gateway treats the inbound as no parent and starts a fresh trace. Run with d
 | `sampler.default_root` | string | `always_on` | YES |
 | `sampler.routes` | array | `[]` | YES |
 | `propagators` | array | `["w3c"]` | YES |
+| `auth_idp_span` | bool | `true` | YES |
+| `websocket_messages` | bool | `false` | YES |
 | `batch.max_queue_size` | int | 2048 | NO (allocated at construction) |
 | `batch.max_export_batch_size` | int | 512 | YES |
 | `batch.schedule_delay_ms` | int | 5000 | YES |
@@ -346,15 +348,59 @@ The gateway treats the inbound as no parent and starts a fresh trace. Run with d
 
 ---
 
+## Phase 3 features
+
+The following hooks landed in the Phase 3 follow-up PR (built on top of the Phase 2 foundation).
+
+### Per-attempt CLIENT span on proxy
+
+Every upstream attempt for a proxied request gets its own CLIENT span. Retries produce distinct spans linked to the same SERVER parent; the per-attempt span_id is stamped into the outbound `traceparent` so each attempt is independently identifiable in the collector. Terminal outcomes set `http.response.status_code` (success) or `error.type` (e.g. `upstream_timeout`, `connect_failed`, `circuit_open`, `client_disconnect`).
+
+### `auth.idp_check` INTERNAL span
+
+When `traces.auth_idp_span = true` (default), every deferred IdP introspection POST is wrapped by an INTERNAL span parented at the SERVER span. Setting it to `false` falls back to recording `auth.pending_start` / `auth.pending_end` events on the SERVER span — useful when collector cardinality is a concern. Live-reloadable.
+
+### Per-message WebSocket spans
+
+```json
+"traces": { "websocket_messages": true }
+```
+
+Default `false`. When enabled, every text/binary frame produces a short `ws.recv` (inbound) or `ws.send` (outbound) INTERNAL span parented at the upgrade SERVER span, with `ws.opcode` and `ws.payload_size` attributes. Control frames (Ping / Pong / Close) are NOT spanned. Live-reloadable. Caveat: WS connections produce far more messages than HTTP requests — enabling this on a high-throughput WS-heavy workload will significantly increase span volume.
+
+### Sampler self-noise auto-derivation
+
+The gateway's own `/health`, `/stats`, and configured Prometheus path are auto-added to `traces.sampler.routes` with `always_off` so operator-side probes never pollute traces. Operator-supplied entries with the same path are preserved verbatim — explicit override always wins.
+
+### `metrics.prometheus.path` reload
+
+When SIGHUP changes `metrics.prometheus.path`, the gateway logs a warn ("restart to apply") and keeps the live value. The HTTP route bound at startup remains the only path served. Restart to register the new path.
+
+### Self-handler graceful shutdown
+
+A route handler that needs to terminate the server (e.g. an admin endpoint exposing `/shutdown`) must NOT call `HttpServer::Stop()` synchronously — that deadlocks the dispatcher. Use `HttpServer::ScheduleStopAfterCurrentResponse()` instead. The helper:
+
+- Populates the response normally and returns from the handler.
+- Schedules `Stop()` on the conn dispatcher via `NetServer::EnQueueOnConnDispatcher`.
+- Drains the calling handler's `active_requests_` decrement naturally before the deferred Stop runs.
+- Idempotent — repeated/concurrent calls collapse via internal CAS.
+
+### `obs_kill_marshal` regression suite
+
+A new test suite ratchets the documented kill-loop contract:
+- `kill_marshals_in_flight_` stays at 0 (RESERVED for a future per-dispatcher EnQueue marshal).
+- The `FinalizeFromSnapshot` CAS resolves multi-thread races: every snapshot is finalized exactly once.
+- `reactor.otel.snapshots_killed_on_timeout` Counter delta = N for N un-finalized survivors.
+
+---
+
 ## Out of scope
 
 The following are deferred and not currently implemented — listed so future readers don't expect them.
 
-- **Per-attempt CLIENT span on proxy.** A separate child span for each upstream attempt of a proxied request, with `error_type` on the terminal callback. Phase 3.
-- **`auth.idp_check` INTERNAL span.** A span around each IdP request lifecycle (JWKS fetch, OIDC discovery, RFC 7662 introspection). Phase 3.
-- **Full §7 metrics catalog.** Wired counters / histograms across server, client, upstream pool, auth, rate-limit, circuit breaker, DNS, WebSocket, and self-metrics. Phase 3.
-- **Per-message WebSocket spans.** Spans for WS frames after the upgrade SERVER span. Phase 3, gated by `traces.websocket_messages` (default `false`).
-- **Self-handler shutdown helper.** `ScheduleStopAfterCurrentResponse()` for handlers that want to deliver their response and *then* trigger a graceful stop. Phase 3.
+- **Connection-level metrics with protocol label.** `connections.active` / `connections.total` need protocol-label plumbing across 6+ inbound/outbound sites.
+- **BSP / PMR / Tracer self-metrics.** The BatchSpanProcessor and PeriodicMetricReader workers need a manager pointer for self-instrumentation.
+- **Per-dispatcher EnQueue kill marshal.** The `kill_marshals_in_flight_` counter is already wired into `WaitForAllAsyncDrain`'s predicate as RESERVED; the actual bump-pre-EnQueue / decrement-in-closure pair is deferred.
 - **Tail sampling.** Out of scope; deploy a Collector with the tail-sampling processor between the gateway and the trace backend.
 - **Histogram exemplars.** Out of scope.
 - **OTLP/protobuf.** OTLP/JSON is the only serializer; OTLP/protobuf may be added later for collector-side parity.

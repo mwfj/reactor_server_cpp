@@ -60,6 +60,8 @@
 #include "observability_self_handler_test.h"
 #include "observability_proxy_client_test.h"
 #include "observability_auth_trace_test.h"
+#include "observability_catalog_test.h"
+#include "observability_kill_marshal_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -284,6 +286,16 @@ void RunAllTest(){
     // events on the SERVER span when the feature flag is off).
     ObservabilityAuthTraceTests::RunAllTests();
 
+    // §7 metrics catalog — every catalogued instrument is registered
+    // at Init(), HTTP server emit sites surface body sizes +
+    // active_requests, kill loop bumps the self-metric.
+    ObservabilityCatalogTests::RunAllTests();
+
+    // Kill-loop invariant guards — RESERVED contract on
+    // kill_marshals_in_flight_, FinalizeFromSnapshot CAS resolves
+    // multi-thread races, snapshots_killed_on_timeout counter accuracy.
+    ObservabilityKillMarshalTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -368,6 +380,10 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     fresh span_id per attempt, status / error.type, retry tree" << std::endl;
     std::cout << "  obs_auth_trace     Auth-path observability — traceparent injected on IdP" << std::endl;
     std::cout << "                     hop, auth.idp_check INTERNAL span (or pending_* events)" << std::endl;
+    std::cout << "  obs_catalog        §7 metrics catalog — instrument registration, HTTP" << std::endl;
+    std::cout << "                     server body / active_requests emit, kill-loop self-metric" << std::endl;
+    std::cout << "  obs_kill_marshal   Kill-loop invariant guards — RESERVED contract on" << std::endl;
+    std::cout << "                     kill_marshals_in_flight, finalize CAS race, kill counter" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -584,6 +600,14 @@ int main(int argc, char* argv[]) {
         // Auth-path observability — traceparent + auth.idp_check span.
         }else if(mode == "obs_auth_trace"){
             ObservabilityAuthTraceTests::RunAllTests();
+        // §7 metrics catalog — instrument registration + HTTP server
+        // emit + kill-loop self-metric.
+        }else if(mode == "obs_catalog"){
+            ObservabilityCatalogTests::RunAllTests();
+        // Kill-loop invariant guards — RESERVED contract +
+        // FinalizeFromSnapshot CAS + snapshots_killed_on_timeout.
+        }else if(mode == "obs_kill_marshal"){
+            ObservabilityKillMarshalTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);
