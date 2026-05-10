@@ -347,6 +347,89 @@ void TestInjectMapStripsMixedCaseDuplicates() {
     }
 }
 
+// Test-only Propagator subclass that conditionally omits a header in
+// Inject(HeadersMap&). Exercises the base-default Inject(HeadersVec&)
+// path: future propagators may rely on the documented strip-then-inject
+// contract without overriding the Vec form.
+class ConditionalOmitPropagator : public Propagator {
+public:
+    static constexpr const char* kAlwaysHeader   = "x-test-always";
+    static constexpr const char* kSometimesHeader = "x-test-sometimes";
+
+    // Bring the base Inject(HeadersVec&) into scope — overriding the
+    // Map-form alone would otherwise hide it via name lookup.
+    using Propagator::Inject;
+
+    std::optional<SpanContext> Extract(const HeadersMap&) const override {
+        return std::nullopt;
+    }
+    bool Inject(const SpanContext& ctx, HeadersMap& headers) const override {
+        if (!ctx.IsValid()) return false;
+        headers[kAlwaysHeader] = "1";
+        // Conditionally omit kSometimesHeader. The base default for
+        // Inject(HeadersVec&) must still strip both owned headers from
+        // the vec, otherwise a stale x-test-sometimes survives.
+        if (ctx.flags().IsSampled()) {
+            headers[kSometimesHeader] = "1";
+        }
+        return true;
+    }
+    void StripOwnedHeaders(HeadersMap& h) const override {
+        h.erase(kAlwaysHeader);
+        h.erase(kSometimesHeader);
+    }
+    const char* Name() const noexcept override { return "test_omit"; }
+};
+
+// Base-default Inject(HeadersVec&) must strip the FULL owned-key set,
+// not just the keys the child Inject happened to write. A child that
+// conditionally omits a header (e.g. W3C with empty tracestate) would
+// otherwise leave a stale entry for that name behind on the wire.
+void TestBaseInjectVecStripsOmittedOwnedHeaders() {
+    try {
+        ConditionalOmitPropagator p;
+        SpanContext ctx;
+        ctx.SetTraceId(TraceId::FromHex("0af7651916cd43dd8448eb211c80319c"));
+        ctx.SetSpanId(SpanId::FromHex("00f067aa0ba902b7"));
+        // Unsampled — Inject(HeadersMap&) writes only kAlwaysHeader.
+        ctx.SetFlags(TraceFlags{0x00});
+
+        std::vector<std::pair<std::string, std::string>> headers;
+        headers.emplace_back("x-test-always", "stale");
+        headers.emplace_back("x-test-sometimes", "stale");
+        headers.emplace_back("host", "example.com");
+
+        bool ok = p.Inject(ctx, headers);
+
+        size_t always_count = 0;
+        size_t sometimes_count = 0;
+        bool host_kept = false;
+        for (const auto& [k, v] : headers) {
+            (void)v;
+            if (k == "x-test-always")     ++always_count;
+            else if (k == "x-test-sometimes") ++sometimes_count;
+            else if (k == "host")             host_kept = true;
+        }
+        // Conditionally-omitted x-test-sometimes must be stripped even
+        // though the child Inject(HeadersMap&) didn't write it.
+        bool pass = ok &&
+                    always_count == 1 &&
+                    sometimes_count == 0 &&
+                    host_kept;
+        TestFramework::RecordTest(
+            "ObsProp: base Inject(vec) strips full owned-key set including omitted",
+            pass, pass ? ""
+                      : "always=" + std::to_string(always_count)
+                       + " sometimes=" + std::to_string(sometimes_count)
+                       + " host=" + std::to_string(host_kept),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsProp: base Inject(vec) strips full owned-key set including omitted",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Inject with invalid context returns false + does not mutate headers.
 void TestInjectInvalidContextNoOp() {
     try {
@@ -451,6 +534,7 @@ void RunAllTests() {
     TestInjectStripsExistingHeaderInVector();
     TestInjectStripsTracestateOnEmptyState();
     TestInjectMapStripsMixedCaseDuplicates();
+    TestBaseInjectVecStripsOmittedOwnedHeaders();
     TestInjectInvalidContextNoOp();
     TestW3CPropagatorImplementsInterface();
     TestW3CStripCaseInsensitive();

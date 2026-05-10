@@ -722,6 +722,121 @@ void TestManagerReloadSwapsPropagator() {
     }
 }
 
+// FlushAll's deadline contract must mirror the per-processor contract
+// (0 = no-wait, < 0 = unbounded, > 0 = bounded). The naive
+// `t_end = now + deadline` shape would collapse a negative sentinel
+// to t_end < now, stripping unbounded down to no-wait. The override
+// must pass the negative sentinel through unchanged so children get
+// the unbounded request they were asked for.
+class CaptureForceFlushDeadlineProcessor :
+    public OBSERVABILITY_NAMESPACE::SpanProcessor {
+public:
+    std::atomic<int64_t> last_deadline_ms_{INT64_MIN};
+    void OnEnd(SpanData) override {}
+    void ForceFlush(std::chrono::milliseconds d) override {
+        last_deadline_ms_.store(d.count(), std::memory_order_release);
+    }
+    void SignalShutdown() override {}
+    void JoinWorkers(std::chrono::milliseconds) override {}
+};
+
+void TestFlushAllPreservesNegativeDeadline() {
+    try {
+        auto sp = std::make_shared<CaptureForceFlushDeadlineProcessor>();
+        ObservabilityConfig cfg = DefaultConfig();
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            sp,
+            std::make_shared<RandomSource>(0xCAFE00A0ULL));
+
+        // Sentinel: -1 means "unbounded" per the per-processor contract.
+        mgr->FlushAll(std::chrono::milliseconds{-1});
+        const int64_t got_neg = sp->last_deadline_ms_.load(
+            std::memory_order_acquire);
+
+        // Positive deadlines still go through the t_end remaining-budget
+        // path — the captured value should be in (0, 5000].
+        sp->last_deadline_ms_.store(INT64_MIN, std::memory_order_release);
+        mgr->FlushAll(std::chrono::milliseconds{5000});
+        const int64_t got_pos = sp->last_deadline_ms_.load(
+            std::memory_order_acquire);
+
+        // Zero is "no-wait" — must pass through as 0, not get amplified.
+        sp->last_deadline_ms_.store(INT64_MIN, std::memory_order_release);
+        mgr->FlushAll(std::chrono::milliseconds{0});
+        const int64_t got_zero = sp->last_deadline_ms_.load(
+            std::memory_order_acquire);
+
+        bool pass = got_neg == -1
+                  && got_pos > 0 && got_pos <= 5000
+                  && got_zero == 0;
+        TestFramework::RecordTest(
+            "ObsMgr: FlushAll preserves negative-deadline sentinel",
+            pass, pass ? ""
+                      : "neg=" + std::to_string(got_neg)
+                       + " pos=" + std::to_string(got_pos)
+                       + " zero=" + std::to_string(got_zero),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: FlushAll preserves negative-deadline sentinel",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Reload's propagator swap must be strong-exception: a Build throw
+// (e.g. unknown propagator name from a programmatic caller bypassing
+// ConfigLoader) must leave the live propagator pointer AND the manager
+// config snapshot untouched. Otherwise the snapshot and the live
+// pointer disagree on what propagators are configured.
+void TestManagerReloadPropagatorBuildThrowsLeavesLiveUnchanged() {
+    try {
+        ObservabilityConfig cfg = DefaultConfig();
+        cfg.traces.propagators = {"w3c"};
+        auto mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCAFE0090ULL));
+
+        // Capture the live propagator pointer before the failed reload.
+        auto p_before = mgr->propagator();
+
+        // Programmatic Reload with an unknown propagator name — Build
+        // will throw invalid_argument from inside Reload.
+        ObservabilityConfig bad = DefaultConfig();
+        bad.traces.propagators = {"w3c", "garbage"};
+        bool threw = false;
+        try { mgr->Reload(bad); }
+        catch (const std::invalid_argument&) { threw = true; }
+
+        // Live propagator pointer must be unchanged (still the W3C-only
+        // composite). Verify by extracting a Jaeger header — it must
+        // STILL not extract (the bad reload would have added Jaeger if
+        // partial mutation happened).
+        auto p_after = mgr->propagator();
+        std::map<std::string, std::string> jaeger_only = {
+            {"uber-trace-id",
+             "1234567890abcdef1234567890abcdef:0011223344556677:0:1"}};
+        bool pointer_unchanged = (p_before.get() == p_after.get());
+        bool still_w3c_only = !p_after->Extract(jaeger_only).has_value();
+
+        bool pass = threw && pointer_unchanged && still_w3c_only;
+        TestFramework::RecordTest(
+            "ObsMgr: Reload Build-throws leaves live propagator unchanged",
+            pass, pass ? ""
+                      : "threw=" + std::to_string(threw)
+                       + " ptr_unchanged=" + std::to_string(pointer_unchanged)
+                       + " still_w3c_only=" + std::to_string(still_w3c_only),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsMgr: Reload Build-throws leaves live propagator unchanged",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- Phase 2: live traces.enabled SIGHUP without restart (Task 1.5) ----
 //
 // Pipeline allocation in MarkServerReady is gated on `traces.exporter`
@@ -1011,6 +1126,8 @@ void RunAllTests() {
     TestExporterIsSharedFalseForSeparateInstances();
     TestManagerPropagatorReflectsConfig();
     TestManagerReloadSwapsPropagator();
+    TestManagerReloadPropagatorBuildThrowsLeavesLiveUnchanged();
+    TestFlushAllPreservesNegativeDeadline();
     TestLiveTracesEnabledFlipKeepsBatchProcessor();
     TestMiddlewareBuildsSnapshotAndSpan();
     TestMiddlewareHonorsCompositePropagator();

@@ -503,6 +503,16 @@ std::shared_ptr<const Propagator> ObservabilityManager::propagator() const noexc
 }
 
 void ObservabilityManager::FlushAll(std::chrono::milliseconds deadline) {
+    // Honor the per-processor deadline contract (0 = no-wait,
+    // < 0 = unbounded, > 0 = bounded). The naive `t_end = now + deadline`
+    // shape collapses a negative sentinel to t_end < now, which would
+    // strip the unbounded request to a no-wait. Preserve the sentinel
+    // by passing -1 through to both processors.
+    if (deadline.count() < 0) {
+        if (span_processor_) span_processor_->ForceFlush(deadline);
+        if (metric_reader_)  metric_reader_->ForceFlush(deadline);
+        return;
+    }
     const auto t_end = std::chrono::steady_clock::now() + deadline;
     auto remaining = [t_end]() {
         const auto now = std::chrono::steady_clock::now();
@@ -702,9 +712,14 @@ void ObservabilityManager::Reload(const ObservabilityConfig& new_config) {
     config_.traces.batch.schedule_delay  = new_config.traces.batch.schedule_delay;
     config_.traces.batch.retries         = new_config.traces.batch.retries;
     if (new_config.traces.propagators != config_.traces.propagators) {
+        // Build first so a Build throw (e.g. unknown name from a future
+        // programmatic caller bypassing ConfigLoader) leaves both the
+        // config snapshot and the live propagator pointer untouched.
+        // Production callers validate at LoadFromString, but the
+        // strong-exception shape costs nothing extra here.
+        auto new_p = CompositePropagator::Build(new_config.traces.propagators);
         config_.traces.propagators = new_config.traces.propagators;
-        std::atomic_store_explicit(&propagator_,
-            CompositePropagator::Build(config_.traces.propagators),
+        std::atomic_store_explicit(&propagator_, std::move(new_p),
             std::memory_order_release);
     }
 

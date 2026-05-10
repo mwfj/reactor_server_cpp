@@ -77,10 +77,13 @@ inline void AppendFlagsHex(uint8_t flags, std::string& out) {
 bool Propagator::Inject(const SpanContext& ctx, HeadersVec& headers) const {
     HeadersMap tmp;
     if (!Inject(ctx, tmp)) return false;
-    // Strip the keys we're about to write so we don't duplicate. The
-    // map-side Inject already strip-replaced its owned keys via the
-    // concrete impl; here we mirror that on the vector representation.
-    for (const auto& [k, _] : tmp) EraseVecHeader(headers, k);
+    // Strip the FULL owned-key set from the vec before appending. We
+    // can't rely on "keys present in tmp" because a child Inject may
+    // conditionally OMIT a header (e.g. W3C with empty tracestate) —
+    // the omitted name would then survive as a stale entry on the wire.
+    // Concrete propagators with a hot-path Vec form should override
+    // this whole method (W3C does); the default is the safe shape.
+    StripOwnedHeaders(headers);
     for (auto& kv : tmp) {
         headers.emplace_back(kv.first, std::move(kv.second));
     }
