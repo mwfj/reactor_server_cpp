@@ -191,15 +191,11 @@ inline void TestHttpServerRequestEmitsCatalogMetrics() {
         });
         TestServerRunner<HttpServer> runner(server);
 
-        // Body length 5 ("abcde") so the histogram shifts off the 0
-        // bucket — proves the inbound size is being recorded.
-        const std::string body = "abcde";
-        std::string req =
-            "POST /echo HTTP/1.1\r\n"
-            "Host: localhost\r\n"
-            "Content-Length: " + std::to_string(body.size()) + "\r\n"
-            "Connection: close\r\n\r\n" + body;
-        // Switch to GET — POST body works too but the existing /echo is GET.
+        // Plain GET with no body — the request body histogram records a
+        // single point in the 0 bucket. Assertion below uses
+        // `!histogram_points.empty()` so the bucket value doesn't matter
+        // for the regression: the catalog wiring + emit site presence is
+        // what's being proven.
         SendRaw(runner.GetPort(),
                  "GET /echo HTTP/1.1\r\nHost: localhost\r\n"
                  "Connection: close\r\n\r\n");

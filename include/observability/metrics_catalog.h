@@ -27,9 +27,10 @@ struct MetricsCatalog {
     UpDownCounter* reactor_http_connections_active = nullptr;
     Counter*       reactor_http_connections_accepted = nullptr;
 
-    // §7.2 client / upstream pool — http.client.request.duration is
-    // wired separately on `ObservabilityManager::http_server_request_duration_`-
-    // adjacent code; once Group 6 client-path emit sites land here.
+    // §7.2 client / upstream pool. Instruments are registered at boot
+    // so `/metrics` surfaces the series as soon as data points arrive;
+    // emit sites for this group are partially deferred — see the PR
+    // description's "Still deferred" section for the wiring status.
     Histogram*     http_client_request_duration = nullptr;
     UpDownCounter* http_client_active_requests = nullptr;
     Counter*       reactor_upstream_retries = nullptr;

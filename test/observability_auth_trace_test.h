@@ -419,6 +419,93 @@ inline void TestAuthIdpSpanDisabledFallsBackToEvents() {
     }
 }
 
+// Regression guard: an UNSAMPLED inbound trace (sampler decision drops
+// the SERVER span — `is_recording == false`) must STILL propagate the
+// W3C trace_id to the IdP introspection POST. Gating IssueTraceContext
+// build on `is_recording` would silently strip-but-fail-to-inject for
+// the dominant unsampled-but-traced flow under TraceIdRatio sampling.
+// Mirror of the same contract enforced for the proxy CLIENT-span path.
+inline void TestUnsampledInboundStillPropagatesTraceparent() {
+    std::cout << "\n[TEST] Auth: unsampled inbound still propagates traceparent"
+              << std::endl;
+    try {
+        ScopedEnv env(kSecretEnvVar, kSecretValue);
+
+        MockIntrospectionServerNS::MockIntrospectionServer mock;
+        if (!mock.Start()) {
+            TestFramework::RecordTest(
+                "AuthTrace: unsampled inbound still propagates traceparent",
+                false, "mock IdP failed to start");
+            return;
+        }
+        mock.EnqueueActiveTrue("user1", {});
+
+        const std::string issuer_name = "test_iss";
+        const std::string upstream    = "mock_idp";
+        ServerConfig cfg = BuildAuthGatewayConfig(mock, issuer_name, upstream);
+
+        // Force the SERVER-span sampler to AlwaysOff so is_recording is
+        // false but the trace context (trace_id) is still propagated.
+        auto processor = std::make_shared<InMemorySpanProcessor>();
+        ObservabilityConfig ocfg;
+        ocfg.enabled = true;
+        ocfg.traces.enabled = true;
+        ocfg.traces.sampler.type = SamplerType::AlwaysOff;
+        ocfg.traces.auth_idp_span = true;
+        ocfg.resource.service_name = "obs-auth-trace-unsampled";
+        auto manager = ObservabilityManager::Create(
+            std::move(ocfg),
+            std::make_shared<Resource>(),
+            processor,
+            std::make_shared<RandomSource>(0xA071FACEULL ^ 0xDEADBEEFULL));
+
+        HttpServer server(cfg);
+        server.SetObservabilityManager(manager);
+        server.Get("/protected", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(200).Body("ok", "text/plain");
+        });
+        TestServerRunner<HttpServer> runner(server);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        std::string resp = SendBearerGet(runner.GetPort(), "/protected",
+                                           "tok-unsampled");
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+        bool resp_ok = ExtractStatus(resp) == 200;
+        std::string idp_traceparent = mock.received_header("traceparent");
+        bool tp_present = !idp_traceparent.empty();
+        // Trace-id must be propagated even for unsampled traces; flags
+        // tail must carry sampled=0 (last 2 hex chars).
+        bool flags_unsampled = tp_present
+            && idp_traceparent.size() == 55
+            && (idp_traceparent.substr(53, 2) == "00");
+        // No auth.idp_check span should have been allocated.
+        auto spans = processor->Drain();
+        bool no_idp_span = true;
+        for (const auto& s : spans) {
+            if (s.kind == SpanKind::INTERNAL && s.name == "auth.idp_check") {
+                no_idp_span = false;
+                break;
+            }
+        }
+
+        bool pass = resp_ok && tp_present && flags_unsampled && no_idp_span;
+        std::string err;
+        if (!resp_ok) err = "response status " + std::to_string(ExtractStatus(resp));
+        else if (!tp_present) err = "traceparent missing on unsampled IdP hop";
+        else if (!flags_unsampled) err = "expected sampled=0 flag, got: " + idp_traceparent;
+        else if (!no_idp_span) err = "auth.idp_check span allocated for unsampled trace";
+
+        TestFramework::RecordTest(
+            "AuthTrace: unsampled inbound still propagates traceparent",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthTrace: unsampled inbound still propagates traceparent",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "AUTH-PATH TRACE OBSERVABILITY TESTS" << std::endl;
@@ -427,6 +514,7 @@ inline void RunAllTests() {
     TestIntrospectionInjectsTraceparent();
     TestAuthIdpCheckSpanAllocated();
     TestAuthIdpSpanDisabledFallsBackToEvents();
+    TestUnsampledInboundStillPropagatesTraceparent();
 }
 
 }  // namespace ObservabilityAuthTraceTests

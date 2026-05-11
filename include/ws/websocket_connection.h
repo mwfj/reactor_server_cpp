@@ -9,6 +9,7 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 class ObservabilitySnapshot;
+class ObservabilityManager;
 }
 
 class WebSocketConnection {
@@ -58,10 +59,15 @@ public:
     // emission site by `ObservabilityManager::WebSocketMessagesEnabled`
     // (default false). Setting null (or never calling) keeps the WS
     // path completely free of observability cost.
+    //
+    // Caches a pointer to the manager's `websocket_messages_enabled_`
+    // atomic so the disabled-fast-path on `MaybeEmitMessageSpan` is a
+    // single relaxed atomic load + branch — no per-frame
+    // `weak_ptr::lock()` atomic CAS. High-throughput WS connections
+    // (the documented worst-case workload for this feature) stay free
+    // of observability cost when the operator hasn't opted in.
     void SetObservabilitySnapshot(
-        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap) {
-        obs_snapshot_ = std::move(snap);
-    }
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap);
 
     // Called when the transport (TCP/TLS) disconnects without a WebSocket Close frame.
     // Fires the close handler so applications can clean up session state.
@@ -95,6 +101,20 @@ private:
     // and ObservabilityManager handle for per-message child spans.
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>
         obs_snapshot_;
+    // Cached pointer to manager's `websocket_messages_enabled_` atomic.
+    // Set by SetObservabilitySnapshot when the snapshot's manager
+    // weak_ptr can be locked at install time. nullptr when not bound;
+    // disabled fast-path checks this with a single relaxed load before
+    // doing any other work. Pointer stays valid for the lifetime of
+    // obs_snapshot_, which holds a shared_ptr that keeps the manager
+    // alive via the snapshot's own manager.lock() chain.
+    const std::atomic<bool>* ws_messages_enabled_flag_ = nullptr;
+    // Manager kept alive for the connection's lifetime so the atomic
+    // pointed to by ws_messages_enabled_flag_ stays valid even when
+    // the snapshot's `manager` weak_ptr would otherwise allow the
+    // manager to expire.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
+        obs_manager_;
 
     void ProcessFrame(const WebSocketFrame& frame);
     void SendFrame(const WebSocketFrame& frame);

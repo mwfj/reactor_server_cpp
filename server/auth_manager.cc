@@ -1425,55 +1425,81 @@ void AuthManager::InvokeAsyncMiddleware(
     // the per-call IssueTraceContext + (optional) `auth.idp_check`
     // INTERNAL span. Both pieces hang off the AsyncPendingState so the
     // resume callback site (MakeIntrospectionDoneCallback) can read them
-    // without a separate parameter. Order matters: allocate the span
-    // FIRST so the IssueTraceContext build below uses it as the parent.
-    if (obs_manager_ && req.trace_ctx.has_value() &&
-        req.trace_ctx->is_recording) {
+    // without a separate parameter.
+    //
+    // Gating contract — DECOUPLE trace-context propagation from span
+    // emission. Inbound `is_recording == false` (unsampled trace) MUST
+    // still propagate `trace_id` to the IdP so downstream services can
+    // continue the trace; gating IssueTraceContext build on is_recording
+    // would silently strip-but-fail-to-inject for the dominant unsampled
+    // case under TraceIdRatio. Mirror `ProxyTransaction::AttemptCheckout`
+    // which builds `attempt_local` unconditionally and gates only span
+    // allocation on `is_recording && inbound_span()`.
+    if (obs_manager_ && req.trace_ctx.has_value()) {
         if (req.obs_snapshot) {
             state->inbound_server_span = req.obs_snapshot->inbound_span;
         }
-        if (obs_manager_->AuthIdpSpanEnabled()) {
-            OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
-            opts.kind = OBSERVABILITY_NAMESPACE::SpanKind::INTERNAL;
-            if (state->inbound_server_span) {
-                opts.parent = state->inbound_server_span->Context();
-                opts.has_parent = true;
-            }
-            state->auth_idp_check_span =
-                obs_manager_->GetTracer("reactor.gateway.auth", "1")
-                    ->StartSpan("auth.idp_check", opts);
-            if (state->auth_idp_check_span) {
-                state->auth_idp_check_span->SetAttribute(
+        if (req.trace_ctx->is_recording) {
+            if (obs_manager_->AuthIdpSpanEnabled()) {
+                OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
+                opts.kind = OBSERVABILITY_NAMESPACE::SpanKind::INTERNAL;
+                if (state->inbound_server_span) {
+                    opts.parent = state->inbound_server_span->Context();
+                    opts.has_parent = true;
+                }
+                state->auth_idp_check_span =
+                    obs_manager_->GetTracer("reactor.gateway.auth", "1")
+                        ->StartSpan("auth.idp_check", opts);
+                if (state->auth_idp_check_span) {
+                    state->auth_idp_check_span->SetAttribute(
+                        "auth.issuer",
+                        OBSERVABILITY_NAMESPACE::AttrValue(chosen->name()));
+                }
+            } else if (state->inbound_server_span) {
+                std::vector<OBSERVABILITY_NAMESPACE::Attribute> ev_attrs;
+                ev_attrs.emplace_back(
                     "auth.issuer",
                     OBSERVABILITY_NAMESPACE::AttrValue(chosen->name()));
+                state->inbound_server_span->AddEvent("auth.pending_start",
+                                                       std::move(ev_attrs));
+                state->emit_pending_end_event = true;
             }
-        } else if (state->inbound_server_span) {
-            std::vector<OBSERVABILITY_NAMESPACE::Attribute> ev_attrs;
-            ev_attrs.emplace_back(
-                "auth.issuer",
-                OBSERVABILITY_NAMESPACE::AttrValue(chosen->name()));
-            state->inbound_server_span->AddEvent("auth.pending_start",
-                                                   std::move(ev_attrs));
-            state->emit_pending_end_event = true;
         }
-        // Build the per-call outbound trace context: trace_id / flags /
-        // state inherit from the inbound `current_local`; span_id is
-        // freshly generated. Parent precedence:
-        //   1. auth.idp_check span (when allocated)
-        //   2. inbound SERVER span
-        //   3. default-constructed (no parent)
+        // Build the per-call outbound trace context. trace_id / flags /
+        // state inherit from the inbound `current_local`; the injected
+        // `local.span_id` MUST resolve to a span the gateway actually
+        // exports when the trace is sampled — otherwise downstream sees
+        // a dangling parent reference. Three precedence levels:
+        //   1. auth.idp_check span — its context is exported by the
+        //      MakeIntrospectionDoneCallback finalize; safe to inject.
+        //   2. inbound SERVER span (auth.idp_check disabled or no span
+        //      allocated) — already exported by the inbound hop.
+        //   3. !is_recording / no inbound span — synthesize a fresh
+        //      span_id. The sampled flag (parent_local.flags()) is 0
+        //      here, so downstream treats the trace as unsampled and
+        //      won't query for parent resolution.
         const auto& parent_local = req.trace_ctx->current_local;
         if (parent_local.IsValid()) {
             OBSERVABILITY_NAMESPACE::IssueTraceContext call_ctx;
-            call_ctx.local = OBSERVABILITY_NAMESPACE::SpanContext(
-                parent_local.trace_id(),
-                obs_manager_->random()->NewSpanId(),
-                parent_local.flags(),
-                parent_local.state(),
-                /*is_remote=*/false);
+            if (state->auth_idp_check_span) {
+                call_ctx.local = state->auth_idp_check_span->Context();
+            } else if (state->inbound_server_span) {
+                call_ctx.local = state->inbound_server_span->Context();
+            } else {
+                call_ctx.local = OBSERVABILITY_NAMESPACE::SpanContext(
+                    parent_local.trace_id(),
+                    obs_manager_->random()->NewSpanId(),
+                    parent_local.flags(),
+                    parent_local.state(),
+                    /*is_remote=*/false);
+            }
             call_ctx.tracer = obs_manager_->GetTracer(
                 "reactor.gateway.auth", "1");
-            call_ctx.propagator = obs_manager_->propagator().get();
+            // Hold the propagator via shared_ptr so a concurrent SIGHUP
+            // that swaps `propagator_` cannot destroy the composite
+            // between construction here and outbound header injection
+            // in ApplyOutboundTraceContext.
+            call_ctx.propagator = obs_manager_->propagator();
             if (state->auth_idp_check_span) {
                 call_ctx.parent = state->auth_idp_check_span->Context();
             } else if (state->inbound_server_span) {

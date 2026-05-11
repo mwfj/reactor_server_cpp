@@ -346,19 +346,44 @@ const char* OpcodeToString(WebSocketOpcode op) {
 }
 }  // namespace
 
+void WebSocketConnection::SetObservabilitySnapshot(
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap) {
+    obs_snapshot_ = std::move(snap);
+    // Cache manager + flag pointer once at install time so per-frame
+    // emission can short-circuit on a single relaxed atomic load.
+    // Without this cache, every frame would pay a weak_ptr::lock()
+    // atomic CAS even when the feature is disabled.
+    if (obs_snapshot_) {
+        obs_manager_ = obs_snapshot_->manager.lock();
+        ws_messages_enabled_flag_ =
+            obs_manager_ ? obs_manager_->WebSocketMessagesEnabledFlag()
+                           : nullptr;
+    } else {
+        obs_manager_.reset();
+        ws_messages_enabled_flag_ = nullptr;
+    }
+}
+
 void WebSocketConnection::MaybeEmitMessageSpan(
     const char* name, WebSocketOpcode opcode, size_t payload_size) {
-    if (!obs_snapshot_) return;
-    auto mgr = obs_snapshot_->manager.lock();
-    if (!mgr || !mgr->WebSocketMessagesEnabled()) return;
+    // Disabled fast path: single relaxed atomic load + branch. Memory
+    // ordering on the flag is relaxed because we don't synchronize any
+    // other state with it — a stale read just delays the per-frame
+    // span by one frame, which is the operator's documented latency.
+    if (!ws_messages_enabled_flag_
+        || !ws_messages_enabled_flag_->load(std::memory_order_relaxed)) {
+        return;
+    }
+    // obs_manager_ + obs_snapshot_ are guaranteed non-null when the
+    // flag pointer is non-null (set together in SetObservabilitySnapshot).
     auto& parent = obs_snapshot_->inbound_span;
     if (!parent) return;
     OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
     opts.kind       = OBSERVABILITY_NAMESPACE::SpanKind::INTERNAL;
     opts.parent     = parent->Context();
     opts.has_parent = true;
-    auto span = mgr->GetTracer("reactor.gateway.ws", "1")
-                    ->StartSpan(name, opts);
+    auto span = obs_manager_->GetTracer("reactor.gateway.ws", "1")
+                              ->StartSpan(name, opts);
     if (!span) return;
     span->SetAttribute("ws.opcode",
         OBSERVABILITY_NAMESPACE::AttrValue(std::string(OpcodeToString(opcode))));

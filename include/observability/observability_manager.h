@@ -104,6 +104,15 @@ public:
     bool WebSocketMessagesEnabled() const noexcept {
         return websocket_messages_enabled_.load(std::memory_order_acquire);
     }
+    // Direct accessor to the live flag's atomic — used by
+    // `WebSocketConnection::SetObservabilitySnapshot` to cache the
+    // pointer at upgrade time so the per-frame fast path is a single
+    // relaxed atomic load + branch (no `weak_ptr::lock()` atomic CAS
+    // per frame). Caller MUST keep the manager alive (via shared_ptr)
+    // for as long as the returned pointer is dereferenced.
+    const std::atomic<bool>* WebSocketMessagesEnabledFlag() const noexcept {
+        return &websocket_messages_enabled_;
+    }
     // Live read of metrics.prometheus.include_target_info — flipped by
     // SIGHUP through Reload(). The /metrics handler consults this on
     // every scrape.

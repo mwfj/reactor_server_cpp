@@ -250,9 +250,14 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     // bound propagator we fall back to the hard-coded union of every
     // shipped format (W3C + Jaeger) so client-supplied trace headers are
     // ALWAYS stripped regardless of whether injection happens.
+    //
+    // Lifetime: `issue_ctx->propagator` is a `shared_ptr` so a
+    // concurrent SIGHUP that swaps `ObservabilityManager::propagator_`
+    // cannot free the composite between strip and inject — we hold a
+    // reference for this call's duration.
     const OBSERVABILITY_NAMESPACE::Propagator* propagator =
         (req.issue_ctx.has_value() && req.issue_ctx->propagator)
-            ? req.issue_ctx->propagator
+            ? req.issue_ctx->propagator.get()
             : nullptr;
     if (propagator) {
         propagator->StripOwnedHeaders(req.headers);
@@ -267,16 +272,15 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
             }
         }
     }
-    // Only inject when the caller has bound a Tracer in issue_ctx.
-    // The Tracer field is the contract signal that the caller is
-    // emitting (StartSpan + End) a CLIENT span with the SAME
-    // precomputed_context as `issue_ctx.local`. Injecting without
-    // that emission produces a downstream parent span_id the gateway
-    // never reports, leaving the upstream's parent reference dangling
-    // in the trace tree.
-    if (req.issue_ctx.has_value()
-        && req.issue_ctx->local.IsValid()
-        && req.issue_ctx->tracer != nullptr) {
+    // Inject whenever `local` is valid. The auth caller sets `local`
+    // to a SpanContext the gateway actually exports (auth.idp_check
+    // span context when allocated, or inbound SERVER context when not),
+    // OR to a freshly-synthesized SpanContext with `sampled=0` for the
+    // unsampled-trace continuity path (downstream sees the trace as
+    // unsampled and won't query for parent resolution). Tracer is no
+    // longer used as the gate — see auth_manager.cc's IssueTraceContext
+    // builder for the precedence rules.
+    if (req.issue_ctx.has_value() && req.issue_ctx->local.IsValid()) {
         if (propagator) {
             propagator->Inject(req.issue_ctx->local, req.headers);
         } else {

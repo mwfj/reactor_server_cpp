@@ -109,13 +109,16 @@ struct IssueTraceContext {
     SpanContext parent;
     Tracer*     tracer = nullptr;
     // Live trace-context propagator (composite of the operator's
-    // `traces.propagators`). Populated by the auth caller from
-    // `ObservabilityManager::propagator().get()`; `const` matches the
-    // accessor's `shared_ptr<const Propagator>` return. When null,
-    // `ApplyOutboundTraceContext` falls back to a stack-local
-    // `W3CPropagator{}` so outbound is always W3C even when no
+    // `traces.propagators`). Held as `shared_ptr` so a concurrent SIGHUP
+    // that swaps `ObservabilityManager::propagator_` cannot destroy the
+    // composite between context construction and outbound header
+    // injection — keeps the old propagator alive for the lifetime of
+    // this IssueTraceContext. Populated from
+    // `ObservabilityManager::propagator()` directly (not `.get()`).
+    // When null, `ApplyOutboundTraceContext` falls back to a stack-
+    // local `W3CPropagator{}` so outbound is always W3C even when no
     // propagator is bound.
-    const Propagator* propagator = nullptr;
+    std::shared_ptr<const Propagator> propagator;
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE
