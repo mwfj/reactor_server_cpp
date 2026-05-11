@@ -846,19 +846,26 @@ void UpstreamH2Connection::FireSinkForDrainEntry(
 
 void UpstreamH2Connection::DropDrainEntriesForStream(int32_t stream_id) {
     if (drain_queue_.empty()) return;
-    auto new_end = std::remove_if(
-        drain_queue_.begin(), drain_queue_.end(),
-        [&](const PendingFrameDrain& e) {
-            // Only drop request-side entries for this stream; control
-            // entries carry stream_id=0 sentinel and must stay in the
-            // queue so the FIFO byte accounting remains accurate.
-            if (!e.is_control && e.stream_id == stream_id) {
-                bytes_in_drain_queue_ -= e.bytes;
-                return true;
-            }
-            return false;
-        });
-    drain_queue_.erase(new_end, drain_queue_.end());
+    // TOMBSTONE — do NOT erase. The reset stream's bytes are already
+    // sitting in the shared transport buffer ahead of (or interleaved
+    // with) sibling streams' bytes; erasing the entries and subtracting
+    // their bytes would skew bytes_in_drain_queue_ vs transport's
+    // `remaining` count, causing OnTransportWriteProgress's
+    // `remaining >= bytes_in_drain_queue_` early-return to skip
+    // attribution while the reset stream's leftover bytes drain. That
+    // starves sibling streams' OnRequestBodyProgress / OnRequestSubmitted
+    // until the reset stream's bytes fully clear — and if the reset
+    // stream's transport-buffered tail stalls, sibling streams can hit
+    // false send-stall timeouts. Convert the entries to is_control so
+    // FireSinkForDrainEntry skips dispatch, but keep their bytes in the
+    // FIFO sum so accounting stays byte-accurate to the wire.
+    for (auto& e : drain_queue_) {
+        if (!e.is_control && e.stream_id == stream_id) {
+            e.is_control = true;
+            e.is_data_frame = false;
+            e.is_end_stream = false;
+        }
+    }
 }
 
 void UpstreamH2Connection::OnTransportWriteProgress(size_t remaining) {

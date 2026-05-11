@@ -4746,6 +4746,104 @@ void TestN9eResetStreamDropsDrainEntries() {
 }
 
 // ---------------------------------------------------------------------------
+// TestN9qResetSiblingDoesNotStarveDrainAttribution — Multiplexed
+// scenario: stream A submits a body; stream B submits then resets
+// (its body bytes are already buffered in the transport ahead of /
+// interleaved with A's). Tombstoning B's entries (vs erasing +
+// subtracting bytes) keeps bytes_in_drain_queue_ accurate to the
+// transport buffer's total — otherwise OnTransportWriteProgress's
+// early-return (`remaining >= bytes_in_drain_queue_`) skips
+// attribution while B's leftover bytes drain, starving A's
+// OnRequestBodyProgress / OnRequestSubmitted and falsely triggering
+// A's send-stall timeout.
+// ---------------------------------------------------------------------------
+void TestN9qResetSiblingDoesNotStarveDrainAttribution() {
+    std::cout << "\n[TEST] H2Upstream N9q: reset sibling does not starve drain attribution..." << std::endl;
+    struct ObservingSink : public RecordingSink {
+        int progress_calls = 0;
+        int submitted_calls = 0;
+        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestSubmitted() override { ++submitted_calls; }
+    };
+    try {
+        auto cfg = MakeH2Conn();
+        // Sinks before conn — sinks-must-outlive-session contract.
+        ObservingSink sink_a;
+        ObservingSink sink_b;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9q: reset sibling does not starve drain attribution",
+                false, "Init failed");
+            return;
+        }
+        // Submit stream A with a body. Frames are pushed to drain_queue_
+        // via on_frame_send.
+        // 20KB body > MAX_FRAME_SIZE (16384) so A has ≥2 DATA frames
+        // (one intermediate → OnRequestBodyProgress, one END_STREAM →
+        // OnRequestSubmitted). Locks the "intermediate progress fires"
+        // half of the contract; a single-DATA-frame body would only
+        // exercise the OnRequestSubmitted half.
+        std::string body_a(20000, 'a');
+        int32_t sid_a = conn.SubmitRequest(
+            "POST", "http", "example.com", "/a", {}, body_a, &sink_a);
+        if (sid_a <= 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N9q: reset sibling does not starve drain attribution",
+                false, "submit A failed");
+            return;
+        }
+        // Submit stream B with a body — its frames are appended to the
+        // queue AFTER A's frames (FIFO order in transport buffer too).
+        std::string body_b(20000, 'b');
+        int32_t sid_b = conn.SubmitRequest(
+            "POST", "http", "example.com", "/b", {}, body_b, &sink_b);
+        if (sid_b <= 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N9q: reset sibling does not starve drain attribution",
+                false, "submit B failed");
+            return;
+        }
+        // Reset stream B before any drain. B's HEADERS+DATA bytes are
+        // already in transport; tombstoned entries stay in drain_queue_
+        // with is_control=true so byte accounting matches transport.
+        // ResetStream also submits an RST_STREAM frame → another control
+        // entry appended.
+        conn.ResetStream(sid_b);
+
+        // Full drain. With tombstoning, walking the queue dispatches
+        // A's HEADERS (no fire, not END_STREAM) → A's DATA frames
+        // (progress fires on intermediates, OnRequestSubmitted on the
+        // END_STREAM DATA) → B's tombstoned entries (no fire) → RST
+        // (no fire). A's sink must see ≥1 progress AND OnRequestSubmitted.
+        conn.OnTransportWriteComplete();
+
+        bool pass = (sink_a.submitted_calls == 1) &&
+                    (sink_a.progress_calls >= 1) &&
+                    (sink_b.progress_calls == 0) &&
+                    (sink_b.submitted_calls == 0);
+        std::string err;
+        if (sink_a.submitted_calls != 1)
+            err += "A submitted_calls=" + std::to_string(sink_a.submitted_calls) +
+                   " (expected 1 — drain attribution starved); ";
+        if (sink_a.progress_calls < 1)
+            err += "A progress_calls=" + std::to_string(sink_a.progress_calls) +
+                   " (expected ≥1); ";
+        if (sink_b.progress_calls != 0 || sink_b.submitted_calls != 0)
+            err += "B fired post-reset: progress=" +
+                   std::to_string(sink_b.progress_calls) +
+                   " submitted=" + std::to_string(sink_b.submitted_calls) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N9q: reset sibling does not starve drain attribution",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9q: reset sibling does not starve drain attribution",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TestN9fPartialDrainOfFinalFrame — A single-DATA-frame body
 // (END_STREAM on the only DATA frame) or the trailing DATA frame of a
 // multi-frame body must still refresh OnRequestBodyProgress while it
@@ -5704,6 +5802,7 @@ void RunAllH2UpstreamTests() {
     TestN9cDefaultSinkSurvivesNewVirtual();
     TestN9dDeferredDrainSemantic();
     TestN9eResetStreamDropsDrainEntries();
+    TestN9qResetSiblingDoesNotStarveDrainAttribution();
     TestN9fPartialDrainOfFinalFrame();
     TestN9gControlFrameByteAccounting();
     TestN9hHeadersOnlyShortReadCL();
