@@ -505,20 +505,32 @@ constexpr int kMaxProxyRetryCount = 10;
 
 // Auto-append always_off sampler routes for gateway self-noise paths
 // (`/metrics`, `/health`, `/stats`) so the operator's own probes never
-// pollute traces. Operator-supplied entries with the same path are
-// preserved verbatim — only paths the operator hasn't already chosen
-// to override get the always_off default.
+// pollute traces. Operator-supplied entries with the same EXACT path
+// are preserved verbatim — only paths the operator hasn't already
+// chosen to override get the always_off default.
+//
+// Order matters: the sampler does a linear first-match scan with
+// path-or-subtree prefix matching (see
+// `ObservabilityManager::EffectiveSamplerForPath`). An operator-
+// supplied wildcard route like `path: "/", sampler: always_on` would
+// outvote a trailing self-noise entry. We therefore PREPEND
+// auto-defaults so they win against wildcards. Operator wins only on
+// EXACT path match (skip-if-exists above) — the documented contract.
 void ApplySamplerSelfNoiseDefaults(
     OBSERVABILITY_NAMESPACE::ObservabilityConfig& obs) {
+    std::vector<OBSERVABILITY_NAMESPACE::SamplerRouteOverride> auto_defaults;
     auto auto_append = [&](const std::string& path) {
         if (path.empty() || path[0] != '/') return;
         for (const auto& existing : obs.traces.sampler.routes) {
             if (existing.path == path) return;
         }
+        for (const auto& existing : auto_defaults) {
+            if (existing.path == path) return;
+        }
         OBSERVABILITY_NAMESPACE::SamplerRouteOverride o;
         o.path    = path;
         o.sampler = OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOff;
-        obs.traces.sampler.routes.push_back(std::move(o));
+        auto_defaults.push_back(std::move(o));
     };
     if (obs.metrics.exporter ==
         OBSERVABILITY_NAMESPACE::kExporterPrometheusPull) {
@@ -526,6 +538,11 @@ void ApplySamplerSelfNoiseDefaults(
     }
     auto_append("/health");
     auto_append("/stats");
+    if (auto_defaults.empty()) return;
+    obs.traces.sampler.routes.insert(
+        obs.traces.sampler.routes.begin(),
+        std::make_move_iterator(auto_defaults.begin()),
+        std::make_move_iterator(auto_defaults.end()));
 }
 
 }  // namespace

@@ -202,12 +202,17 @@ public:
     // Used by `HttpServer::ScheduleStopAfterCurrentResponse()` to schedule
     // `Stop()` to run on a thread that is NOT a socket dispatcher
     // (`IsOnDispatcherThread()` returns false on `conn_dispatcher_`'s own
-    // thread), so the drain barrier engages cleanly. Returns immediately;
-    // the task is silently dropped if the dispatcher has stopped.
+    // thread), so the drain barrier engages cleanly.
+    //
+    // Returns true if the task was enqueued; false if `conn_dispatcher_`
+    // is null (pre-MarkServerReady boot or post-Stop teardown), in which
+    // case the task is dropped and a warn is logged. Callers that key an
+    // idempotency CAS on this call (e.g. `stop_scheduled_`) MUST roll the
+    // CAS back on `false` so a retry can re-arm.
     //
     // Safe to call from any thread, including a route handler running on
     // a socket dispatcher.
-    void EnQueueOnConnDispatcher(std::function<void()> fn);
+    bool EnQueueOnConnDispatcher(std::function<void()> fn);
 
     // Called after init completes but before the blocking event loop.
     // Used by daemon mode to signal readiness to the parent process.

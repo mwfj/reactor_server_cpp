@@ -244,8 +244,7 @@ void AuthManager::Start() {
     }
 
     introspection_client_ =
-        std::make_unique<IntrospectionClient>(upstream_http_client_,
-                                                obs_manager_);
+        std::make_unique<IntrospectionClient>(upstream_http_client_);
 
     for (auto& [name, issuer] : issuers_) {
         issuer->Start();

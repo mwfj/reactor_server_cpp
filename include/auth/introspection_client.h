@@ -9,10 +9,6 @@
 #include <optional>
 // <string>, <vector>, <memory>, <functional>, <atomic>, <cstdint> via common.h
 
-namespace OBSERVABILITY_NAMESPACE {
-class ObservabilityManager;
-}  // namespace OBSERVABILITY_NAMESPACE
-
 namespace AUTH_NAMESPACE {
 
 class Issuer;
@@ -31,14 +27,13 @@ class Issuer;
 // by `dispatcher_index` (same envelope as UpstreamHttpClient::Issue).
 class IntrospectionClient {
  public:
-    // `obs_manager` is non-owning and nullable. Reserved for future
-    // direct use (e.g. emitting introspection self-metrics from the
-    // client itself). Verify() does not consume it today — the caller
-    // builds the IssueTraceContext and passes it via the optional
-    // last parameter, so the client only forwards.
-    explicit IntrospectionClient(
-        std::shared_ptr<UpstreamHttpClient> client,
-        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager = nullptr);
+    // Verify() does not consume the ObservabilityManager today — the
+    // caller builds the IssueTraceContext and passes it via the
+    // optional last parameter, so the client only forwards. When/if
+    // the client gains direct self-metrics responsibility, re-add the
+    // manager pointer to the ctor; for now, dead parameters invite
+    // bit-rot at call sites.
+    explicit IntrospectionClient(std::shared_ptr<UpstreamHttpClient> client);
     ~IntrospectionClient() = default;
 
     IntrospectionClient(const IntrospectionClient&) = delete;

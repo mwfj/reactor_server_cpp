@@ -29,6 +29,7 @@ using OBSERVABILITY_NAMESPACE::NoopSpanProcessor;
 using OBSERVABILITY_NAMESPACE::RandomSource;
 using OBSERVABILITY_NAMESPACE::Resource;
 using OBSERVABILITY_NAMESPACE::SamplerType;
+using OBSERVABILITY_NAMESPACE::SamplerRouteOverride;
 using OBSERVABILITY_NAMESPACE::SpanProcessor;
 using OBSERVABILITY_NAMESPACE::MakeMetricsHandler;
 
@@ -90,8 +91,18 @@ void TestJsonLoadFullSchema() {
             && oc.traces.sampler.type == SamplerType::TraceIdRatio
             && oc.traces.sampler.ratio == 0.25
             && !oc.traces.sampler.routes.empty()
-            && oc.traces.sampler.routes[0].path == "/metrics"
-            && oc.traces.sampler.routes[0].sampler == SamplerType::AlwaysOff
+            // Lookup-by-path rather than positional: auto-appends
+            // (/observability/metrics, /health, /stats) are prepended
+            // by ApplySamplerSelfNoiseDefaults so the operator-supplied
+            // /metrics entry sits AFTER them in the routes vector. The
+            // earlier positional check `routes[0].path == "/metrics"`
+            // accidentally locked in the back-append ordering.
+            && std::any_of(oc.traces.sampler.routes.begin(),
+                           oc.traces.sampler.routes.end(),
+                           [](const SamplerRouteOverride& r) {
+                               return r.path == "/metrics" &&
+                                      r.sampler == SamplerType::AlwaysOff;
+                           })
             && oc.traces.batch.max_queue_size == 1024
             && oc.traces.batch.retries.max_attempts == 4
             && oc.metrics.exporter == "prometheus_pull"
@@ -696,6 +707,60 @@ void TestSamplerSelfNoiseOtlpExporterSkipsPromPath() {
     }
 }
 
+void TestSamplerSelfNoisePrependedBeforeOperatorWildcard() {
+    // Regression: a bare `/` wildcard at the head of the operator's
+    // sampler routes used to outvote auto-appended self-noise entries
+    // because the sampler scan is first-match. Auto-defaults are now
+    // PREPENDED so `/metrics`, `/health`, `/stats` win against `/`.
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {
+                "enabled": true,
+                "traces": {
+                    "sampler": {
+                        "routes": [{"path": "/", "sampler": "always_on"}]
+                    }
+                },
+                "metrics": {
+                    "exporter": "prometheus_pull",
+                    "prometheus": { "path": "/metrics" }
+                }
+            }
+        })");
+        const auto& routes = cfg.observability.traces.sampler.routes;
+        // Locate each entry; auto-defaults must come BEFORE the
+        // wildcard root entry so the first-match scan picks them up.
+        ssize_t pos_root = -1;
+        ssize_t pos_metrics = -1, pos_health = -1, pos_stats = -1;
+        for (size_t i = 0; i < routes.size(); ++i) {
+            const auto& r = routes[i];
+            if (r.path == "/")        pos_root    = static_cast<ssize_t>(i);
+            if (r.path == "/metrics") pos_metrics = static_cast<ssize_t>(i);
+            if (r.path == "/health")  pos_health  = static_cast<ssize_t>(i);
+            if (r.path == "/stats")   pos_stats   = static_cast<ssize_t>(i);
+        }
+        bool pass = pos_root >= 0 && pos_metrics >= 0 && pos_health >= 0 &&
+                    pos_stats >= 0 &&
+                    pos_metrics < pos_root && pos_health < pos_root &&
+                    pos_stats < pos_root;
+        std::string err;
+        if (!pass) {
+            err = "expected metrics/health/stats BEFORE wildcard '/'; got "
+                  "indices metrics=" + std::to_string(pos_metrics) +
+                  " health=" + std::to_string(pos_health) +
+                  " stats=" + std::to_string(pos_stats) +
+                  " root=" + std::to_string(pos_root);
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: self-noise auto-defaults prepended before operator wildcard",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: self-noise auto-defaults prepended before operator wildcard",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- prometheus.path reload-warn ----
 
 void TestPrometheusPathReloadIgnored() {
@@ -995,6 +1060,7 @@ void RunAllTests() {
     TestSamplerSelfNoiseOperatorOverridePreserved();
     TestSamplerSelfNoiseHealthAndStats();
     TestSamplerSelfNoiseOtlpExporterSkipsPromPath();
+    TestSamplerSelfNoisePrependedBeforeOperatorWildcard();
     TestPrometheusPathReloadIgnored();
     TestWebSocketMessagesDefaultOff();
     TestWebSocketMessagesJsonRoundTrip();

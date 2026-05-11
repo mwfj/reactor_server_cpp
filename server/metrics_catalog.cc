@@ -81,6 +81,14 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         MakeCatalog({"protocol"}));
 
     // §7.2 client / upstream pool -----------------------------------
+    // Defense-in-depth: keys whose values come from operator config
+    // (`server.address`, `reactor.upstream.service`) or include
+    // formatted free-text components (`error.type` includes
+    // std::to_string(status_code)) get explicit caps to make the
+    // closed-enum contract visible. Default would already be
+    // kDefaultGenericCap (256), but explicit declaration documents
+    // intent and protects against a future caller forgetting the
+    // discipline.
     out.http_client_request_duration = meter->GetHistogram(
         "http.client.request.duration",
         "Upstream request latency in seconds",
@@ -88,88 +96,108 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         ToVec(kLatencyBuckets),
         MakeCatalog({"http.request.method", "server.address", "server.port",
                        "http.response.status_code", "error.type",
-                       "reactor.upstream.service"}));
+                       "reactor.upstream.service"},
+                     {{"server.address",          kDefaultGenericCap},
+                      {"error.type",              kDefaultGenericCap},
+                      {"reactor.upstream.service", kDefaultGenericCap}}));
 
     out.http_client_active_requests = meter->GetUpDownCounter(
         "http.client.active_requests",
         "In-flight upstream requests",
         "{requests}",
-        MakeCatalog({"reactor.upstream.service"}));
+        MakeCatalog({"reactor.upstream.service"},
+                     {{"reactor.upstream.service", kDefaultGenericCap}}));
 
     out.reactor_upstream_retries = meter->GetCounter(
         "reactor.upstream.retries",
         "Upstream request retries",
         "{retries}",
-        MakeCatalog({"reactor.upstream.service", "reason"}));
+        MakeCatalog({"reactor.upstream.service", "reason"},
+                     {{"reactor.upstream.service", kDefaultGenericCap}}));
 
     out.reactor_upstream_pool_connections_idle = meter->GetUpDownCounter(
         "reactor.upstream.pool.connections.idle",
         "Idle pool connections",
         "{connections}",
-        MakeCatalog({"reactor.upstream.service"}));
+        MakeCatalog({"reactor.upstream.service"},
+                     {{"reactor.upstream.service", kDefaultGenericCap}}));
 
     out.reactor_upstream_pool_connections_active = meter->GetUpDownCounter(
         "reactor.upstream.pool.connections.active",
         "Active pool connections",
         "{connections}",
-        MakeCatalog({"reactor.upstream.service"}));
+        MakeCatalog({"reactor.upstream.service"},
+                     {{"reactor.upstream.service", kDefaultGenericCap}}));
 
     out.reactor_upstream_pool_checkout_wait_duration = meter->GetHistogram(
         "reactor.upstream.pool.checkout.wait.duration",
         "Pool checkout wait time in seconds",
         "s",
         ToVec(kLatencyBuckets),
-        MakeCatalog({"reactor.upstream.service", "outcome"}));
+        MakeCatalog({"reactor.upstream.service", "outcome"},
+                     {{"reactor.upstream.service", kDefaultGenericCap}}));
 
     // §7.3 middleware ------------------------------------------------
+    // `issuer` values are operator-config-bounded (issuer names from
+    // auth config); explicit caps document the bound.
     out.reactor_auth_requests = meter->GetCounter(
         "reactor.auth.requests",
         "Auth admission decisions",
         "{requests}",
-        MakeCatalog({"outcome", "issuer", "reason"}));
+        MakeCatalog({"outcome", "issuer", "reason"},
+                     {{"issuer", kDefaultGenericCap}}));
 
     out.reactor_auth_cache_lookups = meter->GetCounter(
         "reactor.auth.cache.lookups",
         "Auth introspection cache lookups",
         "{lookups}",
-        MakeCatalog({"outcome", "issuer"}));
+        MakeCatalog({"outcome", "issuer"},
+                     {{"issuer", kDefaultGenericCap}}));
 
     out.reactor_auth_jwks_refreshes = meter->GetCounter(
         "reactor.auth.jwks.refreshes",
         "JWKS cache refreshes",
         "{refreshes}",
-        MakeCatalog({"issuer", "outcome"}));
+        MakeCatalog({"issuer", "outcome"},
+                     {{"issuer", kDefaultGenericCap}}));
 
+    // `zone` and `service` values come from operator config (zone
+    // names, upstream names). Explicit caps document the bound.
     out.reactor_rate_limit_decisions = meter->GetCounter(
         "reactor.rate_limit.decisions",
         "Rate-limit admission decisions",
         "{requests}",
-        MakeCatalog({"zone", "decision"}));
+        MakeCatalog({"zone", "decision"},
+                     {{"zone", kDefaultGenericCap}}));
 
     out.reactor_rate_limit_tokens = meter->GetHistogram(
         "reactor.rate_limit.tokens",
         "Bucket level on each check",
         "{tokens}",
         ToVec(kTokensBuckets),
-        MakeCatalog({"zone"}));
+        MakeCatalog({"zone"},
+                     {{"zone", kDefaultGenericCap}}));
 
     out.reactor_circuit_breaker_state = meter->GetUpDownCounter(
         "reactor.circuit_breaker.state",
         "Circuit-breaker membership (1 if in state, else 0)",
         "{}",
-        MakeCatalog({"service", "state"}));
+        MakeCatalog({"service", "state"},
+                     {{"service", kDefaultGenericCap}}));
 
     out.reactor_circuit_breaker_rejected = meter->GetCounter(
         "reactor.circuit_breaker.rejected",
         "Requests rejected by the circuit breaker",
         "{requests}",
-        MakeCatalog({"service", "reason"}));
+        MakeCatalog({"service", "reason"},
+                     {{"service", kDefaultGenericCap}}));
 
     out.reactor_circuit_breaker_transitions = meter->GetCounter(
         "reactor.circuit_breaker.transitions",
         "Circuit-breaker state transitions",
         "{transitions}",
-        MakeCatalog({"service", "from", "to", "trigger"}));
+        MakeCatalog({"service", "from", "to", "trigger"},
+                     {{"service", kDefaultGenericCap}}));
 
     out.reactor_dns_resolves = meter->GetCounter(
         "reactor.dns.resolves",

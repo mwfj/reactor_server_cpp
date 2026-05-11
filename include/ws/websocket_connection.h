@@ -10,6 +10,8 @@
 namespace OBSERVABILITY_NAMESPACE {
 struct ObservabilitySnapshot;
 class ObservabilityManager;
+class Counter;
+class UpDownCounter;
 }
 
 class WebSocketConnection {
@@ -110,6 +112,15 @@ private:
     // obs_snapshot_, which holds a shared_ptr that keeps the manager
     // alive via the snapshot's own manager.lock() chain.
     const std::atomic<bool>* ws_messages_enabled_flag_ = nullptr;
+    // Cached catalog instrument pointers — set at install time so
+    // hot-path frame emission is a single null-check + one virtual
+    // call when observability is unbound. Without this cache every
+    // frame would pay a manager.catalog() member-access + Counter*
+    // field load per direction. Lifetime is the same as obs_manager_:
+    // valid until the next SetObservabilitySnapshot or destruction.
+    OBSERVABILITY_NAMESPACE::Counter* frames_counter_ = nullptr;
+    OBSERVABILITY_NAMESPACE::UpDownCounter*
+        active_connections_counter_ = nullptr;
     // Manager kept alive for the connection's lifetime so the atomic
     // pointed to by ws_messages_enabled_flag_ stays valid even when
     // the snapshot's `manager` weak_ptr would otherwise allow the

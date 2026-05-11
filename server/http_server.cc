@@ -2750,7 +2750,14 @@ void HttpServer::ScheduleStopAfterCurrentResponse() {
     // a socket dispatcher), so the drain barrier engages cleanly and
     // waits on `active_requests_` / `inflight_finalizations_` atomics for
     // the calling handler's still-in-flight response if necessary.
-    net_server_.EnQueueOnConnDispatcher([this]() { Stop(); });
+    //
+    // If the conn dispatcher is gone (pre-MarkServerReady boot or
+    // post-Stop teardown), the enqueue is dropped and we already warned
+    // in NetServer. Roll the CAS back so a retry can re-arm — without
+    // this, a single null-path drop wedges Stop() permanently.
+    if (!net_server_.EnQueueOnConnDispatcher([this]() { Stop(); })) {
+        stop_scheduled_.store(false, std::memory_order_release);
+    }
 }
 
 void HttpServer::Stop() {

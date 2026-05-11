@@ -14,11 +14,11 @@ WebSocketConnection::WebSocketConnection(std::shared_ptr<ConnectionHandler> conn
 WebSocketConnection::~WebSocketConnection() {
     // Matching -1 for the SetObservabilitySnapshot increment. Latch
     // ensures exactly-once decrement across close-then-destroy paths.
-    if (active_counted_ && obs_manager_) {
-        const auto& cat = obs_manager_->catalog();
-        if (cat.reactor_websocket_active_connections != nullptr) {
-            cat.reactor_websocket_active_connections->Add(-1.0, {});
-        }
+    // Use the cached instrument pointer so the dtor decrements against
+    // the SAME instrument we incremented against, not whatever
+    // catalog() happens to expose at dtor time.
+    if (active_counted_ && active_connections_counter_ != nullptr) {
+        active_connections_counter_->Add(-1.0, {});
         active_counted_ = false;
     }
 }
@@ -371,45 +371,52 @@ void WebSocketConnection::SetObservabilitySnapshot(
     // Rebinding/unbinding must retire the previous +1 before swapping
     // state; otherwise a null/reset call leaves active_connections
     // inflated until dtor, contradicting the "Setting null" contract.
-    if (active_counted_ && obs_manager_) {
-        const auto& old_cat = obs_manager_->catalog();
-        if (old_cat.reactor_websocket_active_connections != nullptr) {
-            old_cat.reactor_websocket_active_connections->Add(-1.0, {});
-        }
+    // Use the cached pointer rather than re-reading catalog() so the
+    // decrement matches the instrument we incremented against, even
+    // if the manager's catalog reference rotated mid-stream.
+    if (active_counted_ && active_connections_counter_ != nullptr) {
+        active_connections_counter_->Add(-1.0, {});
         active_counted_ = false;
     }
 
     obs_snapshot_ = std::move(snap);
-    // Cache manager + flag pointer once at install time so per-frame
-    // emission can short-circuit on a single relaxed atomic load.
-    // Without this cache, every frame would pay a weak_ptr::lock()
-    // atomic CAS even when the feature is disabled.
+    // Cache manager + flag + instrument pointers once at install time
+    // so per-frame emission is a single null-check + one virtual call.
+    // Without these caches, every frame would pay a manager.catalog()
+    // member access + Counter* field load per direction.
     if (obs_snapshot_) {
         obs_manager_ = obs_snapshot_->manager.lock();
-        ws_messages_enabled_flag_ =
-            obs_manager_ ? obs_manager_->WebSocketMessagesEnabledFlag()
-                           : nullptr;
-        // §7.3: bump reactor.websocket.active_connections; the matching
-        // decrement runs in the dtor under the `active_counted_` latch
-        // so close-then-destroy paths decrement exactly once.
         if (obs_manager_) {
+            ws_messages_enabled_flag_ =
+                obs_manager_->WebSocketMessagesEnabledFlag();
             const auto& cat = obs_manager_->catalog();
-            if (cat.reactor_websocket_active_connections != nullptr) {
-                cat.reactor_websocket_active_connections->Add(1.0, {});
+            frames_counter_             = cat.reactor_websocket_frames;
+            active_connections_counter_ =
+                cat.reactor_websocket_active_connections;
+            // §7.3: bump reactor.websocket.active_connections; the
+            // matching -1 runs in the dtor (or above on rebind) under
+            // the `active_counted_` latch so each +1 has exactly one
+            // matching -1.
+            if (active_connections_counter_ != nullptr) {
+                active_connections_counter_->Add(1.0, {});
                 active_counted_ = true;
             }
+        } else {
+            ws_messages_enabled_flag_   = nullptr;
+            frames_counter_             = nullptr;
+            active_connections_counter_ = nullptr;
         }
     } else {
         obs_manager_.reset();
-        ws_messages_enabled_flag_ = nullptr;
+        ws_messages_enabled_flag_   = nullptr;
+        frames_counter_             = nullptr;
+        active_connections_counter_ = nullptr;
     }
 }
 
 void WebSocketConnection::BumpFrameCounter(WebSocketOpcode opcode,
                                              const char* direction) {
-    if (!obs_manager_) return;
-    const auto& cat = obs_manager_->catalog();
-    if (cat.reactor_websocket_frames == nullptr) return;
+    if (frames_counter_ == nullptr) return;
     // Closed enum on `op` — protocol-level opcodes only. Cardinality
     // ceiling is 6 × 2 = 12 label combinations per process.
     const char* op = nullptr;
@@ -422,7 +429,7 @@ void WebSocketConnection::BumpFrameCounter(WebSocketOpcode opcode,
         case WebSocketOpcode::Close:        op = "close"; break;
         default:                            op = "other"; break;
     }
-    cat.reactor_websocket_frames->Add(1.0, {
+    frames_counter_->Add(1.0, {
         {"op", op},
         {"direction", direction},
     });

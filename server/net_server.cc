@@ -610,19 +610,22 @@ bool NetServer::IsOnDispatcherThread() const {
     return false;
 }
 
-void NetServer::EnQueueOnConnDispatcher(std::function<void()> fn) {
+bool NetServer::EnQueueOnConnDispatcher(std::function<void()> fn) {
     if (conn_dispatcher_) {
         conn_dispatcher_->EnQueue(std::move(fn));
-        return;
+        return true;
     }
     // Reachable only during boot before MarkServerReady wires the
     // conn dispatcher, or after Stop() has torn it down. From a
     // request handler this should be unreachable — but combining a
     // silent drop with `HttpServer::stop_scheduled_` CAS already
     // flipped would leave operators chasing a hung shutdown with no
-    // log evidence. Warn loud so misuse surfaces immediately.
+    // log evidence. Warn loud so misuse surfaces immediately. The
+    // caller is responsible for rolling back any keyed idempotency
+    // CAS so a retry has a chance once the dispatcher is back.
     logging::Get()->warn(
         "EnQueueOnConnDispatcher: conn_dispatcher_ is null; task dropped");
+    return false;
 }
 
 void NetServer::SetConnectionTimeout(std::chrono::seconds timeout) {
