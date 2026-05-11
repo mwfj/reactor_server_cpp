@@ -136,7 +136,7 @@ void WebSocketConnection::OnRawData(const std::string& data) {
 }
 
 void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
-    // §7.3: count every inbound frame at the entry boundary. Counts
+    // Count every inbound frame at the entry boundary. This includes
     // frames the WS state machine RECEIVED, including ones rejected by
     // the close-handshake branch below — operators investigating a WS
     // disconnect storm want the post-Close burst visible.
@@ -393,9 +393,9 @@ void WebSocketConnection::SetObservabilitySnapshot(
             frames_counter_             = cat.reactor_websocket_frames;
             active_connections_counter_ =
                 cat.reactor_websocket_active_connections;
-            // §7.3: bump reactor.websocket.active_connections; the
-            // matching -1 runs in the dtor (or above on rebind) under
-            // the `active_counted_` latch so each +1 has exactly one
+            // Bump reactor.websocket.active_connections; the matching
+            // -1 runs in the dtor (or above on rebind) under the
+            // `active_counted_` latch so each +1 has exactly one
             // matching -1.
             if (active_connections_counter_ != nullptr) {
                 active_connections_counter_->Add(1.0, {});

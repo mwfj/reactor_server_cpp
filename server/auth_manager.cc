@@ -192,7 +192,9 @@ AuthManager::AuthManager(const AuthConfig& config,
         hmac_key_ = GenerateHmacKey();
     }
 
-    // Shared HTTP client reused across issuers (§19.3).
+    // Shared HTTP client reused across all issuers — one outbound
+    // pool keyed by issuer's `upstream` (JWKS, OIDC discovery,
+    // introspection POSTs).
     upstream_http_client_ = std::make_shared<UpstreamHttpClient>(
         upstream_manager_, dispatchers_);
 

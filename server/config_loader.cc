@@ -539,6 +539,21 @@ void ApplySamplerSelfNoiseDefaults(
     auto_append("/health");
     auto_append("/stats");
     if (auto_defaults.empty()) return;
+    // Info-log so an operator who configured a catch-all `path: "/",
+    // sampler: always_on` sees that the gateway's self-noise paths
+    // have been prepended ahead of their wildcard. Without this log
+    // the override is invisible — operators would have to dump
+    // `traces.sampler.routes` post-load to discover it.
+    std::string names;
+    for (size_t i = 0; i < auto_defaults.size(); ++i) {
+        if (i) names += ", ";
+        names += auto_defaults[i].path;
+    }
+    logging::Get()->info(
+        "Sampler: auto-prepended always_off self-noise routes for [{}] "
+        "(prepended ahead of operator-supplied routes so a catch-all "
+        "wildcard cannot outvote them)",
+        names);
     obs.traces.sampler.routes.insert(
         obs.traces.sampler.routes.begin(),
         std::make_move_iterator(auto_defaults.begin()),

@@ -136,7 +136,7 @@ HttpRouter::Middleware MakeObservabilityMiddleware(
 
         mgr_sp->RegisterLiveSnapshot(snap);
 
-        // §7.1: bump http.server.active_requests on entry; the matching
+        // Bump http.server.active_requests on entry; the matching
         // decrement runs in OnFinalizeWinner. Inbound body size is
         // recorded here once — finalize doesn't see the request body.
         const auto& cat = mgr_sp->catalog();

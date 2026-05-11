@@ -56,19 +56,17 @@ public:
     // Feed raw data from the reactor
     void OnRawData(const std::string& data);
 
-    // Optional observability hook — when set, every text/binary frame
-    // (inbound and outbound) allocates a short `ws.recv` / `ws.send`
-    // INTERNAL span parented at the upgrade SERVER span. Gated at the
-    // emission site by `ObservabilityManager::WebSocketMessagesEnabled`
-    // (default false). Setting null (or never calling) keeps the WS
-    // path completely free of observability cost.
+    // Optional observability hook — when set, text/binary frames
+    // allocate short `ws.recv` / `ws.send` INTERNAL spans parented at
+    // the upgrade SERVER span. Gated at the emission site by
+    // `ObservabilityManager::WebSocketMessagesEnabled` (default false).
+    // Caches the enabled-flag + instrument pointers so the disabled
+    // fast path on per-frame emission is one relaxed atomic load.
     //
-    // Caches a pointer to the manager's `websocket_messages_enabled_`
-    // atomic so the disabled-fast-path on `MaybeEmitMessageSpan` is a
-    // single relaxed atomic load + branch — no per-frame
-    // `weak_ptr::lock()` atomic CAS. High-throughput WS connections
-    // (the documented worst-case workload for this feature) stay free
-    // of observability cost when the operator hasn't opted in.
+    // DISPATCHER-THREAD-ONLY: rebind/unbind issues paired +1/-1 on
+    // `reactor.websocket.active_connections` and overwrites cached
+    // pointers that `MaybeEmitMessageSpan` / `BumpFrameCounter` read
+    // lock-free. Off-thread callers MUST hop via `RunOnDispatcher`.
     void SetObservabilitySnapshot(
         std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap);
 
@@ -136,11 +134,13 @@ private:
 
     void ProcessFrame(const WebSocketFrame& frame);
     void SendFrame(const WebSocketFrame& frame);
-    // Emit a short-lived ws.recv / ws.send INTERNAL span if the live
-    // websocket_messages flag is on. No-op when manager / parent missing.
+    // Emit a ws.recv / ws.send INTERNAL span. No-op when obs unbound.
+    // Called from dispatcher (ProcessFrame) and off-dispatcher under
+    // send_mtx_ (SendFrame); Tracer / Span / BSP own internal mutexes.
     void MaybeEmitMessageSpan(const char* name, WebSocketOpcode opcode,
                               size_t payload_size);
-    // §7.3: bump reactor.websocket.frames {op, direction}. No-op when
-    // observability is not bound on this connection (obs_manager_ null).
+    // Bump reactor.websocket.frames {op, direction}. Same call-site /
+    // threading invariants as MaybeEmitMessageSpan; Counter::Add is
+    // thread-safe.
     void BumpFrameCounter(WebSocketOpcode opcode, const char* direction);
 };

@@ -1127,7 +1127,7 @@ void HttpServer::MarkServerReady() {
     // ctor captures a non-owning auth_manager_ pointer). Skipped when
     // auth.enabled=false — downstream code handles null gracefully.
     //
-    // Middleware install ordering (§3.4, §20 risk #5):
+    // Middleware install ordering:
     //   `PrependMiddleware` pushes to FRONT. Rate-limit was prepended
     //   earlier at the top of MarkServerReady, producing [rate_limit, ...].
     //   Prepending auth NOW — i.e. SECOND — makes auth the new front:
@@ -2672,7 +2672,7 @@ void HttpServer::Start() {
     // If Stop() landed while ResolveMany was blocking (can block for up to
     // dns.overall_timeout_ms), abort cleanly here BEFORE opening any
     // listen socket. Release-acquire semantics: pairs with Stop's
-    // release-store on `stopping_` (§11 invariant).
+    // release-store on `stopping_`.
     if (stopping_.load(std::memory_order_acquire)) {
         logging::Get()->info(
             "Startup aborted after DNS resolution (stop requested); "
@@ -2745,26 +2745,26 @@ void HttpServer::ScheduleStopAfterCurrentResponse() {
             std::memory_order_acq_rel, std::memory_order_acquire)) {
         return;
     }
-    // Route through NetServer's public accessor — `conn_dispatcher_` is
-    // private to NetServer. Stop() runs on conn_dispatcher_'s thread (NOT
-    // a socket dispatcher), so the drain barrier engages cleanly and
-    // waits on `active_requests_` / `inflight_finalizations_` atomics for
-    // the calling handler's still-in-flight response if necessary.
-    //
-    // If the conn dispatcher is gone (pre-MarkServerReady boot or
-    // post-Stop teardown), the enqueue is dropped and we already warned
-    // in NetServer. Roll the CAS back so a retry can re-arm — without
-    // this, a single null-path drop wedges Stop() permanently.
+    // Route through NetServer's accessor; Stop() runs on conn_dispatcher_'s
+    // thread (NOT a socket dispatcher) so the drain barrier engages cleanly.
+    // `[this]` is safe: NetServer is a member of HttpServer, joined before
+    // ~HttpServer returns. On enqueue-drop (null pre-MarkServerReady or
+    // post-Stop teardown) roll back the CAS for symmetry and warn so any
+    // parallel caller B that already returned on observed CAS-success has
+    // an audit trail — Stop() is either unneeded or already ran.
     if (!net_server_.EnQueueOnConnDispatcher([this]() { Stop(); })) {
         stop_scheduled_.store(false, std::memory_order_release);
+        logging::Get()->warn(
+            "ScheduleStopAfterCurrentResponse: enqueue dropped, CAS rolled "
+            "back; parallel callers may have lost their signal");
     }
 }
 
 void HttpServer::Stop() {
     // First executable line: publish shutdown intent with release
-    // ordering (§11 v0.41 invariant). Start()/Reload() poll this at
-    // phase boundaries with acquire ordering so they can abort cleanly
-    // even while wedged in DNS.
+    // ordering. Start()/Reload() poll this at phase boundaries with
+    // acquire ordering so they can abort cleanly even while wedged in
+    // DNS.
     //
     // Stop's pre-drain accept-close path stays lock-free. The post-drain
     // teardown barrier acquires `reload_mtx_` so a Stop observed mid-

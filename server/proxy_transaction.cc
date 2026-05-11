@@ -345,11 +345,11 @@ const char* ErrorTypeForResult(int result_code) {
 
 void ProxyTransaction::FinalizeAttemptSpan(int status_code,
                                             const std::string& error_type) {
-    // §7.2: emit `http.client.request.duration` histogram once per
-    // attempt at the terminal site, BEFORE the span-finalize early
-    // returns. The histogram is independent of trace sampling — every
-    // attempt that started gets a duration record. attempt_start_steady_
-    // is zero-sentinel when obs is disabled, so the inner emit gates
+    // Emit `http.client.request.duration` histogram once per attempt
+    // at the terminal site, BEFORE the span-finalize early returns.
+    // The histogram is independent of trace sampling — every attempt
+    // that started gets a duration record. attempt_start_steady_ is
+    // zero-sentinel when obs is disabled, so the inner emit gates
     // naturally. Reset the sentinel after emit so a second call from
     // Cleanup's dtor backstop (which runs AFTER OnResponseComplete on
     // the success path) doesn't double-record.
@@ -601,9 +601,9 @@ bool ProxyTransaction::PrepareAttemptAdmission() {
     // Circuit breaker gate — consulted before every attempt (first try and
     // retries both). Each attempt gets a fresh admission stamped with the
     // slice's current generation. If the slice rejects with REJECTED_OPEN,
-    // ConsultBreaker delivers the §12.1 response and returns false; the
-    // retry loop treats RESULT_CIRCUIT_OPEN as terminal (§8) so a rejected
-    // retry produces a single 503 to the client, not a nested retry.
+    // ConsultBreaker delivers the circuit-open 503 response and returns
+    // false; the retry loop treats RESULT_CIRCUIT_OPEN as terminal so a
+    // rejected retry produces a single 503 to the client, not a nested retry.
     // Dry-run reject logs inside TryAcquire and returns ADMITTED through
     // the decision enum (REJECTED_OPEN_DRYRUN), so ConsultBreaker proceeds.
     if (!ConsultBreaker()) {
@@ -1165,8 +1165,8 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
     if (error_code == CIRCUIT_OPEN) {
         // Drain path: breaker tripped while this transaction was queued.
         // Do NOT Report success/failure to the slice — our own reject
-        // must not feed back into the failure math. Emit the §12.1
-        // circuit-open response directly.
+        // must not feed back into the failure math. Emit the
+        // circuit-open 503 response directly.
         logging::Get()->info(
             "ProxyTransaction checkout drained by circuit breaker "
             "client_fd={} service={}",
@@ -1813,11 +1813,11 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                 case RetryPolicy::RetryCondition::RESPONSE_TIMEOUT:
                     prev_error = "timeout"; break;
                 case RetryPolicy::RetryCondition::RESPONSE_5XX:
-                    break;  // unreachable — guarded above
+                    break;
             }
             FinalizeAttemptSpan(/*status_code=*/0, prev_error);
         }
-        // §7.2: bump reactor.upstream.retries with {service, reason}.
+        // Bump reactor.upstream.retries with {service, reason}.
         // The closed-enum `reason` label aligns with the RetryCondition
         // taxonomy + retry-budget-exhaustion + breaker-open (see the
         // else-branch below for the latter two — those are NOT retries
@@ -2986,8 +2986,8 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
     }
     if (result_code == RESULT_CIRCUIT_OPEN) {
         // The static factory has no `this`, so it cannot build the
-        // fully §12.1-compliant response (Retry-After derived from
-        // slice state, X-Upstream-Host). All in-class paths for
+        // fully-formed circuit-open response (Retry-After derived
+        // from slice state, X-Upstream-Host). All in-class paths for
         // CIRCUIT_OPEN use the non-static MakeCircuitOpenResponse()
         // — reaching this branch means a future caller forgot that
         // rule. Log loudly so the mistake shows up in logs instead
@@ -3001,7 +3001,7 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         logging::Get()->error(
             "ProxyTransaction::MakeErrorResponse(RESULT_CIRCUIT_OPEN) "
             "invoked from static context — use MakeCircuitOpenResponse() "
-            "to emit §12.1-compliant headers");
+            "to emit the X-Circuit-Breaker / X-Upstream-Host headers");
         HttpResponse resp = HttpResponse::ServiceUnavailable();
         resp.Header("X-Circuit-Breaker", "open");
         resp.Header("Connection", "close");
@@ -3086,9 +3086,9 @@ HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
     // Hint operators (not clients) at which upstream tripped. Useful
     // when a gateway fronts multiple backends; without this header, a
     // 503 is opaque.
-    // §5.5.1: render authority via FormatAuthority so IPv6 literals get
-    // RFC 3986 §3.2.2 bracket wrapping. Byte-identical for hostnames
-    // and IPv4 literals.
+    // Render authority via FormatAuthority so IPv6 literals get RFC
+    // 3986 §3.2.2 bracket wrapping. Byte-identical for hostnames and
+    // IPv4 literals.
     resp.Header("X-Upstream-Host",
                 NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
                     upstream_host_, upstream_port_, /*omit_port=*/false));
@@ -3125,7 +3125,7 @@ bool ProxyTransaction::ConsultBreaker() {
 
     if (admission.decision == CIRCUIT_BREAKER_NAMESPACE::Decision::REJECTED_OPEN) {
         // Hard reject — slice counted it, logged it, and we must not
-        // touch the upstream. Emit §12.1 response and DO NOT Report
+        // touch the upstream. Emit circuit-open 503 and DO NOT Report
         // back (would create a feedback loop — our own reject counting
         // as a failure against the already-OPEN slice).
         if (ResumeHeldRetryable5xxResponse("circuit_open")) {

@@ -43,7 +43,7 @@ std::vector<double> ToVec(const double (&arr)[N]) {
 void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
     Meter* meter = manager.meter_provider()->GetMeter("reactor.gateway", "1");
 
-    // §7.1 server ----------------------------------------------------
+    // Server-side HTTP -----------------------------------------------
     out.http_server_active_requests = meter->GetUpDownCounter(
         "http.server.active_requests",
         "Active inbound requests",
@@ -80,7 +80,7 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         "{connections}",
         MakeCatalog({"protocol"}));
 
-    // §7.2 client / upstream pool -----------------------------------
+    // Client / upstream pool ----------------------------------------
     // Defense-in-depth: keys whose values come from operator config
     // (`server.address`, `reactor.upstream.service`) or include
     // formatted free-text components (`error.type` includes
@@ -137,7 +137,7 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         MakeCatalog({"reactor.upstream.service", "outcome"},
                      {{"reactor.upstream.service", kDefaultGenericCap}}));
 
-    // §7.3 middleware ------------------------------------------------
+    // Middleware (auth + rate limit + circuit breaker + ws) ---------
     // `issuer` values are operator-config-bounded (issuer names from
     // auth config); explicit caps document the bound.
     out.reactor_auth_requests = meter->GetCounter(
@@ -217,7 +217,7 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         "{frames}",
         MakeCatalog({"op", "direction"}));
 
-    // §7.4 self-metrics ---------------------------------------------
+    // Self-metrics (OTel pipeline introspection) --------------------
     out.reactor_otel_spans_created = meter->GetCounter(
         "reactor.otel.spans.created",
         "Spans started by the tracer",
