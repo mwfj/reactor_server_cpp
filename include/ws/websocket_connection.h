@@ -7,9 +7,17 @@
 
 // <memory>, <functional>, <string>, <unordered_map> provided by common.h (via connection_handler.h)
 
+namespace OBSERVABILITY_NAMESPACE {
+struct ObservabilitySnapshot;
+class ObservabilityManager;
+class Counter;
+class UpDownCounter;
+}
+
 class WebSocketConnection {
 public:
     explicit WebSocketConnection(std::shared_ptr<ConnectionHandler> conn);
+    ~WebSocketConnection();
 
     // Public type aliases for backward compatibility
     using MessageCallback = HTTP_CALLBACKS_NAMESPACE::WsMessageCallback;
@@ -48,6 +56,21 @@ public:
     // Feed raw data from the reactor
     void OnRawData(const std::string& data);
 
+    // Optional observability hook — when set, text/binary frames
+    // allocate short `ws.recv` / `ws.send` INTERNAL spans parented at
+    // the upgrade SERVER span. Gated at the emission site by
+    // `ObservabilityManager::WebSocketMessagesEnabled` (default false).
+    // Caches the enabled-flag + instrument pointers so the disabled
+    // fast path on per-frame emission is one relaxed atomic load.
+    //
+    // INSTALL-ONCE-AT-UPGRADE — rebind is unsupported. Called from
+    // `HttpConnectionHandler::AttemptWebSocketUpgrade` on the
+    // connection dispatcher. The cached pointers are read lock-free
+    // from `MaybeEmitMessageSpan` / `BumpFrameCounter` on the data
+    // path; a rebind site would race those reads.
+    void SetObservabilitySnapshot(
+        std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap);
+
     // Called when the transport (TCP/TLS) disconnects without a WebSocket Close frame.
     // Fires the close handler so applications can clean up session state.
     void NotifyTransportClose();
@@ -76,6 +99,64 @@ private:
     // Route parameters extracted during WebSocket upgrade
     std::unordered_map<std::string, std::string> params_;
 
+    // Optional observability snapshot — provides parent SERVER span
+    // and ObservabilityManager handle for per-message child spans.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>
+        obs_snapshot_;
+    // Cached pointer to manager's `websocket_messages_enabled_` atomic.
+    // Set by SetObservabilitySnapshot when the snapshot's manager
+    // weak_ptr can be locked at install time. nullptr when not bound;
+    // disabled fast-path checks this with a single relaxed load before
+    // doing any other work. Pointer stays valid for the lifetime of
+    // obs_snapshot_, which holds a shared_ptr that keeps the manager
+    // alive via the snapshot's own manager.lock() chain.
+    const std::atomic<bool>* ws_messages_enabled_flag_ = nullptr;
+    // Cached catalog instrument pointers — set at install time so
+    // hot-path frame emission is a single null-check + one virtual
+    // call when observability is unbound. Without this cache every
+    // frame would pay a manager.catalog() member-access + Counter*
+    // field load per direction. Lifetime is the same as obs_manager_:
+    // valid until the next SetObservabilitySnapshot or destruction.
+    OBSERVABILITY_NAMESPACE::Counter* frames_counter_ = nullptr;
+    OBSERVABILITY_NAMESPACE::UpDownCounter*
+        active_connections_counter_ = nullptr;
+    // Manager kept alive for the connection's lifetime so the atomic
+    // pointed to by ws_messages_enabled_flag_ stays valid even when
+    // the snapshot's `manager` weak_ptr would otherwise allow the
+    // manager to expire.
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
+        obs_manager_;
+    // Latch — set by SetObservabilitySnapshot when the
+    // reactor.websocket.active_connections UpDownCounter was bumped
+    // by +1; the dtor checks this to issue the matching -1 exactly
+    // once. Cleared after the decrement so a later snapshot reset
+    // can't double-decrement.
+    bool active_counted_ = false;
+    // Install-once latch — set on the FIRST call to
+    // SetObservabilitySnapshot regardless of whether the manager
+    // lock succeeded or any cached pointer was populated. The lock-
+    // free reads from MaybeEmitMessageSpan / BumpFrameCounter use
+    // the cached pointers; a second call would race those reads.
+    // Checking active_counted_/obs_manager_/cached-pointer truthiness
+    // as the guard leaves a corner-case rebind window when the first
+    // call's manager.lock() returned null — `bound_once_` closes it.
+    bool bound_once_ = false;
+
     void ProcessFrame(const WebSocketFrame& frame);
     void SendFrame(const WebSocketFrame& frame);
+    // Emit a ws.recv / ws.send INTERNAL span. No-op when obs unbound.
+    // Called from dispatcher (ProcessFrame) and off-dispatcher under
+    // send_mtx_ (SendFrame); Tracer / Span / BSP own internal mutexes.
+    //
+    // The parent SERVER span is already Ended by the time these spans
+    // emit (finalized at upgrade-101 by HttpConnectionHandler). Children
+    // attach via trace_id, not parent liveness — Tempo/Jaeger render the
+    // ordering as "children after parent end". See
+    // .claude/rules/pitfalls/OBSERVABILITY.md.
+    void MaybeEmitMessageSpan(const char* name, WebSocketOpcode opcode,
+                              size_t payload_size);
+    // Bump reactor.websocket.frames {op, direction}. Same call-site /
+    // threading invariants as MaybeEmitMessageSpan; Counter::Add is
+    // thread-safe.
+    void BumpFrameCounter(WebSocketOpcode opcode, const char* direction);
 };

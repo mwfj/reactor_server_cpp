@@ -57,6 +57,12 @@
 #include "observability_issue_inject_test.h"
 #include "observability_stress_test.h"
 #include "observability_e2e_test.h"
+#include "observability_self_handler_test.h"
+#include "observability_proxy_client_test.h"
+#include "observability_auth_trace_test.h"
+#include "observability_catalog_test.h"
+#include "observability_kill_marshal_test.h"
+#include "observability_ws_messages_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -266,6 +272,36 @@ void RunAllTest(){
     // requests, assert spans are captured by the InMemorySpanProcessor.
     ObservabilityE2ETests::RunAllTests();
 
+    // Self-handler shutdown helper — `ScheduleStopAfterCurrentResponse`
+    // delivers the response then schedules `Stop()` on the conn dispatcher
+    // without deadlocking the calling handler.
+    ObservabilitySelfHandlerTests::RunAllTests();
+
+    // Per-attempt CLIENT span on the proxy path — fresh span_id per
+    // attempt, status_code attribute, error.type on retry-rejecting
+    // outcomes, observability-disabled passthrough.
+    ObservabilityProxyClientTests::RunAllTests();
+
+    // Auth-path observability — `traceparent` injection on the IdP
+    // hop and `auth.idp_check` INTERNAL span (or `auth.pending_*`
+    // events on the SERVER span when the feature flag is off).
+    ObservabilityAuthTraceTests::RunAllTests();
+
+    // Catalogued metrics — every instrument is registered at Init(),
+    // HTTP server emit sites surface body sizes + active_requests,
+    // kill loop bumps the self-metric.
+    ObservabilityCatalogTests::RunAllTests();
+
+    // Kill-loop invariant guards — RESERVED contract on
+    // kill_marshals_in_flight_, FinalizeFromSnapshot CAS resolves
+    // multi-thread races, snapshots_killed_on_timeout counter accuracy.
+    ObservabilityKillMarshalTests::RunAllTests();
+
+    // Per-message WS observability — `traces.websocket_messages` gate,
+    // control-frame skip, fragmented-message single span, install-once
+    // rebind reject.
+    ObservabilityWsMessagesTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -344,6 +380,19 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     (JWKS / OIDC / introspection / OTLP traceparent strip+inject)" << std::endl;
     std::cout << "  obs_stress         Cross-cutting stress / race / lifecycle tests" << std::endl;
     std::cout << "                     (concurrent finalize CAS, churn drain, reload+read)" << std::endl;
+    std::cout << "  obs_self_handler   Self-handler shutdown — `ScheduleStopAfterCurrentResponse`" << std::endl;
+    std::cout << "                     delivers response then defers `Stop()` to conn dispatcher" << std::endl;
+    std::cout << "  obs_proxy_client   Per-attempt CLIENT span on the proxy path —" << std::endl;
+    std::cout << "                     fresh span_id per attempt, status / error.type, retry tree" << std::endl;
+    std::cout << "  obs_auth_trace     Auth-path observability — traceparent injected on IdP" << std::endl;
+    std::cout << "                     hop, auth.idp_check INTERNAL span (or pending_* events)" << std::endl;
+    std::cout << "  obs_catalog        Catalogued metrics — instrument registration, HTTP" << std::endl;
+    std::cout << "                     server body / active_requests emit, kill-loop self-metric" << std::endl;
+    std::cout << "  obs_kill_marshal   Kill-loop invariant guards — RESERVED contract on" << std::endl;
+    std::cout << "                     kill_marshals_in_flight, finalize CAS race, kill counter" << std::endl;
+    std::cout << "  obs_ws_messages    WebSocket per-message tracing — websocket_messages opt-in" << std::endl;
+    std::cout << "                     gate, control-frame span skip, fragmented-message single" << std::endl;
+    std::cout << "                     span, install-once rebind reject" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -551,6 +600,26 @@ int main(int argc, char* argv[]) {
         // Run observability cross-cutting stress / race tests.
         }else if(mode == "obs_stress"){
             ObservabilityStressTests::RunAllTests();
+        // Self-handler shutdown helper tests.
+        }else if(mode == "obs_self_handler"){
+            ObservabilitySelfHandlerTests::RunAllTests();
+        // Per-attempt CLIENT span on the proxy path.
+        }else if(mode == "obs_proxy_client"){
+            ObservabilityProxyClientTests::RunAllTests();
+        // Auth-path observability — traceparent + auth.idp_check span.
+        }else if(mode == "obs_auth_trace"){
+            ObservabilityAuthTraceTests::RunAllTests();
+        // Catalogued metrics — instrument registration + HTTP server
+        // emit + kill-loop self-metric.
+        }else if(mode == "obs_catalog"){
+            ObservabilityCatalogTests::RunAllTests();
+        // Kill-loop invariant guards — RESERVED contract +
+        // FinalizeFromSnapshot CAS + snapshots_killed_on_timeout.
+        }else if(mode == "obs_kill_marshal"){
+            ObservabilityKillMarshalTests::RunAllTests();
+        // Per-message WS observability.
+        }else if(mode == "obs_ws_messages"){
+            ObservabilityWsMessagesTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

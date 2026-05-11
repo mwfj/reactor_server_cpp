@@ -17,6 +17,10 @@ class Dispatcher;
 struct HttpRequest;
 class HttpResponse;
 
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+}  // namespace OBSERVABILITY_NAMESPACE
+
 namespace AUTH_NAMESPACE {
 
 class UpstreamHttpClient;
@@ -87,9 +91,20 @@ class AuthManager {
         std::vector<PerPolicyCountersView> per_policy;
     };
 
+    // Construct an AuthManager.
+    //
+    // `obs_manager` is optional and defaults to nullptr — auth-only
+    // deployments without observability wired pass nullptr. When set,
+    // `InvokeAsyncMiddleware` builds an `IssueTraceContext` for every
+    // introspection POST so the IdP receives `traceparent` / `tracestate`
+    // / `uber-trace-id` headers continuing the inbound trace, and
+    // (when `traces.auth_idp_span` is enabled) allocates an
+    // `auth.idp_check` INTERNAL span over the deferred dispatch.
     AuthManager(const AuthConfig& config,
                 UpstreamManager* upstream_manager,
-                std::vector<std::shared_ptr<Dispatcher>> dispatchers);
+                std::vector<std::shared_ptr<Dispatcher>> dispatchers,
+                OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager
+                    = nullptr);
     ~AuthManager();
 
     AuthManager(const AuthManager&) = delete;
@@ -333,6 +348,21 @@ class AuthManager {
         std::shared_ptr<const AuthForwardConfig> fwd_snap,
         uint64_t policy_incarnation);
 
+    // Allocate the `auth.idp_check` INTERNAL span (or emit the
+    // `auth.pending_start` event in events-fallback mode) once a live
+    // introspection POST is committed. Called from the cache-miss
+    // branch of `InvokeAsyncIntrospection` and from
+    // `InvokeIntrospectionUncached` — NOT from `InvokeAsyncMiddleware`,
+    // because the cache-hit short-circuits don't roundtrip the IdP
+    // and "auth.idp_check" must describe the roundtrip, not the
+    // cache lookup. Also re-points `state.issue_ctx` (built earlier
+    // with inbound_server_span as parent) at the new span so the
+    // outbound POST's traceparent carries the auth.idp_check span_id.
+    void SetupAuthIdpCheckObservability(
+        HttpRouter::AsyncPendingState& state,
+        bool inbound_is_recording,
+        const std::string& issuer_name);
+
     // Stamp a validated AuthContext onto req for the sync fast-paths
     // (cache hit / stale-serve). Mirrors the JWT-mode mutation block.
     static void StampAuthContext(const HttpRequest& req,
@@ -378,6 +408,17 @@ class AuthManager {
 
     UpstreamManager* upstream_manager_;                    // non-owning
     std::vector<std::shared_ptr<Dispatcher>> dispatchers_;
+    // Non-owning observability manager. Nullable. When set, the async
+    // dispatch path builds an `IssueTraceContext` for every introspection
+    // POST and (gated on `traces.auth_idp_span`) allocates an
+    // `auth.idp_check` INTERNAL span over the deferred resolution.
+    //
+    // INVARIANT: AuthManager is declared in HttpServer BEFORE
+    // ObservabilityManager, so reverse-destruction destroys the
+    // observability manager FIRST. AuthManager's destructor MUST NOT
+    // dereference this pointer; only runtime callers (where HttpServer
+    // is still alive) are safe.
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
     std::string hmac_key_;                                 // process-local
 
     std::atomic<uint64_t> generation_{1};

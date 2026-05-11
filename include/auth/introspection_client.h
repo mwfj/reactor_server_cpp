@@ -5,6 +5,7 @@
 #include "auth/auth_context.h"
 #include "auth/auth_result.h"
 #include "auth/upstream_http_client.h"
+#include "observability/trace_context.h"  // IssueTraceContext (optional<>)
 // <string>, <vector>, <memory>, <functional>, <atomic>, <cstdint> via common.h
 
 namespace AUTH_NAMESPACE {
@@ -25,6 +26,12 @@ class Issuer;
 // by `dispatcher_index` (same envelope as UpstreamHttpClient::Issue).
 class IntrospectionClient {
  public:
+    // Verify() does not consume the ObservabilityManager today — the
+    // caller builds the IssueTraceContext and passes it via the
+    // optional last parameter, so the client only forwards. When/if
+    // the client gains direct self-metrics responsibility, re-add the
+    // manager pointer to the ctor; for now, dead parameters invite
+    // bit-rot at call sites.
     explicit IntrospectionClient(std::shared_ptr<UpstreamHttpClient> client);
     ~IntrospectionClient() = default;
 
@@ -80,7 +87,17 @@ class IntrospectionClient {
                 const std::vector<std::string>& claim_keys,
                 uint64_t generation,
                 DoneCallback cb,
-                std::shared_ptr<std::atomic<bool>> cancel_token);
+                std::shared_ptr<std::atomic<bool>> cancel_token,
+                // When present, plugged onto the synthesized
+                // UpstreamHttpClient::Request::issue_ctx so the static
+                // ApplyOutboundTraceContext can strip + inject
+                // `traceparent` / `uber-trace-id` for the IdP hop. Built
+                // by AuthManager::InvokeAsyncMiddleware. Default
+                // `std::nullopt` keeps non-observability callers
+                // (existing tests, auth-only deployments) compiling
+                // unchanged.
+                std::optional<OBSERVABILITY_NAMESPACE::IssueTraceContext>
+                    issue_ctx = std::nullopt);
 
     // Test-visible helpers. Static so unit tests can exercise them without
     // standing up an UpstreamHttpClient. None of these touch the network.

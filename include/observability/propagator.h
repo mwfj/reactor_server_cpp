@@ -23,8 +23,7 @@
 #include "observability/trace_state.h"
 
 #include "../common.h"
-#include <optional>
-// <map>, <string>, <string_view>, <utility>, <vector> via common.h
+// <map>, <string>, <string_view>, <utility>, <vector>, <optional> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 
@@ -92,6 +91,23 @@ public:
     // a fresh context (defends against header-spoofing).
     virtual void StripOwnedHeaders(HeadersMap& headers) const = 0;
     virtual void StripOwnedHeaders(HeadersVec& headers) const;
+
+    // Strip the UNION of every shipped propagator's owned headers,
+    // regardless of which formats are currently configured.
+    //
+    // Why static + format-aware instead of "live-propagator dispatch":
+    // an operator configuring `traces.propagators = ["w3c"]` doesn't
+    // tell the gateway that clients can't ALSO be sending `uber-trace-
+    // id`. With live-propagator-only strip, a client-forged Jaeger
+    // header would slip through to the upstream, bypassing the
+    // gateway's trace-context spoofing defense. The .claude/rules/
+    // pitfalls/OBSERVABILITY.md "strip union" rule was added for
+    // exactly this hazard.
+    //
+    // Idempotent, case-insensitive. Adding a new propagator (b3, etc.)
+    // means adding its owned keys here AND its concrete StripOwnedHeaders.
+    static void StripAllKnownTraceHeaders(HeadersMap& headers);
+    static void StripAllKnownTraceHeaders(HeadersVec& headers);
 
     // Identifier for logging / metric labels: "w3c", "jaeger", "composite".
     virtual const char* Name() const noexcept = 0;

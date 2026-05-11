@@ -136,6 +136,30 @@ HttpRouter::Middleware MakeObservabilityMiddleware(
 
         mgr_sp->RegisterLiveSnapshot(snap);
 
+        // Bump http.server.active_requests on entry; the matching
+        // decrement runs in OnFinalizeWinner. Inbound body size is
+        // recorded here once — finalize doesn't see the request body.
+        const auto& cat = mgr_sp->catalog();
+        if (cat.http_server_active_requests != nullptr) {
+            cat.http_server_active_requests->Add(
+                1.0,
+                OBSERVABILITY_NAMESPACE::MakeActiveRequestsLabels(
+                    request.method, request.route_match.pattern));
+        }
+        if (cat.http_server_request_body_size != nullptr) {
+            std::vector<std::pair<std::string, std::string>> body_labels;
+            body_labels.reserve(2);
+            if (!request.method.empty()) {
+                body_labels.emplace_back("http.request.method", request.method);
+            }
+            if (!request.route_match.pattern.empty()) {
+                body_labels.emplace_back("http.route",
+                                          request.route_match.pattern);
+            }
+            cat.http_server_request_body_size->Record(
+                static_cast<double>(request.body.size()), body_labels);
+        }
+
         // Republish to the request so downstream code (proxy, auth
         // outbound, finalize wiring) can read trace ctx + span + snap.
         request.trace_ctx = rtx;

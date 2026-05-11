@@ -59,17 +59,8 @@
 #include <openssl/bio.h>
 #include <openssl/err.h>
 
-#include <string>
-#include <memory>
-#include <atomic>
-#include <thread>
-#include <chrono>
-#include <optional>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include "common.h"
 #include <poll.h>
-#include <unistd.h>
 
 namespace AuthIntegrationTests {
 

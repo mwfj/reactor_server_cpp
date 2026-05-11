@@ -94,6 +94,21 @@ struct TracesConfig {
     // Recognised names: "w3c", "jaeger". Default {"w3c"} keeps the
     // single-format W3C-only behaviour for callers that don't override.
     std::vector<std::string> propagators = {"w3c"};
+    // When true, AuthManager allocates an `auth.idp_check` INTERNAL
+    // span over the deferred IdP introspection POST so introspection
+    // latency surfaces as a child of the inbound SERVER span. When
+    // false, the deferred dispatch instead emits `auth.pending_start`
+    // / `auth.pending_end` events on the SERVER span. Default true so
+    // the explicit child span is the operator-visible default.
+    // Live-reloadable.
+    bool          auth_idp_span = true;
+    // When true, every text/binary WebSocket message produces a short-
+    // lived INTERNAL span (`ws.recv` / `ws.send`) parented at the
+    // upgrade SERVER span. Default false — high-throughput WS
+    // connections produce far more messages than HTTP requests, and
+    // operators who don't explicitly want per-message visibility
+    // should not pay the span-allocation cost. Live-reloadable.
+    bool          websocket_messages = false;
     // Restart-required equality. ADDING A FIELD:
     //   - restart-only ⇒ include here AND classify in the field-by-
     //     field assignment in ObservabilityManager::Reload (omit it
