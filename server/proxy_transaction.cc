@@ -1625,14 +1625,22 @@ void ProxyTransaction::OnRequestSubmitted() {
         state_ = State::AWAITING_RESPONSE;
     }
     if (was_sending && !h2_response_timeout_armed_) {
-        // Pass the cached fallback budget explicitly. When
-        // response_timeout_ms == 0 (operator-disabled), ArmResponseTimeout()
-        // without an explicit budget is a no-op and the post-submit
-        // watchdog would vanish — leaving a transport-stuck upload
-        // governed only by PING liveness. Mirrors the H1 send-loop
-        // pattern which also passes a non-zero stall budget.
-        ArmResponseTimeout(h2_stall_budget_ms_);
-        h2_response_timeout_armed_ = true;
+        // Mirror H1's OnUpstreamWriteComplete contract exactly:
+        // response_timeout_ms > 0 → arm with that budget;
+        // response_timeout_ms == 0 → clear the deadline entirely so
+        // long-poll / SSE / unbounded-response upstreams aren't capped.
+        // The send-stall fallback budget is for the PRE-submit phase
+        // only — a transport-stuck request never reaches this method
+        // under the deferred-drain dispatch semantic (sink virtuals
+        // fire from real wire-drain callbacks; a stuck transport
+        // keeps the send-stall closure armed).
+        if (config_.response_timeout_ms > 0) {
+            ArmResponseTimeout();
+            h2_response_timeout_armed_ = true;
+        } else {
+            ClearResponseTimeout();
+            h2_response_timeout_armed_ = false;
+        }
     }
 }
 

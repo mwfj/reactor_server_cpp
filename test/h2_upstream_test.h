@@ -46,6 +46,10 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/pool_partition.h"
 #include "upstream/proxy_transaction.h"  // for RESULT_UPSTREAM_DISCONNECT
+#include "upstream/header_rewriter.h"
+#include "upstream/retry_policy.h"
+#include "http/http_request.h"
+#include "http/streaming_response_sender.h"
 #include "upstream/upstream_connection.h"
 #include "upstream/upstream_lease.h"
 #include "upstream/upstream_response_sink.h"
@@ -4901,6 +4905,269 @@ void TestN9gControlFrameByteAccounting() {
 }
 
 // ---------------------------------------------------------------------------
+// H2ResponseTimeoutTestFixture — friend of ProxyTransaction; pokes the
+// private H2 dispatch state so a focused test can exercise
+// OnRequestSubmitted's response_timeout branch without the full pool
+// pipeline. Build via the factory helper below.
+// ---------------------------------------------------------------------------
+struct H2ResponseTimeoutTestFixture {
+    static std::shared_ptr<ProxyTransaction> MakeWithTimeout(
+        int response_timeout_ms)
+    {
+        HttpRequest req;
+        req.method = "GET";
+        req.path = "/";
+        req.dispatcher_index = -1;  // null dispatcher in ctor
+
+        HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender sender;
+        HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback cb =
+            [](const HttpResponse&) {};
+        ProxyConfig cfg;
+        cfg.response_timeout_ms = response_timeout_ms;
+        HeaderRewriter rewriter(HeaderRewriter::Config{
+            cfg.header_rewrite.set_x_forwarded_for,
+            cfg.header_rewrite.set_x_forwarded_proto,
+            cfg.header_rewrite.set_via_header,
+            cfg.header_rewrite.rewrite_host});
+        RetryPolicy retry(RetryPolicy::Config{
+            cfg.retry.max_retries,
+            cfg.retry.retry_on_connect_failure,
+            cfg.retry.retry_on_5xx,
+            cfg.retry.retry_on_timeout,
+            cfg.retry.retry_on_disconnect,
+            cfg.retry.retry_non_idempotent});
+        auto txn = std::make_shared<ProxyTransaction>(
+            std::string("test-h2-timeout"), req,
+            std::move(sender), std::move(cb),
+            nullptr,         // upstream_manager
+            cfg, rewriter, retry,
+            false,           // upstream_tls
+            std::string("127.0.0.1"), 80,
+            std::string(""), std::string(""), std::string(""),
+            nullptr);        // auth_manager
+        return txn;
+    }
+
+    // Drive OnRequestSubmitted's H2 post-send-complete branch. The
+    // public method has guards (h2_path_, cancelled, IsKilledForShutdown,
+    // state_) that require the transaction to be in a specific state;
+    // set them directly so the test exercises ONLY the timeout-decision
+    // logic.
+    static void DriveOnRequestSubmittedFromSending(
+        const std::shared_ptr<ProxyTransaction>& txn)
+    {
+        txn->h2_path_ = true;
+        txn->state_ = ProxyTransaction::State::SENDING_REQUEST;
+        txn->h2_stall_budget_ms_ =
+            ProxyTransaction::ComputeH2StallBudgetMs(
+                txn->config_.response_timeout_ms);
+        txn->OnRequestSubmitted();
+    }
+
+    static bool response_timeout_armed(
+        const std::shared_ptr<ProxyTransaction>& txn)
+    {
+        return txn->h2_response_timeout_armed_;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// TestN9kZeroTimeoutPostSubmit — Mirrors H1's response_timeout_ms=0
+// contract: after the request is fully sent, no per-request deadline
+// is armed. Previously H2 always armed the 30s stall fallback, so
+// long-poll / SSE / late-header upstreams 504'd at 30s contradicting
+// the documented "0 disables the timeout" semantic.
+// ---------------------------------------------------------------------------
+void TestN9kZeroTimeoutPostSubmit() {
+    std::cout << "\n[TEST] H2Upstream N9k: response_timeout_ms=0 → no deadline armed after submit..." << std::endl;
+    try {
+        auto txn = H2ResponseTimeoutTestFixture::MakeWithTimeout(0);
+        H2ResponseTimeoutTestFixture::DriveOnRequestSubmittedFromSending(txn);
+        bool armed = H2ResponseTimeoutTestFixture::response_timeout_armed(txn);
+        bool pass = !armed;
+        TestFramework::RecordTest(
+            "H2Upstream N9k: response_timeout_ms=0 → no deadline armed after submit",
+            pass,
+            pass ? "" : "h2_response_timeout_armed_ should be false for ms=0");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9k: response_timeout_ms=0 → no deadline armed after submit",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9lPositiveTimeoutPostSubmit — Positive response_timeout_ms still
+// arms the deadline as expected. Locks the both-sides of the branch
+// added by the N9k fix.
+// ---------------------------------------------------------------------------
+void TestN9lPositiveTimeoutPostSubmit() {
+    std::cout << "\n[TEST] H2Upstream N9l: response_timeout_ms>0 → deadline armed after submit..." << std::endl;
+    try {
+        auto txn = H2ResponseTimeoutTestFixture::MakeWithTimeout(5000);
+        H2ResponseTimeoutTestFixture::DriveOnRequestSubmittedFromSending(txn);
+        bool armed = H2ResponseTimeoutTestFixture::response_timeout_armed(txn);
+        bool pass = armed;
+        TestFramework::RecordTest(
+            "H2Upstream N9l: response_timeout_ms>0 → deadline armed after submit",
+            pass,
+            pass ? "" : "h2_response_timeout_armed_ should be true for ms=5000");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9l: response_timeout_ms>0 → deadline armed after submit",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9hHeadersOnlyShortReadCL — A response that declares
+// Content-Length > 0 but ends the stream on HEADERS (zero body bytes)
+// MUST surface as an error, not a clean OnComplete. The HEADERS-only
+// path used to classify as NO_BODY, bypassing the CL short-read check
+// in OnStreamClose. After the fix, when end_stream is true and CL > 0
+// on a non-bodyless status, framing is CONTENT_LENGTH so the existing
+// CL short-read backstop fires RESULT_TRUNCATED_RESPONSE on NO_ERROR
+// stream close (or RESULT_UPSTREAM_DISCONNECT if nghttp2's HTTP
+// messaging enforcement fired first via non-NO_ERROR). Either way:
+// OnError fires, OnComplete does NOT.
+// ---------------------------------------------------------------------------
+void TestN9hHeadersOnlyShortReadCL() {
+    std::cout << "\n[TEST] H2Upstream N9h: HEADERS+END_STREAM with CL>0 → OnError (not OnComplete)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9h: HEADERS+END_STREAM with CL>0 → OnError (not OnComplete)",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/",
+                                          {}, "", &sink);
+
+        // Server sends SETTINGS + HEADERS(200, content-length:100, END_STREAM).
+        // Zero body bytes but declared 100 — framing violation.
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-length", "100"}},
+            /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()),
+                         wire.size());
+
+        // OnError MUST fire. The specific RESULT_* code is either
+        // RESULT_TRUNCATED_RESPONSE (our backstop, nghttp2 messaging
+        // enforcement disabled) or RESULT_UPSTREAM_DISCONNECT
+        // (nghttp2's enforcement fired non-NO_ERROR first). What
+        // matters is the truncation is NOT silently dropped.
+        bool pass = (sink.error_calls == 1) && (sink.complete_calls == 0);
+        std::string err;
+        if (sink.error_calls != 1)
+            err += "error_calls=" + std::to_string(sink.error_calls) + " (expected 1); ";
+        if (sink.complete_calls != 0)
+            err += "complete_calls=" + std::to_string(sink.complete_calls) + " (expected 0); ";
+        TestFramework::RecordTest(
+            "H2Upstream N9h: HEADERS+END_STREAM with CL>0 → OnError (not OnComplete)",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9h: HEADERS+END_STREAM with CL>0 → OnError (not OnComplete)",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9iHeadersOnlyShortReadCLZeroLegitimate — A response with
+// content-length: 0 AND END_STREAM on HEADERS is LEGITIMATE (legal
+// empty body). Verifies the fix's `cl > 0` guard doesn't false-trigger
+// truncation for legal empty bodies.
+// ---------------------------------------------------------------------------
+void TestN9iHeadersOnlyShortReadCLZeroLegitimate() {
+    std::cout << "\n[TEST] H2Upstream N9i: HEADERS+END_STREAM with CL=0 → OnComplete (legitimate)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9i: HEADERS+END_STREAM with CL=0 → OnComplete (legitimate)",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/",
+                                          {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-length", "0"}},
+            /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()),
+                         wire.size());
+
+        bool pass = (sink.complete_calls == 1) && (sink.error_calls == 0);
+        std::string err;
+        if (sink.complete_calls != 1)
+            err += "complete_calls=" + std::to_string(sink.complete_calls) + "; ";
+        if (sink.error_calls != 0)
+            err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N9i: HEADERS+END_STREAM with CL=0 → OnComplete (legitimate)",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9i: HEADERS+END_STREAM with CL=0 → OnComplete (legitimate)",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9jHeadResponseWithCLLegitimate — RFC 9110 §9.3.2 explicitly
+// permits HEAD responses to declare Content-Length matching the
+// equivalent-GET body size. END_STREAM on HEADERS with CL > 0 on a
+// HEAD response is LEGITIMATE — must NOT trigger truncation.
+// ---------------------------------------------------------------------------
+void TestN9jHeadResponseWithCLLegitimate() {
+    std::cout << "\n[TEST] H2Upstream N9j: HEAD response with CL>0 + END_STREAM → OnComplete (legitimate)..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9j: HEAD response with CL>0 + END_STREAM → OnComplete (legitimate)",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("HEAD", "http", "example.com", "/",
+                                          {}, "", &sink);
+
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-length", "12345"}},
+            /*end_stream=*/true);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()),
+                         wire.size());
+
+        bool pass = (sink.complete_calls == 1) && (sink.error_calls == 0);
+        std::string err;
+        if (sink.complete_calls != 1)
+            err += "complete_calls=" + std::to_string(sink.complete_calls) + "; ";
+        if (sink.error_calls != 0)
+            err += "error_calls=" + std::to_string(sink.error_calls) + "; ";
+        TestFramework::RecordTest(
+            "H2Upstream N9j: HEAD response with CL>0 + END_STREAM → OnComplete (legitimate)",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9j: HEAD response with CL>0 + END_STREAM → OnComplete (legitimate)",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TestN9c — Default sink ABI: a sink that does NOT override
 // OnRequestBodyProgress must still compile and operate — locks the
 // no-op default contract that prevents binary-compat breakage for
@@ -5210,6 +5477,11 @@ void RunAllH2UpstreamTests() {
     TestN9eResetStreamDropsDrainEntries();
     TestN9fPartialDrainOfFinalFrame();
     TestN9gControlFrameByteAccounting();
+    TestN9hHeadersOnlyShortReadCL();
+    TestN9iHeadersOnlyShortReadCLZeroLegitimate();
+    TestN9jHeadResponseWithCLLegitimate();
+    TestN9kZeroTimeoutPostSubmit();
+    TestN9lPositiveTimeoutPostSubmit();
     TestN7eWiringEarlyHeadersThenIntermediateDataDispatch();
 
     // TestB-series additions — wire-level

@@ -35,6 +35,10 @@ class ProxyTransaction
     : public std::enable_shared_from_this<ProxyTransaction>,
       public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink,
       public OBSERVABILITY_NAMESPACE::UpstreamTransactionLink {
+    // Test-only friend that pokes the private H2 dispatch state to
+    // exercise OnRequestSubmitted's response_timeout branch without
+    // spinning up the full UpstreamManager / dispatcher / pool stack.
+    friend struct H2ResponseTimeoutTestFixture;
 public:
     // Result codes for internal state tracking
     static constexpr int RESULT_SUCCESS             = 0;

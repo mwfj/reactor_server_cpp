@@ -654,56 +654,72 @@ void UpstreamH2Connection::OnHeadersComplete(int32_t stream_id,
     // always either NO_BODY (END_STREAM on HEADERS frame) or
     // CHUNKED-equivalent; check for Content-Length to prefer exact framing.
     using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
-    if (end_stream) {
-        stream->response_head.framing = Framing::NO_BODY;
-    } else if (stream->response_head.status_code == 204 ||
-               stream->response_head.status_code == 304 ||
-               stream->request_method == "HEAD") {
-        // RFC 9110 §15.4 / §15.4.5 / §9.3.2: 204 / 304 / HEAD responses
-        // MUST NOT carry a body. Classify as NO_BODY so Step 1.5 in
-        // OnDataChunkRecvCallback rejects any subsequent body bytes from
-        // a misbehaving peer with RESULT_TRUNCATED_RESPONSE.
-        stream->response_head.framing = Framing::NO_BODY;
-    } else {
-        // Scan accumulated headers for content-length. Cap at the H1
-        // codec's MAX_RESPONSE_BODY_SIZE to defend against malicious or
-        // buggy upstreams advertising absurd values (e.g. 1e18 bytes)
-        // that would propagate through expected_length into snapshot
-        // truncation arithmetic. RFC 9113 lets us treat the header as
-        // informational, so on an over-cap value we fall through to
-        // CHUNKED-equivalent framing and rely on END_STREAM as the
-        // authoritative end-of-body signal.
-        int64_t cl = -1;
-        for (const auto& [nm, val] : stream->response_head.headers) {
-            if (nm == "content-length") {
-                // from_chars: strict full-string consume; std::stoll
-                // skips leading whitespace and would accept "  42".
-                cl = -1;
-                const char* end = val.data() + val.size();
-                int64_t parsed = 0;
-                auto [ptr, ec] = std::from_chars(val.data(), end, parsed);
-                if (ec == std::errc() && ptr == end && parsed >= 0) {
-                    cl = parsed;
-                }
-                if (cl > static_cast<int64_t>(
-                        UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE)) {
-                    logging::Get()->warn(
-                        "UpstreamH2Connection: content-length {} exceeds cap "
-                        "{} on stream {}; treating as chunked",
-                        val,
-                        UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE,
-                        stream_id);
-                    cl = -1;
-                }
-                break;
+    // Parse Content-Length regardless of end_stream so the HEADERS-only
+    // short-read case (end_stream on HEADERS with CL > 0) can be
+    // classified as CONTENT_LENGTH and detected by OnStreamClose's CL
+    // short-read check.
+    int64_t cl = -1;
+    for (const auto& [nm, val] : stream->response_head.headers) {
+        if (nm == "content-length") {
+            // from_chars: strict full-string consume; std::stoll
+            // skips leading whitespace and would accept "  42".
+            cl = -1;
+            const char* end = val.data() + val.size();
+            int64_t parsed = 0;
+            auto [ptr, ec] = std::from_chars(val.data(), end, parsed);
+            if (ec == std::errc() && ptr == end && parsed >= 0) {
+                cl = parsed;
             }
+            if (cl > static_cast<int64_t>(
+                    UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE)) {
+                logging::Get()->warn(
+                    "UpstreamH2Connection: content-length {} exceeds cap "
+                    "{} on stream {}; treating as chunked",
+                    val,
+                    UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE,
+                    stream_id);
+                cl = -1;
+            }
+            break;
         }
-        if (cl >= 0) {
+    }
+
+    const bool bodyless_status =
+        (stream->response_head.status_code == 204 ||
+         stream->response_head.status_code == 304 ||
+         stream->request_method == "HEAD");
+
+    if (bodyless_status) {
+        // RFC 9110 §15.4 / §15.4.5 / §9.3.2: 204 / 304 / HEAD responses
+        // MUST NOT carry a body. Content-Length on these is allowed
+        // as informational (RFC 9110 §9.3.2 specifically permits CL on
+        // HEAD to advertise the equivalent-GET body size) and does NOT
+        // trigger a short-read check. Classify as NO_BODY so Step 1.5
+        // in OnDataChunkRecvCallback rejects any subsequent body bytes
+        // from a misbehaving peer with RESULT_TRUNCATED_RESPONSE.
+        stream->response_head.framing = Framing::NO_BODY;
+    } else if (end_stream) {
+        // END_STREAM on HEADERS with a non-bodyless status. If CL > 0
+        // was declared, peer promised N body bytes and delivered zero
+        // — that's a framing violation. Classify as CONTENT_LENGTH
+        // with expected_length=cl so OnStreamClose's existing CL
+        // short-read check fires RESULT_TRUNCATED_RESPONSE (defense
+        // in depth — nghttp2's HTTP messaging enforcement normally
+        // catches this first via the non-NO_ERROR fan-out, but the
+        // backstop covers the no-messaging-enforcement future).
+        // CL == 0 or absent CL → legitimate empty-body response,
+        // classify as NO_BODY.
+        if (cl > 0) {
             stream->response_head.framing = Framing::CONTENT_LENGTH;
             stream->response_head.expected_length = cl;
         } else {
-            stream->response_head.framing = Framing::CHUNKED;
+            stream->response_head.framing = Framing::NO_BODY;
         }
+    } else if (cl >= 0) {
+        stream->response_head.framing = Framing::CONTENT_LENGTH;
+        stream->response_head.expected_length = cl;
+    } else {
+        stream->response_head.framing = Framing::CHUNKED;
     }
 
     if (!stream->sink->OnHeaders(stream->response_head)) {
