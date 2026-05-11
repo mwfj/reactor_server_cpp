@@ -145,7 +145,7 @@ public:
     // warn-logged no-ops. Fans the swap across every cached Tracer.
     void SwapToBatchSpanProcessor(std::shared_ptr<SpanProcessor> new_processor);
 
-    // §7 metrics catalog — single home for every operator-facing
+    // Catalogued metrics — single home for every operator-facing
     // instrument exposed at `/metrics` and OTLP. Built at `Init()`
     // after `meter_provider_` is ready; subsystems read pointers via
     // this accessor and emit through them. Pointers are owned by the
@@ -300,8 +300,8 @@ private:
     // the full HTTP server semconv catalog is wired.
     Histogram*                                http_server_request_duration_ = nullptr;
 
-    // §7 instrument handles (pointers owned by MeterProvider). Built
-    // by `MetricsCatalog::Build` at the end of `Init()`.
+    // Catalogued instrument handles (pointers owned by MeterProvider).
+    // Built by `MetricsCatalog::Build` at the end of `Init()`.
     MetricsCatalog                            catalog_;
 
     // Live-flag snapshots (atomic; updated on Reload).

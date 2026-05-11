@@ -1,8 +1,8 @@
 #pragma once
 
-// MetricsCatalog — single owning struct of every §7 instrument exposed
-// at `/metrics` and OTLP. Built at `ObservabilityManager::Init()` after
-// `meter_provider_` is constructed; subsystems retrieve instrument
+// MetricsCatalog — single owning struct of every catalogued instrument
+// exposed at `/metrics` and OTLP. Built at `ObservabilityManager::Init()`
+// after `meter_provider_` is constructed; subsystems retrieve instrument
 // pointers via `manager->catalog()` and emit through them.
 //
 // Lifetime: instrument pointers are owned by `MeterProvider` (which is
@@ -20,17 +20,17 @@ class UpDownCounter;
 class ObservabilityManager;
 
 struct MetricsCatalog {
-    // §7.1 server -----------------------------------------------------
+    // Server-side HTTP -----------------------------------------------
     UpDownCounter* http_server_active_requests = nullptr;
     Histogram*     http_server_request_body_size = nullptr;
     Histogram*     http_server_response_body_size = nullptr;
     UpDownCounter* reactor_http_connections_active = nullptr;
     Counter*       reactor_http_connections_accepted = nullptr;
 
-    // §7.2 client / upstream pool. Instruments are registered at boot
-    // so `/metrics` surfaces the series as soon as data points arrive;
-    // emit sites for this group are partially deferred — see the PR
-    // description's "Still deferred" section for the wiring status.
+    // Client / upstream pool. Instruments are registered at boot so
+    // `/metrics` surfaces the series as soon as data points arrive;
+    // emit sites for this group are partially deferred — see the
+    // observability design doc for the wiring status.
     Histogram*     http_client_request_duration = nullptr;
     UpDownCounter* http_client_active_requests = nullptr;
     Counter*       reactor_upstream_retries = nullptr;
@@ -38,7 +38,7 @@ struct MetricsCatalog {
     UpDownCounter* reactor_upstream_pool_connections_active = nullptr;
     Histogram*     reactor_upstream_pool_checkout_wait_duration = nullptr;
 
-    // §7.3 middleware ------------------------------------------------
+    // Middleware (auth + rate limit + circuit breaker + ws) ---------
     Counter*       reactor_auth_requests = nullptr;
     Counter*       reactor_auth_cache_lookups = nullptr;
     Counter*       reactor_auth_jwks_refreshes = nullptr;
@@ -51,7 +51,7 @@ struct MetricsCatalog {
     UpDownCounter* reactor_websocket_active_connections = nullptr;
     Counter*       reactor_websocket_frames = nullptr;
 
-    // §7.4 self-metrics ----------------------------------------------
+    // Self-metrics (OTel pipeline introspection) --------------------
     Counter*       reactor_otel_spans_created = nullptr;
     Counter*       reactor_otel_spans_dropped_unsampled = nullptr;
     Counter*       reactor_otel_spans_dropped_queue_full = nullptr;
