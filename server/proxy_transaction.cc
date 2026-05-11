@@ -311,7 +311,12 @@ void ProxyTransaction::RebuildOutboundTraceHeaders() {
     if (!mgr) return;
     auto p = mgr->propagator();
     if (!p) return;
-    p->StripOwnedHeaders(rewritten_headers_);
+    // Strip the UNION of every shipped format, not just the configured
+    // live propagator's owned set — a client-forged `uber-trace-id`
+    // must not slip through when only W3C is configured. See
+    // .claude/rules/pitfalls/OBSERVABILITY.md "strip union" rule.
+    OBSERVABILITY_NAMESPACE::Propagator::StripAllKnownTraceHeaders(
+        rewritten_headers_);
     p->Inject(current_attempt_.attempt_local, rewritten_headers_);
     // Force the H1 send path to re-serialize with the fresh trace
     // headers — `serialized_request_` is built lazily on first send.
@@ -345,8 +350,9 @@ void ProxyTransaction::FinalizeAttemptSpan(int status_code,
     // returns. The histogram is independent of trace sampling — every
     // attempt that started gets a duration record. attempt_start_steady_
     // is zero-sentinel when obs is disabled, so the inner emit gates
-    // naturally. Reset the sentinel after emit so a second call (e.g.
-    // OnResponseComplete after the dtor backstop) doesn't double-record.
+    // naturally. Reset the sentinel after emit so a second call from
+    // Cleanup's dtor backstop (which runs AFTER OnResponseComplete on
+    // the success path) doesn't double-record.
     if (attempt_start_steady_ !=
         std::chrono::steady_clock::time_point{} &&
         !IsKilledForShutdown()) {
@@ -1793,23 +1799,23 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
         // next AttemptCheckout allocates a fresh span keyed on the new
         // attempt number; without this, the prior attempt would leak
         // into ~ProxyTransaction without End() / DropWithoutEnd. Map
-        // RetryCondition to the closed-enum error.type label.
-        const char* prev_error = nullptr;
-        switch (condition) {
-            case RetryPolicy::RetryCondition::CONNECT_FAILURE:
-                prev_error = "connect_failure"; break;
-            case RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT:
-                prev_error = "upstream_disconnect"; break;
-            case RetryPolicy::RetryCondition::RESPONSE_TIMEOUT:
-                prev_error = "timeout"; break;
-            case RetryPolicy::RetryCondition::RESPONSE_5XX:
-                prev_error = nullptr; break;  // status >= 500 path below
-        }
+        // RetryCondition to the closed-enum error.type label, EXCEPT
+        // for RESPONSE_5XX which carries the upstream status instead.
         if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
             FinalizeAttemptSpan(response_head_.status_code, /*error_type=*/"");
         } else {
-            FinalizeAttemptSpan(/*status_code=*/0,
-                                 prev_error ? prev_error : "upstream_error");
+            const char* prev_error = "upstream_error";
+            switch (condition) {
+                case RetryPolicy::RetryCondition::CONNECT_FAILURE:
+                    prev_error = "connect_failure"; break;
+                case RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT:
+                    prev_error = "upstream_disconnect"; break;
+                case RetryPolicy::RetryCondition::RESPONSE_TIMEOUT:
+                    prev_error = "timeout"; break;
+                case RetryPolicy::RetryCondition::RESPONSE_5XX:
+                    break;  // unreachable — guarded above
+            }
+            FinalizeAttemptSpan(/*status_code=*/0, prev_error);
         }
         // §7.2: bump reactor.upstream.retries with {service, reason}.
         // The closed-enum `reason` label aligns with the RetryCondition
@@ -1977,6 +1983,12 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                                      response_head_.status_code,
                                      attempt_, duration.count());
                 state_ = State::COMPLETE;
+                // Finalize the CLIENT span with the real upstream status
+                // BEFORE Cleanup's backstop. Without this the dtor backstop
+                // labels the span error.type="abandoned", masking the actual
+                // 5xx — exactly the case where operators need the real code.
+                FinalizeAttemptSpan(response_head_.status_code,
+                                     /*error_type=*/"");
                 HttpResponse client_response = BuildClientResponse();
                 DeliverResponse(std::move(client_response));
                 return;

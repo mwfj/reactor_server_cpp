@@ -611,21 +611,30 @@ bool NetServer::IsOnDispatcherThread() const {
 }
 
 bool NetServer::EnQueueOnConnDispatcher(std::function<void()> fn) {
-    if (conn_dispatcher_) {
-        conn_dispatcher_->EnQueue(std::move(fn));
-        return true;
+    // Two warn-loud cases that operators must see:
+    //   (a) `conn_dispatcher_` is null — pre-MarkServerReady boot path.
+    //   (b) `conn_dispatcher_->was_stopped()` — post-Stop teardown. The
+    //       underlying `EnQueue` no-ops silently here, which would let
+    //       a caller's keyed idempotency CAS (e.g. `stop_scheduled_`)
+    //       stay latched with no log evidence — same operator-pain
+    //       shape as case (a). Distinguish in the warn so the operator
+    //       can tell boot-time misuse from a re-entry-after-stop bug.
+    // From a request handler this is unreachable in practice; from a
+    // future caller it must be diagnosable from logs alone. The caller
+    // rolls back its CAS on `false` so a retry has a chance.
+    if (!conn_dispatcher_) {
+        logging::Get()->warn(
+            "EnQueueOnConnDispatcher: conn_dispatcher_ is null; task dropped");
+        return false;
     }
-    // Reachable only during boot before MarkServerReady wires the
-    // conn dispatcher, or after Stop() has torn it down. From a
-    // request handler this should be unreachable — but combining a
-    // silent drop with `HttpServer::stop_scheduled_` CAS already
-    // flipped would leave operators chasing a hung shutdown with no
-    // log evidence. Warn loud so misuse surfaces immediately. The
-    // caller is responsible for rolling back any keyed idempotency
-    // CAS so a retry has a chance once the dispatcher is back.
-    logging::Get()->warn(
-        "EnQueueOnConnDispatcher: conn_dispatcher_ is null; task dropped");
-    return false;
+    if (conn_dispatcher_->was_stopped()) {
+        logging::Get()->warn(
+            "EnQueueOnConnDispatcher: conn_dispatcher_ already stopped; "
+            "task dropped");
+        return false;
+    }
+    conn_dispatcher_->EnQueue(std::move(fn));
+    return true;
 }
 
 void NetServer::SetConnectionTimeout(std::chrono::seconds timeout) {

@@ -1,6 +1,7 @@
 #include "observability/propagator.h"
 
 #include <algorithm>
+#include <array>
 #include <set>
 #include <string_view>
 
@@ -102,6 +103,39 @@ void Propagator::StripOwnedHeaders(HeadersVec& headers) const {
         std::remove_if(headers.begin(), headers.end(),
             [&](const std::pair<std::string, std::string>& kv) {
                 return survivors.find(ToLower(kv.first)) == survivors.end();
+            }),
+        headers.end());
+}
+
+// Union of every shipped propagator's owned headers. Edited in lockstep
+// with each concrete StripOwnedHeaders impl; adding a new propagator
+// requires adding its keys here.
+namespace {
+constexpr std::array<std::string_view, 3> kAllKnownTraceHeaders = {
+    "traceparent",     // W3C Trace Context
+    "tracestate",      // W3C Trace Context
+    "uber-trace-id",   // Jaeger
+};
+}  // namespace
+
+void Propagator::StripAllKnownTraceHeaders(HeadersMap& headers) {
+    for (auto it = headers.begin(); it != headers.end(); ) {
+        bool match = false;
+        for (auto lk : kAllKnownTraceHeaders) {
+            if (EqualsLowerAscii(it->first, lk)) { match = true; break; }
+        }
+        it = match ? headers.erase(it) : std::next(it);
+    }
+}
+
+void Propagator::StripAllKnownTraceHeaders(HeadersVec& headers) {
+    headers.erase(
+        std::remove_if(headers.begin(), headers.end(),
+            [](const std::pair<std::string, std::string>& kv) {
+                for (auto lk : kAllKnownTraceHeaders) {
+                    if (EqualsLowerAscii(kv.first, lk)) return true;
+                }
+                return false;
             }),
         headers.end());
 }

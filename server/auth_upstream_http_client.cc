@@ -244,12 +244,12 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
     // across gateway-internal hops, then inject from issue_ctx when
     // the caller has populated it with a valid local SpanContext.
     //
-    // Strip semantics: when `req.issue_ctx->propagator` is bound, route
-    // through that composite's `StripOwnedHeaders` so the strip set
-    // tracks operator-configured `propagators` automatically. Without a
-    // bound propagator we fall back to the hard-coded union of every
-    // shipped format (W3C + Jaeger) so client-supplied trace headers are
-    // ALWAYS stripped regardless of whether injection happens.
+    // Strip semantics: the strip set is the UNION of every shipped
+    // propagator's owned headers, regardless of the live propagator
+    // config. An operator configuring `traces.propagators = ["w3c"]`
+    // doesn't grant clients permission to forge `uber-trace-id` — the
+    // gateway's spoofing defense must hold against EVERY known format.
+    // See .claude/rules/pitfalls/OBSERVABILITY.md "strip union" rule.
     //
     // Lifetime: `issue_ctx->propagator` is a `shared_ptr` so a
     // concurrent SIGHUP that swaps `ObservabilityManager::propagator_`
@@ -259,19 +259,7 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
         (req.issue_ctx.has_value() && req.issue_ctx->propagator)
             ? req.issue_ctx->propagator.get()
             : nullptr;
-    if (propagator) {
-        propagator->StripOwnedHeaders(req.headers);
-    } else {
-        for (auto it = req.headers.begin(); it != req.headers.end(); ) {
-            if (OBSERVABILITY_NAMESPACE::EqualsLowerAscii(it->first, "traceparent") ||
-                OBSERVABILITY_NAMESPACE::EqualsLowerAscii(it->first, "tracestate") ||
-                OBSERVABILITY_NAMESPACE::EqualsLowerAscii(it->first, "uber-trace-id")) {
-                it = req.headers.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
+    OBSERVABILITY_NAMESPACE::Propagator::StripAllKnownTraceHeaders(req.headers);
     // Defense-in-depth gate: inject only when (a) `local` is valid AND
     // (b) a Tracer is bound. The Tracer field is the caller's contract
     // signal that `local.span_id` references a SpanContext the gateway

@@ -548,6 +548,75 @@ inline void TestHttpClientRequestDurationEmitsPerAttempt() {
     }
 }
 
+// Regression for the .claude/rules/pitfalls/OBSERVABILITY.md "strip
+// union" rule: with `traces.propagators = ["w3c"]` (the default) the
+// proxy must STILL strip a client-supplied `uber-trace-id` from the
+// outbound request, even though Jaeger isn't configured. Without the
+// union strip, a malicious client could pin a chosen Jaeger trace_id
+// onto every downstream span emitted by the upstream.
+inline void TestProxyStripsForeignTraceHeadersUnderDefaultPropagators() {
+    std::cout << "\n[TEST] Proxy strip union: w3c-only config still drops uber-trace-id"
+              << std::endl;
+    try {
+        std::string seen_uber;
+        std::mutex hdr_mtx;
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/echo", [&](const HttpRequest& req, HttpResponse& resp) {
+            std::lock_guard<std::mutex> g(hdr_mtx);
+            auto it = req.headers.find("uber-trace-id");
+            seen_uber = (it != req.headers.end()) ? it->second : "";
+            resp.Status(200).Body("ok", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ManagerFixture gw_fix(SamplerType::AlwaysOn, "obs-strip-union");
+        ServerConfig gw_cfg;
+        gw_cfg.bind_host = "127.0.0.1";
+        gw_cfg.bind_port = 0;
+        gw_cfg.worker_threads = 2;
+        gw_cfg.http2.enabled = false;
+        gw_cfg.upstreams.push_back(
+            MakeProxyUpstreamConfig("backend", "127.0.0.1", backend_port, "/echo"));
+        HttpServer gateway(gw_cfg);
+        gateway.SetObservabilityManager(gw_fix.manager);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Client forges a Jaeger header alongside a benign request.
+        const std::string forged_uber =
+            "deadbeefdeadbeefdeadbeefdeadbeef:1234567890abcdef:0:01";
+        std::string req =
+            "GET /echo HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "uber-trace-id: " + forged_uber + "\r\n"
+            "Connection: close\r\n\r\n";
+        std::string resp = SendHttpRequest(gw_port, req);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        std::string captured;
+        {
+            std::lock_guard<std::mutex> g(hdr_mtx);
+            captured = seen_uber;
+        }
+
+        bool resp_ok = resp.find("200 OK") != std::string::npos;
+        bool stripped = captured.empty();
+        bool pass = resp_ok && stripped;
+        std::string err;
+        if (!resp_ok) err = "response not 200";
+        else if (!stripped) err = "uber-trace-id leaked to backend: '" +
+                                    captured + "'";
+        TestFramework::RecordTest(
+            "ProxyClient: strip union — w3c-only drops client uber-trace-id",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyClient: strip union — w3c-only drops client uber-trace-id",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "PROXY CLIENT-SPAN OBSERVABILITY TESTS" << std::endl;
@@ -558,6 +627,7 @@ inline void RunAllTests() {
     TestRetryAttemptsSurfaceDistinctClientSpans();
     TestHttpClientRequestDurationEmitsPerAttempt();
     TestObservabilityDisabledForwardsTraceparentVerbatim();
+    TestProxyStripsForeignTraceHeadersUnderDefaultPropagators();
 }
 
 }  // namespace ObservabilityProxyClientTests

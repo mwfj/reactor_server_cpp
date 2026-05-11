@@ -118,6 +118,13 @@ struct AttemptTraceContext {
 struct IssueTraceContext {
     SpanContext local;
     SpanContext parent;
+    // Raw pointer because Tracer is owned by TracerProvider, which
+    // outlives every IssueTraceContext via the four-phase shutdown
+    // drain barrier (observability flush completes before
+    // TracerProvider destruction). Asymmetric with `propagator` below
+    // (shared_ptr) because the propagator is hot-swappable via SIGHUP
+    // — a concurrent swap could free the composite mid-call, while
+    // Tracer is constructed once and never replaced.
     Tracer*     tracer = nullptr;
     // Live trace-context propagator (composite of the operator's
     // `traces.propagators`). Held as `shared_ptr` so a concurrent SIGHUP

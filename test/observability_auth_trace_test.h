@@ -129,6 +129,35 @@ std::string SendBearerGet(int port, const std::string& path,
     return resp;
 }
 
+// Like SendBearerGet but injects an extra header — used by the strip
+// union regression test to force a client-supplied uber-trace-id onto
+// the inbound request.
+std::string SendBearerGetWithExtraHeader(int port, const std::string& path,
+                                           const std::string& bearer,
+                                           const std::string& header_name,
+                                           const std::string& header_value) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return "";
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return "";
+    }
+    std::string req = "GET " + path + " HTTP/1.1\r\n"
+                      "Host: localhost\r\n"
+                      "Connection: close\r\n"
+                      "Authorization: Bearer " + bearer + "\r\n"
+                      + header_name + ": " + header_value + "\r\n\r\n";
+    SendAll(fd, req);
+    std::string resp = RecvResponse(fd);
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
+    return resp;
+}
+
 int ExtractStatus(const std::string& resp) {
     if (resp.size() < 12) return 0;
     try { return std::stoi(resp.substr(9, 3)); } catch (...) { return 0; }
@@ -506,6 +535,71 @@ inline void TestUnsampledInboundStillPropagatesTraceparent() {
     }
 }
 
+// Regression for the .claude/rules/pitfalls/OBSERVABILITY.md "strip
+// union" rule on the auth introspection path. With default propagators
+// = ["w3c"], the introspection POST to the IdP must NOT carry a
+// client-forged `uber-trace-id`. Without union strip, an attacker
+// could pin a Jaeger trace_id onto every span the IdP emits.
+inline void TestAuthStripsForeignTraceHeadersUnderDefaultPropagators() {
+    std::cout << "\n[TEST] Auth strip union: w3c-only drops client uber-trace-id"
+              << std::endl;
+    try {
+        ScopedEnv env(kSecretEnvVar, kSecretValue);
+
+        MockIntrospectionServerNS::MockIntrospectionServer mock;
+        if (!mock.Start()) {
+            TestFramework::RecordTest(
+                "AuthTrace: strip union — w3c-only drops client uber-trace-id",
+                false, "mock IdP failed to start");
+            return;
+        }
+        mock.EnqueueActiveTrue("user1", {});
+
+        const std::string issuer_name = "test_iss";
+        const std::string upstream    = "mock_idp";
+        ServerConfig cfg = BuildAuthGatewayConfig(mock, issuer_name, upstream);
+
+        ManagerFixture fix(/*auth_idp_span_enabled=*/true);
+        HttpServer server(cfg);
+        server.SetObservabilityManager(fix.manager);
+        server.Get("/protected", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(200).Body("ok", "text/plain");
+        });
+        TestServerRunner<HttpServer> runner(server);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // Client forges a Jaeger header. Server's default propagators
+        // ["w3c"] would normally only strip W3C-owned keys — the union
+        // strip MUST still drop uber-trace-id.
+        const std::string forged_uber =
+            "deadbeefdeadbeefdeadbeefdeadbeef:1234567890abcdef:0:01";
+        std::string resp = SendBearerGetWithExtraHeader(
+            runner.GetPort(), "/protected", "tok-12345",
+            "uber-trace-id", forged_uber);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+        bool resp_ok = ExtractStatus(resp) == 200;
+        bool count_ok = mock.request_count() >= 1;
+        std::string idp_uber = mock.received_header("uber-trace-id");
+        bool stripped = idp_uber.empty();
+
+        bool pass = resp_ok && count_ok && stripped;
+        std::string err;
+        if (!resp_ok) err = "response status " + std::to_string(ExtractStatus(resp));
+        else if (!count_ok) err = "mock IdP not called";
+        else if (!stripped) err = "uber-trace-id leaked to IdP: '" +
+                                    idp_uber + "'";
+
+        TestFramework::RecordTest(
+            "AuthTrace: strip union — w3c-only drops client uber-trace-id",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthTrace: strip union — w3c-only drops client uber-trace-id",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "AUTH-PATH TRACE OBSERVABILITY TESTS" << std::endl;
@@ -515,6 +609,7 @@ inline void RunAllTests() {
     TestAuthIdpCheckSpanAllocated();
     TestAuthIdpSpanDisabledFallsBackToEvents();
     TestUnsampledInboundStillPropagatesTraceparent();
+    TestAuthStripsForeignTraceHeadersUnderDefaultPropagators();
 }
 
 }  // namespace ObservabilityAuthTraceTests
