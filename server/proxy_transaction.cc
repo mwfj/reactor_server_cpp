@@ -408,12 +408,15 @@ void ProxyTransaction::FinalizeAttemptSpan(int status_code,
     // the CLIENT span semantically empty — usually a caller bug (forgot
     // to map a new RESULT_* code, or hit a code path that didn't
     // populate either). Log loudly so the regression surfaces; we still
-    // End() the span below so it doesn't leak.
+    // End() the span below so it doesn't leak. trace_id is included so
+    // operators can pivot from the warn to the collector record.
     if (status_code <= 0 && error_type.empty()) {
         logging::Get()->warn(
             "FinalizeAttemptSpan: span ended with no status_code AND no "
             "error_type — caller forgot a RESULT_* mapping. service={} "
-            "attempt={}", service_name_, attempt_);
+            "attempt={} trace_id={}",
+            service_name_, attempt_,
+            current_attempt_.attempt_local.trace_id().ToHex());
     }
     auto& span = current_attempt_.upstream_span;
     if (status_code > 0) {
@@ -779,7 +782,7 @@ void ProxyTransaction::SetupAttemptObservability() {
                 opts.precomputed_context = current_attempt_.attempt_local;
                 opts.has_precomputed_context = true;
                 current_attempt_.upstream_span =
-                    mgr->GetTracer("reactor.gateway.http", "1")
+                    mgr->GetTracer("reactor.gateway.http", "1.0.0")
                        ->StartSpan(std::string("HTTP ") + method_,
                                     opts);
                 auto& span = current_attempt_.upstream_span;

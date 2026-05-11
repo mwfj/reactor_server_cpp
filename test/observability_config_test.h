@@ -201,6 +201,32 @@ void TestValidatePromPathMustStartWithSlash() {
     }
 }
 
+void TestValidateRejectsPromPathSlashOnly() {
+    // Regression: bare "/" would route every request via the sampler's
+    // path-or-subtree prefix match, silently disabling traces site-wide.
+    // The auto-append also no-ops on "/", but the silent skip was
+    // operator-invisible — hard-reject at load.
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {"enabled": true,
+                "metrics": {"exporter": "prometheus_pull",
+                             "prometheus": {"path": "/"}}
+            }
+        })");
+        bool threw = false;
+        try { ConfigLoader::Validate(cfg); }
+        catch (const std::invalid_argument&) { threw = true; }
+        TestFramework::RecordTest(
+            "ObsCfg: Validate rejects prom path == \"/\"",
+            threw, threw ? "" : "didn't throw",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: Validate rejects prom path == \"/\"",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 void TestValidateRejectsHistogramBucketsOutOfOrder() {
     try {
         auto cfg = ConfigLoader::LoadFromString(R"({
@@ -1044,6 +1070,7 @@ void RunAllTests() {
     TestPropagatorsListUnknownRejected();
     TestPropagatorsListDuplicateRejected();
     TestValidatePromPathMustStartWithSlash();
+    TestValidateRejectsPromPathSlashOnly();
     TestValidateRejectsHistogramBucketsOutOfOrder();
     TestHotReloadableRejectsBadLiveValue();
     TestHotReloadableSkipsBadLiveValueWhenNotLive();

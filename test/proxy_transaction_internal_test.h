@@ -829,8 +829,15 @@ void TestH2DispatchFailureStampsClientProtocolVersionBeforeRetry() {
     }
 }
 
-void TestWebSocketSnapshotResetDecrementsActiveGauge() {
-    std::cout << "\n[TEST] ProxyTransaction internal: WebSocket snapshot reset decrements active gauge..."
+void TestWebSocketSnapshotInstallOnceContract() {
+    // SetObservabilitySnapshot is now install-once: the cached
+    // instrument pointers are read lock-free from MaybeEmitMessageSpan /
+    // BumpFrameCounter, so a second call (including reset-to-null)
+    // would race those reads. The implementation rejects rebind +
+    // error-logs; the matching -1 fires only from the dtor. This test
+    // verifies (a) the first bind increments, (b) a second call leaves
+    // the gauge unchanged (rebind rejected), and (c) dtor decrements.
+    std::cout << "\n[TEST] ProxyTransaction internal: WebSocket snapshot install-once contract..."
               << std::endl;
     try {
         OBSERVABILITY_NAMESPACE::ObservabilityConfig cfg;
@@ -839,7 +846,7 @@ void TestWebSocketSnapshotResetDecrementsActiveGauge() {
         cfg.metrics.enabled = true;
         cfg.traces.sampler.type =
             OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOn;
-        cfg.resource.service_name = "ws-active-gauge-reset";
+        cfg.resource.service_name = "ws-active-gauge-install-once";
         auto processor =
             std::make_shared<OBSERVABILITY_NAMESPACE::InMemorySpanProcessor>();
         auto manager = OBSERVABILITY_NAMESPACE::ObservabilityManager::Create(
@@ -853,40 +860,49 @@ void TestWebSocketSnapshotResetDecrementsActiveGauge() {
             std::make_shared<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>();
         snap->manager = manager;
 
-        WebSocketConnection ws(std::shared_ptr<ConnectionHandler>{});
-        ws.SetObservabilitySnapshot(snap);
+        auto read_gauge = [&]() -> double {
+            auto s = manager->meter_provider()->Snapshot();
+            double total = 0;
+            for (const auto& inst : s.instruments) {
+                if (inst.name != "reactor.websocket.active_connections") continue;
+                for (const auto& p : inst.counter_points) total += p.value;
+            }
+            return total;
+        };
 
-        auto first = manager->meter_provider()->Snapshot();
         double after_bind = 0;
-        for (const auto& inst : first.instruments) {
-            if (inst.name != "reactor.websocket.active_connections") continue;
-            for (const auto& p : inst.counter_points) after_bind += p.value;
+        double after_rebind_attempt = 0;
+        {
+            WebSocketConnection ws(std::shared_ptr<ConnectionHandler>{});
+            ws.SetObservabilitySnapshot(snap);
+            after_bind = read_gauge();
+            ws.SetObservabilitySnapshot(nullptr);  // rejected
+            after_rebind_attempt = read_gauge();
         }
+        double after_dtor = read_gauge();
 
-        ws.SetObservabilitySnapshot(nullptr);
-
-        auto second = manager->meter_provider()->Snapshot();
-        double after_reset = 0;
-        for (const auto& inst : second.instruments) {
-            if (inst.name != "reactor.websocket.active_connections") continue;
-            for (const auto& p : inst.counter_points) after_reset += p.value;
-        }
-
-        bool pass = after_bind == 1.0 && after_reset == 0.0;
+        bool pass = after_bind == 1.0 &&
+                    after_rebind_attempt == 1.0 &&
+                    after_dtor == 0.0;
         std::string err;
         if (after_bind != 1.0) {
             err += "after bind=" + std::to_string(after_bind) + "; ";
         }
-        if (after_reset != 0.0) {
-            err += "after reset=" + std::to_string(after_reset) + "; ";
+        if (after_rebind_attempt != 1.0) {
+            err += "after rebind-attempt=" +
+                   std::to_string(after_rebind_attempt) +
+                   " (rebind should be rejected); ";
+        }
+        if (after_dtor != 0.0) {
+            err += "after dtor=" + std::to_string(after_dtor) + "; ";
         }
 
         TestFramework::RecordTest(
-            "ProxyTransaction internal: WebSocket snapshot reset decrements active gauge",
+            "ProxyTransaction internal: WebSocket snapshot install-once contract",
             pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "ProxyTransaction internal: WebSocket snapshot reset decrements active gauge",
+            "ProxyTransaction internal: WebSocket snapshot install-once contract",
             false, e.what());
     }
 }
@@ -1243,7 +1259,7 @@ void RunAllTests() {
     TestRetryable5xxIncompleteSnapshotKeepsLeaseDuringBackoff();
     TestRetryable5xxH2PathClearsHoldingDespiteIncompleteSnapshot();
     TestH2DispatchFailureStampsClientProtocolVersionBeforeRetry();
-    TestWebSocketSnapshotResetDecrementsActiveGauge();
+    TestWebSocketSnapshotInstallOnceContract();
     TestHeldRetryable5xxIncompleteSnapshotResumesInsteadOfRetrying();
     TestCheckoutLocalFailureRelaysStoredRetryable5xx();
     TestCheckoutCircuitOpenRelaysStoredRetryable5xx();

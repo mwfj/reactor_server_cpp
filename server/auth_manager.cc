@@ -1466,7 +1466,7 @@ void AuthManager::InvokeAsyncMiddleware(
                     /*is_remote=*/false);
             }
             call_ctx.tracer = obs_manager_->GetTracer(
-                "reactor.gateway.auth", "1");
+                "reactor.gateway.auth", "1.0.0");
             // Hold the propagator via shared_ptr so a concurrent SIGHUP
             // that swaps `propagator_` cannot destroy the composite
             // between construction here and outbound header injection
@@ -1976,21 +1976,27 @@ void AuthManager::SetupAuthIdpCheckObservability(
     opts.parent = state.inbound_server_span->Context();
     opts.has_parent = true;
     state.auth_idp_check_span =
-        obs_manager_->GetTracer("reactor.gateway.auth", "1")
+        obs_manager_->GetTracer("reactor.gateway.auth", "1.0.0")
             ->StartSpan("auth.idp_check", opts);
     if (!state.auth_idp_check_span) return;
     state.auth_idp_check_span->SetAttribute(
         "auth.issuer",
         OBSERVABILITY_NAMESPACE::AttrValue(issuer_name));
     // Re-point the outbound POST traceparent at the auth.idp_check
-    // span. issue_ctx was first wired up in InvokeAsyncMiddleware with
-    // inbound_server_span as parent; promoting it here preserves the
-    // original "level-1: auth.idp_check is outbound parent" intent
-    // for the cache-miss path, while leaving cache hits with no
-    // outbound (and no orphaned span).
+    // span. issue_ctx was wired with inbound_server_span as parent in
+    // InvokeAsyncMiddleware; promoting it here preserves the original
+    // "auth.idp_check is outbound parent" intent for the cache-miss
+    // path. The has_value() skip is reachable when the inbound
+    // parent_local was invalid at middleware time — log so operators
+    // can distinguish "no inbound trace context" from a missed re-point.
     if (state.issue_ctx.has_value()) {
         state.issue_ctx->local  = state.auth_idp_check_span->Context();
         state.issue_ctx->parent = state.auth_idp_check_span->Context();
+    } else {
+        logging::Get()->debug(
+            "SetupAuthIdpCheckObservability: issue_ctx absent "
+            "(inbound parent_local was invalid); outbound POST will "
+            "carry no traceparent");
     }
 }
 

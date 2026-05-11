@@ -521,20 +521,11 @@ void ApplySamplerSelfNoiseDefaults(
     std::vector<OBSERVABILITY_NAMESPACE::SamplerRouteOverride> auto_defaults;
     auto auto_append = [&](const std::string& path) {
         if (path.empty() || path[0] != '/') return;
-        // Reject bare "/" — the sampler matches by path-or-subtree
-        // prefix (see `ObservabilityManager::EffectiveSamplerForPath`),
-        // so an always_off route on "/" would route EVERY path to
-        // always_off, silently disabling traces site-wide. Operators
-        // who genuinely want that should set the top-level sampler
-        // type instead of dressing it up as a self-noise default.
-        if (path == "/") {
-            logging::Get()->warn(
-                "Sampler: refusing to auto-prepend always_off self-noise "
-                "route for path='/' — would catch every request via "
-                "subtree match. Set `observability.traces.sampler.type` "
-                "directly or use a non-root path.");
-            return;
-        }
+        // Defense-in-depth: bare "/" is hard-rejected at ConfigLoader::
+        // Validate, but this lambda runs at load (before Validate) AND
+        // from programmatic callers that may bypass Validate. Skip
+        // silently — the Validate path is the source-of-truth error.
+        if (path == "/") return;
         for (const auto& existing : obs.traces.sampler.routes) {
             if (existing.path == path) return;
         }
@@ -2512,6 +2503,21 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
             || oc.metrics.prometheus.path[0] != '/')) {
         throw std::invalid_argument(
             "observability.metrics.prometheus.path must start with '/'");
+    }
+    // Reject bare "/" — the sampler self-noise auto-prepend depends on
+    // a path-or-subtree prefix match, and a "/" entry would catch every
+    // request via subtree match. The auto-append already warns and
+    // skips, but that leaves /metrics traffic feeding its own traces
+    // (the self-noise filter is silently no-op'd). Hard-reject here so
+    // operators see the misconfig at boot rather than only in the warn
+    // log + a runtime trace anomaly.
+    if (oc.metrics.exporter == OBSERVABILITY_NAMESPACE::kExporterPrometheusPull
+        && oc.metrics.prometheus.path == "/") {
+        throw std::invalid_argument(
+            "observability.metrics.prometheus.path must not be \"/\" — "
+            "the catch-all path would route every request through the "
+            "metrics endpoint and disable trace sampling for the whole "
+            "site. Use a distinct path (default '/metrics').");
     }
 
     // Cross-references into upstreams[] — only at startup (reload_copy

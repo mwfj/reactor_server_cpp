@@ -368,49 +368,30 @@ const char* OpcodeToString(WebSocketOpcode op) {
 
 void WebSocketConnection::SetObservabilitySnapshot(
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap) {
-    // Rebinding/unbinding must retire the previous +1 before swapping
-    // state; otherwise a null/reset call leaves active_connections
-    // inflated until dtor, contradicting the "Setting null" contract.
-    // Use the cached pointer rather than re-reading catalog() so the
-    // decrement matches the instrument we incremented against, even
-    // if the manager's catalog reference rotated mid-stream.
-    if (active_counted_ && active_connections_counter_ != nullptr) {
-        active_connections_counter_->Add(-1.0, {});
-        active_counted_ = false;
+    // INSTALL-ONCE — call once from the upgrade path. The cached
+    // pointers are read lock-free from the data-path emission sites;
+    // a second call would race those reads (see the header docstring).
+    // Defensive guard rather than silently rebinding: log + ignore.
+    if (active_counted_ || obs_manager_ || frames_counter_ ||
+        active_connections_counter_ || ws_messages_enabled_flag_) {
+        logging::Get()->error(
+            "WebSocketConnection::SetObservabilitySnapshot called twice — "
+            "rebind is unsupported; the second call is ignored");
+        return;
     }
-
     obs_snapshot_ = std::move(snap);
-    // Cache manager + flag + instrument pointers once at install time
-    // so per-frame emission is a single null-check + one virtual call.
-    // Without these caches, every frame would pay a manager.catalog()
-    // member access + Counter* field load per direction.
-    if (obs_snapshot_) {
-        obs_manager_ = obs_snapshot_->manager.lock();
-        if (obs_manager_) {
-            ws_messages_enabled_flag_ =
-                obs_manager_->WebSocketMessagesEnabledFlag();
-            const auto& cat = obs_manager_->catalog();
-            frames_counter_             = cat.reactor_websocket_frames;
-            active_connections_counter_ =
-                cat.reactor_websocket_active_connections;
-            // Bump reactor.websocket.active_connections; the matching
-            // -1 runs in the dtor (or above on rebind) under the
-            // `active_counted_` latch so each +1 has exactly one
-            // matching -1.
-            if (active_connections_counter_ != nullptr) {
-                active_connections_counter_->Add(1.0, {});
-                active_counted_ = true;
-            }
-        } else {
-            ws_messages_enabled_flag_   = nullptr;
-            frames_counter_             = nullptr;
-            active_connections_counter_ = nullptr;
-        }
-    } else {
-        obs_manager_.reset();
-        ws_messages_enabled_flag_   = nullptr;
-        frames_counter_             = nullptr;
-        active_connections_counter_ = nullptr;
+    if (!obs_snapshot_) return;
+    obs_manager_ = obs_snapshot_->manager.lock();
+    if (!obs_manager_) return;
+    ws_messages_enabled_flag_ = obs_manager_->WebSocketMessagesEnabledFlag();
+    const auto& cat = obs_manager_->catalog();
+    frames_counter_             = cat.reactor_websocket_frames;
+    active_connections_counter_ = cat.reactor_websocket_active_connections;
+    // Bump reactor.websocket.active_connections; the matching -1 runs
+    // in the dtor under the `active_counted_` latch.
+    if (active_connections_counter_ != nullptr) {
+        active_connections_counter_->Add(1.0, {});
+        active_counted_ = true;
     }
 }
 
@@ -453,7 +434,7 @@ void WebSocketConnection::MaybeEmitMessageSpan(
     opts.kind       = OBSERVABILITY_NAMESPACE::SpanKind::INTERNAL;
     opts.parent     = parent->Context();
     opts.has_parent = true;
-    auto span = obs_manager_->GetTracer("reactor.gateway.ws", "1")
+    auto span = obs_manager_->GetTracer("reactor.gateway.ws", "1.0.0")
                               ->StartSpan(name, opts);
     if (!span) return;
     span->SetAttribute("ws.opcode",
