@@ -40,6 +40,10 @@ class ProxyTransaction
     : public std::enable_shared_from_this<ProxyTransaction>,
       public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink,
       public OBSERVABILITY_NAMESPACE::UpstreamTransactionLink {
+    // Test-only friend that pokes the private H2 dispatch state to
+    // exercise OnRequestSubmitted's response_timeout branch without
+    // spinning up the full UpstreamManager / dispatcher / pool stack.
+    friend struct H2ResponseTimeoutTestFixture;
 public:
     // Result codes for internal state tracking
     static constexpr int RESULT_SUCCESS             = 0;
@@ -60,6 +64,19 @@ public:
     // X-Retry-Budget-Exhausted so operators can tell the two 503s apart
     // from circuit-open rejects.
     static constexpr int RESULT_RETRY_BUDGET_EXHAUSTED = -8;
+    // Upstream response did not match its declared length. Two cases:
+    //   - Content-Length declared, peer delivered fewer bytes before clean
+    //     close, or more bytes than declared.
+    //   - Response classified NO_BODY (status 204/304 or HEAD method) but
+    //     peer sent body bytes anyway.
+    // Terminal — partial body has already been streamed downstream so retry
+    // would double-deliver bytes. Maps to 502 BadGateway in MakeErrorResponse.
+    static constexpr int RESULT_TRUNCATED_RESPONSE  = -10;
+    // CONNECT method on an H2 upstream. RFC 9113 §8.5 forbids :scheme and
+    // :path on CONNECT pseudo-headers, but our H2 codec always emits both;
+    // serving CONNECT here would emit a malformed request. Terminal —
+    // deterministic policy reject (502 BadGateway + X-H2-Limitation header).
+    static constexpr int RESULT_H2_METHOD_NOT_SUPPORTED = -11;
 
     // Constructor copies all needed fields from client_request (method, path,
     // query, headers, body, params, dispatcher_index, client_ip, client_tls,
@@ -137,6 +154,28 @@ public:
         return kill_for_shutdown_.load(std::memory_order_acquire);
     }
 
+    // Returns true iff the comma-separated TE header value contains the
+    // `trailers` token. Handles RFC 9110 §10.1.4 syntax: each entry MAY
+    // carry `;q=...` weight parameters (e.g. `te: trailers;q=1.0`); the
+    // matcher splits on the bare token name (substring before the first
+    // ';' in each comma-segment), trimmed of OWS. Locale-safe ASCII
+    // lowercase via explicit `c | 0x20` branch (NOT std::tolower).
+    // Public + static so test code can verify the contract directly.
+    static bool ContainsTeTrailersToken(const std::string& value);
+
+    // Computes the H2 send-stall budget. Mirrors H1's zero-disable
+    // semantic: response_timeout_ms == 0 opts out of the response-wait
+    // timer but the stall-phase hang protection stays on, falling back
+    // to SEND_STALL_FALLBACK_MS. Negative values are treated the same
+    // as zero (defensive — config validation enforces non-negative,
+    // but a future bug must not produce a zero or negative budget that
+    // would either fire instantly or never).
+    // Public + static so tests verify the contract directly.
+    static int ComputeH2StallBudgetMs(int response_timeout_ms) {
+        return (response_timeout_ms > 0) ? response_timeout_ms
+                                         : SEND_STALL_FALLBACK_MS;
+    }
+
     bool OnHeaders(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override;
     bool OnBodyChunk(const char* data, size_t len) override;
@@ -144,8 +183,37 @@ public:
         const std::vector<std::pair<std::string, std::string>>& trailers) override;
     void OnComplete() override;
     void OnError(int error_code, const std::string& message) override;
+    void OnRequestSubmitted() override;
+    void OnRequestBodyProgress() override;
+
+    // Send-phase stall fallback budget when config_.response_timeout_ms == 0.
+    // The response-wait timeout is operator-disable-able (set to 0), but the
+    // stall-phase hang protection is always on — without it a wedged upstream
+    // that stops reading our request body would pin both the client and the
+    // pooled connection indefinitely. Used by both the H1 send loop and the
+    // H2 send-stall closure (via ComputeH2StallBudgetMs).
+    //
+    // Public so test code can verify the contract directly. Leaking a
+    // static-constexpr int is harmless — no ABI surface, no mutable state.
+    static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
 
 private:
+    // Bump h2_send_stall_generation_ and queue a fresh send-stall
+    // closure for the full budget. Called from DispatchH2 at attempt
+    // start. OnRequestBodyProgress does NOT call this directly —
+    // refreshes flow through h2_last_progress_at_ + the closure's
+    // self-rescheduling check.
+    void ArmH2SendStallDeadline(int budget_ms);
+
+    // Queue (or re-queue) the send-stall closure with the given
+    // generation and delay. Called by ArmH2SendStallDeadline (initial
+    // arm with a fresh generation) and by the closure itself on
+    // observed progress (re-queue with the current generation for the
+    // remaining budget). Same-generation re-queue is correct because
+    // Cleanup / OnRequestSubmitted bump the generation, invalidating
+    // any in-flight closure regardless of who queued it.
+    void QueueH2SendStallClosure(uint64_t generation, int delay_ms);
+
     // State machine states
     enum class State {
         INIT,                // Created, not yet started
@@ -158,6 +226,10 @@ private:
     };
 
     State state_ = State::INIT;
+    // After H2 SubmitRequest failure rollback, state_ briefly reads
+    // SENDING_REQUEST while h2_path_ is already false. AttemptCheckout
+    // (retry path) and DeliverTerminalError (no-retry path) reset it;
+    // no live reader observes the gap.
     int attempt_ = 0;  // Current attempt number (0 = first try)
     // Set by Cancel() — short-circuits checkout / retry / response
     // delivery paths so the transaction is torn down even if an
@@ -304,6 +376,53 @@ private:
     std::weak_ptr<UpstreamH2Connection> h2_conn_weak_;
     int32_t h2_stream_id_ = -1;
     bool h2_path_ = false;
+
+    // True iff the inbound request carried `te: trailers` (RFC 7230 §4.3
+    // / RFC 9113 §8.2.2 — required by gRPC clients to negotiate trailer
+    // support). Captured at construction BEFORE HeaderRewriter strips
+    // all te values per RFC 7230 hop-by-hop rules. The H2 outbound nv
+    // build re-emits a synthetic `te: trailers` based on this flag; H1
+    // path is unchanged (rewriter strips, no re-emit).
+    bool client_te_trailers_ = false;
+
+    // H2 send-stall generation counter. Bounds the time spent in
+    // SENDING_REQUEST waiting for END_STREAM to flush — without this, a
+    // wedged peer that stops reading our DATA frames would pin the H2
+    // stream until the peer's PING timeout (or forever, if PING is
+    // disabled). Armed BEFORE SubmitRequest so the synchronous
+    // on_frame_send_callback path (bodyless requests where nghttp2
+    // inline-flushes HEADERS+END_STREAM) can kill it via generation
+    // bump. Cleanup also bumps to invalidate any in-flight closure.
+    uint64_t h2_send_stall_generation_ = 0;
+
+    // H2 response-timeout arm-once flag. Coordinates the response timer
+    // arming between OnHeaders and OnRequestSubmitted: whichever fires
+    // first arms ArmResponseTimeout and sets this flag, and the other
+    // skips re-arming. Required because the existing H1 OnHeaders path
+    // calls ClearResponseTimeout (semantic doesn't apply to H2's
+    // two-deadline model) and DispatchH2 cannot arm response-timeout
+    // upfront without leaking the budget into the body-write phase.
+    // Reset by Cleanup so retry attempts arm fresh.
+    bool h2_response_timeout_armed_ = false;
+
+    // True once OnRequestSubmitted has fired. OnRequestBodyProgress
+    // gates refresh on this rather than state_ — request-side and
+    // response-side phases diverge on the early-final-headers path.
+    // Reset by DispatchH2 init + Cleanup.
+    bool h2_request_fully_sent_ = false;
+
+    // Last time the H2 codec emitted a request-side DATA frame.
+    // Updated by OnRequestBodyProgress; inspected by the single
+    // in-flight send-stall closure on fire. The closure re-queues
+    // itself for the remaining budget if progress was observed,
+    // otherwise it fires the timeout. This keeps the dispatcher's
+    // min-heap bounded to one closure per request regardless of
+    // upload size, while preserving refresh-on-every-DATA semantics.
+    std::chrono::steady_clock::time_point h2_last_progress_at_{};
+
+    // Cached send-stall budget for this attempt. Computed once in
+    // DispatchH2 so the closure's progress check doesn't recompute.
+    int h2_stall_budget_ms_ = 0;
 
     // H2 response timeout uses a dispatcher-scheduled task instead of a
     // transport-level deadline: the transport is shared across every

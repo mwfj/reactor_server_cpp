@@ -4,6 +4,8 @@
 
 namespace UPSTREAM_CALLBACKS_NAMESPACE {
 
+// New virtuals must have default no-op bodies to preserve embedder
+// ABI; pure-virtual additions break every existing sink subclass.
 class UpstreamResponseSink {
 public:
     virtual ~UpstreamResponseSink() = default;
@@ -19,6 +21,17 @@ public:
         const std::vector<std::pair<std::string, std::string>>&) {}
     virtual void OnComplete() = 0;
     virtual void OnError(int error_code, const std::string& message) = 0;
+
+    // Fired on END_STREAM (HEADERS for bodyless, DATA otherwise). H2
+    // only. May fire synchronously from within SubmitRequest for
+    // bodyless requests — sinks must be reentrant relative to submit.
+    virtual void OnRequestSubmitted() {}
+
+    // Fired per intermediate request-side DATA frame on the wire (not
+    // a per-byte signal — frame coalescing collapses adjacent writes).
+    // H2 only. Sinks should gate refresh logic on their own state
+    // machine; the codec dispatches unconditionally.
+    virtual void OnRequestBodyProgress() {}
 };
 
 }  // namespace UPSTREAM_CALLBACKS_NAMESPACE

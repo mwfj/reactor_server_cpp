@@ -86,6 +86,8 @@ PoolPartition::PoolPartition(
 // Null out all callbacks on a connection's transport to prevent
 // dangling-this use-after-free if the ConnectionHandler outlives
 // the PoolPartition (still in dispatcher's connections_ map).
+// Nulls completion/write-progress too so an H2 borrower's wire-up
+// can't survive an Init failure into the next pool reuse.
 static void ClearTransportCallbacks(UpstreamConnection* conn) {
     if (conn && conn->GetTransport()) {
         auto t = conn->GetTransport();
@@ -93,6 +95,8 @@ static void ClearTransportCallbacks(UpstreamConnection* conn) {
         t->SetCloseCb(nullptr);
         t->SetOnMessageCb(nullptr);
         t->SetErrorCb(nullptr);
+        t->SetCompletionCb(nullptr);
+        t->SetWriteProgressCb(nullptr);
     }
 }
 
@@ -580,20 +584,13 @@ std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
     if (!transport) return nullptr;
 
     auto h2 = std::make_shared<UpstreamH2Connection>(up, cfg);
-    if (!h2->Init()) {
-        logging::Get()->warn(
-            "PoolPartition::AcquireH2Connection: Init failed upstream={} "
-            "host={}:{}",
-            upstream_name, upstream_host_, upstream_port_);
-        return nullptr;
-    }
 
-    // Wire transport callbacks for the H2 session lifecycle. The H2
-    // connection multiplexes the transport for its lifetime, so we
-    // overwrite the pool-owned message and close callbacks: pool
-    // accounting then follows the lease destructor when the H2
-    // connection retires (lease_ is moved into the H2 connection
-    // below — its return-to-pool is what reclaims the slot).
+    // Callbacks wired BEFORE Init() because Init's preface flush can
+    // fire complete_callback synchronously on a writable transport
+    // (DoSendRaw direct-write path) — our drain attribution must be
+    // active for that bootstrap traffic. The H2 connection
+    // multiplexes the transport for its lifetime; pool accounting
+    // follows the lease destructor when the H2 connection retires.
     std::weak_ptr<UpstreamH2Connection> wk = h2;
     transport->SetOnMessageCb(
         [wk](std::shared_ptr<ConnectionHandler>, std::string& data) {
@@ -659,6 +656,37 @@ std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
                 ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                 "transport error");
         });
+    // Drive request-side sink virtuals from REAL transport drain (not
+    // from nghttp2 frame serialization). The H2 session enqueues every
+    // outbound HEADERS/DATA frame into its drain_queue_ inside
+    // on_frame_send_callback; these two hooks pop the queue as bytes
+    // actually leave the transport buffer, then dispatch
+    // OnRequestBodyProgress / OnRequestSubmitted on the corresponding
+    // stream's sink. Matches H1's transport-callback-driven semantic.
+    transport->SetWriteProgressCb(
+        [wk](std::shared_ptr<ConnectionHandler>, size_t remaining) {
+            auto h = wk.lock();
+            if (!h) return;
+            h->OnTransportWriteProgress(remaining);
+        });
+    transport->SetCompletionCb(
+        [wk](std::shared_ptr<ConnectionHandler>) {
+            auto h = wk.lock();
+            if (!h) return;
+            h->OnTransportWriteComplete();
+        });
+
+    if (!h2->Init()) {
+        logging::Get()->warn(
+            "PoolPartition::AcquireH2Connection: Init failed upstream={} "
+            "host={}:{}",
+            upstream_name, upstream_host_, upstream_port_);
+        // Unwire our weak_ptr closures before the transport returns to
+        // the pool — WirePoolCallbacks doesn't overwrite completion /
+        // write-progress on reuse.
+        ClearTransportCallbacks(up);
+        return nullptr;
+    }
 
     h2->AdoptLease(std::move(lease));
     h2_table_.Insert(upstream_name, h2);

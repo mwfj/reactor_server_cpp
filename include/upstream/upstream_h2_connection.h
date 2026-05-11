@@ -88,6 +88,10 @@ public:
     // Submit an outbound HTTP request as a new H2 stream. Returns the
     // nghttp2 stream_id on success (>= 1), or -1 on submit failure or
     // when this connection is no longer usable.
+    //
+    // `client_te_trailers`: if true, the nv-array build appends a
+    // synthetic `te: trailers` entry after the rewriter's strip pass.
+    // Defaulted false to keep existing test callers compiling unchanged.
     int32_t SubmitRequest(
         const std::string& method,
         const std::string& scheme,
@@ -95,7 +99,8 @@ public:
         const std::string& path,
         const std::map<std::string, std::string>& headers,
         const std::string& body,
-        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink);
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink,
+        bool client_te_trailers = false);
 
     // Cancel an in-flight stream. Submits RST_STREAM with NGHTTP2_CANCEL
     // and flushes; defers the flush when called from inside HandleBytes
@@ -141,6 +146,31 @@ public:
     // nghttp2_session_mem_send2 from inside an mem_recv2 callback chain.
     bool in_receive_data() const { return in_receive_data_; }
 
+    // Transport-drain hooks. Wired in PoolPartition::AcquireH2Connection
+    // to the underlying transport's write_progress / completion callbacks.
+    // Each call walks drain_queue_ in serialization order and fires the
+    // per-stream sink virtuals (OnRequestBodyProgress / OnRequestSubmitted)
+    // for bytes that have actually drained to the wire — NOT when nghttp2
+    // serialized them into its internal buffer.
+    //
+    // `remaining` is the transport's current output_buf size after the
+    // partial write. We compute drained = bytes_in_drain_queue_ - remaining
+    // and attribute that many bytes to the front of drain_queue_.
+    void OnTransportWriteProgress(size_t remaining);
+    // Transport buffer fully drained — every frame in drain_queue_ is on
+    // the wire. Fire any remaining sink virtuals and clear the queue.
+    void OnTransportWriteComplete();
+    // Called from the static on_frame_send_callback for EVERY serialized
+    // frame (request HEADERS/DATA AND control frames). Push the frame's
+    // wire-byte count onto drain_queue_; the sink virtuals fire from
+    // the transport-drain hooks above, not here. Control frames carry
+    // is_control=true so dispatch skips them but byte accounting stays
+    // accurate (control bytes interleaved with request bytes in the
+    // transport buffer would otherwise be mis-attributed).
+    void EnqueueFrameForDrain(int32_t stream_id, size_t bytes,
+                              bool is_data_frame, bool is_end_stream,
+                              bool is_control);
+
 private:
     // Non-owning. Lifetime contract: PoolPartition owns the transport
     // and never reclaims it while this connection's stream count > 0.
@@ -185,4 +215,39 @@ private:
     // HandleBytes will pick up any frames they queued. Prevents
     // re-entering nghttp2_session_mem_send2 from a mem_recv2 callback.
     bool in_receive_data_ = false;
+
+    // Per-frame drain tracking. Populated in on_frame_send_callback for
+    // EVERY serialized frame (request HEADERS/DATA AND control frames
+    // like PING, SETTINGS, WINDOW_UPDATE, RST_STREAM); consumed in
+    // OnTransportWriteProgress / OnTransportWriteComplete as bytes drain
+    // off the transport buffer. Each entry sums to the frame's wire size
+    // (9-byte header + payload). Control-frame entries are tracked
+    // purely for accurate byte accounting — they fire no sink virtuals.
+    // Without this, a session reused for a fresh request after a PING
+    // would mis-attribute the PING's drain to the new request's first
+    // frame, firing OnRequestBodyProgress / OnRequestSubmitted before
+    // the request's own bytes had drained.
+    struct PendingFrameDrain {
+        int32_t stream_id;
+        size_t bytes;          // Remaining bytes for this frame on the wire
+        bool is_data_frame;    // OnRequestBodyProgress dispatch (DATA only)
+        bool is_end_stream;    // OnRequestSubmitted dispatch (END_STREAM)
+        bool is_control;       // PING/SETTINGS/WINDOW_UPDATE/RST/etc — no sink
+    };
+    std::deque<PendingFrameDrain> drain_queue_;
+    // Total bytes queued on the transport on our behalf — sum of every
+    // bytes field in drain_queue_. Maintained alongside the queue so we
+    // can compute drained-since-last-fire as
+    //   drained = bytes_in_drain_queue_ - remaining
+    // from the transport's reported `remaining`.
+    size_t bytes_in_drain_queue_ = 0;
+
+    // Pop the front entry of drain_queue_ and fire its sink virtuals.
+    // Caller owns the streams_ lookup. Used by both progress and
+    // complete paths.
+    void FireSinkForDrainEntry(const PendingFrameDrain& entry);
+    // Drop drain_queue_ entries that belong to a stream that has just
+    // been failed / reset. The sink is about to be detached so its
+    // virtuals must not fire post-detach.
+    void DropDrainEntriesForStream(int32_t stream_id);
 };

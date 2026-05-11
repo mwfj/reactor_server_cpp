@@ -203,12 +203,99 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
                             int32_t stream_id, const uint8_t* data,
                             size_t len, void* user_data)
 {
-    // Look up via the connection's own stream table rather than casting
-    // nghttp2's raw user_data pointer directly.
     auto* self = static_cast<UpstreamH2Connection*>(user_data);
     auto* stream = self->GetStream(stream_id);
     if (!stream || !stream->sink) return 0;
-    stream->sink->OnBodyChunk(reinterpret_cast<const char*>(data), len);
+
+    // Defense-in-depth: nghttp2's HTTP-messaging enforcement normally
+    // catches NO_BODY / Content-Length violations before we get here.
+    // Kept active as a backstop for callers that opt out of enforcement.
+    // ResetStream (not raw nghttp2_submit_rst_stream) so in_receive_data_
+    // defers the inline FlushSend until the post-receive flush.
+    using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
+    // Detach sink before OnError so a synchronous teardown chain
+    // (sink OnError → Cleanup → ResetStream) does not re-dispatch on
+    // an already-failed path.
+    auto reject_truncation = [&](const char* msg) {
+        auto* sink = stream->sink;
+        stream->sink = nullptr;
+        if (sink) {
+            sink->OnError(ProxyTransaction::RESULT_TRUNCATED_RESPONSE, msg);
+        }
+        self->ResetStream(stream_id);
+    };
+    if (stream->response_head.framing == Framing::NO_BODY && len > 0) {
+        reject_truncation("body bytes on NO_BODY response");
+        return 0;
+    }
+    if (stream->response_head.framing == Framing::CONTENT_LENGTH &&
+        stream->response_head.expected_length >= 0 &&
+        static_cast<int64_t>(len) >
+            stream->response_head.expected_length -
+            stream->body_bytes_received) {
+        reject_truncation("body exceeds Content-Length");
+        return 0;
+    }
+
+    stream->body_bytes_received += static_cast<int64_t>(len);
+    const bool keep = stream->sink->OnBodyChunk(
+        reinterpret_cast<const char*>(data), len);
+    if (!keep) {
+        // Sink refused further body — detach + RST_STREAM(CANCEL) so
+        // the upstream stops sending. Session stays alive for sibling
+        // streams. The pre-null guards against ResetStream's dead_
+        // short-circuit.
+        stream->sink = nullptr;
+        self->ResetStream(stream_id);
+    }
+    return 0;
+}
+
+// Enqueue EVERY serialized frame for byte-accurate drain tracking.
+// Request-side HEADERS / DATA frames eventually fire sink virtuals from
+// the transport-drain hooks; control frames (PING / SETTINGS /
+// WINDOW_UPDATE / RST_STREAM / GOAWAY / PRIORITY) are tracked as
+// is_control entries so the bytes they consume in the transport buffer
+// are correctly attributed (without this, a PING flushed before a fresh
+// request would shrink the transport's remaining-bytes counter and
+// mis-attribute the PING's drain to the request's first frame, firing
+// OnRequestSubmitted before the request's bytes actually hit the wire).
+int OnFrameSendCallback(nghttp2_session* /*session*/,
+                        const nghttp2_frame* frame, void* user_data)
+{
+    if (!frame) return 0;
+    auto* self = static_cast<UpstreamH2Connection*>(user_data);
+    // Wire size = 9-byte frame header + payload length. nghttp2's
+    // frame->hd.length is the payload size; framework adds 9 for the
+    // fixed header regardless of frame type.
+    const size_t frame_bytes = 9 + static_cast<size_t>(frame->hd.length);
+    const bool is_request_frame =
+        (frame->hd.type == NGHTTP2_HEADERS ||
+         frame->hd.type == NGHTTP2_DATA);
+    if (is_request_frame) {
+        auto* stream = self->GetStream(frame->hd.stream_id);
+        if (!stream || !stream->sink) {
+            // Stream missing or sink detached — still track the bytes
+            // as a control entry so the FIFO byte accounting stays
+            // accurate. The dispatch lookup at fire-time will short-
+            // circuit on the missing stream regardless.
+            self->EnqueueFrameForDrain(frame->hd.stream_id, frame_bytes,
+                                        /*is_data=*/false,
+                                        /*is_end_stream=*/false,
+                                        /*is_control=*/true);
+            return 0;
+        }
+        const bool is_data = (frame->hd.type == NGHTTP2_DATA);
+        const bool eos = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+        self->EnqueueFrameForDrain(frame->hd.stream_id, frame_bytes,
+                                    is_data, eos, /*is_control=*/false);
+        return 0;
+    }
+    // Control frame: track bytes but never dispatch sink virtuals.
+    self->EnqueueFrameForDrain(/*stream_id=*/0, frame_bytes,
+                                /*is_data=*/false,
+                                /*is_end_stream=*/false,
+                                /*is_control=*/true);
     return 0;
 }
 
@@ -243,6 +330,13 @@ UpstreamH2Connection::~UpstreamH2Connection() {
             t->SetOnMessageCb(nullptr);
             t->SetCloseCb(nullptr);
             t->SetErrorCb(nullptr);
+            // Write-progress / completion hooks installed by
+            // AcquireH2Connection — must also be cleared before the
+            // transport returns to the pool, otherwise the next
+            // borrower inherits closures pointing at a destroyed
+            // session.
+            t->SetWriteProgressCb(nullptr);
+            t->SetCompletionCb(nullptr);
         }
     }
     if (session_) {
@@ -280,8 +374,8 @@ bool UpstreamH2Connection::Init() {
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, &OnStreamCloseCallback);
     nghttp2_session_callbacks_set_on_header_callback(cbs, &OnHeaderCallback);
     nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, &OnBeginHeadersCallback);
-    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
-        cbs, &OnDataChunkRecvCallback);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, &OnDataChunkRecvCallback);
+    nghttp2_session_callbacks_set_on_frame_send_callback(cbs, &OnFrameSendCallback);
 
     int rv = nghttp2_session_client_new(&session_, cbs, this);
     nghttp2_session_callbacks_del(cbs);
@@ -478,8 +572,35 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
         auto stream = it->second;
         streams_.erase(it);
         if (stream && stream->sink) {
+            using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
             if (error_code == NGHTTP2_NO_ERROR) {
-                stream->sink->OnComplete();
+                // Content-Length short-read: peer ended the stream cleanly
+                // but delivered fewer bytes than declared. Surface a
+                // truncation error in place of the OnComplete dispatch so
+                // downstream consumers see RESULT_TRUNCATED_RESPONSE rather
+                // than a successful response with a short body.
+                //
+                // In production this branch is also a defense-in-depth
+                // backstop: nghttp2's HTTP messaging enforcement
+                // (default-on) intercepts CL/NO_BODY violations and
+                // delivers them via the non-NO_ERROR fan-out above
+                // (OnDataChunkRecvCallback's Step 1.5 is a parallel
+                // backstop for the same enforcement-disabled future).
+                // The active value of THIS branch is the silent-short-
+                // close case where the peer respects framing on the wire
+                // but lies about Content-Length — neither nghttp2 nor
+                // Step 1.5 can detect that until the clean END_STREAM
+                // arrives short.
+                if (stream->response_head.framing == Framing::CONTENT_LENGTH &&
+                    stream->response_head.expected_length >= 0 &&
+                    stream->body_bytes_received <
+                        stream->response_head.expected_length) {
+                    stream->sink->OnError(
+                        ProxyTransaction::RESULT_TRUNCATED_RESPONSE,
+                        "Content-Length short read");
+                } else {
+                    stream->sink->OnComplete();
+                }
             } else if (error_code == NGHTTP2_HTTP_1_1_REQUIRED) {
                 // RFC 9113 §13 (error code 0xd): peer indicates THIS
                 // request must be retried over HTTP/1.1. Retrying on H2
@@ -540,48 +661,72 @@ void UpstreamH2Connection::OnHeadersComplete(int32_t stream_id,
     // always either NO_BODY (END_STREAM on HEADERS frame) or
     // CHUNKED-equivalent; check for Content-Length to prefer exact framing.
     using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
-    if (end_stream) {
-        stream->response_head.framing = Framing::NO_BODY;
-    } else {
-        // Scan accumulated headers for content-length. Cap at the H1
-        // codec's MAX_RESPONSE_BODY_SIZE to defend against malicious or
-        // buggy upstreams advertising absurd values (e.g. 1e18 bytes)
-        // that would propagate through expected_length into snapshot
-        // truncation arithmetic. RFC 9113 lets us treat the header as
-        // informational, so on an over-cap value we fall through to
-        // CHUNKED-equivalent framing and rely on END_STREAM as the
-        // authoritative end-of-body signal.
-        int64_t cl = -1;
-        for (const auto& [nm, val] : stream->response_head.headers) {
-            if (nm == "content-length") {
-                // from_chars: strict full-string consume; std::stoll
-                // skips leading whitespace and would accept "  42".
-                cl = -1;
-                const char* end = val.data() + val.size();
-                int64_t parsed = 0;
-                auto [ptr, ec] = std::from_chars(val.data(), end, parsed);
-                if (ec == std::errc() && ptr == end && parsed >= 0) {
-                    cl = parsed;
-                }
-                if (cl > static_cast<int64_t>(
-                        UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE)) {
-                    logging::Get()->warn(
-                        "UpstreamH2Connection: content-length {} exceeds cap "
-                        "{} on stream {}; treating as chunked",
-                        val,
-                        UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE,
-                        stream_id);
-                    cl = -1;
-                }
-                break;
+    // Parse Content-Length regardless of end_stream so the HEADERS-only
+    // short-read case (end_stream on HEADERS with CL > 0) can be
+    // classified as CONTENT_LENGTH and detected by OnStreamClose's CL
+    // short-read check.
+    int64_t cl = -1;
+    for (const auto& [nm, val] : stream->response_head.headers) {
+        if (nm == "content-length") {
+            // from_chars: strict full-string consume; std::stoll
+            // skips leading whitespace and would accept "  42".
+            cl = -1;
+            const char* end = val.data() + val.size();
+            int64_t parsed = 0;
+            auto [ptr, ec] = std::from_chars(val.data(), end, parsed);
+            if (ec == std::errc() && ptr == end && parsed >= 0) {
+                cl = parsed;
             }
+            if (cl > static_cast<int64_t>(
+                    UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE)) {
+                logging::Get()->warn(
+                    "UpstreamH2Connection: content-length {} exceeds cap "
+                    "{} on stream {}; treating as chunked",
+                    val,
+                    UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE,
+                    stream_id);
+                cl = -1;
+            }
+            break;
         }
-        if (cl >= 0) {
+    }
+
+    const bool bodyless_status =
+        (stream->response_head.status_code == 204 ||
+         stream->response_head.status_code == 304 ||
+         stream->request_method == "HEAD");
+
+    if (bodyless_status) {
+        // RFC 9110 §15.4 / §15.4.5 / §9.3.2: 204 / 304 / HEAD responses
+        // MUST NOT carry a body. Content-Length on these is allowed
+        // as informational (RFC 9110 §9.3.2 specifically permits CL on
+        // HEAD to advertise the equivalent-GET body size) and does NOT
+        // trigger a short-read check. Classify as NO_BODY so Step 1.5
+        // in OnDataChunkRecvCallback rejects any subsequent body bytes
+        // from a misbehaving peer with RESULT_TRUNCATED_RESPONSE.
+        stream->response_head.framing = Framing::NO_BODY;
+    } else if (end_stream) {
+        // END_STREAM on HEADERS with a non-bodyless status. If CL > 0
+        // was declared, peer promised N body bytes and delivered zero
+        // — that's a framing violation. Classify as CONTENT_LENGTH
+        // with expected_length=cl so OnStreamClose's existing CL
+        // short-read check fires RESULT_TRUNCATED_RESPONSE (defense
+        // in depth — nghttp2's HTTP messaging enforcement normally
+        // catches this first via the non-NO_ERROR fan-out, but the
+        // backstop covers the no-messaging-enforcement future).
+        // CL == 0 or absent CL → legitimate empty-body response,
+        // classify as NO_BODY.
+        if (cl > 0) {
             stream->response_head.framing = Framing::CONTENT_LENGTH;
             stream->response_head.expected_length = cl;
         } else {
-            stream->response_head.framing = Framing::CHUNKED;
+            stream->response_head.framing = Framing::NO_BODY;
         }
+    } else if (cl >= 0) {
+        stream->response_head.framing = Framing::CONTENT_LENGTH;
+        stream->response_head.expected_length = cl;
+    } else {
+        stream->response_head.framing = Framing::CHUNKED;
     }
 
     if (!stream->sink->OnHeaders(stream->response_head)) {
@@ -629,6 +774,12 @@ void UpstreamH2Connection::FailAllStreams(int error_code,
     if (streams_.empty()) return;
     auto streams = std::move(streams_);
     streams_.clear();
+    // Drain queue entries for these streams are now stale — sinks are
+    // about to be invoked via OnError and must not fire request-side
+    // virtuals afterwards. Clear the whole queue: no other streams are
+    // left to attribute drained bytes to.
+    drain_queue_.clear();
+    bytes_in_drain_queue_ = 0;
     for (auto& kv : streams) {
         if (kv.second && kv.second->sink) {
             kv.second->sink->OnError(error_code, reason);
@@ -647,16 +798,133 @@ void UpstreamH2Connection::ResetStream(int32_t stream_id) {
     if (it == streams_.end()) return;
     // Detach the sink before submitting RST_STREAM so the eventual
     // OnStreamClose does not fire OnError on a transaction that has
-    // already moved on (e.g. a retry in progress).
+    // already moved on (e.g. a retry in progress). The drain-queue
+    // sweep removes any not-yet-fired progress/submitted entries for
+    // this stream so they don't later dispatch to the nulled sink.
     if (it->second) it->second->sink = nullptr;
+    DropDrainEntriesForStream(stream_id);
     int rv = nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE, stream_id, NGHTTP2_CANCEL);
-    
+
     if (rv != 0) {
         logging::Get()->warn(
             "UpstreamH2Connection: submit_rst_stream sid={} rv={}",
             stream_id, rv);
     }
     if (!in_receive_data_) FlushSend();
+}
+
+void UpstreamH2Connection::EnqueueFrameForDrain(int32_t stream_id,
+                                                size_t bytes,
+                                                bool is_data_frame,
+                                                bool is_end_stream,
+                                                bool is_control) {
+    drain_queue_.push_back(
+        PendingFrameDrain{stream_id, bytes, is_data_frame, is_end_stream,
+                          is_control});
+    bytes_in_drain_queue_ += bytes;
+}
+
+void UpstreamH2Connection::FireSinkForDrainEntry(const PendingFrameDrain& entry) {
+    // Control frames are tracked for byte accounting only — never
+    // dispatch sink virtuals for them (no stream to look up; the
+    // sentinel stream_id is meaningless).
+    if (entry.is_control) return;
+    // Stream may have been reset between serialization and drain — the
+    // sink is nulled by ResetStream / FailAllStreams in that case, so
+    // a stale lookup short-circuits here.
+    auto it = streams_.find(entry.stream_id);
+    if (it == streams_.end() || !it->second || !it->second->sink) return;
+    if (entry.is_end_stream) {
+        it->second->sink->OnRequestSubmitted();
+    } else if (entry.is_data_frame) {
+        it->second->sink->OnRequestBodyProgress();
+    }
+}
+
+void UpstreamH2Connection::DropDrainEntriesForStream(int32_t stream_id) {
+    if (drain_queue_.empty()) return;
+    // TOMBSTONE — do NOT erase. The reset stream's bytes are already
+    // sitting in the shared transport buffer ahead of (or interleaved
+    // with) sibling streams' bytes; erasing the entries and subtracting
+    // their bytes would skew bytes_in_drain_queue_ vs transport's
+    // `remaining` count, causing OnTransportWriteProgress's
+    // `remaining >= bytes_in_drain_queue_` early-return to skip
+    // attribution while the reset stream's leftover bytes drain. That
+    // starves sibling streams' OnRequestBodyProgress / OnRequestSubmitted
+    // until the reset stream's bytes fully clear — and if the reset
+    // stream's transport-buffered tail stalls, sibling streams can hit
+    // false send-stall timeouts. Convert the entries to is_control so
+    // FireSinkForDrainEntry skips dispatch, but keep their bytes in the
+    // FIFO sum so accounting stays byte-accurate to the wire.
+    for (auto& e : drain_queue_) {
+        if (!e.is_control && e.stream_id == stream_id) {
+            e.is_control = true;
+            e.is_data_frame = false;
+            e.is_end_stream = false;
+        }
+    }
+}
+
+void UpstreamH2Connection::OnTransportWriteProgress(size_t remaining) {
+    if (dead_) return;
+    if (drain_queue_.empty()) return;
+    // The transport buffer may contain bytes we did NOT push through
+    // on_frame_send (e.g. the 24-byte HTTP/2 client connection preface
+    // magic string at session start). When `remaining` exceeds our
+    // tracked queue total, those untracked bytes are still draining
+    // ahead of our first queued frame — leave the queue total alone
+    // and wait. Updating bytes_in_drain_queue_ = remaining here would
+    // inflate the tracked sum and over-attribute drained bytes to the
+    // front entry on the next fire.
+    if (remaining >= bytes_in_drain_queue_) return;
+    size_t drained = bytes_in_drain_queue_ - remaining;
+    bytes_in_drain_queue_ = remaining;
+    while (drained > 0 && !drain_queue_.empty()) {
+        PendingFrameDrain& front = drain_queue_.front();
+        if (drained >= front.bytes) {
+            drained -= front.bytes;
+            PendingFrameDrain entry = front;
+            drain_queue_.pop_front();
+            // Fire AFTER pop so a sink callback that re-enters
+            // (e.g., Cleanup → ResetStream → DropDrainEntriesForStream)
+            // does not invalidate `front`.
+            FireSinkForDrainEntry(entry);
+        } else {
+            // Partial drain: refresh the per-stream stall timestamp via
+            // OnRequestBodyProgress regardless of END_STREAM. A single
+            // DATA frame body or the trailing DATA frame of a multi-
+            // frame upload would otherwise never see progress while
+            // its bytes are actively leaving the socket — the stall
+            // budget would expire mid-drain even though the wire is
+            // healthy. OnRequestSubmitted is reserved for the
+            // FULL-drain branch above, so firing progress here cannot
+            // race the submitted dispatch. Control-frame entries
+            // (is_control=true) skip dispatch via FireSinkForDrainEntry.
+            front.bytes -= drained;
+            drained = 0;
+            if (front.is_data_frame && !front.is_control) {
+                PendingFrameDrain partial_entry{
+                    front.stream_id, 0, /*is_data=*/true,
+                    /*is_end_stream=*/false, /*is_control=*/false};
+                FireSinkForDrainEntry(partial_entry);
+            }
+        }
+    }
+}
+
+void UpstreamH2Connection::OnTransportWriteComplete() {
+    if (dead_) return;
+    if (drain_queue_.empty()) {
+        bytes_in_drain_queue_ = 0;
+        return;
+    }
+    // Transport buffer is empty — every queued frame is on the wire.
+    auto pending = std::move(drain_queue_);
+    drain_queue_.clear();
+    bytes_in_drain_queue_ = 0;
+    for (auto& entry : pending) {
+        FireSinkForDrainEntry(entry);
+    }
 }
 
 namespace {
@@ -687,9 +955,29 @@ int32_t UpstreamH2Connection::SubmitRequest(
     const std::string& path,
     const std::map<std::string, std::string>& headers,
     const std::string& body,
-    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink)
+    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink,
+    bool client_te_trailers)
 {
     if (!IsUsable()) return -1;
+
+    // Secondary CONNECT-rejection gate. Primary gate lives in
+    // ProxyTransaction::DispatchH2; this catches direct callers that
+    // bypass it (unit tests / future code paths). Sink->OnError fires
+    // here, so callers that also run their own rollback on a -1 return
+    // must be idempotent on the error path.
+    if (method == "CONNECT") {
+        const std::string host = transport_ ? transport_->upstream_host()
+                                            : std::string("?");
+        logging::Get()->warn(
+            "UpstreamH2Connection: rejecting CONNECT secondary gate "
+            "(primary gate bypassed?) host={}", host);
+        if (sink) {
+            sink->OnError(
+                ProxyTransaction::RESULT_H2_METHOD_NOT_SUPPORTED,
+                "CONNECT not supported on H2 upstream");
+        }
+        return -1;
+    }
 
     // Build lowercased header-name backing store FIRST so the nghttp2_nv
     // pointers we build next stay valid for the synchronous submit call.
@@ -743,8 +1031,17 @@ int32_t UpstreamH2Connection::SubmitRequest(
                 kv.second.data(), kv.second.size());
     }
 
+    // Re-emit te: trailers after the rewriter's strip pass. RFC 9113
+    // §8.2.2 permits exactly this token; gRPC clients require it for
+    // trailer support negotiation. Static literals have program-lifetime
+    // storage, safe to reference for the synchronous submit call.
+    if (client_te_trailers) {
+        push_nv("te", 2, "trailers", 8);
+    }
+
     auto stream = std::make_shared<UpstreamH2Stream>();
     stream->sink = sink;
+    stream->request_method = method;
 
     nghttp2_data_provider2 provider = {};
     nghttp2_data_provider2* data_prd = nullptr;

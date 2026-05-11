@@ -9,9 +9,11 @@ A C++17 network server and gateway built on the Reactor pattern. It uses non-blo
 - **WebSocket** — RFC 6455 support: handshake, binary/text frames, fragmentation, close handshake, ping/pong
 - **TLS/SSL** — OpenSSL 3.x integration for downstream server TLS and upstream client TLS
 - **Upstream Proxy** — per-service connection pools with TLS, streaming response relay, retry policy, trailer handling, and header rewriting
+- **HTTP/2 Upstream** — per-upstream opt-in multiplexed H2 client (donated-lease pattern), ALPN-negotiated `auto / always / never` dispatch, two-deadline send-stall + response-timeout model, transport-drain-driven sink dispatch, GOAWAY/PING liveness, live-reloadable session settings
 - **Rate Limiting** — per-client / per-route token-bucket middleware with LRU eviction, `RateLimit-*` headers, dry-run mode, hot reload
 - **Circuit Breaking** — per-upstream state machines, retry budgets, dry-run mode, wait-queue drain, hot-reloadable breaker tuning
 - **OAuth 2.0 Token Validation** — JWT validation with JWKS/OIDC discovery, multi-issuer policies, outbound identity headers, and RFC 7662 introspection mode
+- **Observability (OpenTelemetry)** — W3C + Jaeger trace propagation, OTLP/JSON traces + metrics push, Prometheus pull `/metrics`, route-aware sampling, per-request span tree across inbound + auth + proxy + WS, idempotent finalize-CAS bookkeeping, four-phase graceful shutdown
 - **DNS and IPv6** — bind-host and upstream hostname resolution, IPv4/IPv6 family selection, stale-on-error reload handling
 - **Reactor Core** — edge-triggered epoll (Linux) / kqueue (macOS), non-blocking I/O, multi-threaded dispatcher pool
 - **Thread Pool** — configurable worker threads for event loop dispatchers
@@ -496,6 +498,8 @@ make -C thread_pool
 | [docs/configuration.md](docs/configuration.md) | JSON config, environment variables, DNS, upstreams, rate limiting, structured logging |
 | [docs/oauth2.md](docs/oauth2.md) | OAuth 2.0 JWT and introspection validation |
 | [docs/circuit_breaker.md](docs/circuit_breaker.md) | Circuit breaker configuration, retry budgets, hot reload, observability |
+| [docs/http2_upstream.md](docs/http2_upstream.md) | HTTP/2 upstream client — `prefer` modes, reload semantics, failure modes, tuning |
+| [docs/observability.md](docs/observability.md) | OpenTelemetry — traces, metrics, propagators, sampling, OTLP / Prometheus configuration |
 
 ## Platform Support
 
