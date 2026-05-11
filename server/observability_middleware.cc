@@ -141,16 +141,10 @@ HttpRouter::Middleware MakeObservabilityMiddleware(
         // recorded here once — finalize doesn't see the request body.
         const auto& cat = mgr_sp->catalog();
         if (cat.http_server_active_requests != nullptr) {
-            std::vector<std::pair<std::string, std::string>> ar_labels;
-            ar_labels.reserve(2);
-            if (!request.method.empty()) {
-                ar_labels.emplace_back("http.request.method", request.method);
-            }
-            if (!request.route_match.pattern.empty()) {
-                ar_labels.emplace_back("http.route",
-                                         request.route_match.pattern);
-            }
-            cat.http_server_active_requests->Add(1.0, ar_labels);
+            cat.http_server_active_requests->Add(
+                1.0,
+                OBSERVABILITY_NAMESPACE::MakeActiveRequestsLabels(
+                    request.method, request.route_match.pattern));
         }
         if (cat.http_server_request_body_size != nullptr) {
             std::vector<std::pair<std::string, std::string>> body_labels;

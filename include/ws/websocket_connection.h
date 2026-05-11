@@ -63,10 +63,11 @@ public:
     // Caches the enabled-flag + instrument pointers so the disabled
     // fast path on per-frame emission is one relaxed atomic load.
     //
-    // DISPATCHER-THREAD-ONLY: rebind/unbind issues paired +1/-1 on
-    // `reactor.websocket.active_connections` and overwrites cached
-    // pointers that `MaybeEmitMessageSpan` / `BumpFrameCounter` read
-    // lock-free. Off-thread callers MUST hop via `RunOnDispatcher`.
+    // INSTALL-ONCE-AT-UPGRADE — rebind is unsupported. Called from
+    // `HttpConnectionHandler::AttemptWebSocketUpgrade` on the
+    // connection dispatcher. The cached pointers are read lock-free
+    // from `MaybeEmitMessageSpan` / `BumpFrameCounter` on the data
+    // path; a rebind site would race those reads.
     void SetObservabilitySnapshot(
         std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap);
 

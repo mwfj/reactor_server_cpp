@@ -310,7 +310,18 @@ void ProxyTransaction::RebuildOutboundTraceHeaders() {
     auto* mgr = obs_manager();
     if (!mgr) return;
     auto p = mgr->propagator();
-    if (!p) return;
+    if (!p) {
+        // Reachable during init/SIGHUP races between manager.Init() and
+        // first config commit, or if the operator removed every
+        // propagator from `observability.traces.propagators`. Strip
+        // still runs in the caller (Propagator::StripAllKnownTrace-
+        // Headers); we just can't inject a fresh traceparent.
+        logging::Get()->debug(
+            "RebuildOutboundTraceHeaders: live propagator null; outbound "
+            "request will carry no traceparent for service={} attempt={}",
+            service_name_, attempt_);
+        return;
+    }
     // Strip the UNION of every shipped format, not just the configured
     // live propagator's owned set — a client-forged `uber-trace-id`
     // must not slip through when only W3C is configured. See
@@ -392,6 +403,17 @@ void ProxyTransaction::FinalizeAttemptSpan(int status_code,
         current_attempt_.upstream_span->DropWithoutEnd();
         current_attempt_.upstream_span.reset();
         return;
+    }
+    // Defensive: an End() with neither status_code nor error_type leaves
+    // the CLIENT span semantically empty — usually a caller bug (forgot
+    // to map a new RESULT_* code, or hit a code path that didn't
+    // populate either). Log loudly so the regression surfaces; we still
+    // End() the span below so it doesn't leak.
+    if (status_code <= 0 && error_type.empty()) {
+        logging::Get()->warn(
+            "FinalizeAttemptSpan: span ended with no status_code AND no "
+            "error_type — caller forgot a RESULT_* mapping. service={} "
+            "attempt={}", service_name_, attempt_);
     }
     auto& span = current_attempt_.upstream_span;
     if (status_code > 0) {
@@ -716,14 +738,7 @@ void ProxyTransaction::StartCheckoutAsync() {
     );
 }
 
-void ProxyTransaction::AttemptCheckout() {
-    state_ = State::CHECKOUT_PENDING;
-    if (!PrepareAttemptAdmission()) {
-        return;
-    }
-    ActivateAttemptTracking();
-    EnsureCheckoutCancelToken();
-
+void ProxyTransaction::SetupAttemptObservability() {
     // Build the per-attempt outbound trace context BEFORE we choose
     // between H1 and H2 dispatch — both paths read `current_attempt_`
     // for the wire-format injection. trace_id / flags / state inherit
@@ -778,13 +793,16 @@ void ProxyTransaction::AttemptCheckout() {
                     "server.port",
                     OBSERVABILITY_NAMESPACE::AttrValue(
                         static_cast<int64_t>(upstream_port_)));
-                // network.protocol.version is set at dispatch time —
-                // see SetProtocolVersionOnAttemptSpan called from
-                // DispatchH1 / DispatchH2 / the deferred-handshake
-                // ALPN-resolution callback. Setting it here would
-                // mislabel attempts that route through DispatchH2
-                // because the protocol decision happens AFTER
-                // AttemptCheckout.
+                // Stamp a placeholder network.protocol.version so a
+                // disconnect BEFORE DispatchH1/H2 still ends the span
+                // with a defined protocol attribute. DispatchH1 sets
+                // "1.1", DispatchH2 sets "2"; if neither runs (e.g.
+                // TLS handshake failure on the deferred path), the
+                // CLIENT span retains "unknown" instead of falling
+                // back to default-no-attribute.
+                span->SetAttribute(
+                    "network.protocol.version",
+                    OBSERVABILITY_NAMESPACE::AttrValue(std::string("unknown")));
                 span->SetAttribute(
                     "http.request.resend_count",
                     OBSERVABILITY_NAMESPACE::AttrValue(
@@ -797,6 +815,16 @@ void ProxyTransaction::AttemptCheckout() {
             RebuildOutboundTraceHeaders();
         }
     }
+}
+
+void ProxyTransaction::AttemptCheckout() {
+    state_ = State::CHECKOUT_PENDING;
+    if (!PrepareAttemptAdmission()) {
+        return;
+    }
+    ActivateAttemptTracking();
+    EnsureCheckoutCancelToken();
+    SetupAttemptObservability();
 
     // Fast path: if a usable multiplexed H2 session already exists for
     // this upstream, dispatch onto it without consuming a pool slot.
@@ -2501,6 +2529,12 @@ void ProxyTransaction::BeginRetryAttemptFromHeld5xx() {
     ResetForRetryAttempt();
     ActivateAttemptTracking();
     EnsureCheckoutCancelToken();
+    // Mirror AttemptCheckout: allocate a fresh CLIENT span + rebuild
+    // outbound trace headers so the held-5xx retry surfaces as a
+    // distinct span_id on the wire. Without this the retry is
+    // invisible in the trace tree and replays the prior attempt's
+    // traceparent on its serialized request.
+    SetupAttemptObservability();
     StartCheckoutAsync();
 }
 

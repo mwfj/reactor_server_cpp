@@ -413,6 +413,15 @@ private:
     void ActivateAttemptTracking();
     void EnsureCheckoutCancelToken();
     void StartCheckoutAsync();
+    // Per-attempt observability setup: resets current_attempt_, captures
+    // attempt_start_steady_, allocates the CLIENT span (when sampled),
+    // and rebuilds the outbound trace headers so the wire carries this
+    // attempt's fresh span_id. Called from BOTH AttemptCheckout AND
+    // BeginRetryAttemptFromHeld5xx — the held-5xx retry path also needs
+    // a fresh CLIENT span + invalidated serialized_request_, otherwise
+    // the retry reuses the prior attempt's traceparent on the wire and
+    // is invisible in the trace tree.
+    void SetupAttemptObservability();
     // Pre-checkout fast path for H2 reuse — see implementation comment.
     // Returns true if the transaction was dispatched through an
     // existing multiplexed H2 session (caller must NOT then call

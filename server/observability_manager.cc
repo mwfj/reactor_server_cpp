@@ -467,15 +467,9 @@ void ObservabilityManager::OnFinalizeWinner(
             static_cast<double>(wire_body_size), body_labels);
     }
     if (catalog_.http_server_active_requests != nullptr) {
-        std::vector<std::pair<std::string, std::string>> ar_labels;
-        ar_labels.reserve(2);
-        if (!snap.method.empty()) {
-            ar_labels.emplace_back("http.request.method", snap.method);
-        }
-        if (!snap.route_pattern.empty()) {
-            ar_labels.emplace_back("http.route", snap.route_pattern);
-        }
-        catalog_.http_server_active_requests->Add(-1.0, ar_labels);
+        catalog_.http_server_active_requests->Add(
+            -1.0,
+            MakeActiveRequestsLabels(snap.method, snap.route_pattern));
     }
 
     // Attach response-side attributes before ending:
@@ -709,9 +703,20 @@ void ObservabilityManager::KillOutstandingSnapshots(
             snap.inbound_span->DropWithoutEnd();
         }
 
+        // Symmetric -1 for the +1 emitted by ObservabilityMiddleware on
+        // request entry. The kill loop bypasses OnFinalizeWinner, so
+        // without this site the gauge leaks by N on every shutdown
+        // that times out N survivors (OBSERVABILITY.md "exactly one
+        // +1 and -1 per finalize" invariant).
+        if (catalog_.http_server_active_requests != nullptr) {
+            catalog_.http_server_active_requests->Add(
+                -1.0,
+                MakeActiveRequestsLabels(snap.method, snap.route_pattern));
+        }
+
         DeregisterAndDecrement(snap);
         snapshots_killed_on_timeout_.fetch_add(1, std::memory_order_relaxed);
-        // §7.4 self-metric — surface kill-loop activity at /metrics.
+        // Self-metric — surface kill-loop activity at /metrics.
         if (catalog_.reactor_otel_snapshots_killed_on_timeout != nullptr) {
             catalog_.reactor_otel_snapshots_killed_on_timeout->Add(1.0, {});
         }

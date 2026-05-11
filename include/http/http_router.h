@@ -39,6 +39,19 @@ struct AsyncMiddlewarePayload {
 // one of the two decrements active_requests_.
 class AsyncPendingState {
 public:
+    // Backstop for the dropped-state case: if the async-middleware
+    // resume never fires (e.g., transport abort outside the resume
+    // try/catch envelope, finalizer throw on the resume RunOnDispatcher
+    // closure), the dtor synthesizes the matching trace cleanup so the
+    // `auth.idp_check` span doesn't leak with no End() and the
+    // `auth.pending_start` event doesn't sit orphaned on the SERVER
+    // span. Mirrors `~ObservabilitySnapshot`'s "unfinalized_drop"
+    // backstop. Idempotent: a resume that already ran will have
+    // reset the fields before destruction. Runs on whichever thread
+    // drops the last shared_ptr — Span::End and Span::AddEvent are
+    // documented thread-safe via internal mutexes.
+    ~AsyncPendingState();
+
     // Sync fast-path.
     bool completed_sync() const {
         return completed_sync_.load(std::memory_order_acquire);

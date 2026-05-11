@@ -348,6 +348,21 @@ class AuthManager {
         std::shared_ptr<const AuthForwardConfig> fwd_snap,
         uint64_t policy_incarnation);
 
+    // Allocate the `auth.idp_check` INTERNAL span (or emit the
+    // `auth.pending_start` event in events-fallback mode) once a live
+    // introspection POST is committed. Called from the cache-miss
+    // branch of `InvokeAsyncIntrospection` and from
+    // `InvokeIntrospectionUncached` — NOT from `InvokeAsyncMiddleware`,
+    // because the cache-hit short-circuits don't roundtrip the IdP
+    // and "auth.idp_check" must describe the roundtrip, not the
+    // cache lookup. Also re-points `state.issue_ctx` (built earlier
+    // with inbound_server_span as parent) at the new span so the
+    // outbound POST's traceparent carries the auth.idp_check span_id.
+    void SetupAuthIdpCheckObservability(
+        HttpRouter::AsyncPendingState& state,
+        bool inbound_is_recording,
+        const std::string& issuer_name);
+
     // Stamp a validated AuthContext onto req for the sync fast-paths
     // (cache hit / stale-serve). Mirrors the JWT-mode mutation block.
     static void StampAuthContext(const HttpRequest& req,

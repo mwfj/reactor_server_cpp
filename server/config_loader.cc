@@ -521,6 +521,20 @@ void ApplySamplerSelfNoiseDefaults(
     std::vector<OBSERVABILITY_NAMESPACE::SamplerRouteOverride> auto_defaults;
     auto auto_append = [&](const std::string& path) {
         if (path.empty() || path[0] != '/') return;
+        // Reject bare "/" — the sampler matches by path-or-subtree
+        // prefix (see `ObservabilityManager::EffectiveSamplerForPath`),
+        // so an always_off route on "/" would route EVERY path to
+        // always_off, silently disabling traces site-wide. Operators
+        // who genuinely want that should set the top-level sampler
+        // type instead of dressing it up as a self-noise default.
+        if (path == "/") {
+            logging::Get()->warn(
+                "Sampler: refusing to auto-prepend always_off self-noise "
+                "route for path='/' — would catch every request via "
+                "subtree match. Set `observability.traces.sampler.type` "
+                "directly or use a non-root path.");
+            return;
+        }
         for (const auto& existing : obs.traces.sampler.routes) {
             if (existing.path == path) return;
         }

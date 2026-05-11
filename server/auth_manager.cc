@@ -1440,51 +1440,22 @@ void AuthManager::InvokeAsyncMiddleware(
         if (req.obs_snapshot) {
             state->inbound_server_span = req.obs_snapshot->inbound_span;
         }
-        if (req.trace_ctx->is_recording) {
-            if (obs_manager_->AuthIdpSpanEnabled()) {
-                OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
-                opts.kind = OBSERVABILITY_NAMESPACE::SpanKind::INTERNAL;
-                if (state->inbound_server_span) {
-                    opts.parent = state->inbound_server_span->Context();
-                    opts.has_parent = true;
-                }
-                state->auth_idp_check_span =
-                    obs_manager_->GetTracer("reactor.gateway.auth", "1")
-                        ->StartSpan("auth.idp_check", opts);
-                if (state->auth_idp_check_span) {
-                    state->auth_idp_check_span->SetAttribute(
-                        "auth.issuer",
-                        OBSERVABILITY_NAMESPACE::AttrValue(chosen->name()));
-                }
-            } else if (state->inbound_server_span) {
-                std::vector<OBSERVABILITY_NAMESPACE::Attribute> ev_attrs;
-                ev_attrs.emplace_back(
-                    "auth.issuer",
-                    OBSERVABILITY_NAMESPACE::AttrValue(chosen->name()));
-                state->inbound_server_span->AddEvent("auth.pending_start",
-                                                       std::move(ev_attrs));
-                state->emit_pending_end_event = true;
-            }
-        }
         // Build the per-call outbound trace context. trace_id / flags /
         // state inherit from the inbound `current_local`; the injected
         // `local.span_id` MUST resolve to a span the gateway actually
         // exports when the trace is sampled — otherwise downstream sees
-        // a dangling parent reference. Three precedence levels:
-        //   1. auth.idp_check span — its context is exported by the
-        //      MakeIntrospectionDoneCallback finalize; safe to inject.
-        //   2. inbound SERVER span (auth.idp_check disabled or no span
-        //      allocated) — already exported by the inbound hop.
-        //   3. !is_recording / no inbound span — synthesize a fresh
+        // a dangling parent reference. Two precedence levels here:
+        //   1. inbound SERVER span — already exported by the inbound
+        //      hop; the default fallback before the cache-miss path
+        //      then re-pointed at the auth.idp_check span by
+        //      SetupAuthIdpCheckObservability on cache miss.
+        //   2. !is_recording / no inbound span — synthesize a fresh
         //      span_id. The sampled flag (parent_local.flags()) is 0
-        //      here, so downstream treats the trace as unsampled and
-        //      won't query for parent resolution.
+        //      here, so downstream treats the trace as unsampled.
         const auto& parent_local = req.trace_ctx->current_local;
         if (parent_local.IsValid()) {
             OBSERVABILITY_NAMESPACE::IssueTraceContext call_ctx;
-            if (state->auth_idp_check_span) {
-                call_ctx.local = state->auth_idp_check_span->Context();
-            } else if (state->inbound_server_span) {
+            if (state->inbound_server_span) {
                 call_ctx.local = state->inbound_server_span->Context();
             } else {
                 call_ctx.local = OBSERVABILITY_NAMESPACE::SpanContext(
@@ -1501,9 +1472,7 @@ void AuthManager::InvokeAsyncMiddleware(
             // between construction here and outbound header injection
             // in ApplyOutboundTraceContext.
             call_ctx.propagator = obs_manager_->propagator();
-            if (state->auth_idp_check_span) {
-                call_ctx.parent = state->auth_idp_check_span->Context();
-            } else if (state->inbound_server_span) {
+            if (state->inbound_server_span) {
                 call_ctx.parent = state->inbound_server_span->Context();
             }
             state->issue_ctx = std::move(call_ctx);
@@ -1979,6 +1948,52 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
 
 }  // namespace
 
+void AuthManager::SetupAuthIdpCheckObservability(
+        HttpRouter::AsyncPendingState& state,
+        bool inbound_is_recording,
+        const std::string& issuer_name) {
+    if (!obs_manager_ || !inbound_is_recording) return;
+
+    if (!obs_manager_->AuthIdpSpanEnabled()) {
+        // Events-fallback mode: emit auth.pending_start on the inbound
+        // SERVER span; MakeIntrospectionDoneCallback emits the matching
+        // auth.pending_end when the IdP roundtrip completes.
+        if (!state.inbound_server_span) return;
+        std::vector<OBSERVABILITY_NAMESPACE::Attribute> ev_attrs;
+        ev_attrs.emplace_back(
+            "auth.issuer",
+            OBSERVABILITY_NAMESPACE::AttrValue(issuer_name));
+        state.inbound_server_span->AddEvent("auth.pending_start",
+                                              std::move(ev_attrs));
+        state.emit_pending_end_event = true;
+        return;
+    }
+
+    // Span mode.
+    if (!state.inbound_server_span) return;
+    OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
+    opts.kind = OBSERVABILITY_NAMESPACE::SpanKind::INTERNAL;
+    opts.parent = state.inbound_server_span->Context();
+    opts.has_parent = true;
+    state.auth_idp_check_span =
+        obs_manager_->GetTracer("reactor.gateway.auth", "1")
+            ->StartSpan("auth.idp_check", opts);
+    if (!state.auth_idp_check_span) return;
+    state.auth_idp_check_span->SetAttribute(
+        "auth.issuer",
+        OBSERVABILITY_NAMESPACE::AttrValue(issuer_name));
+    // Re-point the outbound POST traceparent at the auth.idp_check
+    // span. issue_ctx was first wired up in InvokeAsyncMiddleware with
+    // inbound_server_span as parent; promoting it here preserves the
+    // original "level-1: auth.idp_check is outbound parent" intent
+    // for the cache-miss path, while leaving cache hits with no
+    // outbound (and no orphaned span).
+    if (state.issue_ctx.has_value()) {
+        state.issue_ctx->local  = state.auth_idp_check_span->Context();
+        state.issue_ctx->parent = state.auth_idp_check_span->Context();
+    }
+}
+
 void AuthManager::InvokeAsyncIntrospection(
         const std::shared_ptr<Issuer>& issuer,
         const IssuerSnapshot& snap,
@@ -2099,6 +2114,18 @@ void AuthManager::InvokeAsyncIntrospection(
     // the POST when known-degraded; serve fresh otherwise") without giving
     // the auth subsystem direct visibility into CircuitBreakerManager.
     introspection_cache_miss_.fetch_add(1, std::memory_order_relaxed);
+
+    // The IdP roundtrip is now committed (cache miss + non-stale). Allocate
+    // auth.idp_check (or emit auth.pending_start) here so it describes
+    // the actual roundtrip — cache hits short-circuited above never get
+    // a span, eliminating the orphaned-span leak that the previous
+    // InvokeAsyncMiddleware-time allocation produced.
+    if (state) {
+        SetupAuthIdpCheckObservability(*state,
+                                        req.trace_ctx.has_value() &&
+                                            req.trace_ctx->is_recording,
+                                        issuer_name);
+    }
 
     // Snapshot every field the deferred completion may read INTO BY-VALUE
     // LOCALS. After this function returns, `req`, `snap`, `issuer` (the
@@ -2254,6 +2281,15 @@ void AuthManager::InvokeIntrospectionUncached(
     const std::string realm_local = policy.realm.empty()
         ? std::string("api") : policy.realm;
     const std::string issuer_name = issuer->name();
+    // No-cache path: every call is a live POST. Allocate auth.idp_check
+    // (or emit auth.pending_start) here for symmetry with the cache-
+    // miss branch in InvokeAsyncIntrospection.
+    if (state) {
+        SetupAuthIdpCheckObservability(*state,
+                                        req.trace_ctx.has_value() &&
+                                            req.trace_ctx->is_recording,
+                                        issuer_name);
+    }
     const std::string policy_name = policy.name;
     const auto on_undet = policy.on_undetermined;
     const auto required_scopes = policy.required_scopes;

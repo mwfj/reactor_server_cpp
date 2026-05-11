@@ -600,6 +600,112 @@ inline void TestAuthStripsForeignTraceHeadersUnderDefaultPropagators() {
     }
 }
 
+// Regression: the second request hits the introspection cache (warmed
+// by the first) and must NOT allocate auth.idp_check span / emit
+// auth.pending_start. The previous code allocated the span at
+// InvokeAsyncMiddleware time — BEFORE the cache lookup — which left
+// every cache-hit request with an orphaned auth.pending_start event
+// on the SERVER span (no matching auth.pending_end ever emitted) in
+// events-fallback mode. Use events mode here because it lets the
+// regression surface as visible event entries on the SERVER span
+// rather than a span that's silently dropped via DropWithoutEnd.
+inline void TestAuthCacheHitEmitsNoOrphanedPendingStart() {
+    std::cout << "\n[TEST] Auth: cache hit does NOT emit orphaned pending_start"
+              << std::endl;
+    try {
+        ScopedEnv env(kSecretEnvVar, kSecretValue);
+
+        MockIntrospectionServerNS::MockIntrospectionServer mock;
+        if (!mock.Start()) {
+            TestFramework::RecordTest(
+                "AuthTrace: cache hit does not emit orphaned pending_start",
+                false, "mock IdP failed to start");
+            return;
+        }
+        // Same active=true response for both calls; the second will
+        // never reach the mock because the first warms the cache.
+        mock.EnqueueActiveTrue("user1", {});
+
+        const std::string issuer_name = "test_iss";
+        const std::string upstream    = "mock_idp";
+        ServerConfig cfg = BuildAuthGatewayConfig(mock, issuer_name, upstream);
+
+        // Events-fallback mode: auth_idp_span=false routes the
+        // observability hook through auth.pending_start/auth.pending_end
+        // events on the SERVER span. An orphaned start (no matching end)
+        // is the observable signature of the cache-hit-span-leak bug.
+        ManagerFixture fix(/*auth_idp_span_enabled=*/false);
+        HttpServer server(cfg);
+        server.SetObservabilityManager(fix.manager);
+        server.Get("/protected", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(200).Body("ok", "text/plain");
+        });
+        TestServerRunner<HttpServer> runner(server);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // First request: cache miss → real IdP call → pending_start +
+        // pending_end events both emitted on the SERVER span.
+        SendBearerGet(runner.GetPort(), "/protected", "warm-tok-xyz");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        // Second request, SAME token: cache hit → short-circuits before
+        // SetupAuthIdpCheckObservability → SERVER span has NO
+        // pending_start (and consequently no orphaned event).
+        SendBearerGet(runner.GetPort(), "/protected", "warm-tok-xyz");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        auto spans = fix.processor->Drain();
+        // Look at every SERVER span (one per request). The first SHOULD
+        // have both pending_start + pending_end; the second SHOULD have
+        // neither.
+        int server_count = 0;
+        int pending_start_total = 0;
+        int pending_end_total   = 0;
+        int orphaned_starts     = 0;
+        for (const auto& s : spans) {
+            if (s.kind != SpanKind::SERVER) continue;
+            ++server_count;
+            int starts = 0;
+            int ends   = 0;
+            for (const auto& e : s.events) {
+                if (e.name == "auth.pending_start") ++starts;
+                else if (e.name == "auth.pending_end") ++ends;
+            }
+            pending_start_total += starts;
+            pending_end_total   += ends;
+            if (starts > ends) orphaned_starts += (starts - ends);
+        }
+        bool mock_called_exactly_once = (mock.request_count() == 1);
+        // Expected: starts==1, ends==1, orphaned==0, mock called 1x
+        bool pass = server_count >= 2 &&
+                    pending_start_total == 1 &&
+                    pending_end_total   == 1 &&
+                    orphaned_starts     == 0 &&
+                    mock_called_exactly_once;
+        std::string err;
+        if (server_count < 2)               err = "expected >=2 SERVER spans (got " +
+                                                  std::to_string(server_count) + ")";
+        else if (pending_start_total != 1)  err = "expected exactly 1 pending_start "
+                                                  "across both requests; got " +
+                                                  std::to_string(pending_start_total);
+        else if (pending_end_total != 1)    err = "expected exactly 1 pending_end; got " +
+                                                  std::to_string(pending_end_total);
+        else if (orphaned_starts > 0)       err = std::to_string(orphaned_starts) +
+                                                  " orphaned pending_start event(s) on "
+                                                  "SERVER span — cache-hit leaked event";
+        else if (!mock_called_exactly_once) err = "mock IdP called " +
+                                                  std::to_string(mock.request_count()) +
+                                                  " times (expected 1: cache hit on 2nd req)";
+
+        TestFramework::RecordTest(
+            "AuthTrace: cache hit does not emit orphaned pending_start",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "AuthTrace: cache hit does not emit orphaned pending_start",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "AUTH-PATH TRACE OBSERVABILITY TESTS" << std::endl;
@@ -610,6 +716,7 @@ inline void RunAllTests() {
     TestAuthIdpSpanDisabledFallsBackToEvents();
     TestUnsampledInboundStillPropagatesTraceparent();
     TestAuthStripsForeignTraceHeadersUnderDefaultPropagators();
+    TestAuthCacheHitEmitsNoOrphanedPendingStart();
 }
 
 }  // namespace ObservabilityAuthTraceTests

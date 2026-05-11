@@ -210,6 +210,12 @@ public:
     // idempotency CAS on this call (e.g. `stop_scheduled_`) MUST roll the
     // CAS back on `false` so a retry can re-arm.
     //
+    // Residual TOCTOU: a `true` return is best-effort — the inner
+    // `EnQueue` can no-op silently if the dispatcher stops between
+    // the `was_stopped()` recheck here and the dispatcher's queue
+    // lock acquisition. Acceptable today because Stop() is the only
+    // caller and Stop() is idempotent.
+    //
     // Safe to call from any thread, including a route handler running on
     // a socket dispatcher.
     bool EnQueueOnConnDispatcher(std::function<void()> fn);

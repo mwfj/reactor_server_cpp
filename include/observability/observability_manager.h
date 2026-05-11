@@ -53,6 +53,25 @@ namespace OBSERVABILITY_NAMESPACE {
 
 class PeriodicMetricReader;
 
+// Shared label shape for `http.server.active_requests`. Used by the
+// three matched +1 / -1 sites (entry middleware, OnFinalizeWinner,
+// KillOutstandingSnapshots) so the gauge can never drift across
+// label schemas. Empty method / route are skipped so the labelless
+// series captures requests that haven't matched a route yet.
+inline std::vector<std::pair<std::string, std::string>>
+MakeActiveRequestsLabels(const std::string& method,
+                          const std::string& route_pattern) {
+    std::vector<std::pair<std::string, std::string>> labels;
+    labels.reserve(2);
+    if (!method.empty()) {
+        labels.emplace_back("http.request.method", method);
+    }
+    if (!route_pattern.empty()) {
+        labels.emplace_back("http.route", route_pattern);
+    }
+    return labels;
+}
+
 class ObservabilityManager
     : public std::enable_shared_from_this<ObservabilityManager> {
 public:

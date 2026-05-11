@@ -41,7 +41,8 @@ std::vector<double> ToVec(const double (&arr)[N]) {
 }  // namespace
 
 void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
-    Meter* meter = manager.meter_provider()->GetMeter("reactor.gateway", "1");
+    Meter* meter = manager.meter_provider()->GetMeter("reactor.gateway",
+                                                         "1.0.0");
 
     // Server-side HTTP -----------------------------------------------
     out.http_server_active_requests = meter->GetUpDownCounter(
