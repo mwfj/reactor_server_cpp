@@ -8,7 +8,7 @@
 // <memory>, <functional>, <string>, <unordered_map> provided by common.h (via connection_handler.h)
 
 namespace OBSERVABILITY_NAMESPACE {
-class ObservabilitySnapshot;
+struct ObservabilitySnapshot;
 class ObservabilityManager;
 }
 

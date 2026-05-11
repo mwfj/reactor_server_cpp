@@ -92,8 +92,8 @@ std::map<std::string, std::string> BuildHeaders(
 IntrospectionClient::IntrospectionClient(
         std::shared_ptr<UpstreamHttpClient> client,
         OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager)
-    : client_(std::move(client)),
-      obs_manager_(obs_manager) {
+    : client_(std::move(client)) {
+    (void)obs_manager;
     logging::Get()->debug(
         "IntrospectionClient constructed client={}",
         static_cast<const void*>(client_.get()));

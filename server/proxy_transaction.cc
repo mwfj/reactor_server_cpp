@@ -1020,6 +1020,12 @@ void ProxyTransaction::DispatchH1() {
 }
 
 void ProxyTransaction::DispatchH2() {
+    // Stamp the CLIENT span before any H2 acquisition/reuse failure can
+    // short-circuit into MaybeRetry/DeliverTerminalError. Without this,
+    // failed H2 attempts finalize without network.protocol.version even
+    // though successful H2 attempts record "2".
+    SetProtocolVersionOnAttemptSpan("2");
+
     PoolPartition* partition = nullptr;
     if (upstream_manager_ && dispatcher_index_ >= 0) {
         partition = upstream_manager_->GetPoolPartition(
@@ -1035,11 +1041,9 @@ void ProxyTransaction::DispatchH2() {
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
     }
-    // Protocol decision finalized — stamp the CLIENT span. Covers both
-    // reuse path (existing multiplexed session) and fresh-session path
-    // (lease moved into a brand-new H2 connection), AND
-    // TryDispatchExistingH2Session which calls DispatchH2 directly.
-    SetProtocolVersionOnAttemptSpan("2");
+    // Protocol decision finalized — the span was stamped above before
+    // any early-return failure path. Reaching here means the H2 session
+    // acquisition succeeded; continue the dispatch using the same span.
     // Reuse path: lease_ was untouched by AcquireH2Connection; fresh-
     // session path: lease_ has been moved into the H2 connection. In
     // either case the transaction no longer needs a direct lease —
@@ -2183,8 +2187,29 @@ void ProxyTransaction::Cleanup() {
     // No-op when MaybeRetry / OnResponseComplete / DeliverTerminalError /
     // Cancel already finalized the span (current_attempt_.upstream_span
     // is null after their FinalizeAttemptSpan calls).
+    //
+    // Cleanup() is called from ~ProxyTransaction(), which is implicitly
+    // noexcept under C++17 — an exception escaping here terminates the
+    // process via std::terminate. FinalizeAttemptSpan internally
+    // allocates (Histogram::Record / SetAttribute / End), each of which
+    // can throw std::bad_alloc. Wrap so the destructor path cannot
+    // bring down the server; on throw, drop the span without End() —
+    // BSP doesn't receive it, but the alternative (process termination)
+    // is strictly worse. catch (...) covers non-std::exception throws
+    // from any future Span-implementation override or third-party hook.
     if (current_attempt_.upstream_span) {
-        FinalizeAttemptSpan(/*status_code=*/0, "abandoned");
+        try {
+            FinalizeAttemptSpan(/*status_code=*/0, "abandoned");
+        } catch (...) {
+            if (current_attempt_.upstream_span) {
+                current_attempt_.upstream_span->DropWithoutEnd();
+                current_attempt_.upstream_span.reset();
+            }
+            logging::Get()->error(
+                "ProxyTransaction::Cleanup backstop FinalizeAttemptSpan "
+                "threw; dropped span without End() to keep destructor "
+                "noexcept");
+        }
     }
     InvalidateStreamTimers();
     stream_sender_.SetDrainListener(nullptr);

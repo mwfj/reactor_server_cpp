@@ -290,6 +290,94 @@ inline void TestKillLoopBumpsSelfMetric() {
     }
 }
 
+// Ratchet for the docstring's "WIRED today" inventory: exercises the
+// HTTP server flow + kill-loop and asserts every instrument we claim
+// is wired actually surfaces data points in the MeterProvider snapshot.
+// A future refactor that silently moves an emit site out of the path
+// without updating the doc will trip this test rather than producing
+// a present-but-zero series that goes unnoticed.
+//
+// Scope: only catalog instruments exercisable by THIS suite's fixtures
+// are checked here. The proxy retries / WS frames / WS active-conn
+// emit sites are ratcheted by their feature suites (`obs_proxy_client`
+// for retries + duration, `ws` for frames) — including them here would
+// require duplicating their booting infrastructure.
+inline void TestWiredInstrumentsHaveEmitSites() {
+    std::cout << "\n[TEST] MetricsCatalog: WIRED-today instruments have emit sites"
+              << std::endl;
+    try {
+        ManagerFixture fix;
+
+        // Step 1 — exercise the HTTP server flow to fire server-side
+        // wired instruments (active_requests, body sizes).
+        ServerConfig cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.bind_port = 0;
+        cfg.worker_threads = 1;
+        cfg.http2.enabled = false;
+        HttpServer server(cfg);
+        server.SetObservabilityManager(fix.manager);
+        server.Get("/wired", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(200).Body("ok", "text/plain");
+        });
+        TestServerRunner<HttpServer> runner(server);
+        SendRaw(runner.GetPort(),
+                 "GET /wired HTTP/1.1\r\nHost: localhost\r\n"
+                 "Connection: close\r\n\r\n");
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+        // Step 2 — exercise the kill loop to fire the self-metric.
+        auto* tracer = fix.manager->GetTracer("test-catalog-ratchet");
+        OBSERVABILITY_NAMESPACE::StartSpanOptions span_opts;
+        span_opts.kind = OBSERVABILITY_NAMESPACE::SpanKind::SERVER;
+        auto span = tracer->StartSpan("ratchet-snapshot", span_opts);
+        auto snap = std::make_shared<ObservabilitySnapshot>();
+        snap->inbound_span = std::move(span);
+        snap->manager = fix.manager;
+        fix.manager->RegisterLiveSnapshot(snap);
+        fix.manager->KillOutstandingSnapshots(std::chrono::milliseconds(0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        auto mp = fix.manager->meter_provider()->Snapshot();
+
+        // Closed-set of instruments the docstring claims are wired AND
+        // exercisable by this suite's HTTP + kill-loop fixtures.
+        static const std::vector<std::string> kWired = {
+            "http.server.active_requests",
+            "http.server.request.body.size",
+            "http.server.response.body.size",
+            "reactor.otel.snapshots_killed_on_timeout",
+        };
+
+        std::vector<std::string> missing;
+        for (const auto& name : kWired) {
+            bool found = false;
+            for (const auto& inst : mp.instruments) {
+                if (inst.name != name) continue;
+                if (!inst.counter_points.empty()
+                    || !inst.histogram_points.empty()) {
+                    found = true; break;
+                }
+            }
+            if (!found) missing.push_back(name);
+        }
+
+        bool pass = missing.empty();
+        std::string err;
+        if (!pass) {
+            err = "missing data points for: ";
+            for (const auto& n : missing) err += n + " ";
+        }
+        TestFramework::RecordTest(
+            "Catalog: WIRED-today instruments have emit sites",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Catalog: WIRED-today instruments have emit sites",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "METRICS CATALOG TESTS" << std::endl;
@@ -298,6 +386,7 @@ inline void RunAllTests() {
     TestCatalogInstrumentsRegistered();
     TestHttpServerRequestEmitsCatalogMetrics();
     TestKillLoopBumpsSelfMetric();
+    TestWiredInstrumentsHaveEmitSites();
 }
 
 }  // namespace ObservabilityCatalogTests

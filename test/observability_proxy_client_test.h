@@ -524,12 +524,18 @@ inline void TestHttpClientRequestDurationEmitsPerAttempt() {
             }
         }
 
-        bool points_ok = duration_points >= 1;
+        // Single non-retried request → exactly one terminal site fires
+        // → exactly one histogram point. `>= 1` would silently mask a
+        // double-emit bug if the same call site recorded twice (e.g. a
+        // future refactor moving the emit out of FinalizeAttemptSpan
+        // without removing the original).
+        bool points_ok = duration_points == 1;
         bool nonzero_sum = total_sum > 0;
         bool labels_ok = saw_status_label && saw_service_label;
         bool pass = points_ok && nonzero_sum && labels_ok;
         std::string err;
-        if (!points_ok) err = "no histogram points recorded";
+        if (!points_ok) err = "expected exactly 1 histogram point; got " +
+                                std::to_string(duration_points);
         else if (!nonzero_sum) err = "histogram sum is zero (timer fired with no elapsed time)";
         else if (!labels_ok) err = "expected labels missing (status=200, service=backend)";
         TestFramework::RecordTest(

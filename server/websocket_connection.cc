@@ -368,6 +368,17 @@ const char* OpcodeToString(WebSocketOpcode op) {
 
 void WebSocketConnection::SetObservabilitySnapshot(
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap) {
+    // Rebinding/unbinding must retire the previous +1 before swapping
+    // state; otherwise a null/reset call leaves active_connections
+    // inflated until dtor, contradicting the "Setting null" contract.
+    if (active_counted_ && obs_manager_) {
+        const auto& old_cat = obs_manager_->catalog();
+        if (old_cat.reactor_websocket_active_connections != nullptr) {
+            old_cat.reactor_websocket_active_connections->Add(-1.0, {});
+        }
+        active_counted_ = false;
+    }
+
     obs_snapshot_ = std::move(snap);
     // Cache manager + flag pointer once at install time so per-frame
     // emission can short-circuit on a single relaxed atomic load.

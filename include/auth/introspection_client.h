@@ -133,11 +133,6 @@ class IntrospectionClient {
 
  private:
     std::shared_ptr<UpstreamHttpClient> client_;
-    // Non-owning. Nullable. RESERVED for future direct use (e.g.
-    // introspection self-metrics keyed on issuer / outcome). The Verify
-    // path today forwards `issue_ctx` from its caller without consulting
-    // the manager directly.
-    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
 };
 
 }  // namespace AUTH_NAMESPACE

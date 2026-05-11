@@ -1960,6 +1960,17 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
             // doesn't try to End() a partially-finalized span.
             c.state->auth_idp_check_span.reset();
             c.state->emit_pending_end_event = false;
+        } catch (...) {
+            // Defense-in-depth — non-std::exception throws (raw integer,
+            // third-party type) would otherwise bypass the typed catch
+            // and re-enter the documented failure mode where state->
+            // Complete never runs. All in-tree code throws std::exception
+            // -derived types today; this catches a future violation.
+            logging::Get()->error(
+                "auth-trace finalize threw non-std exception; dropping "
+                "obs work, completing request anyway");
+            c.state->auth_idp_check_span.reset();
+            c.state->emit_pending_end_event = false;
         }
         c.state->Complete(std::move(payload));
     };
