@@ -355,6 +355,12 @@ private:
     // shutdown won the kill race.
     void FinalizeAttemptSpan(int status_code,
                               const std::string& error_type);
+    // Stamp `network.protocol.version` on the current attempt's CLIENT
+    // span at dispatch time — set to "1.1" from DispatchH1 / "2" from
+    // DispatchH2 (incl. the TryDispatchExistingH2Session reuse path and
+    // the deferred-handshake ALPN-resolved callback). No-op when the
+    // attempt span wasn't allocated (DROP / observability-disabled).
+    void SetProtocolVersionOnAttemptSpan(const char* version);
 
     // Latch — Start() bumps inflight_transactions_ exactly once and
     // the destructor decrements iff this is set. Atomic because Start

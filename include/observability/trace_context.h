@@ -104,6 +104,17 @@ struct AttemptTraceContext {
 //     parent. For auth-path callers with `auth_idp_check_span` enabled,
 //     this is the auth.idp_check INTERNAL span; with that span
 //     disabled, this falls back to the inbound SERVER span's context.
+// Caller contract — populating an IssueTraceContext that
+// `ApplyOutboundTraceContext` will inject from requires ALL of:
+//   (1) `local.IsValid()` — non-zero trace_id + span_id;
+//   (2) `local.span_id` either references a SpanContext the gateway
+//       actually exports (e.g. auth.idp_check or inbound SERVER span)
+//       OR `local.flags().IsSampled() == false` (unsampled trace —
+//       dangling parent is benign because downstream won't query);
+//   (3) `tracer != nullptr` — defense-in-depth signal that the caller
+//       intends to honor (1)+(2). Future callers that forget the
+//       contract will fail this gate and skip injection rather than
+//       silently leaking a phantom span_id downstream.
 struct IssueTraceContext {
     SpanContext local;
     SpanContext parent;

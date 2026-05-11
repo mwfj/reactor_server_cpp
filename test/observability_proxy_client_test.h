@@ -355,8 +355,28 @@ inline void TestRetryAttemptsSurfaceDistinctClientSpans() {
                                resend_counts[1] >= 1;
         bool backend_called = backend_calls.load() >= 2;
 
+        // §7.2 emit-site check: reactor.upstream.retries Counter must
+        // increment for every retry that actually re-contacted the
+        // upstream. With max_retries=1 we expect exactly 1 retry; the
+        // backend was called twice (initial + retry).
+        double retries_total = 0;
+        std::string retries_reason;
+        auto metrics = gw_fix.manager->meter_provider()->Snapshot();
+        for (const auto& inst : metrics.instruments) {
+            if (inst.name == "reactor.upstream.retries") {
+                for (const auto& p : inst.counter_points) {
+                    retries_total += p.value;
+                    for (const auto& kv : p.labels.kv) {
+                        if (kv.first == "reason") retries_reason = kv.second;
+                    }
+                }
+            }
+        }
+        bool retry_counter_ok =
+            retries_total >= 1.0 && retries_reason == "response_5xx";
+
         bool pass = count_ok && ids_distinct && trace_shared &&
-                    resend_advanced && backend_called;
+                    resend_advanced && backend_called && retry_counter_ok;
         std::string err;
         if (!count_ok) err = "expected >=2 CLIENT spans; got " +
                               std::to_string(client_span_ids.size());
@@ -366,6 +386,9 @@ inline void TestRetryAttemptsSurfaceDistinctClientSpans() {
         else if (!backend_called) err = "backend hit only " +
                                          std::to_string(backend_calls.load()) +
                                          " times";
+        else if (!retry_counter_ok) err = "reactor.upstream.retries=" +
+                                            std::to_string(retries_total) +
+                                            " reason='" + retries_reason + "'";
         TestFramework::RecordTest(
             "ProxyClient: retry attempts emit distinct CLIENT spans",
             pass, err, TestFramework::TestCategory::OTHER);

@@ -19,6 +19,8 @@
 #include "observability/span.h"
 #include "observability/span_status.h"
 #include "observability/attr_value.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
 #include "observability/propagator.h"
 #include "observability/tracer_provider.h"
 #include "observability/tracer.h"
@@ -369,6 +371,13 @@ void ProxyTransaction::FinalizeAttemptSpan(int status_code,
     current_attempt_.upstream_span.reset();
 }
 
+void ProxyTransaction::SetProtocolVersionOnAttemptSpan(const char* version) {
+    if (!current_attempt_.upstream_span || version == nullptr) return;
+    current_attempt_.upstream_span->SetAttribute(
+        "network.protocol.version",
+        OBSERVABILITY_NAMESPACE::AttrValue(std::string(version)));
+}
+
 void ProxyTransaction::Start() {
     // Bump exactly once per transaction; the destructor's matching
     // decrement is gated on the same latch. exchange returns the
@@ -713,13 +722,13 @@ void ProxyTransaction::AttemptCheckout() {
                     "server.port",
                     OBSERVABILITY_NAMESPACE::AttrValue(
                         static_cast<int64_t>(upstream_port_)));
-                // ProxyTransaction's only outbound codec today is the H1
-                // codec; the H2 path lives in a sibling phase. Hardcoded
-                // truthful value until that phase plumbs in a negotiated
-                // protocol source.
-                span->SetAttribute(
-                    "network.protocol.version",
-                    OBSERVABILITY_NAMESPACE::AttrValue(std::string("1.1")));
+                // network.protocol.version is set at dispatch time —
+                // see SetProtocolVersionOnAttemptSpan called from
+                // DispatchH1 / DispatchH2 / the deferred-handshake
+                // ALPN-resolution callback. Setting it here would
+                // mislabel attempts that route through DispatchH2
+                // because the protocol decision happens AFTER
+                // AttemptCheckout.
                 span->SetAttribute(
                     "http.request.resend_count",
                     OBSERVABILITY_NAMESPACE::AttrValue(
@@ -898,6 +907,11 @@ void ProxyTransaction::DispatchH1() {
         codec_->SetRequestMethod(method_);
         codec_->SetSink(this);
     }
+    // Protocol decision finalized here — stamp the CLIENT span. Safe to
+    // call on the prefer="auto" deferred-handshake path: the ALPN-
+    // resolved callback invokes DispatchH1/DispatchH2 directly, both of
+    // which arrive at this stamp before sending the request.
+    SetProtocolVersionOnAttemptSpan("1.1");
 
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn) {
@@ -971,6 +985,11 @@ void ProxyTransaction::DispatchH2() {
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
     }
+    // Protocol decision finalized — stamp the CLIENT span. Covers both
+    // reuse path (existing multiplexed session) and fresh-session path
+    // (lease moved into a brand-new H2 connection), AND
+    // TryDispatchExistingH2Session which calls DispatchH2 directly.
+    SetProtocolVersionOnAttemptSpan("2");
     // Reuse path: lease_ was untouched by AcquireH2Connection; fresh-
     // session path: lease_ has been moved into the H2 connection. In
     // either case the transaction no longer needs a direct lease —
@@ -1737,6 +1756,32 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
         } else {
             FinalizeAttemptSpan(/*status_code=*/0,
                                  prev_error ? prev_error : "upstream_error");
+        }
+        // §7.2: bump reactor.upstream.retries with {service, reason}.
+        // The closed-enum `reason` label aligns with the RetryCondition
+        // taxonomy + retry-budget-exhaustion + breaker-open (see the
+        // else-branch below for the latter two — those are NOT retries
+        // but rejections of would-be retries; only the retry-accepted
+        // path bumps here).
+        if (auto* mgr = obs_manager()) {
+            const auto& cat = mgr->catalog();
+            if (cat.reactor_upstream_retries != nullptr) {
+                const char* reason = "unknown";
+                switch (condition) {
+                    case RetryPolicy::RetryCondition::CONNECT_FAILURE:
+                        reason = "connect_failure"; break;
+                    case RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT:
+                        reason = "upstream_disconnect"; break;
+                    case RetryPolicy::RetryCondition::RESPONSE_TIMEOUT:
+                        reason = "timeout"; break;
+                    case RetryPolicy::RetryCondition::RESPONSE_5XX:
+                        reason = "response_5xx"; break;
+                }
+                cat.reactor_upstream_retries->Add(1.0, {
+                    {"reactor.upstream.service", service_name_},
+                    {"reason", reason},
+                });
+            }
         }
         attempt_++;
 

@@ -272,15 +272,22 @@ void UpstreamHttpClient::ApplyOutboundTraceContext(Request& req) {
             }
         }
     }
-    // Inject whenever `local` is valid. The auth caller sets `local`
-    // to a SpanContext the gateway actually exports (auth.idp_check
-    // span context when allocated, or inbound SERVER context when not),
-    // OR to a freshly-synthesized SpanContext with `sampled=0` for the
-    // unsampled-trace continuity path (downstream sees the trace as
-    // unsampled and won't query for parent resolution). Tracer is no
-    // longer used as the gate — see auth_manager.cc's IssueTraceContext
-    // builder for the precedence rules.
-    if (req.issue_ctx.has_value() && req.issue_ctx->local.IsValid()) {
+    // Defense-in-depth gate: inject only when (a) `local` is valid AND
+    // (b) a Tracer is bound. The Tracer field is the caller's contract
+    // signal that `local.span_id` references a SpanContext the gateway
+    // actually exports (or is part of an unsampled trace where the
+    // dangling parent is benign). Removing the Tracer gate would let
+    // any future caller that populates `local` without satisfying the
+    // contract silently leak a phantom span_id downstream. The auth
+    // path (today's only caller) always binds a Tracer, so the gate is
+    // free; future callers must do the same.
+    //
+    // See `auth_manager.cc`'s IssueTraceContext builder for the local-
+    // span-id precedence (auth.idp_check span → inbound SERVER span →
+    // fresh synthesized SpanContext with sampled=0 inherited).
+    if (req.issue_ctx.has_value()
+        && req.issue_ctx->local.IsValid()
+        && req.issue_ctx->tracer != nullptr) {
         if (propagator) {
             propagator->Inject(req.issue_ctx->local, req.headers);
         } else {

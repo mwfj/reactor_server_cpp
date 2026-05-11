@@ -1,6 +1,8 @@
 #include "ws/websocket_connection.h"
 #include "ws/utf8_validate.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
 #include "observability/observability_manager.h"
 #include "observability/observability_snapshot.h"
 #include "observability/span.h"
@@ -8,6 +10,18 @@
 
 WebSocketConnection::WebSocketConnection(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
+
+WebSocketConnection::~WebSocketConnection() {
+    // Matching -1 for the SetObservabilitySnapshot increment. Latch
+    // ensures exactly-once decrement across close-then-destroy paths.
+    if (active_counted_ && obs_manager_) {
+        const auto& cat = obs_manager_->catalog();
+        if (cat.reactor_websocket_active_connections != nullptr) {
+            cat.reactor_websocket_active_connections->Add(-1.0, {});
+        }
+        active_counted_ = false;
+    }
+}
 
 void WebSocketConnection::OnMessage(MessageCallback callback) { callbacks_.message_callback = std::move(callback); }
 void WebSocketConnection::OnClose(CloseCallback callback) { callbacks_.close_callback = std::move(callback); }
@@ -122,6 +136,11 @@ void WebSocketConnection::OnRawData(const std::string& data) {
 }
 
 void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
+    // §7.3: count every inbound frame at the entry boundary. Counts
+    // frames the WS state machine RECEIVED, including ones rejected by
+    // the close-handshake branch below — operators investigating a WS
+    // disconnect storm want the post-Close burst visible.
+    BumpFrameCounter(frame.opcode, "in");
     // If we've sent a close frame, only accept Close replies and Ping/Pong control frames.
     // RFC 6455 §5.5.2: endpoint MUST respond to Ping until Close is received.
     // Discard data/continuation frames during the close handshake.
@@ -331,6 +350,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
 
 void WebSocketConnection::SendFrame(const WebSocketFrame& frame) {
     if (!conn_) return;
+    BumpFrameCounter(frame.opcode, "out");
     std::string wire = frame.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
 }
@@ -358,10 +378,43 @@ void WebSocketConnection::SetObservabilitySnapshot(
         ws_messages_enabled_flag_ =
             obs_manager_ ? obs_manager_->WebSocketMessagesEnabledFlag()
                            : nullptr;
+        // §7.3: bump reactor.websocket.active_connections; the matching
+        // decrement runs in the dtor under the `active_counted_` latch
+        // so close-then-destroy paths decrement exactly once.
+        if (obs_manager_) {
+            const auto& cat = obs_manager_->catalog();
+            if (cat.reactor_websocket_active_connections != nullptr) {
+                cat.reactor_websocket_active_connections->Add(1.0, {});
+                active_counted_ = true;
+            }
+        }
     } else {
         obs_manager_.reset();
         ws_messages_enabled_flag_ = nullptr;
     }
+}
+
+void WebSocketConnection::BumpFrameCounter(WebSocketOpcode opcode,
+                                             const char* direction) {
+    if (!obs_manager_) return;
+    const auto& cat = obs_manager_->catalog();
+    if (cat.reactor_websocket_frames == nullptr) return;
+    // Closed enum on `op` — protocol-level opcodes only. Cardinality
+    // ceiling is 6 × 2 = 12 label combinations per process.
+    const char* op = nullptr;
+    switch (opcode) {
+        case WebSocketOpcode::Text:         op = "text"; break;
+        case WebSocketOpcode::Binary:       op = "binary"; break;
+        case WebSocketOpcode::Continuation: op = "continuation"; break;
+        case WebSocketOpcode::Ping:         op = "ping"; break;
+        case WebSocketOpcode::Pong:         op = "pong"; break;
+        case WebSocketOpcode::Close:        op = "close"; break;
+        default:                            op = "other"; break;
+    }
+    cat.reactor_websocket_frames->Add(1.0, {
+        {"op", op},
+        {"direction", direction},
+    });
 }
 
 void WebSocketConnection::MaybeEmitMessageSpan(

@@ -15,6 +15,7 @@ class ObservabilityManager;
 class WebSocketConnection {
 public:
     explicit WebSocketConnection(std::shared_ptr<ConnectionHandler> conn);
+    ~WebSocketConnection();
 
     // Public type aliases for backward compatibility
     using MessageCallback = HTTP_CALLBACKS_NAMESPACE::WsMessageCallback;
@@ -115,6 +116,12 @@ private:
     // manager to expire.
     std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilityManager>
         obs_manager_;
+    // Latch — set by SetObservabilitySnapshot when the
+    // reactor.websocket.active_connections UpDownCounter was bumped
+    // by +1; the dtor checks this to issue the matching -1 exactly
+    // once. Cleared after the decrement so a later snapshot reset
+    // can't double-decrement.
+    bool active_counted_ = false;
 
     void ProcessFrame(const WebSocketFrame& frame);
     void SendFrame(const WebSocketFrame& frame);
@@ -122,4 +129,7 @@ private:
     // websocket_messages flag is on. No-op when manager / parent missing.
     void MaybeEmitMessageSpan(const char* name, WebSocketOpcode opcode,
                               size_t payload_size);
+    // §7.3: bump reactor.websocket.frames {op, direction}. No-op when
+    // observability is not bound on this connection (obs_manager_ null).
+    void BumpFrameCounter(WebSocketOpcode opcode, const char* direction);
 };
