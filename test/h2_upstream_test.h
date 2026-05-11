@@ -50,6 +50,8 @@
 #include "upstream/retry_policy.h"
 #include "http/http_request.h"
 #include "http/streaming_response_sender.h"
+#include <fstream>
+#include <iterator>
 #include "upstream/upstream_connection.h"
 #include "upstream/upstream_lease.h"
 #include "upstream/upstream_response_sink.h"
@@ -5048,6 +5050,40 @@ struct H2ResponseTimeoutTestFixture {
     {
         return txn->h2_response_timeout_armed_;
     }
+
+    // Capture the live send-stall generation. Used by the early-final-
+    // headers test to confirm OnHeaders bumps it when it transitions
+    // out of SENDING_REQUEST.
+    static uint64_t send_stall_generation(
+        const std::shared_ptr<ProxyTransaction>& txn)
+    {
+        return txn->h2_send_stall_generation_;
+    }
+
+    // Capture the live state. Used by tests that need to verify
+    // state transitions without going through the full pool pipeline.
+    static ProxyTransaction::State state(
+        const std::shared_ptr<ProxyTransaction>& txn)
+    {
+        return txn->state_;
+    }
+
+    // Drive OnHeaders with a synthetic UpstreamResponseHead so the
+    // early-final-headers test can observe the SENDING_REQUEST →
+    // AWAITING_RESPONSE transition + send-stall invalidation.
+    static void DriveOnHeadersWhileSending(
+        const std::shared_ptr<ProxyTransaction>& txn,
+        int status_code)
+    {
+        txn->h2_path_ = true;
+        txn->state_ = ProxyTransaction::State::SENDING_REQUEST;
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead head;
+        head.status_code = status_code;
+        head.keep_alive = true;
+        head.framing =
+            UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing::NO_BODY;
+        txn->OnHeaders(head);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -5094,6 +5130,87 @@ void TestN9lPositiveTimeoutPostSubmit() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "H2Upstream N9l: response_timeout_ms>0 → deadline armed after submit",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9oEarlyFinalHeadersInvalidateSendStallClosure — Peer delivers
+// final headers WHILE we're still sending the request body
+// (state_ == SENDING_REQUEST). OnHeaders must bump
+// h2_send_stall_generation_ so the in-flight stall closure can't
+// fire later and spuriously surface RESPONSE_TIMEOUT against a stream
+// whose headers are already in hand. Mirrors the body-phase invariant
+// that final headers end the send-side watchdog.
+// ---------------------------------------------------------------------------
+void TestN9oEarlyFinalHeadersInvalidateSendStallClosure() {
+    std::cout << "\n[TEST] H2Upstream N9o: early final headers bump send-stall generation..." << std::endl;
+    try {
+        auto txn = H2ResponseTimeoutTestFixture::MakeWithTimeout(5000);
+        // Simulate: SENDING_REQUEST + a stall closure armed against
+        // the current generation. (DriveOnHeadersWhileSending sets
+        // h2_path_=true and state_=SENDING_REQUEST.)
+        const uint64_t gen_before =
+            H2ResponseTimeoutTestFixture::send_stall_generation(txn);
+        H2ResponseTimeoutTestFixture::DriveOnHeadersWhileSending(
+            txn, /*status=*/413);
+        const uint64_t gen_after =
+            H2ResponseTimeoutTestFixture::send_stall_generation(txn);
+        const auto state_after =
+            H2ResponseTimeoutTestFixture::state(txn);
+
+        const bool transitioned =
+            (state_after == ProxyTransaction::State::AWAITING_RESPONSE);
+        const bool gen_bumped = (gen_after > gen_before);
+        bool pass = transitioned && gen_bumped;
+        std::string err;
+        if (!transitioned) err += "state did not advance to AWAITING_RESPONSE; ";
+        if (!gen_bumped) err += "send_stall_generation_ did not advance (closure would fire); ";
+        TestFramework::RecordTest(
+            "H2Upstream N9o: early final headers bump send-stall generation",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9o: early final headers bump send-stall generation",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9pH2ResponseTimeoutClosureHonorsShutdownKill — The H2 response-
+// timeout closure must guard on IsKilledForShutdown() in addition to
+// cancelled_. MarkKilledForShutdown sets the kill flag before Cancel
+// enqueues, so a matured timeout firing inside that window would
+// otherwise report a breaker failure and trigger MaybeRetry during
+// drain.
+// ---------------------------------------------------------------------------
+void TestN9pH2ResponseTimeoutClosureHonorsShutdownKill() {
+    std::cout << "\n[TEST] H2Upstream N9p: H2 response-timeout closure honors shutdown kill..." << std::endl;
+    // Code-inspection lock: verify the closure source contains the
+    // IsKilledForShutdown check. The closure is dispatcher-driven so
+    // a direct fire path requires a real dispatcher fixture; this is
+    // the lighter regression-prevention check.
+    bool pass = false;
+    try {
+        std::ifstream in("server/proxy_transaction.cc");
+        std::string src((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        // Locate the H2 response-timeout closure (uniquely identified
+        // by its warn message) and confirm the guard is in scope.
+        auto warn = src.find("ProxyTransaction H2 response timeout client_fd=");
+        if (warn != std::string::npos) {
+            // Look backwards from the warn for the guard within ~400 chars.
+            const size_t lookback = warn > 400 ? warn - 400 : 0;
+            auto guard = src.find("IsKilledForShutdown()", lookback);
+            pass = (guard != std::string::npos && guard < warn);
+        }
+        TestFramework::RecordTest(
+            "H2Upstream N9p: H2 response-timeout closure honors shutdown kill",
+            pass,
+            pass ? "" : "IsKilledForShutdown check missing from response-timeout closure");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9p: H2 response-timeout closure honors shutdown kill",
             false, e.what());
     }
 }
@@ -5596,6 +5713,8 @@ void RunAllH2UpstreamTests() {
     TestN9lPositiveTimeoutPostSubmit();
     TestN9mSinkOnBodyChunkFalseStopsConsumption();
     TestN9nFreshSessionBootstrapCallbackOrdering();
+    TestN9oEarlyFinalHeadersInvalidateSendStallClosure();
+    TestN9pH2ResponseTimeoutClosureHonorsShutdownKill();
     TestN7eWiringEarlyHeadersThenIntermediateDataDispatch();
 
     // TestB-series additions — wire-level

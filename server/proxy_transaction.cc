@@ -1322,17 +1322,19 @@ bool ProxyTransaction::OnHeaders(
     }
 
     if (h2_path_) {
-        // H2: stall closure stays armed until OnRequestSubmitted /
-        // Cleanup bumps the generation — an early peer-final-headers
-        // (e.g. 413) before our END_STREAM keeps stall protection. No
-        // poison_connection_ here: H2 multiplexes streams, so an early
+        // H2: early-final-headers — peer responded before our END_STREAM.
+        // No poison_connection_: H2 multiplexes streams, so an early
         // status on one stream is not a transport-fatal signal.
         if (state_ == State::SENDING_REQUEST) {
             state_ = State::AWAITING_RESPONSE;
+            // Invalidate the send-stall closure. Otherwise it fires
+            // after the budget elapses with state in AWAITING_RESPONSE /
+            // RECEIVING_BODY and spuriously surfaces RESPONSE_TIMEOUT
+            // against a stream whose headers are already in hand.
+            ++h2_send_stall_generation_;
+            h2_request_fully_sent_ = true;
         }
         // Header phase done; body phase is governed by stream timers.
-        // Reset the arm-once flag so a later OnRequestSubmitted skips
-        // re-arming.
         ClearResponseTimeout();
         h2_response_timeout_armed_ = false;
     } else {
@@ -2785,7 +2787,12 @@ void ProxyTransaction::ArmResponseTimeout(int explicit_budget_ms) {
             [weak_self, generation]() {
                 auto self = weak_self.lock();
                 if (!self) return;
-                if (self->cancelled_) return;
+                // IsKilledForShutdown check mirrors the send-stall
+                // closure: MarkKilledForShutdown sets the kill flag
+                // before Cancel() enqueues, so a matured timeout that
+                // fires inside that window must not report a breaker
+                // failure or trigger MaybeRetry during drain.
+                if (self->cancelled_ || self->IsKilledForShutdown()) return;
                 if (generation != self->h2_response_timeout_generation_) return;
                 logging::Get()->warn(
                     "ProxyTransaction H2 response timeout client_fd={} "
