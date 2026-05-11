@@ -4740,6 +4740,167 @@ void TestN9eResetStreamDropsDrainEntries() {
 }
 
 // ---------------------------------------------------------------------------
+// TestN9fPartialDrainOfFinalFrame — A single-DATA-frame body
+// (END_STREAM on the only DATA frame) or the trailing DATA frame of a
+// multi-frame body must still refresh OnRequestBodyProgress while it
+// is partially draining. Otherwise a healthy upload sitting in the
+// transport buffer for longer than the stall budget gets false-timed-out.
+// ---------------------------------------------------------------------------
+void TestN9fPartialDrainOfFinalFrame() {
+    std::cout << "\n[TEST] H2Upstream N9f: partial-drain of final DATA frame fires progress..." << std::endl;
+    struct ObservingSink : public RecordingSink {
+        int progress_calls = 0;
+        int submitted_calls = 0;
+        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestSubmitted() override { ++submitted_calls; }
+    };
+    try {
+        auto cfg = MakeH2Conn();
+        ObservingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9f: partial-drain of final DATA frame fires progress",
+                false, "Init failed");
+            return;
+        }
+        // 4KB body fits in a single DATA frame (MAX_FRAME_SIZE=16384).
+        // That DATA frame carries both is_data=true AND is_end_stream=true.
+        std::string body(4096, 'p');
+        int32_t sid = conn.SubmitRequest(
+            "POST", "http", "example.com", "/upload", {}, body, &sink);
+        if (sid <= 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N9f: partial-drain of final DATA frame fires progress",
+                false, "submit failed");
+            return;
+        }
+
+        // The transport reports a partial drain (some bytes still
+        // buffered). Without the fix, this case wouldn't fire any
+        // sink virtual because the only DATA frame is END_STREAM,
+        // and the old gate was `is_data_frame && !is_end_stream`.
+        // After the fix, OnRequestBodyProgress refreshes the timestamp.
+        size_t total_queued = 0;
+        // Worst-case: HEADERS + single DATA frame; together a few KB.
+        // Tell the transport "1KB still buffered" — most of the frame
+        // has drained but not all.
+        conn.OnTransportWriteProgress(1024);
+        const int after_partial_progress = sink.progress_calls;
+        const int after_partial_submitted = sink.submitted_calls;
+
+        // Then fully drain — the submitted dispatch fires now.
+        conn.OnTransportWriteComplete();
+        bool pass = (after_partial_progress >= 1) &&
+                    (after_partial_submitted == 0) &&
+                    (sink.submitted_calls == 1);
+        std::string err;
+        if (after_partial_progress == 0) {
+            err += "no progress on partial drain (single-frame body case); ";
+        }
+        if (after_partial_submitted != 0) {
+            err += "submitted fired during partial drain; ";
+        }
+        if (sink.submitted_calls != 1) {
+            err += "submitted_calls=" + std::to_string(sink.submitted_calls) +
+                   " (expected 1 after full drain); ";
+        }
+        (void)total_queued;
+        TestFramework::RecordTest(
+            "H2Upstream N9f: partial-drain of final DATA frame fires progress",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9f: partial-drain of final DATA frame fires progress",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9gControlFrameByteAccounting — A PING (or other control frame)
+// flushed before a request must consume its own bytes in the drain
+// queue; otherwise its drain would be mis-attributed to the request's
+// first frame, firing OnRequestSubmitted / OnRequestBodyProgress
+// before the request's own bytes had actually drained.
+// ---------------------------------------------------------------------------
+void TestN9gControlFrameByteAccounting() {
+    std::cout << "\n[TEST] H2Upstream N9g: control-frame bytes do not mis-attribute to request..." << std::endl;
+    struct ObservingSink : public RecordingSink {
+        int progress_calls = 0;
+        int submitted_calls = 0;
+        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestSubmitted() override { ++submitted_calls; }
+    };
+    try {
+        auto cfg = MakeH2Conn();
+        ObservingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9g: control-frame bytes do not mis-attribute to request",
+                false, "Init failed");
+            return;
+        }
+        // Flush a PING first — it pushes a control entry (17 bytes:
+        // 9-byte header + 8-byte opaque payload) into the drain queue.
+        const auto now = std::chrono::steady_clock::now();
+        conn.SendPing(now);
+
+        // Now submit a bodyless request. Its HEADERS frame enters the
+        // queue after the PING. Without per-frame byte accounting,
+        // shrinking the transport's `remaining` would attribute the
+        // PING's drain to the HEADERS frame and fire
+        // OnRequestSubmitted prematurely.
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &sink);
+        if (sid <= 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N9g: control-frame bytes do not mis-attribute to request",
+                false, "submit failed");
+            return;
+        }
+        // Simulate the transport draining ONLY the PING bytes (17).
+        // The drain queue's HEADERS entry must remain — no sink
+        // dispatch yet.
+        // Compute: drain queue total bytes minus the headers frame
+        // size leaves the PING bytes drained. Tell the transport that
+        // the headers frame is still pending.
+        // PING entry = 17 bytes, HEADERS frame = 9 + payload (~30 for
+        // a tiny GET). Tell the transport "30 bytes still buffered"
+        // — well within the HEADERS frame size, so the PING has
+        // drained but HEADERS has not.
+        conn.OnTransportWriteProgress(30);
+        const int after_ping_drain_submitted = sink.submitted_calls;
+        const int after_ping_drain_progress = sink.progress_calls;
+
+        // Full drain dispatches the HEADERS frame's submitted virtual.
+        conn.OnTransportWriteComplete();
+
+        bool pass = (after_ping_drain_submitted == 0) &&
+                    (after_ping_drain_progress == 0) &&
+                    (sink.submitted_calls == 1);
+        std::string err;
+        if (after_ping_drain_submitted != 0) {
+            err += "submitted fired during PING-only drain (mis-attribution); ";
+        }
+        if (after_ping_drain_progress != 0) {
+            err += "progress fired during PING-only drain; ";
+        }
+        if (sink.submitted_calls != 1) {
+            err += "submitted_calls=" + std::to_string(sink.submitted_calls) +
+                   " (expected 1 after full drain); ";
+        }
+        TestFramework::RecordTest(
+            "H2Upstream N9g: control-frame bytes do not mis-attribute to request",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9g: control-frame bytes do not mis-attribute to request",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TestN9c — Default sink ABI: a sink that does NOT override
 // OnRequestBodyProgress must still compile and operate — locks the
 // no-op default contract that prevents binary-compat breakage for
@@ -5047,6 +5208,8 @@ void RunAllH2UpstreamTests() {
     TestN9cDefaultSinkSurvivesNewVirtual();
     TestN9dDeferredDrainSemantic();
     TestN9eResetStreamDropsDrainEntries();
+    TestN9fPartialDrainOfFinalFrame();
+    TestN9gControlFrameByteAccounting();
     TestN7eWiringEarlyHeadersThenIntermediateDataDispatch();
 
     // TestB-series additions — wire-level

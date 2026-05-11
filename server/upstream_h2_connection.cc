@@ -242,35 +242,51 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     return 0;
 }
 
-// Enqueue request-side frames for deferred sink dispatch. Sink virtuals
-// fire from OnTransportWriteProgress / OnTransportWriteComplete when the
-// bytes actually drain off the transport buffer — NOT here, where the
-// frame is only in nghttp2's internal output buffer.
-//
-// Every HEADERS / DATA frame for a tracked stream is pushed to the
-// drain queue (including non-end-stream frames, so byte accounting
-// stays tight). Frames for unknown / sinkless streams (control frames,
-// peer-initiated PUSH_PROMISE) are not queued — they consume transport
-// bytes but never fire sink virtuals, so dropping them is safe (the
-// drain-queue total only tracks request-side bytes that the transport
-// callback will attribute back to streams).
+// Enqueue EVERY serialized frame for byte-accurate drain tracking.
+// Request-side HEADERS / DATA frames eventually fire sink virtuals from
+// the transport-drain hooks; control frames (PING / SETTINGS /
+// WINDOW_UPDATE / RST_STREAM / GOAWAY / PRIORITY) are tracked as
+// is_control entries so the bytes they consume in the transport buffer
+// are correctly attributed (without this, a PING flushed before a fresh
+// request would shrink the transport's remaining-bytes counter and
+// mis-attribute the PING's drain to the request's first frame, firing
+// OnRequestSubmitted before the request's bytes actually hit the wire).
 int OnFrameSendCallback(nghttp2_session* /*session*/,
                         const nghttp2_frame* frame, void* user_data)
 {
     if (!frame) return 0;
-    if (frame->hd.type != NGHTTP2_HEADERS &&
-        frame->hd.type != NGHTTP2_DATA) {
+    auto* self = static_cast<UpstreamH2Connection*>(user_data);
+    // Wire size = 9-byte frame header + payload length. nghttp2's
+    // frame->hd.length is the payload size; framework adds 9 for the
+    // fixed header regardless of frame type.
+    const size_t frame_bytes = 9 + static_cast<size_t>(frame->hd.length);
+    const bool is_request_frame =
+        (frame->hd.type == NGHTTP2_HEADERS ||
+         frame->hd.type == NGHTTP2_DATA);
+    if (is_request_frame) {
+        auto* stream = self->GetStream(frame->hd.stream_id);
+        if (!stream || !stream->sink) {
+            // Stream missing or sink detached — still track the bytes
+            // as a control entry so the FIFO byte accounting stays
+            // accurate. The dispatch lookup at fire-time will short-
+            // circuit on the missing stream regardless.
+            self->EnqueueFrameForDrain(frame->hd.stream_id, frame_bytes,
+                                        /*is_data=*/false,
+                                        /*is_end_stream=*/false,
+                                        /*is_control=*/true);
+            return 0;
+        }
+        const bool is_data = (frame->hd.type == NGHTTP2_DATA);
+        const bool eos = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+        self->EnqueueFrameForDrain(frame->hd.stream_id, frame_bytes,
+                                    is_data, eos, /*is_control=*/false);
         return 0;
     }
-    auto* self = static_cast<UpstreamH2Connection*>(user_data);
-    auto* stream = self->GetStream(frame->hd.stream_id);
-    if (!stream || !stream->sink) return 0;
-    // Wire size = 9-byte frame header + payload length.
-    const size_t frame_bytes = 9 + static_cast<size_t>(frame->hd.length);
-    const bool is_data = (frame->hd.type == NGHTTP2_DATA);
-    const bool eos = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
-    self->EnqueueFrameForDrain(frame->hd.stream_id, frame_bytes,
-                                is_data, eos);
+    // Control frame: track bytes but never dispatch sink virtuals.
+    self->EnqueueFrameForDrain(/*stream_id=*/0, frame_bytes,
+                                /*is_data=*/false,
+                                /*is_end_stream=*/false,
+                                /*is_control=*/true);
     return 0;
 }
 
@@ -777,14 +793,20 @@ void UpstreamH2Connection::ResetStream(int32_t stream_id) {
 void UpstreamH2Connection::EnqueueFrameForDrain(int32_t stream_id,
                                                  size_t bytes,
                                                  bool is_data_frame,
-                                                 bool is_end_stream) {
+                                                 bool is_end_stream,
+                                                 bool is_control) {
     drain_queue_.push_back(
-        PendingFrameDrain{stream_id, bytes, is_data_frame, is_end_stream});
+        PendingFrameDrain{stream_id, bytes, is_data_frame, is_end_stream,
+                          is_control});
     bytes_in_drain_queue_ += bytes;
 }
 
 void UpstreamH2Connection::FireSinkForDrainEntry(
     const PendingFrameDrain& entry) {
+    // Control frames are tracked for byte accounting only — never
+    // dispatch sink virtuals for them (no stream to look up; the
+    // sentinel stream_id is meaningless).
+    if (entry.is_control) return;
     // Stream may have been reset between serialization and drain — the
     // sink is nulled by ResetStream / FailAllStreams in that case, so
     // a stale lookup short-circuits here.
@@ -802,7 +824,10 @@ void UpstreamH2Connection::DropDrainEntriesForStream(int32_t stream_id) {
     auto new_end = std::remove_if(
         drain_queue_.begin(), drain_queue_.end(),
         [&](const PendingFrameDrain& e) {
-            if (e.stream_id == stream_id) {
+            // Only drop request-side entries for this stream; control
+            // entries carry stream_id=0 sentinel and must stay in the
+            // queue so the FIFO byte accounting remains accurate.
+            if (!e.is_control && e.stream_id == stream_id) {
                 bytes_in_drain_queue_ -= e.bytes;
                 return true;
             }
@@ -814,14 +839,15 @@ void UpstreamH2Connection::DropDrainEntriesForStream(int32_t stream_id) {
 void UpstreamH2Connection::OnTransportWriteProgress(size_t remaining) {
     if (dead_) return;
     if (drain_queue_.empty()) return;
-    // Bytes drained since the last fire = the shrinkage of our tracked
-    // queue total. The transport may report remaining > our total when
-    // it holds bytes from sources we don't track (none today, but be
-    // defensive): in that case drained == 0 and we do nothing.
-    if (remaining >= bytes_in_drain_queue_) {
-        bytes_in_drain_queue_ = remaining;
-        return;
-    }
+    // The transport buffer may contain bytes we did NOT push through
+    // on_frame_send (e.g. the 24-byte HTTP/2 client connection preface
+    // magic string at session start). When `remaining` exceeds our
+    // tracked queue total, those untracked bytes are still draining
+    // ahead of our first queued frame — leave the queue total alone
+    // and wait. Updating bytes_in_drain_queue_ = remaining here would
+    // inflate the tracked sum and over-attribute drained bytes to the
+    // front entry on the next fire.
+    if (remaining >= bytes_in_drain_queue_) return;
     size_t drained = bytes_in_drain_queue_ - remaining;
     bytes_in_drain_queue_ = remaining;
     while (drained > 0 && !drain_queue_.empty()) {
@@ -835,15 +861,22 @@ void UpstreamH2Connection::OnTransportWriteProgress(size_t remaining) {
             // does not invalidate `front`.
             FireSinkForDrainEntry(entry);
         } else {
-            // Partial drain of this DATA frame: fire progress (refreshes
-            // the per-stream stall timestamp) but keep the entry — the
-            // remaining bytes still need to drain before any END_STREAM
-            // dispatch.
+            // Partial drain: refresh the per-stream stall timestamp via
+            // OnRequestBodyProgress regardless of END_STREAM. A single
+            // DATA frame body or the trailing DATA frame of a multi-
+            // frame upload would otherwise never see progress while
+            // its bytes are actively leaving the socket — the stall
+            // budget would expire mid-drain even though the wire is
+            // healthy. OnRequestSubmitted is reserved for the
+            // FULL-drain branch above, so firing progress here cannot
+            // race the submitted dispatch. Control-frame entries
+            // (is_control=true) skip dispatch via FireSinkForDrainEntry.
             front.bytes -= drained;
             drained = 0;
-            if (front.is_data_frame && !front.is_end_stream) {
+            if (front.is_data_frame && !front.is_control) {
                 PendingFrameDrain partial_entry{
-                    front.stream_id, 0, true, false};
+                    front.stream_id, 0, /*is_data=*/true,
+                    /*is_end_stream=*/false, /*is_control=*/false};
                 FireSinkForDrainEntry(partial_entry);
             }
         }

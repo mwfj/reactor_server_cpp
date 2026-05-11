@@ -1735,7 +1735,15 @@ void ProxyTransaction::DeliverTerminalError(int result_code,
     if (response_committed_ && relay_mode_ == RelayMode::STREAMING) {
         using AbortReason = HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
         AbortReason reason = AbortReason::UPSTREAM_ERROR;
-        if (result_code == RESULT_UPSTREAM_DISCONNECT) {
+        if (result_code == RESULT_UPSTREAM_DISCONNECT ||
+            result_code == RESULT_TRUNCATED_RESPONSE) {
+            // Both are framing/short-read violations on the upstream
+            // body — surface them as UPSTREAM_TRUNCATED so downstream
+            // observability and abort labels distinguish them from
+            // generic upstream errors. RESULT_TRUNCATED_RESPONSE is
+            // the application-level (defense-in-depth) detection;
+            // RESULT_UPSTREAM_DISCONNECT is nghttp2's enforcement
+            // path. Same semantic, same abort label.
             reason = AbortReason::UPSTREAM_TRUNCATED;
         } else if (result_code == RESULT_RESPONSE_TIMEOUT) {
             reason = AbortReason::UPSTREAM_TIMEOUT;

@@ -162,12 +162,16 @@ public:
     // Transport buffer fully drained — every frame in drain_queue_ is on
     // the wire. Fire any remaining sink virtuals and clear the queue.
     void OnTransportWriteComplete();
-    // Called from the static on_frame_send_callback for each serialized
-    // HEADERS/DATA frame. Push the frame's wire-byte count onto
-    // drain_queue_; the sink virtuals fire from the transport-drain
-    // hooks above, not here.
+    // Called from the static on_frame_send_callback for EVERY serialized
+    // frame (request HEADERS/DATA AND control frames). Push the frame's
+    // wire-byte count onto drain_queue_; the sink virtuals fire from
+    // the transport-drain hooks above, not here. Control frames carry
+    // is_control=true so dispatch skips them but byte accounting stays
+    // accurate (control bytes interleaved with request bytes in the
+    // transport buffer would otherwise be mis-attributed).
     void EnqueueFrameForDrain(int32_t stream_id, size_t bytes,
-                              bool is_data_frame, bool is_end_stream);
+                              bool is_data_frame, bool is_end_stream,
+                              bool is_control);
 
 private:
     // Non-owning. Lifetime contract: PoolPartition owns the transport
@@ -214,18 +218,23 @@ private:
     // re-entering nghttp2_session_mem_send2 from a mem_recv2 callback.
     bool in_receive_data_ = false;
 
-    // Per-frame drain tracking. Populated in on_frame_send_callback when
-    // nghttp2 hands us a serialized frame; consumed in
+    // Per-frame drain tracking. Populated in on_frame_send_callback for
+    // EVERY serialized frame (request HEADERS/DATA AND control frames
+    // like PING, SETTINGS, WINDOW_UPDATE, RST_STREAM); consumed in
     // OnTransportWriteProgress / OnTransportWriteComplete as bytes drain
     // off the transport buffer. Each entry sums to the frame's wire size
-    // (9-byte header + payload). Sink virtuals fire when the bytes
-    // genuinely hit the wire, mirroring H1's transport-callback-driven
-    // semantic.
+    // (9-byte header + payload). Control-frame entries are tracked
+    // purely for accurate byte accounting — they fire no sink virtuals.
+    // Without this, a session reused for a fresh request after a PING
+    // would mis-attribute the PING's drain to the new request's first
+    // frame, firing OnRequestBodyProgress / OnRequestSubmitted before
+    // the request's own bytes had drained.
     struct PendingFrameDrain {
         int32_t stream_id;
         size_t bytes;          // Remaining bytes for this frame on the wire
         bool is_data_frame;    // OnRequestBodyProgress dispatch (DATA only)
         bool is_end_stream;    // OnRequestSubmitted dispatch (END_STREAM)
+        bool is_control;       // PING/SETTINGS/WINDOW_UPDATE/RST/etc — no sink
     };
     std::deque<PendingFrameDrain> drain_queue_;
     // Total bytes queued on the transport on our behalf — sum of every
