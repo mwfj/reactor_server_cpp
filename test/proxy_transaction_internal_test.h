@@ -12,6 +12,12 @@
 
 #include "test_framework.h"
 #include "http/http_status.h"
+#include "observability/observability_manager.h"
+#include "observability/resource.h"
+#include "observability/span_kind.h"
+#include "observability/span_processor.h"
+#include "observability/tracer.h"
+#include "ws/websocket_connection.h"
 
 namespace ProxyTransactionInternalTests {
 
@@ -717,6 +723,190 @@ void TestRetryable5xxH2PathClearsHoldingDespiteIncompleteSnapshot() {
     }
 }
 
+void TestH2DispatchFailureStampsClientProtocolVersionBeforeRetry() {
+    std::cout << "\n[TEST] ProxyTransaction internal: H2 dispatch failure stamps protocol version before retry..."
+              << std::endl;
+    try {
+        HttpRequest request;
+        request.method = "GET";
+        request.url = "/h2-dispatch-fail";
+        request.path = "/h2-dispatch-fail";
+        request.headers["host"] = "example.test";
+        request.client_fd = 42;
+
+        auto tx = MakeInternalProxyTransaction(request);
+
+        auto parent_ctx = OBSERVABILITY_NAMESPACE::SpanContext(
+            OBSERVABILITY_NAMESPACE::TraceId::FromHex(
+                "11111111111111111111111111111111"),
+            OBSERVABILITY_NAMESPACE::SpanId::FromHex("2222222222222222"),
+            OBSERVABILITY_NAMESPACE::TraceFlags(0x01),
+            OBSERVABILITY_NAMESPACE::TraceState(),
+            /*is_remote=*/false);
+        auto attempt_ctx = OBSERVABILITY_NAMESPACE::SpanContext(
+            parent_ctx.trace_id(),
+            OBSERVABILITY_NAMESPACE::SpanId::FromHex("3333333333333333"),
+            parent_ctx.flags(),
+            parent_ctx.state(),
+            /*is_remote=*/false);
+        tx->current_attempt_.attempt_local = attempt_ctx;
+
+        auto processor =
+            std::make_shared<OBSERVABILITY_NAMESPACE::InMemorySpanProcessor>();
+        OBSERVABILITY_NAMESPACE::ObservabilityConfig cfg;
+        cfg.enabled = true;
+        cfg.traces.enabled = true;
+        cfg.metrics.enabled = false;
+        cfg.traces.sampler.type =
+            OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOn;
+        cfg.resource.service_name = "proxy-h2-dispatch-fail";
+        auto manager = OBSERVABILITY_NAMESPACE::ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<OBSERVABILITY_NAMESPACE::Resource>(),
+            processor,
+            std::make_shared<OBSERVABILITY_NAMESPACE::RandomSource>(
+                0xFACEB00CULL));
+
+        OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
+        opts.kind = OBSERVABILITY_NAMESPACE::SpanKind::CLIENT;
+        opts.parent = parent_ctx;
+        opts.has_parent = true;
+        opts.precomputed_context = attempt_ctx;
+        opts.has_precomputed_context = true;
+        tx->current_attempt_.upstream_span =
+            manager->GetTracer("reactor.gateway.http", "1")
+                ->StartSpan("HTTP GET", opts);
+
+        auto snap =
+            std::make_shared<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>();
+        snap->manager = manager;
+        tx->AttachObservabilitySnapshot(snap);
+
+        RetryPolicy::Config retry_cfg;
+        retry_cfg.max_retries = 0;  // force terminal failure after DispatchH2
+        retry_cfg.retry_on_connect_failure = true;
+        tx->retry_policy_ = RetryPolicy(retry_cfg);
+        tx->dispatcher_index_ = -1;  // no partition -> DispatchH2 fails fast
+
+        tx->DispatchH2();
+
+        auto spans = processor->Drain();
+        bool client_found = false;
+        std::string proto;
+        std::string error_type;
+        for (const auto& s : spans) {
+            if (s.kind != OBSERVABILITY_NAMESPACE::SpanKind::CLIENT) continue;
+            client_found = true;
+            for (const auto& a : s.attributes) {
+                if (a.key == "network.protocol.version") {
+                    proto = std::get<std::string>(a.value.value);
+                } else if (a.key == "error.type") {
+                    error_type = std::get<std::string>(a.value.value);
+                }
+            }
+        }
+
+        bool pass = client_found &&
+                    proto == "2" &&
+                    error_type == "connect_failure";
+        std::string err;
+        if (!client_found) err += "no CLIENT span finalized; ";
+        if (proto != "2") err += "network.protocol.version=" + proto + "; ";
+        if (error_type != "connect_failure") {
+            err += "error.type=" + error_type + "; ";
+        }
+
+        tx->complete_cb_invoked_ = true;
+        tx->complete_cb_ = nullptr;
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: H2 dispatch failure stamps protocol version before retry",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: H2 dispatch failure stamps protocol version before retry",
+            false, e.what());
+    }
+}
+
+void TestWebSocketSnapshotInstallOnceContract() {
+    // SetObservabilitySnapshot is now install-once: the cached
+    // instrument pointers are read lock-free from MaybeEmitMessageSpan /
+    // BumpFrameCounter, so a second call (including reset-to-null)
+    // would race those reads. The implementation rejects rebind +
+    // error-logs; the matching -1 fires only from the dtor. This test
+    // verifies (a) the first bind increments, (b) a second call leaves
+    // the gauge unchanged (rebind rejected), and (c) dtor decrements.
+    std::cout << "\n[TEST] ProxyTransaction internal: WebSocket snapshot install-once contract..."
+              << std::endl;
+    try {
+        OBSERVABILITY_NAMESPACE::ObservabilityConfig cfg;
+        cfg.enabled = true;
+        cfg.traces.enabled = true;
+        cfg.metrics.enabled = true;
+        cfg.traces.sampler.type =
+            OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOn;
+        cfg.resource.service_name = "ws-active-gauge-install-once";
+        auto processor =
+            std::make_shared<OBSERVABILITY_NAMESPACE::InMemorySpanProcessor>();
+        auto manager = OBSERVABILITY_NAMESPACE::ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<OBSERVABILITY_NAMESPACE::Resource>(),
+            processor,
+            std::make_shared<OBSERVABILITY_NAMESPACE::RandomSource>(
+                0x1234ABCDULL));
+
+        auto snap =
+            std::make_shared<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot>();
+        snap->manager = manager;
+
+        auto read_gauge = [&]() -> double {
+            auto s = manager->meter_provider()->Snapshot();
+            double total = 0;
+            for (const auto& inst : s.instruments) {
+                if (inst.name != "reactor.websocket.active_connections") continue;
+                for (const auto& p : inst.counter_points) total += p.value;
+            }
+            return total;
+        };
+
+        double after_bind = 0;
+        double after_rebind_attempt = 0;
+        {
+            WebSocketConnection ws(std::shared_ptr<ConnectionHandler>{});
+            ws.SetObservabilitySnapshot(snap);
+            after_bind = read_gauge();
+            ws.SetObservabilitySnapshot(nullptr);  // rejected
+            after_rebind_attempt = read_gauge();
+        }
+        double after_dtor = read_gauge();
+
+        bool pass = after_bind == 1.0 &&
+                    after_rebind_attempt == 1.0 &&
+                    after_dtor == 0.0;
+        std::string err;
+        if (after_bind != 1.0) {
+            err += "after bind=" + std::to_string(after_bind) + "; ";
+        }
+        if (after_rebind_attempt != 1.0) {
+            err += "after rebind-attempt=" +
+                   std::to_string(after_rebind_attempt) +
+                   " (rebind should be rejected); ";
+        }
+        if (after_dtor != 0.0) {
+            err += "after dtor=" + std::to_string(after_dtor) + "; ";
+        }
+
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: WebSocket snapshot install-once contract",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ProxyTransaction internal: WebSocket snapshot install-once contract",
+            false, e.what());
+    }
+}
+
 void TestHeldRetryable5xxIncompleteSnapshotResumesInsteadOfRetrying() {
     std::cout << "\n[TEST] ProxyTransaction internal: held 5xx incomplete snapshot resumes instead of retrying..."
               << std::endl;
@@ -1068,6 +1258,8 @@ void RunAllTests() {
     TestRetryable5xxRetryReleasesLeaseBeforeBackoff();
     TestRetryable5xxIncompleteSnapshotKeepsLeaseDuringBackoff();
     TestRetryable5xxH2PathClearsHoldingDespiteIncompleteSnapshot();
+    TestH2DispatchFailureStampsClientProtocolVersionBeforeRetry();
+    TestWebSocketSnapshotInstallOnceContract();
     TestHeldRetryable5xxIncompleteSnapshotResumesInsteadOfRetrying();
     TestCheckoutLocalFailureRelaysStoredRetryable5xx();
     TestCheckoutCircuitOpenRelaysStoredRetryable5xx();

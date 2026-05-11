@@ -172,6 +172,18 @@ class MockIntrospectionServer {
         return last_body_;
     }
 
+    // Lookup an arbitrary header (case-insensitive) from the most recent
+    // request. Returns empty when absent. Used by trace-context tests
+    // (`traceparent`, `uber-trace-id`, etc.) without expanding the
+    // dedicated last_*_ accessor surface.
+    std::string received_header(const std::string& name) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::string lower(name);
+        for (auto& c : lower) c = static_cast<char>(std::tolower(
+            static_cast<unsigned char>(c)));
+        return ExtractHeader(last_headers_block_, lower);
+    }
+
     // Number of fully-handled requests since Start().
     size_t request_count() const {
         return request_count_.load(std::memory_order_acquire);
@@ -254,11 +266,13 @@ class MockIntrospectionServer {
                                     std::min(content_length,
                                               buf.size() - (header_end + 4)));
             }
-            std::string auth = ExtractHeader(buf.substr(0, header_end), "authorization");
+            std::string headers_block = buf.substr(0, header_end);
+            std::string auth = ExtractHeader(headers_block, "authorization");
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 last_body_ = std::move(body);
                 last_authorization_ = std::move(auth);
+                last_headers_block_ = std::move(headers_block);
             }
             request_count_.fetch_add(1, std::memory_order_acq_rel);
         }
@@ -353,6 +367,7 @@ class MockIntrospectionServer {
     std::vector<ResponseScript> scripts_;
     std::string last_authorization_;
     std::string last_body_;
+    std::string last_headers_block_;
 
     std::string host_;
     uint16_t port_ = 0;

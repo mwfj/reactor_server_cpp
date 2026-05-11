@@ -7,7 +7,7 @@
 // through its parent connection's nghttp2_session. Defined in
 // upstream/upstream_h2_connection.h.
 class UpstreamH2Connection;
-class UpstreamH2Stream;
+struct UpstreamH2Stream;
 
 // Outbound H2 codec for a single upstream stream. Mirrors
 // `UpstreamHttpCodec` (the H1 implementation) but routes byte handling

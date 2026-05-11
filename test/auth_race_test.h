@@ -59,22 +59,10 @@
 #include <openssl/evp.h>
 #include <openssl/bio.h>
 
-#include <string>
-#include <memory>
-#include <atomic>
-#include <thread>
-#include <chrono>
-#include <vector>
-#include <mutex>
-#include <random>
-#include <optional>
-#include <sstream>
-
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+#include "common.h"
 #include <poll.h>
-#include <unistd.h>
+#include <random>
+#include <sstream>
 
 namespace AuthRaceTests {
 

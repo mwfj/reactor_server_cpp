@@ -39,12 +39,14 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
-// Forward declarations — defined in span.h / tracer.h respectively.
-// shared_ptr<Span> AND Tracer* only need the pointee's complete type at
-// `.cc` call sites; the header declaration point is satisfied by the
-// forward declaration alone.
+// Forward declarations — defined in span.h / tracer.h / propagator.h
+// respectively. Pulling the full headers would create cycles through the
+// wider observability tree; the forward declarations are sufficient
+// because every use here is through pointers / shared_ptr that only
+// need the pointee's complete type at `.cc` call sites.
 class Span;
 class Tracer;
+class Propagator;
 
 // Per-request inbound trace context.
 //
@@ -102,10 +104,39 @@ struct AttemptTraceContext {
 //     parent. For auth-path callers with `auth_idp_check_span` enabled,
 //     this is the auth.idp_check INTERNAL span; with that span
 //     disabled, this falls back to the inbound SERVER span's context.
+// Caller contract — populating an IssueTraceContext that
+// `ApplyOutboundTraceContext` will inject from requires ALL of:
+//   (1) `local.IsValid()` — non-zero trace_id + span_id;
+//   (2) `local.span_id` either references a SpanContext the gateway
+//       actually exports (e.g. auth.idp_check or inbound SERVER span)
+//       OR `local.flags().IsSampled() == false` (unsampled trace —
+//       dangling parent is benign because downstream won't query);
+//   (3) `tracer != nullptr` — defense-in-depth signal that the caller
+//       intends to honor (1)+(2). Future callers that forget the
+//       contract will fail this gate and skip injection rather than
+//       silently leaking a phantom span_id downstream.
 struct IssueTraceContext {
     SpanContext local;
     SpanContext parent;
+    // Raw pointer because Tracer is owned by TracerProvider, which
+    // outlives every IssueTraceContext via the four-phase shutdown
+    // drain barrier (observability flush completes before
+    // TracerProvider destruction). Asymmetric with `propagator` below
+    // (shared_ptr) because the propagator is hot-swappable via SIGHUP
+    // — a concurrent swap could free the composite mid-call, while
+    // Tracer is constructed once and never replaced.
     Tracer*     tracer = nullptr;
+    // Live trace-context propagator (composite of the operator's
+    // `traces.propagators`). Held as `shared_ptr` so a concurrent SIGHUP
+    // that swaps `ObservabilityManager::propagator_` cannot destroy the
+    // composite between context construction and outbound header
+    // injection — keeps the old propagator alive for the lifetime of
+    // this IssueTraceContext. Populated from
+    // `ObservabilityManager::propagator()` directly (not `.get()`).
+    // When null, `ApplyOutboundTraceContext` falls back to a stack-
+    // local `W3CPropagator{}` so outbound is always W3C even when no
+    // propagator is bound.
+    std::shared_ptr<const Propagator> propagator;
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

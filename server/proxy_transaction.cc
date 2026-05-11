@@ -15,6 +15,16 @@
 #include "http/trailer_policy.h"
 #include "log/logger.h"
 #include "observability/observability_snapshot.h"
+#include "observability/observability_manager.h"
+#include "observability/span.h"
+#include "observability/span_status.h"
+#include "observability/attr_value.h"
+#include "observability/counter.h"
+#include "observability/histogram.h"
+#include "observability/metrics_catalog.h"
+#include "observability/propagator.h"
+#include "observability/tracer_provider.h"
+#include "observability/tracer.h"
 #include <unordered_set>
 
 namespace {
@@ -268,6 +278,11 @@ ProxyTransaction::ProxyTransaction(
       // outbound-hop time must consult the validated identity captured
       // here, not a dangling reference.
       auth_ctx_(client_request.auth),
+      // Same lifetime contract as auth_ctx_: copy the inbound trace
+      // context so per-attempt outbound traceparent injection has a
+      // stable source through every retry. Empty when observability is
+      // disabled or the inbound had no trace context.
+      inbound_trace_ctx_(client_request.trace_ctx),
       upstream_manager_(upstream_manager),
       auth_manager_(auth_manager),
       dispatcher_(upstream_manager && client_request.dispatcher_index >= 0
@@ -325,6 +340,169 @@ ProxyTransaction::~ProxyTransaction() {
 void ProxyTransaction::AttachObservabilitySnapshot(
         std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap) {
     obs_snapshot_ = std::move(snap);
+}
+
+OBSERVABILITY_NAMESPACE::ObservabilityManager*
+ProxyTransaction::obs_manager() const noexcept {
+    if (!obs_snapshot_) return nullptr;
+    if (auto m = obs_snapshot_->manager.lock()) return m.get();
+    return nullptr;
+}
+
+OBSERVABILITY_NAMESPACE::Span*
+ProxyTransaction::inbound_span() const noexcept {
+    return obs_snapshot_ ? obs_snapshot_->inbound_span.get() : nullptr;
+}
+
+void ProxyTransaction::RebuildOutboundTraceHeaders() {
+    if (!current_attempt_.attempt_local.IsValid()) return;
+    auto* mgr = obs_manager();
+    if (!mgr) return;
+    auto p = mgr->propagator();
+    if (!p) {
+        // Reachable during init/SIGHUP races between manager.Init() and
+        // first config commit, or if the operator removed every
+        // propagator from `observability.traces.propagators`. Strip
+        // still runs in the caller (Propagator::StripAllKnownTrace-
+        // Headers); we just can't inject a fresh traceparent.
+        logging::Get()->debug(
+            "RebuildOutboundTraceHeaders: live propagator null; outbound "
+            "request will carry no traceparent for service={} attempt={}",
+            service_name_, attempt_);
+        return;
+    }
+    // Strip the UNION of every shipped format, not just the configured
+    // live propagator's owned set — a client-forged `uber-trace-id`
+    // must not slip through when only W3C is configured. See
+    // .claude/rules/pitfalls/OBSERVABILITY.md "strip union" rule.
+    OBSERVABILITY_NAMESPACE::Propagator::StripAllKnownTraceHeaders(
+        rewritten_headers_);
+    p->Inject(current_attempt_.attempt_local, rewritten_headers_);
+    // Force the H1 send path to re-serialize with the fresh trace
+    // headers — `serialized_request_` is built lazily on first send.
+    serialized_request_.clear();
+}
+
+namespace {
+// Map an internal RESULT_* code to the OTel `error.type` string used on
+// the CLIENT span. Closed enum (no operator-supplied free-text) so the
+// metric label cardinality stays bounded.
+const char* ErrorTypeForResult(int result_code) {
+    switch (result_code) {
+        case ProxyTransaction::RESULT_CHECKOUT_FAILED:        return "connect_failure";
+        case ProxyTransaction::RESULT_SEND_FAILED:            return "send_failed";
+        case ProxyTransaction::RESULT_PARSE_ERROR:            return "parse_error";
+        case ProxyTransaction::RESULT_RESPONSE_TIMEOUT:       return "timeout";
+        case ProxyTransaction::RESULT_UPSTREAM_DISCONNECT:    return "upstream_disconnect";
+        case ProxyTransaction::RESULT_POOL_EXHAUSTED:         return "pool_exhausted";
+        case ProxyTransaction::RESULT_RESPONSE_TOO_LARGE:     return "response_too_large";
+        case ProxyTransaction::RESULT_CIRCUIT_OPEN:           return "circuit_open";
+        case ProxyTransaction::RESULT_RETRY_BUDGET_EXHAUSTED: return "retry_budget_exhausted";
+        default:                                              return "upstream_error";
+    }
+}
+}  // namespace
+
+void ProxyTransaction::FinalizeAttemptSpan(int status_code,
+                                            const std::string& error_type) {
+    // Emit `http.client.request.duration` histogram once per attempt
+    // at the terminal site, BEFORE the span-finalize early returns.
+    // The histogram is independent of trace sampling — every attempt
+    // that started gets a duration record. attempt_start_steady_ is
+    // zero-sentinel when obs is disabled, so the inner emit gates
+    // naturally. Reset the sentinel after emit so a second call from
+    // Cleanup's dtor backstop (which runs AFTER OnResponseComplete on
+    // the success path) doesn't double-record.
+    if (attempt_start_steady_ != std::chrono::steady_clock::time_point{} 
+        && !IsKilledForShutdown()) {
+        auto* mgr = obs_manager();
+        if (mgr) {
+            const auto& cat = mgr->catalog();
+            if (cat.http_client_request_duration != nullptr) {
+                auto elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() -
+                    attempt_start_steady_).count();
+                std::vector<std::pair<std::string, std::string>> labels;
+                labels.reserve(6);
+                if (!method_.empty()) {
+                    labels.emplace_back("http.request.method", method_);
+                }
+                labels.emplace_back("server.address", upstream_host_);
+                labels.emplace_back("server.port",
+                                     std::to_string(upstream_port_));
+                if (status_code > 0) {
+                    labels.emplace_back("http.response.status_code",
+                                         std::to_string(status_code));
+                }
+                if (!error_type.empty()) {
+                    labels.emplace_back("error.type", error_type);
+                }
+                labels.emplace_back("reactor.upstream.service",
+                                     service_name_);
+                cat.http_client_request_duration->Record(elapsed, labels);
+            }
+            // Matching -1 for the +1 from SetupAttemptObservability.
+            // Same gate as the histogram above so the pair stays
+            // balanced; same labels (service name only) as the +1.
+            if (cat.http_client_active_requests != nullptr) {
+                cat.http_client_active_requests->Add(
+                    -1.0,
+                    {{"reactor.upstream.service", service_name_}});
+            }
+        }
+        attempt_start_steady_ = std::chrono::steady_clock::time_point{};
+    }
+    if (!current_attempt_.upstream_span) return;
+    // Kill loop already invalidated the span — drop without End() so we
+    // don't double-finalize after KillOutstandingSnapshots ran.
+    if (IsKilledForShutdown()) {
+        current_attempt_.upstream_span->DropWithoutEnd();
+        current_attempt_.upstream_span.reset();
+        return;
+    }
+    // Defensive: an End() with neither status_code nor error_type leaves
+    // the CLIENT span semantically empty — usually a caller bug (forgot
+    // to map a new RESULT_* code, or hit a code path that didn't
+    // populate either). Log loudly so the regression surfaces; we still
+    // End() the span below so it doesn't leak. trace_id is included so
+    // operators can pivot from the warn to the collector record.
+    if (status_code <= 0 && error_type.empty()) {
+        logging::Get()->warn(
+            "FinalizeAttemptSpan: span ended with no status_code AND no "
+            "error_type — caller forgot a RESULT_* mapping. service={} "
+            "attempt={} trace_id={}",
+            service_name_, attempt_,
+            current_attempt_.attempt_local.trace_id().ToHex());
+    }
+    auto& span = current_attempt_.upstream_span;
+    if (status_code > 0) {
+        span->SetAttribute(
+            "http.response.status_code",
+            OBSERVABILITY_NAMESPACE::AttrValue(static_cast<int64_t>(status_code)));
+        if (status_code >= 400) {
+            span->SetStatus(OBSERVABILITY_NAMESPACE::SpanStatusCode::ERROR,
+                             std::to_string(status_code));
+            span->SetAttribute(
+                "error.type",
+                OBSERVABILITY_NAMESPACE::AttrValue(std::to_string(status_code)));
+        }
+    }
+    if (!error_type.empty()) {
+        span->SetStatus(OBSERVABILITY_NAMESPACE::SpanStatusCode::ERROR,
+                         error_type);
+        span->SetAttribute(
+            "error.type",
+            OBSERVABILITY_NAMESPACE::AttrValue(error_type));
+    }
+    span->End();
+    current_attempt_.upstream_span.reset();
+}
+
+void ProxyTransaction::SetProtocolVersionOnAttemptSpan(const char* version) {
+    if (!current_attempt_.upstream_span || version == nullptr) return;
+    current_attempt_.upstream_span->SetAttribute(
+        "network.protocol.version",
+        OBSERVABILITY_NAMESPACE::AttrValue(std::string(version)));
 }
 
 void ProxyTransaction::Start() {
@@ -410,34 +588,34 @@ void ProxyTransaction::Start() {
         fwd_snap ? fwd_snap.get() : nullptr,
         &auth_ctx_);
 
-    // Outbound trace context: PRESERVE the client's traceparent /
-    // tracestate verbatim — the standard reverse-proxy behaviour
-    // that keeps the client's trace tree intact across the gateway
-    // hop. Stripping without replacement would break transparent
-    // W3C propagation; injecting a fresh context without emitting
-    // a CLIENT span would leave downstream services with a parent
-    // span_id the gateway never reports.
+    // Outbound trace context. Two regimes coexist:
     //
-    // TODO: once the per-attempt CLIENT span lands (deferred), switch
-    // to strip-and-replace here so SERVER and upstream see the SAME
-    // trace_id (the SERVER span's trace_id, with the CLIENT span as
-    // parent) instead of the diverging tree the verbatim forward
-    // produces. Until then, propagator_test.h's outbound-strip cases
-    // exercise the auth path; the proxy path stays verbatim by design.
+    //   (1) Observability ENABLED + inbound carries a recording
+    //       trace context: AttemptCheckout's RebuildOutboundTraceHeaders
+    //       strip-and-replaces traceparent/tracestate with the per-
+    //       attempt CLIENT span's identity (fresh span_id per retry,
+    //       trace_id inherited). Downstream services see the gateway
+    //       CLIENT span as parent — the trace tree continues through us.
+    //   (2) Observability DISABLED, or inbound has no trace context:
+    //       The client's traceparent/tracestate forward VERBATIM.
+    //       Stripping without replacement would break transparent W3C
+    //       propagation; injecting a fresh context without emitting a
+    //       CLIENT span would leave downstream services with a parent
+    //       span_id the gateway never reports.
     //
-    // Threat note for operators: a malicious client can populate
-    // arbitrary trace_id / span_id / trace-flags in traceparent and
-    // arbitrary key=value entries in tracestate, and this proxy hop
-    // forwards them verbatim to every upstream behind the gateway.
-    // Operators MUST NOT trust upstream trace_ids for log
-    // correlation across a security boundary — a same-trace_id
+    // Threat note for operators (applies to regime (2)): a malicious
+    // client can populate arbitrary trace_id / span_id / trace-flags
+    // in traceparent and arbitrary key=value entries in tracestate,
+    // and the verbatim forward replays them to every upstream behind
+    // the gateway. Operators MUST NOT trust upstream trace_ids for
+    // log correlation across a security boundary — a same-trace_id
     // observation only proves the client claimed it, not that the
-    // request originated from a peer in the same trust domain.
-    // Auth-path requests bound for an IdP go through
-    // UpstreamHttpClient::ApplyOutboundTraceContext, which strips
-    // the inbound headers and only re-injects when the auth caller
-    // populates issue_ctx (today: never). That path is the secure
-    // default; the proxy hop is the operator-visible exception.
+    // request originated from a peer in the same trust domain. Auth-
+    // path requests bound for an IdP go through
+    // UpstreamHttpClient::ApplyOutboundTraceContext, which strips the
+    // inbound headers and re-injects from the auth-built IssueTraceContext
+    // — that path is the secure default for IdP hops regardless of
+    // regime.
 
     // Compute upstream path with strip_prefix support.
     // Prefer upstream_path_override_ (extracted from catch-all route param by
@@ -504,9 +682,9 @@ bool ProxyTransaction::PrepareAttemptAdmission() {
     // Circuit breaker gate — consulted before every attempt (first try and
     // retries both). Each attempt gets a fresh admission stamped with the
     // slice's current generation. If the slice rejects with REJECTED_OPEN,
-    // ConsultBreaker delivers the circuit-open response and returns false;
-    // the retry loop treats RESULT_CIRCUIT_OPEN as terminal so a rejected
-    // retry produces a single 503 to the client, not a nested retry.
+    // ConsultBreaker delivers the circuit-open 503 response and returns
+    // false; the retry loop treats RESULT_CIRCUIT_OPEN as terminal so a
+    // rejected retry produces a single 503 to the client, not a nested retry.
     // Dry-run reject logs inside TryAcquire and returns ADMITTED through
     // the decision enum (REJECTED_OPEN_DRYRUN), so ConsultBreaker proceeds.
     if (!ConsultBreaker()) {
@@ -619,6 +797,82 @@ void ProxyTransaction::StartCheckoutAsync() {
     );
 }
 
+void ProxyTransaction::SetupAttemptObservability() {
+    // Fresh per-attempt context: trace_id / flags / state inherit from
+    // the inbound; span_id is regenerated so retries surface as distinct
+    // CLIENT spans. Sentinel start tick → FinalizeAttemptSpan skips emit
+    // when observability is off.
+    current_attempt_ = OBSERVABILITY_NAMESPACE::AttemptTraceContext{};
+    attempt_start_steady_ = std::chrono::steady_clock::time_point{};
+    auto* mgr = obs_manager();
+    if (mgr) {
+        // Duration histogram fires per-attempt regardless of trace sampling.
+        attempt_start_steady_ = std::chrono::steady_clock::now();
+        // Bump http.client.active_requests; matching -1 in
+        // FinalizeAttemptSpan, gated on attempt_start_steady_ non-sentinel.
+        // TODO: kill-loop survivors leak +1 until the snapshot carries
+        // the upstream label and the kill path can emit the matching -1.
+        const auto& cat = mgr->catalog();
+        if (cat.http_client_active_requests != nullptr) {
+            cat.http_client_active_requests->Add(
+                1.0,
+                {{"reactor.upstream.service", service_name_}});
+        }
+    }
+    if (mgr && inbound_trace_ctx_.has_value()) {
+        const auto& parent_local = inbound_trace_ctx_->current_local;
+        if (parent_local.IsValid()) {
+            current_attempt_.attempt_local = OBSERVABILITY_NAMESPACE::SpanContext(
+                parent_local.trace_id(),
+                mgr->random()->NewSpanId(),
+                parent_local.flags(),
+                parent_local.state(),
+                /*is_remote=*/false);
+
+            // DROP path (not recording / no SERVER span) still emits the
+            // fresh span_id outbound with sampled=0 so downstream services
+            // see a continuous trace tree; the local CLIENT span is skipped.
+            if (inbound_trace_ctx_->is_recording && inbound_span()) {
+                OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
+                opts.kind = OBSERVABILITY_NAMESPACE::SpanKind::CLIENT;
+                opts.parent = inbound_span()->Context();
+                opts.has_parent = true;
+                opts.precomputed_context = current_attempt_.attempt_local;
+                opts.has_precomputed_context = true;
+                current_attempt_.upstream_span =
+                    mgr->GetTracer("reactor.gateway.http", "1.0.0")
+                       ->StartSpan(std::string("HTTP ") + method_,
+                                    opts);
+                auto& span = current_attempt_.upstream_span;
+                span->SetAttribute(
+                    "http.request.method",
+                    OBSERVABILITY_NAMESPACE::AttrValue(method_));
+                span->SetAttribute(
+                    "server.address",
+                    OBSERVABILITY_NAMESPACE::AttrValue(upstream_host_));
+                span->SetAttribute(
+                    "server.port",
+                    OBSERVABILITY_NAMESPACE::AttrValue(
+                        static_cast<int64_t>(upstream_port_)));
+                // Placeholder protocol.version — DispatchH1/H2 overwrite
+                // it; this preserves a defined attribute if dispatch never
+                // runs (e.g. TLS failure before DispatchH1/H2).
+                span->SetAttribute(
+                    "network.protocol.version",
+                    OBSERVABILITY_NAMESPACE::AttrValue(std::string("unknown")));
+                span->SetAttribute(
+                    "http.request.resend_count",
+                    OBSERVABILITY_NAMESPACE::AttrValue(
+                        static_cast<int64_t>(attempt_)));
+            }
+
+            // Invalidate cached serialized request so the next H1 send
+            // carries this attempt's fresh `traceparent`.
+            RebuildOutboundTraceHeaders();
+        }
+    }
+}
+
 void ProxyTransaction::AttemptCheckout() {
     state_ = State::CHECKOUT_PENDING;
     if (!PrepareAttemptAdmission()) {
@@ -626,6 +880,7 @@ void ProxyTransaction::AttemptCheckout() {
     }
     ActivateAttemptTracking();
     EnsureCheckoutCancelToken();
+    SetupAttemptObservability();
 
     // Fast path: if a usable multiplexed H2 session already exists for
     // this upstream, dispatch onto it without consuming a pool slot.
@@ -792,6 +1047,11 @@ void ProxyTransaction::DispatchH1() {
         codec_->SetRequestMethod(method_);
         codec_->SetSink(this);
     }
+    // Protocol decision finalized here — stamp the CLIENT span. Safe to
+    // call on the prefer="auto" deferred-handshake path: the ALPN-
+    // resolved callback invokes DispatchH1/DispatchH2 directly, both of
+    // which arrive at this stamp before sending the request.
+    SetProtocolVersionOnAttemptSpan("1.1");
 
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn) {
@@ -850,6 +1110,12 @@ void ProxyTransaction::DispatchH1() {
 }
 
 void ProxyTransaction::DispatchH2() {
+    // Stamp the CLIENT span before any H2 acquisition/reuse failure can
+    // short-circuit into MaybeRetry/DeliverTerminalError. Without this,
+    // failed H2 attempts finalize without network.protocol.version even
+    // though successful H2 attempts record "2".
+    SetProtocolVersionOnAttemptSpan("2");
+
     // Primary CONNECT-rejection gate. RFC 9113 §8.5 forbids :scheme and
     // :path on CONNECT pseudo-headers, but our H2 codec always emits
     // both — serving CONNECT through this path would emit a malformed
@@ -888,6 +1154,9 @@ void ProxyTransaction::DispatchH2() {
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
     }
+    // Protocol decision finalized — the span was stamped above before
+    // any early-return failure path. Reaching here means the H2 session
+    // acquisition succeeded; continue the dispatch using the same span.
     // Reuse path: lease_ was untouched by AcquireH2Connection; fresh-
     // session path: lease_ has been moved into the H2 connection. In
     // either case the transaction no longer needs a direct lease —
@@ -1061,6 +1330,13 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
         // ReleaseBreakerAdmissionNeutral clears admission_generation_
         // internally, so Cleanup/destructor won't double-report.
         ReleaseBreakerAdmissionNeutral();
+        // Finalize the CLIENT span BEFORE any terminal delivery — these
+        // sites all jump straight to Cleanup, which would otherwise hit
+        // the dtor backstop and label the span "abandoned". The current
+        // attempt failed admission to the circuit breaker; closed-enum
+        // error.type = "circuit_open".
+        FinalizeAttemptSpan(/*status_code=*/0,
+                             ErrorTypeForResult(RESULT_CIRCUIT_OPEN));
         if (ResumeHeldRetryable5xxResponse("checkout_circuit_open")) {
             return;
         }
@@ -1082,8 +1358,15 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
         // Use RESULT_POOL_EXHAUSTED → 503 (not 502 which implies upstream failure).
         // Release the breaker slot neutrally — admission never reached upstream.
         ReportBreakerOutcome(RESULT_POOL_EXHAUSTED);
-        if (DeliverPendingRetryable5xxResponse("checkout_local_failure")) {
-            return;
+        // Held-5xx delivery bypasses OnError → DeliverTerminalError, so
+        // finalize the CLIENT span here (same rationale as the CIRCUIT_OPEN
+        // branch above). The fall-through OnError path already finalizes.
+        if (pending_retryable_5xx_response_) {
+            FinalizeAttemptSpan(/*status_code=*/0,
+                                 ErrorTypeForResult(RESULT_POOL_EXHAUSTED));
+            if (DeliverPendingRetryable5xxResponse("checkout_local_failure")) {
+                return;
+            }
         }
         OnError(RESULT_POOL_EXHAUSTED,
                 "Pool checkout failed (local capacity, error=" +
@@ -1551,6 +1834,11 @@ void ProxyTransaction::OnResponseComplete() {
                          client_fd_, service_name_, upstream_fd,
                          response_head_.status_code, attempt_, duration.count());
 
+    // End the per-attempt CLIENT span. FinalizeAttemptSpan marks
+    // status >= 400 as Error and DropWithoutEnd if shutdown won the
+    // kill race.
+    FinalizeAttemptSpan(response_head_.status_code, /*error_type=*/"");
+
     if (relay_mode_ == RelayMode::STREAMING && response_committed_) {
         auto result = stream_sender_.End(response_trailers_);
         if (result == HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
@@ -1742,6 +2030,10 @@ void ProxyTransaction::DeliverTerminalError(int result_code,
     ReportBreakerOutcome(result_code);
 
     state_ = State::FAILED;
+    // End the per-attempt CLIENT span with the closed-enum error.type
+    // string; FinalizeAttemptSpan marks SpanStatusCode::ERROR and
+    // (when shutdown won the kill race) DropWithoutEnd.
+    FinalizeAttemptSpan(/*status_code=*/0, ErrorTypeForResult(result_code));
     if (response_committed_ && relay_mode_ == RelayMode::STREAMING) {
         using AbortReason = HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason;
         AbortReason reason = AbortReason::UPSTREAM_ERROR;
@@ -1803,6 +2095,54 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             held_retryable_5xx_saw_eof_ = false;
         } else {
             ClearPendingRetryable5xxResponse();
+        }
+        // End the previous attempt's CLIENT span BEFORE attempt_++. The
+        // next AttemptCheckout allocates a fresh span keyed on the new
+        // attempt number; without this, the prior attempt would leak
+        // into ~ProxyTransaction without End() / DropWithoutEnd. Map
+        // RetryCondition to the closed-enum error.type label, EXCEPT
+        // for RESPONSE_5XX which carries the upstream status instead.
+        if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
+            FinalizeAttemptSpan(response_head_.status_code, /*error_type=*/"");
+        } else {
+            const char* prev_error = "upstream_error";
+            switch (condition) {
+                case RetryPolicy::RetryCondition::CONNECT_FAILURE:
+                    prev_error = "connect_failure"; break;
+                case RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT:
+                    prev_error = "upstream_disconnect"; break;
+                case RetryPolicy::RetryCondition::RESPONSE_TIMEOUT:
+                    prev_error = "timeout"; break;
+                case RetryPolicy::RetryCondition::RESPONSE_5XX:
+                    break;
+            }
+            FinalizeAttemptSpan(/*status_code=*/0, prev_error);
+        }
+        // Bump reactor.upstream.retries with {service, reason}.
+        // The closed-enum `reason` label aligns with the RetryCondition
+        // taxonomy + retry-budget-exhaustion + breaker-open (see the
+        // else-branch below for the latter two — those are NOT retries
+        // but rejections of would-be retries; only the retry-accepted
+        // path bumps here).
+        if (auto* mgr = obs_manager()) {
+            const auto& cat = mgr->catalog();
+            if (cat.reactor_upstream_retries != nullptr) {
+                const char* reason = "unknown";
+                switch (condition) {
+                    case RetryPolicy::RetryCondition::CONNECT_FAILURE:
+                        reason = "connect_failure"; break;
+                    case RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT:
+                        reason = "upstream_disconnect"; break;
+                    case RetryPolicy::RetryCondition::RESPONSE_TIMEOUT:
+                        reason = "timeout"; break;
+                    case RetryPolicy::RetryCondition::RESPONSE_5XX:
+                        reason = "response_5xx"; break;
+                }
+                cat.reactor_upstream_retries->Add(1.0, {
+                    {"reactor.upstream.service", service_name_},
+                    {"reason", reason},
+                });
+            }
         }
         attempt_++;
 
@@ -1944,6 +2284,12 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                                      response_head_.status_code,
                                      attempt_, duration.count());
                 state_ = State::COMPLETE;
+                // Finalize the CLIENT span with the real upstream status
+                // BEFORE Cleanup's backstop. Without this the dtor backstop
+                // labels the span error.type="abandoned", masking the actual
+                // 5xx — exactly the case where operators need the real code.
+                FinalizeAttemptSpan(response_head_.status_code,
+                                     /*error_type=*/"");
                 HttpResponse client_response = BuildClientResponse();
                 DeliverResponse(std::move(client_response));
                 return;
@@ -2123,6 +2469,11 @@ void ProxyTransaction::Cancel() {
     // or fail still close / re-trip the cycle normally, and a broken
     // upstream under cancel-spam will still fail those real probes.
     ReleaseBreakerAdmissionNeutral();
+    // End the per-attempt CLIENT span with the closed-enum
+    // `client_disconnect` label so cancellation surfaces distinctly
+    // from upstream-initiated errors. DropWithoutEnd inside if the
+    // shutdown kill loop won the race.
+    FinalizeAttemptSpan(/*status_code=*/0, "client_disconnect");
     if (response_committed_ && relay_mode_ == RelayMode::STREAMING) {
         stream_sender_.Abort(
             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::
@@ -2135,6 +2486,30 @@ void ProxyTransaction::Cancel() {
 }
 
 void ProxyTransaction::Cleanup() {
+    // Backstop for the per-attempt CLIENT span. Several early-return
+    // paths (held-5xx delivery via DeliverPendingRetryable5xxResponse →
+    // DeliverResponse) skip the explicit FinalizeAttemptSpan and would
+    // otherwise leak a span without End() through ~ProxyTransaction.
+    // No-op when an explicit Finalize* already cleared upstream_span.
+    //
+    // ~ProxyTransaction is implicitly noexcept (C++17); FinalizeAttemptSpan
+    // can allocate (Histogram::Record / End / SetAttribute), so any throw
+    // here would std::terminate the process. Drop the span without End()
+    // on throw — losing the span is strictly better than process death.
+    if (current_attempt_.upstream_span) {
+        try {
+            FinalizeAttemptSpan(/*status_code=*/0, "abandoned");
+        } catch (...) {
+            if (current_attempt_.upstream_span) {
+                current_attempt_.upstream_span->DropWithoutEnd();
+                current_attempt_.upstream_span.reset();
+            }
+            logging::Get()->error(
+                "ProxyTransaction::Cleanup backstop FinalizeAttemptSpan "
+                "threw; dropped span without End() to keep destructor "
+                "noexcept");
+        }
+    }
     InvalidateStreamTimers();
     stream_sender_.SetDrainListener(nullptr);
     paused_parse_bytes_.clear();
@@ -2423,6 +2798,12 @@ void ProxyTransaction::BeginRetryAttemptFromHeld5xx() {
     ResetForRetryAttempt();
     ActivateAttemptTracking();
     EnsureCheckoutCancelToken();
+    // Mirror AttemptCheckout: allocate a fresh CLIENT span + rebuild
+    // outbound trace headers so the held-5xx retry surfaces as a
+    // distinct span_id on the wire. Without this the retry is
+    // invisible in the trace tree and replays the prior attempt's
+    // traceparent on its serialized request.
+    SetupAttemptObservability();
     StartCheckoutAsync();
 }
 

@@ -1,9 +1,27 @@
 #include "ws/websocket_connection.h"
 #include "ws/utf8_validate.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
+#include "observability/observability_snapshot.h"
+#include "observability/span.h"
+#include "observability/tracer.h"
 
 WebSocketConnection::WebSocketConnection(std::shared_ptr<ConnectionHandler> conn)
     : conn_(std::move(conn)) {}
+
+WebSocketConnection::~WebSocketConnection() {
+    // Matching -1 for the SetObservabilitySnapshot increment. Latch
+    // ensures exactly-once decrement across close-then-destroy paths.
+    // Use the cached instrument pointer so the dtor decrements against
+    // the SAME instrument we incremented against, not whatever
+    // catalog() happens to expose at dtor time.
+    if (active_counted_ && active_connections_counter_ != nullptr) {
+        active_connections_counter_->Add(-1.0, {});
+        active_counted_ = false;
+    }
+}
 
 void WebSocketConnection::OnMessage(MessageCallback callback) { callbacks_.message_callback = std::move(callback); }
 void WebSocketConnection::OnClose(CloseCallback callback) { callbacks_.close_callback = std::move(callback); }
@@ -21,12 +39,14 @@ void WebSocketConnection::SendText(const std::string& message) {
         if (callbacks_.error_callback) callbacks_.error_callback(*this, "Outbound text message is not valid UTF-8");
         return;
     }
+    MaybeEmitMessageSpan("ws.send", WebSocketOpcode::Text, message.size());
     SendFrame(WebSocketFrame::TextFrame(message));
 }
 
 void WebSocketConnection::SendBinary(const std::string& data) {
     std::lock_guard<std::recursive_mutex> lck(send_mtx_);
     if (close_sent_ || !is_open_) return;  // No data frames after close
+    MaybeEmitMessageSpan("ws.send", WebSocketOpcode::Binary, data.size());
     SendFrame(WebSocketFrame::BinaryFrame(data));
 }
 
@@ -116,6 +136,11 @@ void WebSocketConnection::OnRawData(const std::string& data) {
 }
 
 void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
+    // Count every inbound frame at the entry boundary. This includes
+    // frames the WS state machine RECEIVED, including ones rejected by
+    // the close-handshake branch below — operators investigating a WS
+    // disconnect storm want the post-Close burst visible.
+    BumpFrameCounter(frame.opcode, "in");
     // If we've sent a close frame, only accept Close replies and Ping/Pong control frames.
     // RFC 6455 §5.5.2: endpoint MUST respond to Ping until Close is received.
     // Discard data/continuation frames during the close handshake.
@@ -151,6 +176,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                     SendClose(1007, "Invalid UTF-8");
                     return;
                 }
+                MaybeEmitMessageSpan("ws.recv", frame.opcode, frame.payload.size());
                 if (callbacks_.message_callback) {
                     callbacks_.message_callback(*this, frame.payload,
                                      frame.opcode == WebSocketOpcode::Binary);
@@ -198,6 +224,7 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
                     fragment_buffer_.clear();
                     return;
                 }
+                MaybeEmitMessageSpan("ws.recv", fragment_opcode_, fragment_buffer_.size());
                 if (callbacks_.message_callback) {
                     callbacks_.message_callback(*this, fragment_buffer_,
                                      fragment_opcode_ == WebSocketOpcode::Binary);
@@ -323,6 +350,98 @@ void WebSocketConnection::ProcessFrame(const WebSocketFrame& frame) {
 
 void WebSocketConnection::SendFrame(const WebSocketFrame& frame) {
     if (!conn_) return;
+    BumpFrameCounter(frame.opcode, "out");
     std::string wire = frame.Serialize();
     conn_->SendRaw(wire.data(), wire.size());
+}
+
+namespace {
+const char* OpcodeToString(WebSocketOpcode op) {
+    switch (op) {
+        case WebSocketOpcode::Text:   return "text";
+        case WebSocketOpcode::Binary: return "binary";
+        case WebSocketOpcode::Continuation: return "continuation";
+        default: return "other";
+    }
+}
+}  // namespace
+
+void WebSocketConnection::SetObservabilitySnapshot(
+    std::shared_ptr<OBSERVABILITY_NAMESPACE::ObservabilitySnapshot> snap) {
+    // INSTALL-ONCE — call once from the upgrade path. The cached
+    // pointers are read lock-free from the data-path emission sites;
+    // a second call would race those reads (see the header docstring).
+    // `bound_once_` is set BEFORE the manager-lock early-return so a
+    // first call with `snap == nullptr` or expired manager still
+    // rejects subsequent calls.
+    if (bound_once_) {
+        logging::Get()->error(
+            "WebSocketConnection::SetObservabilitySnapshot called twice — "
+            "rebind is unsupported; the second call is ignored");
+        return;
+    }
+    bound_once_ = true;
+    obs_snapshot_ = std::move(snap);
+    if (!obs_snapshot_) return;
+    obs_manager_ = obs_snapshot_->manager.lock();
+    if (!obs_manager_) return;
+    ws_messages_enabled_flag_ = obs_manager_->WebSocketMessagesEnabledFlag();
+    const auto& cat = obs_manager_->catalog();
+    frames_counter_             = cat.reactor_websocket_frames;
+    active_connections_counter_ = cat.reactor_websocket_active_connections;
+    // Bump reactor.websocket.active_connections; the matching -1 runs
+    // in the dtor under the `active_counted_` latch.
+    if (active_connections_counter_ != nullptr) {
+        active_connections_counter_->Add(1.0, {});
+        active_counted_ = true;
+    }
+}
+
+void WebSocketConnection::BumpFrameCounter(WebSocketOpcode opcode,
+                                             const char* direction) {
+    if (frames_counter_ == nullptr) return;
+    // Closed enum on `op` — protocol-level opcodes only. Cardinality
+    // ceiling is 6 × 2 = 12 label combinations per process.
+    const char* op = nullptr;
+    switch (opcode) {
+        case WebSocketOpcode::Text:         op = "text"; break;
+        case WebSocketOpcode::Binary:       op = "binary"; break;
+        case WebSocketOpcode::Continuation: op = "continuation"; break;
+        case WebSocketOpcode::Ping:         op = "ping"; break;
+        case WebSocketOpcode::Pong:         op = "pong"; break;
+        case WebSocketOpcode::Close:        op = "close"; break;
+        default:                            op = "other"; break;
+    }
+    frames_counter_->Add(1.0, {
+        {"op", op},
+        {"direction", direction},
+    });
+}
+
+void WebSocketConnection::MaybeEmitMessageSpan(
+    const char* name, WebSocketOpcode opcode, size_t payload_size) {
+    // Disabled fast path: single relaxed atomic load + branch. Memory
+    // ordering on the flag is relaxed because we don't synchronize any
+    // other state with it — a stale read just delays the per-frame
+    // span by one frame, which is the operator's documented latency.
+    if (!ws_messages_enabled_flag_
+        || !ws_messages_enabled_flag_->load(std::memory_order_relaxed)) {
+        return;
+    }
+    // obs_manager_ + obs_snapshot_ are guaranteed non-null when the
+    // flag pointer is non-null (set together in SetObservabilitySnapshot).
+    auto& parent = obs_snapshot_->inbound_span;
+    if (!parent) return;
+    OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
+    opts.kind       = OBSERVABILITY_NAMESPACE::SpanKind::INTERNAL;
+    opts.parent     = parent->Context();
+    opts.has_parent = true;
+    auto span = obs_manager_->GetTracer("reactor.gateway.ws", "1.0.0")
+                              ->StartSpan(name, opts);
+    if (!span) return;
+    span->SetAttribute("ws.opcode",
+        OBSERVABILITY_NAMESPACE::AttrValue(std::string(OpcodeToString(opcode))));
+    span->SetAttribute("ws.payload_size",
+        OBSERVABILITY_NAMESPACE::AttrValue(static_cast<int64_t>(payload_size)));
+    span->End();
 }

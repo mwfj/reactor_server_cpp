@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common.h"
-#include <optional>
 #include <set>
 // <string>, <vector>, <map>, <optional> via common.h
 

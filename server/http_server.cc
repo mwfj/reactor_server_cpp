@@ -1127,7 +1127,7 @@ void HttpServer::MarkServerReady() {
     // ctor captures a non-owning auth_manager_ pointer). Skipped when
     // auth.enabled=false — downstream code handles null gracefully.
     //
-    // Middleware install ordering (§3.4, §20 risk #5):
+    // Middleware install ordering:
     //   `PrependMiddleware` pushes to FRONT. Rate-limit was prepended
     //   earlier at the top of MarkServerReady, producing [rate_limit, ...].
     //   Prepending auth NOW — i.e. SECOND — makes auth the new front:
@@ -1155,7 +1155,8 @@ void HttpServer::MarkServerReady() {
     // silent-no-op gap.
     try {
         auth_manager_ = std::make_unique<AUTH_NAMESPACE::AuthManager>(
-            auth_config_, upstream_manager_.get(), dispatchers);
+            auth_config_, upstream_manager_.get(), dispatchers,
+            observability_manager_.get());
     } catch (const std::exception& e) {
         if (auth_config_.enabled) {
             logging::Get()->error(
@@ -2671,7 +2672,7 @@ void HttpServer::Start() {
     // If Stop() landed while ResolveMany was blocking (can block for up to
     // dns.overall_timeout_ms), abort cleanly here BEFORE opening any
     // listen socket. Release-acquire semantics: pairs with Stop's
-    // release-store on `stopping_` (§11 invariant).
+    // release-store on `stopping_`.
     if (stopping_.load(std::memory_order_acquire)) {
         logging::Get()->info(
             "Startup aborted after DNS resolution (stop requested); "
@@ -2737,11 +2738,31 @@ HttpServer::GetBindResolved() const {
     return bind_resolved_;
 }
 
+void HttpServer::ScheduleStopAfterCurrentResponse() {
+    bool expected = false;
+    if (!stop_scheduled_.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+    // Route through NetServer's accessor; Stop() runs on conn_dispatcher_'s
+    // thread (NOT a socket dispatcher) so the drain barrier engages cleanly.
+    // `[this]` is safe: NetServer is a member of HttpServer, joined before
+    // ~HttpServer returns.
+    //
+    // On enqueue-failure the CAS stays latched — both failure modes (null
+    // pre-MarkServerReady, was_stopped() post-Stop) imply Stop() is either
+    // unneeded or already ran. Keeping the latch is correct: subsequent
+    // calls correctly no-op rather than re-attempting a queue that won't
+    // accept the task. NetServer's warn-log is the audit trail.
+    (void)net_server_.EnQueueOnConnDispatcher([this]() { Stop(); });
+}
+
 void HttpServer::Stop() {
     // First executable line: publish shutdown intent with release
-    // ordering (§11 v0.41 invariant). Start()/Reload() poll this at
-    // phase boundaries with acquire ordering so they can abort cleanly
-    // even while wedged in DNS.
+    // ordering. Start()/Reload() poll this at phase boundaries with
+    // acquire ordering so they can abort cleanly even while wedged in
+    // DNS.
     //
     // Stop's pre-drain accept-close path stays lock-free. The post-drain
     // teardown barrier acquires `reload_mtx_` so a Stop observed mid-

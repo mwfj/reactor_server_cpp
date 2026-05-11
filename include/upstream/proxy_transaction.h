@@ -14,14 +14,19 @@
 #include "http/http_callbacks.h"
 #include "http/http_response.h"
 #include "observability/observability_snapshot.h"  // UpstreamTransactionLink
-#include <optional>
-// <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono> provided by common.h
+#include "observability/trace_context.h"            // AttemptTraceContext / RequestTraceContext
+// <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono>, <optional> provided by common.h
 
 // Forward declarations
 class UpstreamManager;
 class ConnectionHandler;
 class Dispatcher;
 class UpstreamH2Connection;
+
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+class Span;
+}  // namespace OBSERVABILITY_NAMESPACE
 
 namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerSlice;
@@ -50,8 +55,10 @@ public:
     static constexpr int RESULT_POOL_EXHAUSTED      = -6;  // Local capacity → 503
     static constexpr int RESULT_RESPONSE_TOO_LARGE  = -9;  // Local buffering cap → 502
     // Circuit breaker rejected this attempt before it touched the upstream.
-    // Carries Retry-After + X-Circuit-Breaker headers.
-    // Terminal — retry loop MUST NOT retry this outcome.
+    // Response carries Retry-After + X-Circuit-Breaker headers. Terminal —
+    // retry loop MUST NOT retry this outcome (a same-cycle re-admission
+    // would just re-reject and would feed back into the breaker's failure
+    // math).
     static constexpr int RESULT_CIRCUIT_OPEN        = -7;
     // Retry budget exhausted. No Retry-After; distinct header
     // X-Retry-Budget-Exhausted so operators can tell the two 503s apart
@@ -270,6 +277,14 @@ private:
     // references kept. Empty when no policy matched inbound.
     std::optional<AUTH_NAMESPACE::AuthContext> auth_ctx_;
 
+    // Inbound RequestTraceContext copied at construction. Same lifetime
+    // contract as auth_ctx_: storing a reference into the original
+    // HttpRequest is unsafe because parser_.Reset() invalidates it.
+    // Empty when the inbound had no trace context (observability
+    // disabled or DROP path with no ObservabilitySnapshot).
+    std::optional<OBSERVABILITY_NAMESPACE::RequestTraceContext>
+        inbound_trace_ctx_;
+
     // Dependencies
     UpstreamManager* upstream_manager_;   // non-owning, outlives the transaction
     AUTH_NAMESPACE::AuthManager* auth_manager_ = nullptr;  // non-owning, nullable
@@ -432,6 +447,49 @@ private:
         obs_snapshot_;
     std::atomic<bool> kill_for_shutdown_{false};
 
+    // Per-attempt mutable trace context. Reset on every AttemptCheckout
+    // call before propagator strip+inject + re-serialization. Carries the
+    // freshly-generated span_id for THIS attempt's outbound `traceparent`
+    // (so retries get a fresh CLIENT span rather than reusing the prior
+    // attempt's span_id) plus the optional CLIENT span allocated when
+    // the inbound is recording. Empty when observability is disabled
+    // (`obs_snapshot_` null) — the verbatim-forward path then preserves
+    // any client-supplied trace headers.
+    OBSERVABILITY_NAMESPACE::AttemptTraceContext current_attempt_;
+
+    // Per-attempt steady-clock start time, captured in AttemptCheckout
+    // alongside `current_attempt_`. Read by FinalizeAttemptSpan to
+    // emit the `http.client.request.duration` histogram. Set to
+    // time_point{} sentinel when observability is disabled — the
+    // sentinel suppresses the histogram emit (the catalog instrument
+    // would otherwise record a misleading zero on every call).
+    std::chrono::steady_clock::time_point attempt_start_steady_{};
+
+    // Lock the manager weak_ptr through the snapshot. Returns nullptr
+    // when observability is disabled or the manager has been destroyed.
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager() const noexcept;
+    // Read inbound SERVER span for parent linkage. Null when DROP path
+    // OR observability disabled.
+    OBSERVABILITY_NAMESPACE::Span* inbound_span() const noexcept;
+    // Per-attempt strip-and-inject of `traceparent` / `tracestate` /
+    // `uber-trace-id` onto `rewritten_headers_` followed by invalidation
+    // of `serialized_request_`. Called from `AttemptCheckout` after
+    // `current_attempt_.attempt_local` is built. No-op when
+    // observability is disabled or the attempt context is invalid.
+    void RebuildOutboundTraceHeaders();
+    // Allocate / finalize the per-attempt CLIENT span. End-of-attempt
+    // sites (OnComplete / OnError / Cancel / MaybeRetry) call
+    // FinalizeAttemptSpan; survivor spans are dropped without End() when
+    // shutdown won the kill race.
+    void FinalizeAttemptSpan(int status_code,
+                              const std::string& error_type);
+    // Stamp `network.protocol.version` on the current attempt's CLIENT
+    // span at dispatch time — set to "1.1" from DispatchH1 / "2" from
+    // DispatchH2 (incl. the TryDispatchExistingH2Session reuse path and
+    // the deferred-handshake ALPN-resolved callback). No-op when the
+    // attempt span wasn't allocated (DROP / observability-disabled).
+    void SetProtocolVersionOnAttemptSpan(const char* version);
+
     // Latch — Start() bumps inflight_transactions_ exactly once and
     // the destructor decrements iff this is set. Atomic because Start
     // runs on the owning dispatcher thread while ~ProxyTransaction
@@ -475,6 +533,15 @@ private:
     void ActivateAttemptTracking();
     void EnsureCheckoutCancelToken();
     void StartCheckoutAsync();
+    // Per-attempt observability setup: resets current_attempt_, captures
+    // attempt_start_steady_, allocates the CLIENT span (when sampled),
+    // and rebuilds the outbound trace headers so the wire carries this
+    // attempt's fresh span_id. Called from BOTH AttemptCheckout AND
+    // BeginRetryAttemptFromHeld5xx — the held-5xx retry path also needs
+    // a fresh CLIENT span + invalidated serialized_request_, otherwise
+    // the retry reuses the prior attempt's traceparent on the wire and
+    // is invisible in the trace tree.
+    void SetupAttemptObservability();
     // Pre-checkout fast path for H2 reuse — see implementation comment.
     // Returns true if the transaction was dispatched through an
     // existing multiplexed H2 session (caller must NOT then call

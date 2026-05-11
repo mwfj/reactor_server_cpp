@@ -5,7 +5,6 @@
 #include "http/route_match.h"
 #include "observability/common.h"        // forward decls for Span / ObservabilitySnapshot
 #include "observability/trace_context.h" // RequestTraceContext (complete type for std::optional<>)
-#include <optional>
 // <unordered_map> provided by common.h
 
 // Forward declarations for observability types we hold as pointer /

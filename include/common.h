@@ -25,7 +25,9 @@
 #include <functional>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <atomic>
+#include <optional>
 
 // Support cross-platform (current support Linux & macOS)
 // Common system-level library

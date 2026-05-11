@@ -17,8 +17,7 @@
 // entirely.
 
 #include "../common.h"
-#include <optional>
-// <string>, <string_view>, <utility>, <vector> via common.h
+// <string>, <string_view>, <utility>, <vector>, <optional> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 

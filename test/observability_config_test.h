@@ -29,6 +29,7 @@ using OBSERVABILITY_NAMESPACE::NoopSpanProcessor;
 using OBSERVABILITY_NAMESPACE::RandomSource;
 using OBSERVABILITY_NAMESPACE::Resource;
 using OBSERVABILITY_NAMESPACE::SamplerType;
+using OBSERVABILITY_NAMESPACE::SamplerRouteOverride;
 using OBSERVABILITY_NAMESPACE::SpanProcessor;
 using OBSERVABILITY_NAMESPACE::MakeMetricsHandler;
 
@@ -89,9 +90,19 @@ void TestJsonLoadFullSchema() {
             && oc.traces.otlp.headers.count("x-tenant") == 1
             && oc.traces.sampler.type == SamplerType::TraceIdRatio
             && oc.traces.sampler.ratio == 0.25
-            && oc.traces.sampler.routes.size() == 1
-            && oc.traces.sampler.routes[0].path == "/metrics"
-            && oc.traces.sampler.routes[0].sampler == SamplerType::AlwaysOff
+            && !oc.traces.sampler.routes.empty()
+            // Lookup-by-path rather than positional: auto-appends
+            // (/observability/metrics, /health, /stats) are prepended
+            // by ApplySamplerSelfNoiseDefaults so the operator-supplied
+            // /metrics entry sits AFTER them in the routes vector. The
+            // earlier positional check `routes[0].path == "/metrics"`
+            // accidentally locked in the back-append ordering.
+            && std::any_of(oc.traces.sampler.routes.begin(),
+                           oc.traces.sampler.routes.end(),
+                           [](const SamplerRouteOverride& r) {
+                               return r.path == "/metrics" &&
+                                      r.sampler == SamplerType::AlwaysOff;
+                           })
             && oc.traces.batch.max_queue_size == 1024
             && oc.traces.batch.retries.max_attempts == 4
             && oc.metrics.exporter == "prometheus_pull"
@@ -186,6 +197,32 @@ void TestValidatePromPathMustStartWithSlash() {
             TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("ObsCfg: Validate rejects prom path without leading /",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestValidateRejectsPromPathSlashOnly() {
+    // Regression: bare "/" would route every request via the sampler's
+    // path-or-subtree prefix match, silently disabling traces site-wide.
+    // The auto-append also no-ops on "/", but the silent skip was
+    // operator-invisible — hard-reject at load.
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {"enabled": true,
+                "metrics": {"exporter": "prometheus_pull",
+                             "prometheus": {"path": "/"}}
+            }
+        })");
+        bool threw = false;
+        try { ConfigLoader::Validate(cfg); }
+        catch (const std::invalid_argument&) { threw = true; }
+        TestFramework::RecordTest(
+            "ObsCfg: Validate rejects prom path == \"/\"",
+            threw, threw ? "" : "didn't throw",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: Validate rejects prom path == \"/\"",
             false, e.what(), TestFramework::TestCategory::OTHER);
     }
 }
@@ -574,6 +611,330 @@ void TestOperatorEqDetectsRestartChange() {
     }
 }
 
+// ---- Sampler self-noise auto-derivation ----
+
+void TestSamplerSelfNoisePromAutoAppended() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {
+                "enabled": true,
+                "metrics": {
+                    "exporter": "prometheus_pull",
+                    "prometheus": { "path": "/metrics" }
+                }
+            }
+        })");
+        const auto& routes = cfg.observability.traces.sampler.routes;
+        bool found = false;
+        for (const auto& r : routes) {
+            if (r.path == "/metrics" && r.sampler == SamplerType::AlwaysOff) {
+                found = true; break;
+            }
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: prometheus path auto-appended as always_off",
+            found, found ? "" : "no /metrics always_off route added",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: prometheus path auto-appended as always_off",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestSamplerSelfNoiseOperatorOverridePreserved() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {
+                "enabled": true,
+                "traces": {
+                    "sampler": {
+                        "routes": [{"path": "/metrics", "sampler": "always_on"}]
+                    }
+                },
+                "metrics": {
+                    "exporter": "prometheus_pull",
+                    "prometheus": { "path": "/metrics" }
+                }
+            }
+        })");
+        const auto& routes = cfg.observability.traces.sampler.routes;
+        int matches = 0;
+        bool always_on = false;
+        for (const auto& r : routes) {
+            if (r.path == "/metrics") {
+                ++matches;
+                if (r.sampler == SamplerType::AlwaysOn) always_on = true;
+            }
+        }
+        bool pass = matches == 1 && always_on;
+        std::string err;
+        if (matches != 1) err = "expected 1 entry for /metrics, got " + std::to_string(matches);
+        else if (!always_on) err = "operator-supplied always_on overridden to always_off";
+        TestFramework::RecordTest(
+            "ObsCfg: operator-supplied sampler route not overridden",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: operator-supplied sampler route not overridden",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestSamplerSelfNoiseHealthAndStats() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": { "enabled": true }
+        })");
+        const auto& routes = cfg.observability.traces.sampler.routes;
+        bool health = false, stats = false;
+        for (const auto& r : routes) {
+            if (r.path == "/health" && r.sampler == SamplerType::AlwaysOff) health = true;
+            if (r.path == "/stats"  && r.sampler == SamplerType::AlwaysOff) stats  = true;
+        }
+        bool pass = health && stats;
+        std::string err;
+        if (!health) err = "/health missing";
+        else if (!stats) err = "/stats missing";
+        TestFramework::RecordTest(
+            "ObsCfg: /health and /stats auto-appended as always_off",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: /health and /stats auto-appended as always_off",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestSamplerSelfNoiseOtlpExporterSkipsPromPath() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {
+                "enabled": true,
+                "metrics": { "exporter": "otlp_http", "prometheus": { "path": "/metrics" } }
+            }
+        })");
+        const auto& routes = cfg.observability.traces.sampler.routes;
+        bool prom_route = false;
+        for (const auto& r : routes) {
+            if (r.path == "/metrics") { prom_route = true; break; }
+        }
+        // /health, /stats are unconditional; /metrics is only auto-added
+        // when prometheus_pull is the metrics exporter.
+        bool pass = !prom_route;
+        TestFramework::RecordTest(
+            "ObsCfg: /metrics not auto-appended for non-prometheus exporter",
+            pass, pass ? "" : "/metrics route added without prometheus_pull",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: /metrics not auto-appended for non-prometheus exporter",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestSamplerSelfNoisePrependedBeforeOperatorWildcard() {
+    // Regression: a bare `/` wildcard at the head of the operator's
+    // sampler routes used to outvote auto-appended self-noise entries
+    // because the sampler scan is first-match. Auto-defaults are now
+    // PREPENDED so `/metrics`, `/health`, `/stats` win against `/`.
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {
+                "enabled": true,
+                "traces": {
+                    "sampler": {
+                        "routes": [{"path": "/", "sampler": "always_on"}]
+                    }
+                },
+                "metrics": {
+                    "exporter": "prometheus_pull",
+                    "prometheus": { "path": "/metrics" }
+                }
+            }
+        })");
+        const auto& routes = cfg.observability.traces.sampler.routes;
+        // Locate each entry; auto-defaults must come BEFORE the
+        // wildcard root entry so the first-match scan picks them up.
+        ssize_t pos_root = -1;
+        ssize_t pos_metrics = -1, pos_health = -1, pos_stats = -1;
+        for (size_t i = 0; i < routes.size(); ++i) {
+            const auto& r = routes[i];
+            if (r.path == "/")        pos_root    = static_cast<ssize_t>(i);
+            if (r.path == "/metrics") pos_metrics = static_cast<ssize_t>(i);
+            if (r.path == "/health")  pos_health  = static_cast<ssize_t>(i);
+            if (r.path == "/stats")   pos_stats   = static_cast<ssize_t>(i);
+        }
+        bool pass = pos_root >= 0 && pos_metrics >= 0 && pos_health >= 0 &&
+                    pos_stats >= 0 &&
+                    pos_metrics < pos_root && pos_health < pos_root &&
+                    pos_stats < pos_root;
+        std::string err;
+        if (!pass) {
+            err = "expected metrics/health/stats BEFORE wildcard '/'; got "
+                  "indices metrics=" + std::to_string(pos_metrics) +
+                  " health=" + std::to_string(pos_health) +
+                  " stats=" + std::to_string(pos_stats) +
+                  " root=" + std::to_string(pos_root);
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: self-noise auto-defaults prepended before operator wildcard",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: self-noise auto-defaults prepended before operator wildcard",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- prometheus.path reload-warn ----
+
+void TestPrometheusPathReloadIgnored() {
+    try {
+        ObservabilityConfig cfg;
+        cfg.enabled = true;
+        cfg.metrics.exporter = "prometheus_pull";
+        cfg.metrics.prometheus.path = "/metrics";
+        cfg.resource.service_name = "obs-cfg-test";
+        std::vector<Attribute> attrs;
+        attrs.emplace_back("service.name", AttrValue(std::string("obs-cfg-test")));
+        auto m = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(std::move(attrs)),
+            std::shared_ptr<SpanProcessor>(std::make_shared<NoopSpanProcessor>()),
+            std::make_shared<RandomSource>(0xCFCF1234ULL));
+
+        ObservabilityConfig staged;
+        staged.enabled = true;
+        staged.metrics.exporter = "prometheus_pull";
+        staged.metrics.prometheus.path = "/observability/metrics";  // restart-only
+        m->Reload(staged);
+
+        const auto& live = m->config();
+        bool path_unchanged = live.metrics.prometheus.path == "/metrics";
+        TestFramework::RecordTest(
+            "ObsCfg: prometheus.path reload keeps live value (restart-only)",
+            path_unchanged,
+            path_unchanged ? "" : ("path applied unexpectedly: " + live.metrics.prometheus.path),
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: prometheus.path reload keeps live value (restart-only)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---- websocket_messages live atomic ----
+
+void TestWebSocketMessagesDefaultOff() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": { "enabled": true }
+        })");
+        bool pass = cfg.observability.traces.websocket_messages == false;
+        TestFramework::RecordTest(
+            "ObsCfg: traces.websocket_messages defaults off",
+            pass, pass ? "" : "default flipped to true",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.websocket_messages defaults off",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestWebSocketMessagesJsonRoundTrip() {
+    try {
+        auto cfg = ConfigLoader::LoadFromString(R"({
+            "observability": {
+                "enabled": true,
+                "traces": { "websocket_messages": true }
+            }
+        })");
+        bool pass = cfg.observability.traces.websocket_messages == true;
+        TestFramework::RecordTest(
+            "ObsCfg: traces.websocket_messages parses from JSON",
+            pass, pass ? "" : "field not parsed",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.websocket_messages parses from JSON",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestWebSocketMessagesReloadFlips() {
+    try {
+        ObservabilityConfig cfg;
+        cfg.enabled = true;
+        cfg.traces.websocket_messages = false;
+        cfg.resource.service_name = "obs-ws-msg";
+        std::vector<Attribute> attrs;
+        attrs.emplace_back("service.name", AttrValue(std::string("obs-ws-msg")));
+        auto m = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(std::move(attrs)),
+            std::shared_ptr<SpanProcessor>(std::make_shared<NoopSpanProcessor>()),
+            std::make_shared<RandomSource>(0xCFCF5678ULL));
+
+        bool boot_off = m->WebSocketMessagesEnabled() == false;
+
+        ObservabilityConfig staged;
+        staged.enabled = true;
+        staged.traces.websocket_messages = true;
+        m->Reload(staged);
+
+        bool reloaded_on = m->WebSocketMessagesEnabled() == true;
+
+        // Flip back to off — confirm both directions.
+        ObservabilityConfig staged2;
+        staged2.enabled = true;
+        staged2.traces.websocket_messages = false;
+        m->Reload(staged2);
+
+        bool reloaded_off = m->WebSocketMessagesEnabled() == false;
+
+        bool pass = boot_off && reloaded_on && reloaded_off;
+        std::string err;
+        if (!boot_off)     err = "boot value not honored";
+        else if (!reloaded_on)  err = "reload to true did not flip atomic";
+        else if (!reloaded_off) err = "reload back to false did not flip atomic";
+        TestFramework::RecordTest(
+            "ObsCfg: traces.websocket_messages live atomic reload",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.websocket_messages live atomic reload",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+void TestWebSocketMessagesRejectsNonBool() {
+    try {
+        bool threw = false;
+        try {
+            ConfigLoader::LoadFromString(R"({
+                "observability": {
+                    "enabled": true,
+                    "traces": { "websocket_messages": "yes" }
+                }
+            })");
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        TestFramework::RecordTest(
+            "ObsCfg: traces.websocket_messages rejects non-boolean",
+            threw, threw ? "" : "non-boolean accepted",
+            TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "ObsCfg: traces.websocket_messages rejects non-boolean",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // ---- MakeMetricsHandler runtime gate ----
 
 namespace {
@@ -709,6 +1070,7 @@ void RunAllTests() {
     TestPropagatorsListUnknownRejected();
     TestPropagatorsListDuplicateRejected();
     TestValidatePromPathMustStartWithSlash();
+    TestValidateRejectsPromPathSlashOnly();
     TestValidateRejectsHistogramBucketsOutOfOrder();
     TestHotReloadableRejectsBadLiveValue();
     TestHotReloadableSkipsBadLiveValueWhenNotLive();
@@ -721,6 +1083,16 @@ void RunAllTests() {
     TestMetricsHandlerRendersWithTargetInfo();
     TestMetricsHandlerOmitsTargetInfoOnLiveFlip();
     TestMetricsHandlerContentTypeFromAccept();
+    TestSamplerSelfNoisePromAutoAppended();
+    TestSamplerSelfNoiseOperatorOverridePreserved();
+    TestSamplerSelfNoiseHealthAndStats();
+    TestSamplerSelfNoiseOtlpExporterSkipsPromPath();
+    TestSamplerSelfNoisePrependedBeforeOperatorWildcard();
+    TestPrometheusPathReloadIgnored();
+    TestWebSocketMessagesDefaultOff();
+    TestWebSocketMessagesJsonRoundTrip();
+    TestWebSocketMessagesReloadFlips();
+    TestWebSocketMessagesRejectsNonBool();
 }
 
 }  // namespace ObservabilityConfigTests

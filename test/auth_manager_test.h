@@ -41,14 +41,7 @@
 #include "http/http_router.h"
 #include "log/logger.h"
 
-#include <cstdlib>
-#include <memory>
-#include <string>
-#include <vector>
-#include <thread>
-#include <atomic>
-#include <optional>
-
+#include "common.h"
 namespace AuthManagerTests {
 
 // ---------------------------------------------------------------------------

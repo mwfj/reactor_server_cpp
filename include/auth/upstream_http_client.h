@@ -2,8 +2,7 @@
 
 #include "common.h"
 #include "observability/trace_context.h"
-#include <optional>
-// <string>, <map>, <memory>, <functional>, <vector>, <chrono>, <atomic> via common.h
+// <string>, <map>, <memory>, <functional>, <vector>, <chrono>, <atomic>, <optional> via common.h
 
 class UpstreamManager;
 class Dispatcher;

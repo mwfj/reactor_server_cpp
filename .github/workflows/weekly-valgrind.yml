@@ -88,7 +88,11 @@ jobs:
             obs_shutdown \
             obs_linkkill \
             obs_issue \
-            obs_e2e ; do
+            obs_e2e \
+            obs_self_handler \
+            obs_proxy_client \
+            obs_auth_trace \
+            obs_catalog ; do
             echo "::group::valgrind test_runner $suite"
             valgrind \
               --error-exitcode=1 \

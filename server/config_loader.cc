@@ -503,6 +503,68 @@ constexpr uint32_t kMaxStreamIdleTimeoutSec = 3600;
 constexpr uint32_t kMaxStreamDurationSec = 86400;
 constexpr int kMaxProxyRetryCount = 10;
 
+// Auto-append always_off sampler routes for gateway self-noise paths
+// (`/metrics`, `/health`, `/stats`) so the operator's own probes never
+// pollute traces. Operator-supplied entries with the same EXACT path
+// are preserved verbatim — only paths the operator hasn't already
+// chosen to override get the always_off default.
+//
+// Order matters: the sampler does a linear first-match scan with
+// path-or-subtree prefix matching (see
+// `ObservabilityManager::EffectiveSamplerForPath`). An operator-
+// supplied wildcard route like `path: "/", sampler: always_on` would
+// outvote a trailing self-noise entry. We therefore PREPEND
+// auto-defaults so they win against wildcards. Operator wins only on
+// EXACT path match (skip-if-exists above) — the documented contract.
+void ApplySamplerSelfNoiseDefaults(
+    OBSERVABILITY_NAMESPACE::ObservabilityConfig& obs) {
+    std::vector<OBSERVABILITY_NAMESPACE::SamplerRouteOverride> auto_defaults;
+    auto auto_append = [&](const std::string& path) {
+        if (path.empty() || path[0] != '/') return;
+        // Defense-in-depth: bare "/" is hard-rejected at ConfigLoader::
+        // Validate, but this lambda runs at load (before Validate) AND
+        // from programmatic callers that may bypass Validate. Skip
+        // silently — the Validate path is the source-of-truth error.
+        if (path == "/") return;
+        for (const auto& existing : obs.traces.sampler.routes) {
+            if (existing.path == path) return;
+        }
+        for (const auto& existing : auto_defaults) {
+            if (existing.path == path) return;
+        }
+        OBSERVABILITY_NAMESPACE::SamplerRouteOverride o;
+        o.path    = path;
+        o.sampler = OBSERVABILITY_NAMESPACE::SamplerType::AlwaysOff;
+        auto_defaults.push_back(std::move(o));
+    };
+    if (obs.metrics.exporter ==
+        OBSERVABILITY_NAMESPACE::kExporterPrometheusPull) {
+        auto_append(obs.metrics.prometheus.path);
+    }
+    auto_append("/health");
+    auto_append("/stats");
+    if (auto_defaults.empty()) return;
+    // Info-log so an operator who configured a catch-all `path: "/",
+    // sampler: always_on` sees that the gateway's self-noise paths
+    // have been prepended ahead of their wildcard. Without this log
+    // the override is invisible — operators would have to dump
+    // `traces.sampler.routes` post-load to discover it.
+    std::string names;
+    for (size_t i = 0; i < auto_defaults.size(); ++i) {
+        if (i) names += ", ";
+        names += auto_defaults[i].path;
+    }
+    logging::Get()->info(
+        "Sampler: auto-prepended always_off self-noise routes for [{}] "
+        "(prepended ahead of operator-supplied routes so a catch-all "
+        "wildcard cannot outvote them)",
+        names);
+    obs.traces.sampler.routes.insert(
+        obs.traces.sampler.routes.begin(),
+        std::make_move_iterator(auto_defaults.begin()),
+        std::make_move_iterator(auto_defaults.end()));
+}
+
 }  // namespace
 
 ServerConfig ConfigLoader::LoadFromFile(const std::string& path) {
@@ -1124,6 +1186,19 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                 }
                 oc.traces.propagators = std::move(names);
             }
+            if (tj.contains("auth_idp_span")) {
+                if (!tj["auth_idp_span"].is_boolean())
+                    throw std::invalid_argument(
+                        "observability.traces.auth_idp_span must be boolean");
+                oc.traces.auth_idp_span = tj["auth_idp_span"].get<bool>();
+            }
+            if (tj.contains("websocket_messages")) {
+                if (!tj["websocket_messages"].is_boolean())
+                    throw std::invalid_argument(
+                        "observability.traces.websocket_messages must be boolean");
+                oc.traces.websocket_messages =
+                    tj["websocket_messages"].get<bool>();
+            }
             if (tj.contains("sampler")) {
                 if (!tj["sampler"].is_object())
                     throw std::runtime_error(
@@ -1401,6 +1476,8 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
             }
         }
     }
+
+    ApplySamplerSelfNoiseDefaults(config.observability);
 
     return config;
 }
@@ -2426,6 +2503,21 @@ static void ValidateObservabilityRestart(const ServerConfig& config,
             || oc.metrics.prometheus.path[0] != '/')) {
         throw std::invalid_argument(
             "observability.metrics.prometheus.path must start with '/'");
+    }
+    // Reject bare "/" — the sampler self-noise auto-prepend depends on
+    // a path-or-subtree prefix match, and a "/" entry would catch every
+    // request via subtree match. The auto-append already warns and
+    // skips, but that leaves /metrics traffic feeding its own traces
+    // (the self-noise filter is silently no-op'd). Hard-reject here so
+    // operators see the misconfig at boot rather than only in the warn
+    // log + a runtime trace anomaly.
+    if (oc.metrics.exporter == OBSERVABILITY_NAMESPACE::kExporterPrometheusPull
+        && oc.metrics.prometheus.path == "/") {
+        throw std::invalid_argument(
+            "observability.metrics.prometheus.path must not be \"/\" — "
+            "the catch-all path would route every request through the "
+            "metrics endpoint and disable trace sampling for the whole "
+            "site. Use a distinct path (default '/metrics').");
     }
 
     // Cross-references into upstreams[] — only at startup (reload_copy

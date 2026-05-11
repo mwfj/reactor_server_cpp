@@ -24,14 +24,7 @@
 #include "http/http_router.h"
 #include "log/logger.h"
 
-#include <string>
-#include <vector>
-#include <memory>
-#include <thread>
-#include <atomic>
-#include <algorithm>
-#include <optional>
-#include <cstdlib>
+#include "common.h"
 
 namespace AuthObservabilityTests {
 

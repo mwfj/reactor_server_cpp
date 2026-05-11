@@ -197,6 +197,23 @@ public:
     // Used to detect Stop-from-handler scenarios that would deadlock drain wait.
     bool IsOnDispatcherThread() const;
 
+    // Enqueue a task on `conn_dispatcher_`'s thread.
+    //
+    // Used by `HttpServer::ScheduleStopAfterCurrentResponse()` to schedule
+    // `Stop()` to run on a thread that is NOT a socket dispatcher
+    // (`IsOnDispatcherThread()` returns false on `conn_dispatcher_`'s own
+    // thread), so the drain barrier engages cleanly.
+    //
+    // Residual TOCTOU: a `true` return is best-effort — the inner
+    // `EnQueue` can no-op silently if the dispatcher stops between
+    // the `was_stopped()` recheck here and the dispatcher's queue
+    // lock acquisition. Acceptable today because Stop() is the only
+    // caller and Stop() is idempotent.
+    //
+    // Safe to call from any thread, including a route handler running on
+    // a socket dispatcher.
+    bool EnQueueOnConnDispatcher(std::function<void()> fn);
+
     // Called after init completes but before the blocking event loop.
     // Used by daemon mode to signal readiness to the parent process.
     void SetReadyCallback(std::function<void()> cb) { ready_callback_ = std::move(cb); }

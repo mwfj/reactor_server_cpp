@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common.h"
-#include <optional>
 // <string>, <cstdint> via common.h
 
 namespace AUTH_NAMESPACE {

@@ -2,6 +2,7 @@
 #include "http/http_status.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include "observability/span.h"
 #include "ws/websocket_handshake.h"
 // <algorithm> provided by common.h (via http_request.h)
 
@@ -11,6 +12,30 @@
 //     (TripCancel and DecrementOnce share the exchange).
 //   - cancel_cb_ fires exactly once when TripCancel wins the exchange
 //     (move-and-clear, exception-safe).
+
+AsyncPendingState::~AsyncPendingState() {
+    // Backstop for the dropped-state case: a successful resume clears
+    // both fields, so this body is a no-op on the happy path. End() /
+    // AddEvent are dispatcher-thread-only per Span docs; the dtor may
+    // run anywhere, so we use `DropWithoutEnd` (atomic only) for the
+    // span and skip the event emission entirely. Logged at debug
+    // because a graceful shutdown of N in-flight requests fires this
+    // dtor N times — warn-level would spam the operator log under
+    // routine drain.
+    if (auth_idp_check_span) {
+        auth_idp_check_span->DropWithoutEnd();
+        auth_idp_check_span.reset();
+        logging::Get()->debug(
+            "AsyncPendingState dtor: dropped auth.idp_check span "
+            "without End() (async resume bypassed)");
+    }
+    if (emit_pending_end_event) {
+        emit_pending_end_event = false;
+        logging::Get()->debug(
+            "AsyncPendingState dtor: skipped auth.pending_end event "
+            "(cross-thread AddEvent unsafe)");
+    }
+}
 
 void AsyncPendingState::Complete(AsyncMiddlewarePayload payload) {
     std::function<void(AsyncMiddlewarePayload)> cb_to_fire;
