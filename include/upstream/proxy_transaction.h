@@ -46,8 +46,8 @@ public:
     static constexpr int RESULT_POOL_EXHAUSTED      = -6;  // Local capacity → 503
     static constexpr int RESULT_RESPONSE_TOO_LARGE  = -9;  // Local buffering cap → 502
     // Circuit breaker rejected this attempt before it touched the upstream.
-    // Carries Retry-After + X-Circuit-Breaker headers (§12.1).
-    // Terminal — retry loop MUST NOT retry this outcome (§8).
+    // Carries Retry-After + X-Circuit-Breaker headers.
+    // Terminal — retry loop MUST NOT retry this outcome.
     static constexpr int RESULT_CIRCUIT_OPEN        = -7;
     // Retry budget exhausted. No Retry-After; distinct header
     // X-Retry-Budget-Exhausted so operators can tell the two 503s apart

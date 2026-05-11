@@ -203,29 +203,19 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
                             int32_t stream_id, const uint8_t* data,
                             size_t len, void* user_data)
 {
-    // Look up via the connection's own stream table rather than casting
-    // nghttp2's raw user_data pointer directly.
     auto* self = static_cast<UpstreamH2Connection*>(user_data);
     auto* stream = self->GetStream(stream_id);
     if (!stream || !stream->sink) return 0;
 
-    // Defense-in-depth pre-dispatch validation. In production this code
-    // is unreachable: nghttp2's HTTP messaging enforcement (default-on)
-    // intercepts NO_BODY and Content-Length violations before this
-    // callback fires, routing them through OnStreamClose with a
-    // non-NO_ERROR code. These checks remain active as a backstop for
-    // future code paths that opt out of enforcement (e.g.
-    // nghttp2_option_set_no_http_messaging for streaming protocols).
-    // RST through ResetStream (not nghttp2_submit_rst_stream directly) so
-    // the in_receive_data_ guard defers the inline FlushSend; the
-    // post-receive flush in HandleBytes picks up the queued frame.
+    // Defense-in-depth: nghttp2's HTTP-messaging enforcement normally
+    // catches NO_BODY / Content-Length violations before we get here.
+    // Kept active as a backstop for callers that opt out of enforcement.
+    // ResetStream (not raw nghttp2_submit_rst_stream) so in_receive_data_
+    // defers the inline FlushSend until the post-receive flush.
     using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
-    // Detach the sink BEFORE calling OnError so the synchronous
-    // teardown chain (ProxyTransaction OnError → Cleanup → h2->
-    // ResetStream) does not re-dispatch sink->OnError on an
-    // already-failed path. The outer self->ResetStream below is the
-    // safety net for paths where Cleanup doesn't run; nghttp2 dedups
-    // the duplicate RST submission silently in production.
+    // Detach sink before OnError so a synchronous teardown chain
+    // (sink OnError → Cleanup → ResetStream) does not re-dispatch on
+    // an already-failed path.
     auto reject_truncation = [&](const char* msg) {
         auto* sink = stream->sink;
         stream->sink = nullptr;
@@ -252,22 +242,10 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     return 0;
 }
 
-// Fired when nghttp2 actually puts a frame on the wire (via
-// FlushSend → nghttp2_session_mem_send2). Two request-side signals
-// matter to the sink:
-//   * END_STREAM on HEADERS (bodyless) or DATA (final frame) →
-//     OnRequestSubmitted: request fully sent, swap send-stall for
-//     response-completion deadline.
-//   * Intermediate DATA frame (no END_STREAM) → OnRequestBodyProgress:
-//     refresh the send-stall budget so a slow-but-progressing upload
-//     mirrors H1's transport-level SetWriteProgressCb behavior.
-//
-// May fire SYNCHRONOUSLY inside SubmitRequest when nghttp2 inline-
-// flushes a bodyless HEADERS+END_STREAM frame; the sink contract
-// (OnRequestSubmitted docstring on UpstreamResponseSink) requires
-// callers to be safe under that ordering. ProxyTransaction handles
-// the synchronous case by initializing all H2 state BEFORE invoking
-// h2->SubmitRequest.
+// Dispatches request-side sink signals from frame-serialization edges.
+// END_STREAM (HEADERS or DATA) → OnRequestSubmitted; intermediate DATA
+// → OnRequestBodyProgress. May fire SYNCHRONOUSLY inside SubmitRequest
+// for bodyless requests — sink contract requires reentrancy.
 int OnFrameSendCallback(nghttp2_session* /*session*/,
                         const nghttp2_frame* frame, void* user_data)
 {
@@ -282,9 +260,8 @@ int OnFrameSendCallback(nghttp2_session* /*session*/,
     if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
         stream->sink->OnRequestSubmitted();
     } else if (frame->hd.type == NGHTTP2_DATA) {
-        // HEADERS without END_STREAM is the request-headers frame for
-        // a bodied request; the upcoming DATA frames are the progress
-        // signal, not the HEADERS itself. Only DATA frames refresh.
+        // Only DATA frames are body-progress signals; the HEADERS frame
+        // itself (no END_STREAM, bodied request) is request-header data.
         stream->sink->OnRequestBodyProgress();
     }
     return 0;
@@ -807,13 +784,11 @@ int32_t UpstreamH2Connection::SubmitRequest(
 {
     if (!IsUsable()) return -1;
 
-    // Secondary CONNECT-rejection gate. The primary gate in
-    // ProxyTransaction::DispatchH2 catches CONNECT before it reaches the
-    // codec, but a future code path bypassing DispatchH2 (or a unit test
-    // exercising this method directly) would otherwise emit a malformed
-    // H2 request. nghttp2 is left untouched: no stream allocation, no
-    // submit, no frame queue. Sink receives the deterministic policy
-    // reject so the caller's MaybeRetry sees a terminal code.
+    // Secondary CONNECT-rejection gate. Primary gate lives in
+    // ProxyTransaction::DispatchH2; this catches direct callers that
+    // bypass it (unit tests / future code paths). Sink->OnError fires
+    // here, so callers that also run their own rollback on a -1 return
+    // must be idempotent on the error path.
     if (method == "CONNECT") {
         const std::string host = transport_ ? transport_->upstream_host()
                                             : std::string("?");

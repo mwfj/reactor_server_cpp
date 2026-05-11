@@ -504,8 +504,8 @@ bool ProxyTransaction::PrepareAttemptAdmission() {
     // Circuit breaker gate — consulted before every attempt (first try and
     // retries both). Each attempt gets a fresh admission stamped with the
     // slice's current generation. If the slice rejects with REJECTED_OPEN,
-    // ConsultBreaker delivers the §12.1 response and returns false; the
-    // retry loop treats RESULT_CIRCUIT_OPEN as terminal (§8) so a rejected
+    // ConsultBreaker delivers the circuit-open response and returns false;
+    // the retry loop treats RESULT_CIRCUIT_OPEN as terminal so a rejected
     // retry produces a single 503 to the client, not a nested retry.
     // Dry-run reject logs inside TryAcquire and returns ADMITTED through
     // the decision enum (REJECTED_OPEN_DRYRUN), so ConsultBreaker proceeds.
@@ -945,19 +945,13 @@ void ProxyTransaction::DispatchH2() {
         path_with_query.append(query_);
     }
 
-    // Initialize H2 state BEFORE h2->SubmitRequest. SubmitRequest may
-    // synchronously fire on_frame_send_callback (via FlushSend) for
-    // bodyless requests where nghttp2 inline-flushes HEADERS+END_STREAM,
-    // dispatching OnRequestSubmitted INSIDE the call. If we deferred
-    // h2_path_/state_/generation init to after the call, the
-    // OnRequestSubmitted override's `if (!h2_path_) return;` guard
-    // would silently drop the kill of the send-stall closure → spurious
-    // OnError(UPSTREAM_DISCONNECT) ~30s later.
-    //
-    // Send-stall budget mirrors the H1 zero-disable semantic in the
-    // H1 send loop above: response_timeout_ms == 0 opts out of the
-    // response-wait timer but the stall protection stays on, falling
-    // back to SEND_STALL_FALLBACK_MS.
+    // Initialize H2 state BEFORE SubmitRequest. Bodyless requests can
+    // inline-flush HEADERS+END_STREAM and fire OnRequestSubmitted
+    // synchronously; the override's `!h2_path_` guard would otherwise
+    // drop the kill of the just-queued send-stall closure.
+    // Budget mirrors the H1 zero-disable semantic: response_timeout_ms
+    // == 0 opts out of the response-wait timer; stall protection stays
+    // on via SEND_STALL_FALLBACK_MS.
     h2_path_ = true;
     h2_conn_weak_ = h2;
     state_ = State::SENDING_REQUEST;
@@ -1038,8 +1032,8 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
     if (error_code == CIRCUIT_OPEN) {
         // Drain path: breaker tripped while this transaction was queued.
         // Do NOT Report success/failure to the slice — our own reject
-        // must not feed back into the failure math. Emit the §12.1
-        // circuit-open response directly.
+        // must not feed back into the failure math. Emit the circuit-open
+        // response (Retry-After + X-Circuit-Breaker headers) directly.
         logging::Get()->info(
             "ProxyTransaction checkout drained by circuit breaker "
             "client_fd={} service={}",
@@ -1323,47 +1317,27 @@ bool ProxyTransaction::OnHeaders(
     }
 
     if (h2_path_) {
-        // H2 final-headers branch. The send-stall closure stays armed
-        // until OnRequestSubmitted (or Cleanup) bumps the generation —
-        // an early peer-final-headers (e.g. 413) before our END_STREAM
-        // is sent does not cancel the stall protection. Response timer
-        // is armed at the FIRST of {OnHeaders, OnRequestSubmitted} via
-        // the arm-once flag; whichever fires later sees armed=true and
-        // skips the redundant arm.
-        //
-        // No poison_connection_=true here on the early-final-headers
-        // path: H1 poisons because its transport-sharing model
-        // contaminates subsequent keep-alive use, but H2 multiplexes
-        // streams over a single transport — an early 413 on one stream
-        // is not a fatal upstream signal and should not block sibling
-        // stream reuse.
+        // H2: stall closure stays armed until OnRequestSubmitted /
+        // Cleanup bumps the generation — an early peer-final-headers
+        // (e.g. 413) before our END_STREAM keeps stall protection. No
+        // poison_connection_ here: H2 multiplexes streams, so an early
+        // status on one stream is not a transport-fatal signal.
         if (state_ == State::SENDING_REQUEST) {
             state_ = State::AWAITING_RESPONSE;
         }
-        // Final headers in hand → header-phase timer (T1) is done.
-        // Body-phase timing is governed by stream_idle_timeout_sec /
-        // stream_max_duration_sec, NOT by response_timeout_ms. Clear
-        // any armed closure (no-op if OnRequestSubmitted hasn't run
-        // yet) and reset the arm-once flag so a later
-        // OnRequestSubmitted's was_sending guard correctly skips
-        // re-arming. Mirrors H1's ClearResponseTimeout below.
+        // Header phase done; body phase is governed by stream timers.
+        // Reset the arm-once flag so a later OnRequestSubmitted skips
+        // re-arming.
         ClearResponseTimeout();
         h2_response_timeout_armed_ = false;
     } else {
-        // H1 path: existing behavior preserved verbatim.
         if (state_ == State::SENDING_REQUEST) {
-            // Early response: the request write is no longer the active
-            // phase. If the upstream later finishes flushing the request
-            // bytes, that callback must not re-arm the response-header
-            // timer or move us back into the pre-headers state machine.
+            // Early response: subsequent request-write completion must
+            // not re-arm the header timer or move us back to the
+            // pre-headers state.
             state_ = State::AWAITING_RESPONSE;
             poison_connection_ = true;
         }
-        // T1 is complete once the response head arrives. Body-phase
-        // timing uses the dedicated T2/T3 stream timers.
-        // Note: H1 has no `h2_response_timeout_armed_` reset because
-        // the flag is H2-only — the H1 path uses transport-level
-        // SetDeadline cleared by ClearResponseTimeout itself.
         ClearResponseTimeout();
     }
 
@@ -1646,7 +1620,13 @@ void ProxyTransaction::OnRequestSubmitted() {
         state_ = State::AWAITING_RESPONSE;
     }
     if (was_sending && !h2_response_timeout_armed_) {
-        ArmResponseTimeout();
+        // Pass the cached fallback budget explicitly. When
+        // response_timeout_ms == 0 (operator-disabled), ArmResponseTimeout()
+        // without an explicit budget is a no-op and the post-submit
+        // watchdog would vanish — leaving a transport-stuck upload
+        // governed only by PING liveness. Mirrors the H1 send-loop
+        // pattern which also passes a non-zero stall budget.
+        ArmResponseTimeout(h2_stall_budget_ms_);
         h2_response_timeout_armed_ = true;
     }
 }
@@ -1675,7 +1655,7 @@ void ProxyTransaction::QueueH2SendStallClosure(uint64_t generation,
         [weak_self, generation]() {
             auto self = weak_self.lock();
             if (!self) return;
-            if (self->cancelled_) return;
+            if (self->cancelled_ || self->IsKilledForShutdown()) return;
             if (generation != self->h2_send_stall_generation_) return;
 
             // Progress check: if we've seen a DATA flush within the
@@ -2904,23 +2884,15 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         return MakeRetryBudgetResponse();
     }
     if (result_code == RESULT_CIRCUIT_OPEN) {
-        // The static factory has no `this`, so it cannot build the
-        // fully §12.1-compliant response (Retry-After derived from
-        // slice state, X-Upstream-Host). All in-class paths for
-        // CIRCUIT_OPEN use the non-static MakeCircuitOpenResponse()
-        // — reaching this branch means a future caller forgot that
-        // rule. Log loudly so the mistake shows up in logs instead
-        // of producing a stealth regression against the contract.
-        //
-        // Still emit `X-Circuit-Breaker: open` + `Connection: close`
-        // so the response remains self-identifying as a circuit-open
-        // reject. Clients inspecting that header will correctly back
-        // off via their own client-side logic rather than treating
-        // this as an anonymous 503.
+        // Static factory has no `this`, so it cannot derive Retry-After
+        // from slice state or attach X-Upstream-Host. All in-class paths
+        // use the non-static MakeCircuitOpenResponse(); reaching this
+        // branch means a future caller forgot. Log loud and emit the
+        // self-identifying headers we can build without context.
         logging::Get()->error(
             "ProxyTransaction::MakeErrorResponse(RESULT_CIRCUIT_OPEN) "
             "invoked from static context — use MakeCircuitOpenResponse() "
-            "to emit §12.1-compliant headers");
+            "to emit full circuit-open headers");
         HttpResponse resp = HttpResponse::ServiceUnavailable();
         resp.Header("X-Circuit-Breaker", "open");
         resp.Header("Connection", "close");
@@ -3016,9 +2988,8 @@ HttpResponse ProxyTransaction::MakeCircuitOpenResponse() const {
     // Hint operators (not clients) at which upstream tripped. Useful
     // when a gateway fronts multiple backends; without this header, a
     // 503 is opaque.
-    // §5.5.1: render authority via FormatAuthority so IPv6 literals get
-    // RFC 3986 §3.2.2 bracket wrapping. Byte-identical for hostnames
-    // and IPv4 literals.
+    // Render authority via FormatAuthority so IPv6 literals get RFC 3986
+    // §3.2.2 bracket wrapping. Byte-identical for hostnames and IPv4.
     resp.Header("X-Upstream-Host",
                 NET_DNS_NAMESPACE::DnsResolver::FormatAuthority(
                     upstream_host_, upstream_port_, /*omit_port=*/false));
@@ -3055,7 +3026,7 @@ bool ProxyTransaction::ConsultBreaker() {
 
     if (admission.decision == CIRCUIT_BREAKER_NAMESPACE::Decision::REJECTED_OPEN) {
         // Hard reject — slice counted it, logged it, and we must not
-        // touch the upstream. Emit §12.1 response and DO NOT Report
+        // touch the upstream. Emit circuit-open response and DO NOT Report
         // back (would create a feedback loop — our own reject counting
         // as a failure against the already-OPEN slice).
         if (ResumeHeldRetryable5xxResponse("circuit_open")) {
