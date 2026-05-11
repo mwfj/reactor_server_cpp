@@ -1907,34 +1907,58 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
         }
         // Finalize the optional `auth.idp_check` INTERNAL span — closed-
         // enum labels keep metric cardinality bounded.
-        if (c.state->auth_idp_check_span) {
-            c.state->auth_idp_check_span->SetAttribute(
-                "auth.outcome",
-                OBSERVABILITY_NAMESPACE::AttrValue(
-                    std::string(OutcomeAttrLabel(result.vr.outcome))));
-            c.state->auth_idp_check_span->SetAttribute(
-                "auth.cache_outcome",
-                OBSERVABILITY_NAMESPACE::AttrValue(
-                    std::string(OutcomeCacheAttrLabel(c.cache))));
-            if (result.vr.outcome == VerifyOutcome::UNDETERMINED) {
-                c.state->auth_idp_check_span->SetStatus(
-                    OBSERVABILITY_NAMESPACE::SpanStatusCode::ERROR,
-                    result.vr.log_reason);
+        //
+        // Inner try/catch envelope: SetAttribute / End / AddEvent each
+        // perform allocations and may throw (OOM, container resizing,
+        // or a SpanProcessor::OnEnd that itself throws). Without this
+        // envelope, a throw here propagates out through
+        // UpstreamHttpClient::Transaction::Finish — whose outer catch
+        // only logs without calling `state->Complete`, which leaks
+        // `active_requests_` / `inflight_finalizations_` and hangs the
+        // request. Matches the canonical pitfall pattern in
+        // `.claude/rules/pitfalls/OBSERVABILITY.md` ("Async-resume
+        // route handlers run outside HandleCompleteRequest's catch").
+        // On throw, drop the obs work; `state->Complete` below ALWAYS
+        // runs so do_bookkeeping fires.
+        try {
+            if (c.state->auth_idp_check_span) {
+                c.state->auth_idp_check_span->SetAttribute(
+                    "auth.outcome",
+                    OBSERVABILITY_NAMESPACE::AttrValue(
+                        std::string(OutcomeAttrLabel(result.vr.outcome))));
+                c.state->auth_idp_check_span->SetAttribute(
+                    "auth.cache_outcome",
+                    OBSERVABILITY_NAMESPACE::AttrValue(
+                        std::string(OutcomeCacheAttrLabel(c.cache))));
+                if (result.vr.outcome == VerifyOutcome::UNDETERMINED) {
+                    c.state->auth_idp_check_span->SetStatus(
+                        OBSERVABILITY_NAMESPACE::SpanStatusCode::ERROR,
+                        result.vr.log_reason);
+                }
+                c.state->auth_idp_check_span->End();
+                c.state->auth_idp_check_span.reset();
             }
-            c.state->auth_idp_check_span->End();
+            // Events-fallback: when `auth.idp_check` is disabled, emit
+            // `auth.pending_end` on the inbound SERVER span paired with
+            // the `auth.pending_start` written at allocation time.
+            if (c.state->emit_pending_end_event &&
+                c.state->inbound_server_span) {
+                std::vector<OBSERVABILITY_NAMESPACE::Attribute> end_attrs;
+                end_attrs.emplace_back(
+                    "auth.outcome",
+                    OBSERVABILITY_NAMESPACE::AttrValue(
+                        std::string(OutcomeAttrLabel(result.vr.outcome))));
+                c.state->inbound_server_span->AddEvent("auth.pending_end",
+                                                         std::move(end_attrs));
+                c.state->emit_pending_end_event = false;
+            }
+        } catch (const std::exception& e) {
+            logging::Get()->error(
+                "auth-trace finalize threw; dropping obs work, completing "
+                "request anyway. what={}", e.what());
+            // Reset the span pointer so a subsequent dtor backstop
+            // doesn't try to End() a partially-finalized span.
             c.state->auth_idp_check_span.reset();
-        }
-        // Events-fallback: when `auth.idp_check` is disabled, emit
-        // `auth.pending_end` on the inbound SERVER span paired with
-        // the `auth.pending_start` written at allocation time.
-        if (c.state->emit_pending_end_event && c.state->inbound_server_span) {
-            std::vector<OBSERVABILITY_NAMESPACE::Attribute> end_attrs;
-            end_attrs.emplace_back(
-                "auth.outcome",
-                OBSERVABILITY_NAMESPACE::AttrValue(
-                    std::string(OutcomeAttrLabel(result.vr.outcome))));
-            c.state->inbound_server_span->AddEvent("auth.pending_end",
-                                                     std::move(end_attrs));
             c.state->emit_pending_end_event = false;
         }
         c.state->Complete(std::move(payload));

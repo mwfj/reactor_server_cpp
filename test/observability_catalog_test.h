@@ -2,16 +2,31 @@
 
 // MetricsCatalog — manager-owned `§7` instrument table built at
 // `Init()` and consumed by emit sites across the codebase. Tests cover:
+//
 //   * Every catalogued instrument is registered (non-null pointer).
-//   * Wired emit sites surface as series in MeterProvider::Snapshot().
-//     Specifically: HTTP server `active_requests`, request body size,
-//     response body size — exercised via a real HttpServer + a real
-//     HTTP request through the observability middleware. The kill-loop
-//     self-metric (`reactor.otel.snapshots_killed_on_timeout`) is
-//     exercised by registering a snapshot and forcing
-//     `KillOutstandingSnapshots` to bump it.
-//   * Instruments with no wired emit sites show up as registered-with-
-//     zero-points (the catalog visibility contract).
+//   * Wired emit sites that fire on the exercised flow surface as
+//     series in MeterProvider::Snapshot() — covered explicitly by
+//     `TestHttpServerRequestEmitsCatalogMetrics` and
+//     `TestKillLoopBumpsSelfMetric`. Additional wired emit sites
+//     (proxy retries, WS frames) are exercised by their feature-level
+//     suites (`obs_proxy_client`, `ws`).
+//
+// Wiring status (cross-reference `.claude/documents/design/`
+// `OPENTELEMETRY_DESIGN.md` §17.2 — "Phase 3 — still deferred"):
+//   - WIRED today: http.server.active_requests, http.server.request.body.size,
+//     http.server.response.body.size, http.client.request.duration,
+//     reactor.upstream.retries, reactor.websocket.frames,
+//     reactor.websocket.active_connections,
+//     reactor.otel.snapshots_killed_on_timeout.
+//   - REGISTERED for forward-compat (no emit site today; documented in
+//     the design doc's "still deferred" table): the remaining
+//     §7.2 / §7.3 / §7.4 instruments. `/metrics` surfaces these as
+//     present-but-zero series until their emit sites land.
+//
+// `TestCatalogInstrumentsRegistered` ratchets the registration
+// invariant. `TestWiredInstrumentsHaveEmitSites` (below) ratchets the
+// wired-set so a future change that silently disables an emit site
+// trips the test rather than producing an empty series.
 
 #include "test_framework.h"
 #include "test_server_runner.h"

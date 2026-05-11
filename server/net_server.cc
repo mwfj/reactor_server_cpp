@@ -613,7 +613,16 @@ bool NetServer::IsOnDispatcherThread() const {
 void NetServer::EnQueueOnConnDispatcher(std::function<void()> fn) {
     if (conn_dispatcher_) {
         conn_dispatcher_->EnQueue(std::move(fn));
+        return;
     }
+    // Reachable only during boot before MarkServerReady wires the
+    // conn dispatcher, or after Stop() has torn it down. From a
+    // request handler this should be unreachable — but combining a
+    // silent drop with `HttpServer::stop_scheduled_` CAS already
+    // flipped would leave operators chasing a hung shutdown with no
+    // log evidence. Warn loud so misuse surfaces immediately.
+    logging::Get()->warn(
+        "EnQueueOnConnDispatcher: conn_dispatcher_ is null; task dropped");
 }
 
 void NetServer::SetConnectionTimeout(std::chrono::seconds timeout) {

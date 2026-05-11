@@ -337,6 +337,14 @@ private:
     // any client-supplied trace headers.
     OBSERVABILITY_NAMESPACE::AttemptTraceContext current_attempt_;
 
+    // Per-attempt steady-clock start time, captured in AttemptCheckout
+    // alongside `current_attempt_`. Read by FinalizeAttemptSpan to
+    // emit the `http.client.request.duration` histogram. Set to
+    // time_point{} sentinel when observability is disabled — the
+    // sentinel suppresses the histogram emit (the catalog instrument
+    // would otherwise record a misleading zero on every call).
+    std::chrono::steady_clock::time_point attempt_start_steady_{};
+
     // Lock the manager weak_ptr through the snapshot. Returns nullptr
     // when observability is disabled or the manager has been destroyed.
     OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager() const noexcept;

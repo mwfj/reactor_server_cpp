@@ -460,6 +460,88 @@ inline void TestObservabilityDisabledForwardsTraceparentVerbatim() {
     }
 }
 
+// Regression for the §7.2 emit-site addition: every CLIENT span
+// finalize site (success / 5xx / retry / abandoned / cancel) must
+// record one `http.client.request.duration` histogram point. The
+// existing retry test exercises two attempts via the happy retry
+// path (attempt 0 + attempt 1 both reach OnResponseComplete) and
+// also proves that the Cleanup backstop is harmless on the normal
+// path (it sees `current_attempt_.upstream_span` already null and
+// no-ops). This test focuses on the duration histogram surface.
+inline void TestHttpClientRequestDurationEmitsPerAttempt() {
+    std::cout << "\n[TEST] Proxy: http.client.request.duration records "
+                 "one point per attempt"
+              << std::endl;
+    try {
+        std::atomic<int> backend_calls{0};
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/duration",
+            [&backend_calls](const HttpRequest&, HttpResponse& resp) {
+                backend_calls.fetch_add(1, std::memory_order_relaxed);
+                // Small artificial delay so the histogram lands in a
+                // non-zero bucket — proves the timer is real, not a
+                // race that records 0 on every observation.
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                resp.Status(200).Body("ok", "text/plain");
+            });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        ManagerFixture gw_fix(SamplerType::AlwaysOn, "obs-gateway-duration");
+        ServerConfig gw_cfg;
+        gw_cfg.bind_host = "127.0.0.1";
+        gw_cfg.bind_port = 0;
+        gw_cfg.worker_threads = 2;
+        gw_cfg.http2.enabled = false;
+        gw_cfg.upstreams.push_back(MakeProxyUpstreamConfig(
+            "backend", "127.0.0.1", backend_port, "/duration"));
+        HttpServer gateway(gw_cfg);
+        gateway.SetObservabilityManager(gw_fix.manager);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        SendHttpRequest(gw_port,
+            "GET /duration HTTP/1.1\r\nHost: localhost\r\n"
+            "Connection: close\r\n\r\n");
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+        auto metrics = gw_fix.manager->meter_provider()->Snapshot();
+        int duration_points = 0;
+        double total_sum = 0;
+        bool saw_status_label = false;
+        bool saw_service_label = false;
+        for (const auto& inst : metrics.instruments) {
+            if (inst.name != "http.client.request.duration") continue;
+            for (const auto& p : inst.histogram_points) {
+                ++duration_points;
+                total_sum += p.sum;
+                for (const auto& kv : p.labels.kv) {
+                    if (kv.first == "http.response.status_code" &&
+                        kv.second == "200") saw_status_label = true;
+                    if (kv.first == "reactor.upstream.service" &&
+                        kv.second == "backend") saw_service_label = true;
+                }
+            }
+        }
+
+        bool points_ok = duration_points >= 1;
+        bool nonzero_sum = total_sum > 0;
+        bool labels_ok = saw_status_label && saw_service_label;
+        bool pass = points_ok && nonzero_sum && labels_ok;
+        std::string err;
+        if (!points_ok) err = "no histogram points recorded";
+        else if (!nonzero_sum) err = "histogram sum is zero (timer fired with no elapsed time)";
+        else if (!labels_ok) err = "expected labels missing (status=200, service=backend)";
+        TestFramework::RecordTest(
+            "Proxy: http.client.request.duration records per-attempt duration",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Proxy: http.client.request.duration records per-attempt duration",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "PROXY CLIENT-SPAN OBSERVABILITY TESTS" << std::endl;
@@ -468,6 +550,7 @@ inline void RunAllTests() {
     TestSuccessfulProxyEmitsClientSpan();
     TestUpstream5xxMarksClientSpanError();
     TestRetryAttemptsSurfaceDistinctClientSpans();
+    TestHttpClientRequestDurationEmitsPerAttempt();
     TestObservabilityDisabledForwardsTraceparentVerbatim();
 }
 
