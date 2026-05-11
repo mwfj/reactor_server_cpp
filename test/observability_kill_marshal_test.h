@@ -184,6 +184,60 @@ inline void TestKillCounterIncrementsByN() {
     }
 }
 
+// Single-snapshot exclusive-winner — pointed CAS audit. N threads all
+// call `FinalizeFromSnapshot` on the SAME snapshot; the gate's
+// compare_exchange_strong on `finalized` must let exactly ONE caller
+// return true. Catches refactors that fan terminal observations across
+// multiple writers without preserving "first-wins" semantics (a class
+// of bug that the per-N-snapshots aggregate test in
+// TestConcurrentKillAndFinalizeRespectCASGate would miss if the CAS
+// stayed correct on a per-thread basis but failed on a per-snapshot
+// basis).
+inline void TestSingleSnapshotExclusiveWinner() {
+    std::cout << "\n[TEST] KillMarshal: single snapshot exclusive winner"
+              << std::endl;
+    try {
+        auto m = MakeManager();
+        auto snap = std::make_shared<ObservabilitySnapshot>();
+        m->RegisterLiveSnapshot(snap);
+
+        constexpr int N = 32;
+        std::atomic<int> winners{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (int t = 0; t < N; ++t) {
+            threads.emplace_back([&, t] {
+                while (!go.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                if (m->FinalizeFromSnapshot(*snap, 200 + (t % 50), 0, "")) {
+                    winners.fetch_add(1, std::memory_order_relaxed);
+                }
+            });
+        }
+        go.store(true, std::memory_order_release);
+        for (auto& th : threads) th.join();
+
+        const int observed = winners.load();
+        const bool finalized = snap->finalized.load();
+        const bool drained = m->inflight_finalizations() == 0;
+        const bool pass = observed == 1 && finalized && drained;
+        std::string err;
+        if (observed != 1) err = "winners=" + std::to_string(observed) +
+                                  " (expected 1)";
+        else if (!finalized) err = "snapshot not finalized";
+        else if (!drained) err = "inflight_finalizations leaked";
+        TestFramework::RecordTest(
+            "KillMarshal: single snapshot — exactly one CAS winner under N racers",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "KillMarshal: single snapshot — exactly one CAS winner under N racers",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "KILL-LOOP INVARIANT TESTS" << std::endl;
@@ -191,6 +245,7 @@ inline void RunAllTests() {
 
     TestKillMarshalReservedStaysZero();
     TestConcurrentKillAndFinalizeRespectCASGate();
+    TestSingleSnapshotExclusiveWinner();
     TestKillCounterIncrementsByN();
 }
 

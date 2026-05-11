@@ -393,6 +393,14 @@ void ProxyTransaction::FinalizeAttemptSpan(int status_code,
                                      service_name_);
                 cat.http_client_request_duration->Record(elapsed, labels);
             }
+            // Matching -1 for the +1 from SetupAttemptObservability.
+            // Same gate as the histogram above so the pair stays
+            // balanced; same labels (service name only) as the +1.
+            if (cat.http_client_active_requests != nullptr) {
+                cat.http_client_active_requests->Add(
+                    -1.0,
+                    {{"reactor.upstream.service", service_name_}});
+            }
         }
         attempt_start_steady_ = std::chrono::steady_clock::time_point{};
     }
@@ -758,6 +766,20 @@ void ProxyTransaction::SetupAttemptObservability() {
         // no inbound trace context is present (every attempt's latency
         // is operator-visible, independent of trace sampling).
         attempt_start_steady_ = std::chrono::steady_clock::now();
+        // Bump http.client.active_requests; matching -1 in
+        // FinalizeAttemptSpan. The pair is gated on
+        // attempt_start_steady_ being non-sentinel so retries +
+        // killed-on-shutdown paths stay balanced. Survivors of the
+        // kill loop will leak +1 entries — operator-visible via the
+        // same kill-loop counter that flags the http.server gauge
+        // leak; a follow-up can wire a kill-path -1 once snapshot
+        // carries the upstream label.
+        const auto& cat = mgr->catalog();
+        if (cat.http_client_active_requests != nullptr) {
+            cat.http_client_active_requests->Add(
+                1.0,
+                {{"reactor.upstream.service", service_name_}});
+        }
     }
     if (mgr && inbound_trace_ctx_.has_value()) {
         const auto& parent_local = inbound_trace_ctx_->current_local;
@@ -1220,6 +1242,13 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
         // ReleaseBreakerAdmissionNeutral clears admission_generation_
         // internally, so Cleanup/destructor won't double-report.
         ReleaseBreakerAdmissionNeutral();
+        // Finalize the CLIENT span BEFORE any terminal delivery — these
+        // sites all jump straight to Cleanup, which would otherwise hit
+        // the dtor backstop and label the span "abandoned". The current
+        // attempt failed admission to the circuit breaker; closed-enum
+        // error.type = "circuit_open".
+        FinalizeAttemptSpan(/*status_code=*/0,
+                             ErrorTypeForResult(RESULT_CIRCUIT_OPEN));
         if (ResumeHeldRetryable5xxResponse("checkout_circuit_open")) {
             return;
         }
@@ -1241,8 +1270,18 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
         // Use RESULT_POOL_EXHAUSTED → 503 (not 502 which implies upstream failure).
         // Release the breaker slot neutrally — admission never reached upstream.
         ReportBreakerOutcome(RESULT_POOL_EXHAUSTED);
-        if (DeliverPendingRetryable5xxResponse("checkout_local_failure")) {
-            return;
+        // Held-5xx delivery short-circuits OnError → DeliverTerminalError →
+        // FinalizeAttemptSpan; finalize the CLIENT span explicitly BEFORE
+        // delivery so Cleanup's backstop doesn't label it "abandoned".
+        // FinalizeAttemptSpan is no-op if the span isn't allocated, so
+        // calling it speculatively is cheap. The OnError branch below
+        // already finalizes via DeliverTerminalError.
+        if (pending_retryable_5xx_response_) {
+            FinalizeAttemptSpan(/*status_code=*/0,
+                                 ErrorTypeForResult(RESULT_POOL_EXHAUSTED));
+            if (DeliverPendingRetryable5xxResponse("checkout_local_failure")) {
+                return;
+            }
         }
         OnError(RESULT_POOL_EXHAUSTED,
                 "Pool checkout failed (local capacity, error=" +

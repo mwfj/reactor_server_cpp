@@ -62,6 +62,7 @@
 #include "observability_auth_trace_test.h"
 #include "observability_catalog_test.h"
 #include "observability_kill_marshal_test.h"
+#include "observability_ws_messages_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -296,6 +297,12 @@ void RunAllTest(){
     // multi-thread races, snapshots_killed_on_timeout counter accuracy.
     ObservabilityKillMarshalTests::RunAllTests();
 
+    // Per-message WS observability — `traces.websocket_messages` opt-in
+    // gates ws.recv / ws.send INTERNAL spans, control frames skip span
+    // emission, fragmented messages emit one span at FIN reassembly,
+    // and SetObservabilitySnapshot install-once latch rejects rebinds.
+    ObservabilityWsMessagesTests::RunAllTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -384,6 +391,9 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     server body / active_requests emit, kill-loop self-metric" << std::endl;
     std::cout << "  obs_kill_marshal   Kill-loop invariant guards — RESERVED contract on" << std::endl;
     std::cout << "                     kill_marshals_in_flight, finalize CAS race, kill counter" << std::endl;
+    std::cout << "  obs_ws_messages    WebSocket per-message tracing — websocket_messages opt-in" << std::endl;
+    std::cout << "                     gate, control-frame span skip, fragmented-message single" << std::endl;
+    std::cout << "                     span, install-once rebind reject" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -608,6 +618,10 @@ int main(int argc, char* argv[]) {
         // FinalizeFromSnapshot CAS + snapshots_killed_on_timeout.
         }else if(mode == "obs_kill_marshal"){
             ObservabilityKillMarshalTests::RunAllTests();
+        // Per-message WS observability — websocket_messages gate,
+        // control-frame skip, fragmented-message single-span, rebind reject.
+        }else if(mode == "obs_ws_messages"){
+            ObservabilityWsMessagesTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

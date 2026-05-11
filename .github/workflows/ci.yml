@@ -209,7 +209,8 @@ jobs:
             obs_proxy_client \
             obs_auth_trace \
             obs_catalog \
-            obs_kill_marshal ; do
+            obs_kill_marshal \
+            obs_ws_messages ; do
             echo "::group::test_runner $suite"
             ./test_runner "$suite"
             echo "::endgroup::"
@@ -298,3 +299,10 @@ jobs:
         # async-resume path through the auth middleware. Platform-sensitive
         # because of socket + thread scheduling on the IdP mock.
         run: ./test_runner obs_auth_trace
+      - name: Test - obs_ws_messages (per-message WS observability)
+        # Boots a real HttpServer, completes WS upgrades over TCP, exchanges
+        # masked client + server frames. Exercises the websocket_messages
+        # gate, control-frame skip, fragmented-message single-span, and
+        # install-once rebind reject — all on dispatcher-driven socket I/O,
+        # so kqueue vs epoll scheduling differences can surface here.
+        run: ./test_runner obs_ws_messages

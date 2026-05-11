@@ -402,7 +402,7 @@ test_obs: test_obs_foundation test_obs_tracer test_obs_metrics \
           test_obs_export test_obs_prom test_obs_config test_obs_shutdown \
           test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e \
           test_obs_self_handler test_obs_proxy_client test_obs_auth_trace \
-          test_obs_catalog test_obs_kill_marshal
+          test_obs_catalog test_obs_kill_marshal test_obs_ws_messages
 	@echo "All observability suites passed."
 
 test_obs_foundation: $(TARGET)
@@ -476,6 +476,10 @@ test_obs_auth_trace: $(TARGET)
 test_obs_catalog: $(TARGET)
 	@echo "Running observability metrics-catalog tests..."
 	./$(TARGET) obs_catalog
+
+test_obs_ws_messages: $(TARGET)
+	@echo "Running WebSocket per-message observability tests..."
+	./$(TARGET) obs_ws_messages
 
 # Thread-Sanitizer build for dual-stack stop/reload/destruction race tests.
 # Builds a separate binary (test_runner_tsan) with -fsanitize=thread and

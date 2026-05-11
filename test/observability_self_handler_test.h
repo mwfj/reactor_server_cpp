@@ -204,10 +204,78 @@ inline void TestStopFromHandlerWithInflightSibling() {
     }
 }
 
+// Concurrent CAS audit — N external threads race to call
+// `ScheduleStopAfterCurrentResponse` simultaneously after the server is
+// ready. The compare_exchange_strong on `stop_scheduled_` must collapse
+// every caller to a single deferred `Stop()`, regardless of which
+// thread wins the CAS. This is the multi-thread counterpart to
+// `TestStopFromHandlerIdempotent` (which races sequentially from inside
+// one handler). Verifies the S8 fix invariant: the latch keeps callers
+// well-formed even when the EnQueue side fails (here it succeeds, but
+// the same single-Stop CAS path is the gate).
+inline void TestStopFromConcurrentExternalThreads() {
+    std::cout << "\n[TEST] ScheduleStopAfterCurrentResponse: N concurrent external threads"
+              << std::endl;
+    try {
+        ServerConfig cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.bind_port = 0;
+        cfg.worker_threads = 1;
+        cfg.http2.enabled = false;
+
+        HttpServer server(cfg);
+        server.Get("/ok", [](const HttpRequest&, HttpResponse& resp) {
+            resp.Status(200).Body("ok", "text/plain");
+        });
+
+        ManualServerRunner runner(server);
+
+        constexpr int N = 16;
+        std::atomic<bool> go{false};
+        std::vector<std::thread> threads;
+        threads.reserve(N);
+        for (int t = 0; t < N; ++t) {
+            threads.emplace_back([&] {
+                while (!go.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+                server.ScheduleStopAfterCurrentResponse();
+            });
+        }
+        auto t0 = std::chrono::steady_clock::now();
+        go.store(true, std::memory_order_release);
+        for (auto& th : threads) th.join();
+
+        // The deferred Stop() runs on conn_dispatcher_; wait for the
+        // server thread to exit normally.
+        runner.thread.join();
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+
+        // After the server fully stops, no observable counter exposes
+        // "how many CAS winners". The strong signals are: (a) the
+        // server exited within a bounded budget, and (b) no thread
+        // crashed. A broken CAS that fired N parallel Stop()s would
+        // either hang on the recursive drain barrier (Stop holds
+        // reload_mtx_ + drains inflight) or surface a TSan / ASan
+        // report — both rejected by the test in their respective CI
+        // matrices.
+        bool fast_enough = elapsed < std::chrono::seconds(5);
+        TestFramework::RecordTest(
+            "Self-handler shutdown: N concurrent external CAS racers — single Stop",
+            fast_enough,
+            fast_enough ? "" : "elapsed too long, CAS may have leaked extra Stop()s");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "Self-handler shutdown: N concurrent external CAS racers — single Stop",
+            false, e.what());
+    }
+}
+
 inline void RunAllTests() {
     TestStopFromHandlerDoesNotDeadlock();
     TestStopFromHandlerIdempotent();
     TestStopFromHandlerWithInflightSibling();
+    TestStopFromConcurrentExternalThreads();
 }
 
 }  // namespace ObservabilitySelfHandlerTests

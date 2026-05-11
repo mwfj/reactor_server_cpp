@@ -132,12 +132,32 @@ private:
     // once. Cleared after the decrement so a later snapshot reset
     // can't double-decrement.
     bool active_counted_ = false;
+    // Install-once latch — set on the FIRST call to
+    // SetObservabilitySnapshot regardless of whether the manager
+    // lock succeeded or any cached pointer was populated. The lock-
+    // free reads from MaybeEmitMessageSpan / BumpFrameCounter use
+    // the cached pointers; a second call would race those reads.
+    // Checking active_counted_/obs_manager_/cached-pointer truthiness
+    // as the guard leaves a corner-case rebind window when the first
+    // call's manager.lock() returned null — `bound_once_` closes it.
+    bool bound_once_ = false;
 
     void ProcessFrame(const WebSocketFrame& frame);
     void SendFrame(const WebSocketFrame& frame);
     // Emit a ws.recv / ws.send INTERNAL span. No-op when obs unbound.
     // Called from dispatcher (ProcessFrame) and off-dispatcher under
     // send_mtx_ (SendFrame); Tracer / Span / BSP own internal mutexes.
+    //
+    // Parent-span lifetime note: the upgrade SERVER span is finalized
+    // by HttpConnectionHandler BEFORE SetObservabilitySnapshot wires
+    // this connection, so the inbound SERVER span recorded in
+    // `obs_snapshot_->inbound_span` is already Ended by the time
+    // any frame-level span emits. This is semantically legal —
+    // parent-trace-id linking is time-independent — but produces a
+    // visually-surprising trace where the SERVER span "ends" before
+    // its children "start" in Tempo/Jaeger. See
+    // .claude/rules/pitfalls/OBSERVABILITY.md "WS upgrade SERVER
+    // span ends before SetObservabilitySnapshot".
     void MaybeEmitMessageSpan(const char* name, WebSocketOpcode opcode,
                               size_t payload_size);
     // Bump reactor.websocket.frames {op, direction}. Same call-site /

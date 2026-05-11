@@ -371,14 +371,16 @@ void WebSocketConnection::SetObservabilitySnapshot(
     // INSTALL-ONCE — call once from the upgrade path. The cached
     // pointers are read lock-free from the data-path emission sites;
     // a second call would race those reads (see the header docstring).
-    // Defensive guard rather than silently rebinding: log + ignore.
-    if (active_counted_ || obs_manager_ || frames_counter_ ||
-        active_connections_counter_ || ws_messages_enabled_flag_) {
+    // `bound_once_` is set BEFORE the manager-lock early-return so a
+    // first call with `snap == nullptr` or expired manager still
+    // rejects subsequent calls.
+    if (bound_once_) {
         logging::Get()->error(
             "WebSocketConnection::SetObservabilitySnapshot called twice — "
             "rebind is unsupported; the second call is ignored");
         return;
     }
+    bound_once_ = true;
     obs_snapshot_ = std::move(snap);
     if (!obs_snapshot_) return;
     obs_manager_ = obs_snapshot_->manager.lock();

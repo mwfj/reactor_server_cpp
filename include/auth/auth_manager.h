@@ -412,6 +412,15 @@ class AuthManager {
     // dispatch path builds an `IssueTraceContext` for every introspection
     // POST and (gated on `traces.auth_idp_span`) allocates an
     // `auth.idp_check` INTERNAL span over the deferred resolution.
+    //
+    // INVARIANT: this pointer is valid for the lifetime of the owning
+    // HttpServer's runtime. By `http_server.h` member-declaration order
+    // (auth_manager_ at line 582 BEFORE observability_manager_ at
+    // line 610), reverse-destruction destroys observability_manager_
+    // FIRST — so AuthManager's destructor MUST NOT dereference this
+    // pointer. A future field reorder would let normal-runtime calls
+    // (e.g. obs_manager_->propagator() inside InvokeAsyncMiddleware)
+    // survive past ObservabilityManager destruction → UAF.
     OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
     std::string hmac_key_;                                 // process-local
 

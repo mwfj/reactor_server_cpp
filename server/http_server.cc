@@ -2748,16 +2748,14 @@ void HttpServer::ScheduleStopAfterCurrentResponse() {
     // Route through NetServer's accessor; Stop() runs on conn_dispatcher_'s
     // thread (NOT a socket dispatcher) so the drain barrier engages cleanly.
     // `[this]` is safe: NetServer is a member of HttpServer, joined before
-    // ~HttpServer returns. On enqueue-drop (null pre-MarkServerReady or
-    // post-Stop teardown) roll back the CAS for symmetry and warn so any
-    // parallel caller B that already returned on observed CAS-success has
-    // an audit trail — Stop() is either unneeded or already ran.
-    if (!net_server_.EnQueueOnConnDispatcher([this]() { Stop(); })) {
-        stop_scheduled_.store(false, std::memory_order_release);
-        logging::Get()->warn(
-            "ScheduleStopAfterCurrentResponse: enqueue dropped, CAS rolled "
-            "back; parallel callers may have lost their signal");
-    }
+    // ~HttpServer returns.
+    //
+    // On enqueue-failure the CAS stays latched — both failure modes (null
+    // pre-MarkServerReady, was_stopped() post-Stop) imply Stop() is either
+    // unneeded or already ran. Keeping the latch is correct: subsequent
+    // calls correctly no-op rather than re-attempting a queue that won't
+    // accept the task. NetServer's warn-log is the audit trail.
+    (void)net_server_.EnQueueOnConnDispatcher([this]() { Stop(); });
 }
 
 void HttpServer::Stop() {
