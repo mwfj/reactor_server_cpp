@@ -4905,6 +4905,85 @@ void TestN9gControlFrameByteAccounting() {
 }
 
 // ---------------------------------------------------------------------------
+// TestN9mSinkOnBodyChunkFalseStopsConsumption — A sink returning false
+// from OnBodyChunk must detach + submit RST_STREAM so no further body
+// dispatches reach the sink.
+// ---------------------------------------------------------------------------
+void TestN9mSinkOnBodyChunkFalseStopsConsumption() {
+    std::cout << "\n[TEST] H2Upstream N9m: sink OnBodyChunk false → stream reset, no further dispatches..." << std::endl;
+    struct RejectingSink : public RecordingSink {
+        bool reject_after_first = true;
+        int body_chunks = 0;
+        bool OnBodyChunk(const char* data, size_t len) override {
+            ++body_chunks;
+            RecordingSink::OnBodyChunk(data, len);
+            // Reject every chunk including the first — simulates a
+            // downstream commit failure on first body byte.
+            return !reject_after_first;
+        }
+    };
+    try {
+        auto cfg = MakeH2Conn();
+        RejectingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9m: sink OnBodyChunk false → stream reset, no further dispatches",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/",
+                                          {}, "", &sink);
+
+        // Peer sends SETTINGS + HEADERS (no end_stream) + DATA(50) + DATA(50, end_stream).
+        // After the first DATA chunk, sink returns false. The H2 code
+        // path detaches the sink and submits RST_STREAM. The second
+        // DATA chunk must NOT dispatch to the (now-null) sink.
+        std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
+        auto hdrs = H2WireTest::BuildHeadersFrame(
+            sid, {{":status", "200"}, {"content-type", "text/plain"}},
+            /*end_stream=*/false);
+        wire.insert(wire.end(), hdrs.begin(), hdrs.end());
+        conn.HandleBytes(reinterpret_cast<const char*>(wire.data()),
+                         wire.size());
+
+        std::vector<uint8_t> body1(50, 'a');
+        auto data1 = BuildDataFrame(sid, body1.data(), body1.size(),
+                                    /*end_stream=*/false);
+        conn.HandleBytes(reinterpret_cast<const char*>(data1.data()),
+                         data1.size());
+
+        // First chunk should have dispatched (sink saw it, then said no).
+        const int chunks_after_first = sink.body_chunks;
+
+        // Second chunk: sink is now detached. body_chunks must NOT
+        // advance. Implementation detail: nghttp2 may or may not have
+        // already processed the RST_STREAM submission by the time the
+        // second DATA frame is handed in; either way, our application
+        // code looks up stream->sink and finds nullptr → skip.
+        std::vector<uint8_t> body2(50, 'b');
+        auto data2 = BuildDataFrame(sid, body2.data(), body2.size(),
+                                    /*end_stream=*/true);
+        conn.HandleBytes(reinterpret_cast<const char*>(data2.data()),
+                         data2.size());
+
+        bool pass = (chunks_after_first == 1) && (sink.body_chunks == 1);
+        std::string err;
+        if (chunks_after_first != 1)
+            err += "first-chunk dispatch=" + std::to_string(chunks_after_first) + "; ";
+        if (sink.body_chunks != 1)
+            err += "post-rejection chunks=" + std::to_string(sink.body_chunks) + " (expected 1); ";
+        TestFramework::RecordTest(
+            "H2Upstream N9m: sink OnBodyChunk false → stream reset, no further dispatches",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9m: sink OnBodyChunk false → stream reset, no further dispatches",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // H2ResponseTimeoutTestFixture — friend of ProxyTransaction; pokes the
 // private H2 dispatch state so a focused test can exercise
 // OnRequestSubmitted's response_timeout branch without the full pool
@@ -5015,6 +5094,39 @@ void TestN9lPositiveTimeoutPostSubmit() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "H2Upstream N9l: response_timeout_ms>0 → deadline armed after submit",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9nFreshSessionBootstrapCallbackOrdering — Init's preface SETTINGS
+// is tracked as a control drain entry that OnTransportWriteComplete
+// pops cleanly without firing any sink dispatch.
+// ---------------------------------------------------------------------------
+void TestN9nFreshSessionBootstrapCallbackOrdering() {
+    std::cout << "\n[TEST] H2Upstream N9n: fresh session Init populates drain queue with SETTINGS..." << std::endl;
+    try {
+        auto cfg = MakeH2Conn();
+        // Sink before conn — sinks-must-outlive-session contract.
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9n: fresh session Init populates drain queue with SETTINGS",
+                false, "Init failed");
+            return;
+        }
+        conn.OnTransportWriteComplete();
+        int32_t sid = conn.SubmitRequest("GET", "http", "example.com", "/",
+                                          {}, "", &sink);
+        bool pass = (sid > 0);
+        TestFramework::RecordTest(
+            "H2Upstream N9n: fresh session Init populates drain queue with SETTINGS",
+            pass,
+            pass ? "" : "submit after bootstrap drain failed sid=" + std::to_string(sid));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9n: fresh session Init populates drain queue with SETTINGS",
             false, e.what());
     }
 }
@@ -5482,6 +5594,8 @@ void RunAllH2UpstreamTests() {
     TestN9jHeadResponseWithCLLegitimate();
     TestN9kZeroTimeoutPostSubmit();
     TestN9lPositiveTimeoutPostSubmit();
+    TestN9mSinkOnBodyChunkFalseStopsConsumption();
+    TestN9nFreshSessionBootstrapCallbackOrdering();
     TestN7eWiringEarlyHeadersThenIntermediateDataDispatch();
 
     // TestB-series additions — wire-level

@@ -238,7 +238,16 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     }
 
     stream->body_bytes_received += static_cast<int64_t>(len);
-    stream->sink->OnBodyChunk(reinterpret_cast<const char*>(data), len);
+    const bool keep = stream->sink->OnBodyChunk(
+        reinterpret_cast<const char*>(data), len);
+    if (!keep) {
+        // Sink refused further body — detach + RST_STREAM(CANCEL) so
+        // the upstream stops sending. Session stays alive for sibling
+        // streams. The pre-null guards against ResetStream's dead_
+        // short-circuit.
+        stream->sink = nullptr;
+        self->ResetStream(stream_id);
+    }
     return 0;
 }
 
