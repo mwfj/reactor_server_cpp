@@ -376,6 +376,8 @@ The gateway's own `/health`, `/stats`, and configured Prometheus path are auto-a
 
 When SIGHUP changes `metrics.prometheus.path`, the gateway logs a warn ("restart to apply") and keeps the live value. The HTTP route bound at startup remains the only path served. Restart to register the new path.
 
+> **Breaking (Phase 3):** `metrics.prometheus.path = "/"` is now rejected at boot when `metrics.exporter = "prometheus_pull"`. Previously the sampler self-noise auto-prepend silently no-op'd on this value, leaving `/metrics` traffic to feed its own traces; the loud-fail makes the misconfig visible immediately. Set a distinct path (the default `/metrics` is the canonical choice).
+
 ### Self-handler graceful shutdown
 
 A route handler that needs to terminate the server (e.g. an admin endpoint exposing `/shutdown`) must NOT call `HttpServer::Stop()` synchronously — that deadlocks the dispatcher. Use `HttpServer::ScheduleStopAfterCurrentResponse()` instead. The helper:

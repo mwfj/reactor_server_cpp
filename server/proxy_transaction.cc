@@ -750,25 +750,18 @@ void ProxyTransaction::StartCheckoutAsync() {
 }
 
 void ProxyTransaction::SetupAttemptObservability() {
-    // Build the per-attempt outbound trace context BEFORE we choose
-    // between H1 and H2 dispatch — both paths read `current_attempt_`
-    // for the wire-format injection. trace_id / flags / state inherit
-    // from the inbound `current_local`; span_id is freshly generated
-    // per attempt so retries surface as distinct CLIENT spans.
+    // Fresh per-attempt context: trace_id / flags / state inherit from
+    // the inbound; span_id is regenerated so retries surface as distinct
+    // CLIENT spans. Sentinel start tick → FinalizeAttemptSpan skips emit
+    // when observability is off.
     current_attempt_ = OBSERVABILITY_NAMESPACE::AttemptTraceContext{};
-    // Capture the per-attempt start tick used by
-    // http.client.request.duration. Reset to a sentinel when obs is
-    // disabled so FinalizeAttemptSpan skips the emit.
     attempt_start_steady_ = std::chrono::steady_clock::time_point{};
     auto* mgr = obs_manager();
     if (mgr) {
-        // Per-attempt start tick fires the duration histogram even when
-        // no inbound trace context is present (every attempt's latency
-        // is operator-visible, independent of trace sampling).
+        // Duration histogram fires per-attempt regardless of trace sampling.
         attempt_start_steady_ = std::chrono::steady_clock::now();
         // Bump http.client.active_requests; matching -1 in
-        // FinalizeAttemptSpan, gated on attempt_start_steady_ non-sentinel
-        // so retries + killed-on-shutdown paths stay balanced.
+        // FinalizeAttemptSpan, gated on attempt_start_steady_ non-sentinel.
         // TODO: kill-loop survivors leak +1 until the snapshot carries
         // the upstream label and the kill path can emit the matching -1.
         const auto& cat = mgr->catalog();
@@ -788,11 +781,9 @@ void ProxyTransaction::SetupAttemptObservability() {
                 parent_local.state(),
                 /*is_remote=*/false);
 
-            // Allocate the CLIENT span only when the inbound is recording
-            // AND an inbound SERVER span actually exists (DROP path skips
-            // the allocation, but the per-attempt span_id is still emitted
-            // outbound with sampled=0 so downstream services see a
-            // continuous trace tree).
+            // DROP path (not recording / no SERVER span) still emits the
+            // fresh span_id outbound with sampled=0 so downstream services
+            // see a continuous trace tree; the local CLIENT span is skipped.
             if (inbound_trace_ctx_->is_recording && inbound_span()) {
                 OBSERVABILITY_NAMESPACE::StartSpanOptions opts;
                 opts.kind = OBSERVABILITY_NAMESPACE::SpanKind::CLIENT;
@@ -815,13 +806,9 @@ void ProxyTransaction::SetupAttemptObservability() {
                     "server.port",
                     OBSERVABILITY_NAMESPACE::AttrValue(
                         static_cast<int64_t>(upstream_port_)));
-                // Stamp a placeholder network.protocol.version so a
-                // disconnect BEFORE DispatchH1/H2 still ends the span
-                // with a defined protocol attribute. DispatchH1 sets
-                // "1.1", DispatchH2 sets "2"; if neither runs (e.g.
-                // TLS handshake failure on the deferred path), the
-                // CLIENT span retains "unknown" instead of falling
-                // back to default-no-attribute.
+                // Placeholder protocol.version — DispatchH1/H2 overwrite
+                // it; this preserves a defined attribute if dispatch never
+                // runs (e.g. TLS failure before DispatchH1/H2).
                 span->SetAttribute(
                     "network.protocol.version",
                     OBSERVABILITY_NAMESPACE::AttrValue(std::string("unknown")));
@@ -831,9 +818,8 @@ void ProxyTransaction::SetupAttemptObservability() {
                         static_cast<int64_t>(attempt_)));
             }
 
-            // Refresh outbound trace headers + invalidate the cached
-            // serialized request so the next H1 send carries this
-            // attempt's fresh `traceparent`.
+            // Invalidate cached serialized request so the next H1 send
+            // carries this attempt's fresh `traceparent`.
             RebuildOutboundTraceHeaders();
         }
     }
@@ -2249,30 +2235,16 @@ void ProxyTransaction::Cancel() {
 }
 
 void ProxyTransaction::Cleanup() {
-    // Backstop for the per-attempt CLIENT span. Eight early-return
-    // paths in OnCheckoutReady / DispatchH1 / OnCheckoutError /
-    // SendUpstreamRequest / MaybeRetry hand off to
-    // DeliverPendingRetryable5xxResponse, which calls DeliverResponse
-    // → Cleanup without an intermediate FinalizeAttemptSpan. Without
-    // this backstop the unique_ptr<Span> dtor on ~ProxyTransaction
-    // runs without End() → BSP never receives the span → the
-    // attempt that triggered held-5xx delivery is invisible in the
-    // trace tree. "abandoned" is the closed-enum label for the
-    // class — the precise reject_source string lives in the
-    // structured log; the CLIENT span only needs a coarse error.type.
-    // No-op when MaybeRetry / OnResponseComplete / DeliverTerminalError /
-    // Cancel already finalized the span (current_attempt_.upstream_span
-    // is null after their FinalizeAttemptSpan calls).
+    // Backstop for the per-attempt CLIENT span. Several early-return
+    // paths (held-5xx delivery via DeliverPendingRetryable5xxResponse →
+    // DeliverResponse) skip the explicit FinalizeAttemptSpan and would
+    // otherwise leak a span without End() through ~ProxyTransaction.
+    // No-op when an explicit Finalize* already cleared upstream_span.
     //
-    // Cleanup() is called from ~ProxyTransaction(), which is implicitly
-    // noexcept under C++17 — an exception escaping here terminates the
-    // process via std::terminate. FinalizeAttemptSpan internally
-    // allocates (Histogram::Record / SetAttribute / End), each of which
-    // can throw std::bad_alloc. Wrap so the destructor path cannot
-    // bring down the server; on throw, drop the span without End() —
-    // BSP doesn't receive it, but the alternative (process termination)
-    // is strictly worse. catch (...) covers non-std::exception throws
-    // from any future Span-implementation override or third-party hook.
+    // ~ProxyTransaction is implicitly noexcept (C++17); FinalizeAttemptSpan
+    // can allocate (Histogram::Record / End / SetAttribute), so any throw
+    // here would std::terminate the process. Drop the span without End()
+    // on throw — losing the span is strictly better than process death.
     if (current_attempt_.upstream_span) {
         try {
             FinalizeAttemptSpan(/*status_code=*/0, "abandoned");
