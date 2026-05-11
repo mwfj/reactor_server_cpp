@@ -374,10 +374,8 @@ bool UpstreamH2Connection::Init() {
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs, &OnStreamCloseCallback);
     nghttp2_session_callbacks_set_on_header_callback(cbs, &OnHeaderCallback);
     nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, &OnBeginHeadersCallback);
-    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(
-        cbs, &OnDataChunkRecvCallback);
-    nghttp2_session_callbacks_set_on_frame_send_callback(
-        cbs, &OnFrameSendCallback);
+    nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, &OnDataChunkRecvCallback);
+    nghttp2_session_callbacks_set_on_frame_send_callback(cbs, &OnFrameSendCallback);
 
     int rv = nghttp2_session_client_new(&session_, cbs, this);
     nghttp2_session_callbacks_del(cbs);
@@ -816,18 +814,17 @@ void UpstreamH2Connection::ResetStream(int32_t stream_id) {
 }
 
 void UpstreamH2Connection::EnqueueFrameForDrain(int32_t stream_id,
-                                                 size_t bytes,
-                                                 bool is_data_frame,
-                                                 bool is_end_stream,
-                                                 bool is_control) {
+                                                size_t bytes,
+                                                bool is_data_frame,
+                                                bool is_end_stream,
+                                                bool is_control) {
     drain_queue_.push_back(
         PendingFrameDrain{stream_id, bytes, is_data_frame, is_end_stream,
                           is_control});
     bytes_in_drain_queue_ += bytes;
 }
 
-void UpstreamH2Connection::FireSinkForDrainEntry(
-    const PendingFrameDrain& entry) {
+void UpstreamH2Connection::FireSinkForDrainEntry(const PendingFrameDrain& entry) {
     // Control frames are tracked for byte accounting only — never
     // dispatch sink virtuals for them (no stream to look up; the
     // sentinel stream_id is meaningless).
