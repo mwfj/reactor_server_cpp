@@ -242,10 +242,18 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     return 0;
 }
 
-// Dispatches request-side sink signals from frame-serialization edges.
-// END_STREAM (HEADERS or DATA) → OnRequestSubmitted; intermediate DATA
-// → OnRequestBodyProgress. May fire SYNCHRONOUSLY inside SubmitRequest
-// for bodyless requests — sink contract requires reentrancy.
+// Enqueue request-side frames for deferred sink dispatch. Sink virtuals
+// fire from OnTransportWriteProgress / OnTransportWriteComplete when the
+// bytes actually drain off the transport buffer — NOT here, where the
+// frame is only in nghttp2's internal output buffer.
+//
+// Every HEADERS / DATA frame for a tracked stream is pushed to the
+// drain queue (including non-end-stream frames, so byte accounting
+// stays tight). Frames for unknown / sinkless streams (control frames,
+// peer-initiated PUSH_PROMISE) are not queued — they consume transport
+// bytes but never fire sink virtuals, so dropping them is safe (the
+// drain-queue total only tracks request-side bytes that the transport
+// callback will attribute back to streams).
 int OnFrameSendCallback(nghttp2_session* /*session*/,
                         const nghttp2_frame* frame, void* user_data)
 {
@@ -257,13 +265,12 @@ int OnFrameSendCallback(nghttp2_session* /*session*/,
     auto* self = static_cast<UpstreamH2Connection*>(user_data);
     auto* stream = self->GetStream(frame->hd.stream_id);
     if (!stream || !stream->sink) return 0;
-    if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-        stream->sink->OnRequestSubmitted();
-    } else if (frame->hd.type == NGHTTP2_DATA) {
-        // Only DATA frames are body-progress signals; the HEADERS frame
-        // itself (no END_STREAM, bodied request) is request-header data.
-        stream->sink->OnRequestBodyProgress();
-    }
+    // Wire size = 9-byte frame header + payload length.
+    const size_t frame_bytes = 9 + static_cast<size_t>(frame->hd.length);
+    const bool is_data = (frame->hd.type == NGHTTP2_DATA);
+    const bool eos = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
+    self->EnqueueFrameForDrain(frame->hd.stream_id, frame_bytes,
+                                is_data, eos);
     return 0;
 }
 
@@ -298,6 +305,13 @@ UpstreamH2Connection::~UpstreamH2Connection() {
             t->SetOnMessageCb(nullptr);
             t->SetCloseCb(nullptr);
             t->SetErrorCb(nullptr);
+            // Write-progress / completion hooks installed by
+            // AcquireH2Connection — must also be cleared before the
+            // transport returns to the pool, otherwise the next
+            // borrower inherits closures pointing at a destroyed
+            // session.
+            t->SetWriteProgressCb(nullptr);
+            t->SetCompletionCb(nullptr);
         }
     }
     if (session_) {
@@ -721,6 +735,12 @@ void UpstreamH2Connection::FailAllStreams(int error_code,
     if (streams_.empty()) return;
     auto streams = std::move(streams_);
     streams_.clear();
+    // Drain queue entries for these streams are now stale — sinks are
+    // about to be invoked via OnError and must not fire request-side
+    // virtuals afterwards. Clear the whole queue: no other streams are
+    // left to attribute drained bytes to.
+    drain_queue_.clear();
+    bytes_in_drain_queue_ = 0;
     for (auto& kv : streams) {
         if (kv.second && kv.second->sink) {
             kv.second->sink->OnError(error_code, reason);
@@ -739,16 +759,110 @@ void UpstreamH2Connection::ResetStream(int32_t stream_id) {
     if (it == streams_.end()) return;
     // Detach the sink before submitting RST_STREAM so the eventual
     // OnStreamClose does not fire OnError on a transaction that has
-    // already moved on (e.g. a retry in progress).
+    // already moved on (e.g. a retry in progress). The drain-queue
+    // sweep removes any not-yet-fired progress/submitted entries for
+    // this stream so they don't later dispatch to the nulled sink.
     if (it->second) it->second->sink = nullptr;
+    DropDrainEntriesForStream(stream_id);
     int rv = nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE, stream_id, NGHTTP2_CANCEL);
-    
+
     if (rv != 0) {
         logging::Get()->warn(
             "UpstreamH2Connection: submit_rst_stream sid={} rv={}",
             stream_id, rv);
     }
     if (!in_receive_data_) FlushSend();
+}
+
+void UpstreamH2Connection::EnqueueFrameForDrain(int32_t stream_id,
+                                                 size_t bytes,
+                                                 bool is_data_frame,
+                                                 bool is_end_stream) {
+    drain_queue_.push_back(
+        PendingFrameDrain{stream_id, bytes, is_data_frame, is_end_stream});
+    bytes_in_drain_queue_ += bytes;
+}
+
+void UpstreamH2Connection::FireSinkForDrainEntry(
+    const PendingFrameDrain& entry) {
+    // Stream may have been reset between serialization and drain — the
+    // sink is nulled by ResetStream / FailAllStreams in that case, so
+    // a stale lookup short-circuits here.
+    auto it = streams_.find(entry.stream_id);
+    if (it == streams_.end() || !it->second || !it->second->sink) return;
+    if (entry.is_end_stream) {
+        it->second->sink->OnRequestSubmitted();
+    } else if (entry.is_data_frame) {
+        it->second->sink->OnRequestBodyProgress();
+    }
+}
+
+void UpstreamH2Connection::DropDrainEntriesForStream(int32_t stream_id) {
+    if (drain_queue_.empty()) return;
+    auto new_end = std::remove_if(
+        drain_queue_.begin(), drain_queue_.end(),
+        [&](const PendingFrameDrain& e) {
+            if (e.stream_id == stream_id) {
+                bytes_in_drain_queue_ -= e.bytes;
+                return true;
+            }
+            return false;
+        });
+    drain_queue_.erase(new_end, drain_queue_.end());
+}
+
+void UpstreamH2Connection::OnTransportWriteProgress(size_t remaining) {
+    if (dead_) return;
+    if (drain_queue_.empty()) return;
+    // Bytes drained since the last fire = the shrinkage of our tracked
+    // queue total. The transport may report remaining > our total when
+    // it holds bytes from sources we don't track (none today, but be
+    // defensive): in that case drained == 0 and we do nothing.
+    if (remaining >= bytes_in_drain_queue_) {
+        bytes_in_drain_queue_ = remaining;
+        return;
+    }
+    size_t drained = bytes_in_drain_queue_ - remaining;
+    bytes_in_drain_queue_ = remaining;
+    while (drained > 0 && !drain_queue_.empty()) {
+        PendingFrameDrain& front = drain_queue_.front();
+        if (drained >= front.bytes) {
+            drained -= front.bytes;
+            PendingFrameDrain entry = front;
+            drain_queue_.pop_front();
+            // Fire AFTER pop so a sink callback that re-enters
+            // (e.g., Cleanup → ResetStream → DropDrainEntriesForStream)
+            // does not invalidate `front`.
+            FireSinkForDrainEntry(entry);
+        } else {
+            // Partial drain of this DATA frame: fire progress (refreshes
+            // the per-stream stall timestamp) but keep the entry — the
+            // remaining bytes still need to drain before any END_STREAM
+            // dispatch.
+            front.bytes -= drained;
+            drained = 0;
+            if (front.is_data_frame && !front.is_end_stream) {
+                PendingFrameDrain partial_entry{
+                    front.stream_id, 0, true, false};
+                FireSinkForDrainEntry(partial_entry);
+            }
+        }
+    }
+}
+
+void UpstreamH2Connection::OnTransportWriteComplete() {
+    if (dead_) return;
+    if (drain_queue_.empty()) {
+        bytes_in_drain_queue_ = 0;
+        return;
+    }
+    // Transport buffer is empty — every queued frame is on the wire.
+    auto pending = std::move(drain_queue_);
+    drain_queue_.clear();
+    bytes_in_drain_queue_ = 0;
+    for (auto& entry : pending) {
+        FireSinkForDrainEntry(entry);
+    }
 }
 
 namespace {

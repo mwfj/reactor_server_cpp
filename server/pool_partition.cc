@@ -659,6 +659,25 @@ std::shared_ptr<UpstreamH2Connection> PoolPartition::AcquireH2Connection(
                 ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                 "transport error");
         });
+    // Drive request-side sink virtuals from REAL transport drain (not
+    // from nghttp2 frame serialization). The H2 session enqueues every
+    // outbound HEADERS/DATA frame into its drain_queue_ inside
+    // on_frame_send_callback; these two hooks pop the queue as bytes
+    // actually leave the transport buffer, then dispatch
+    // OnRequestBodyProgress / OnRequestSubmitted on the corresponding
+    // stream's sink. Matches H1's transport-callback-driven semantic.
+    transport->SetWriteProgressCb(
+        [wk](std::shared_ptr<ConnectionHandler>, size_t remaining) {
+            auto h = wk.lock();
+            if (!h) return;
+            h->OnTransportWriteProgress(remaining);
+        });
+    transport->SetCompletionCb(
+        [wk](std::shared_ptr<ConnectionHandler>) {
+            auto h = wk.lock();
+            if (!h) return;
+            h->OnTransportWriteComplete();
+        });
 
     h2->AdoptLease(std::move(lease));
     h2_table_.Insert(upstream_name, h2);

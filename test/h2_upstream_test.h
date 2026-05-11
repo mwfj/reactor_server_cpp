@@ -3422,8 +3422,9 @@ void TestN7bCLOverflowRejected() {
 }
 
 // ---------------------------------------------------------------------------
-// TestN8 — OnRequestSubmitted fires for bodyless GET (synchronous path):
-// stream_id is valid and the sink's OnRequestSubmitted was called.
+// TestN8 — OnRequestSubmitted fires for bodyless GET only after the
+// transport reports drain. Sink virtuals are gated on real wire progress
+// via OnTransportWriteComplete, NOT on nghttp2 frame serialization.
 // ---------------------------------------------------------------------------
 
 // Extended RecordingSink that tracks OnRequestSubmitted for N-series tests.
@@ -3455,7 +3456,7 @@ struct RecordingSinkEx : public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSi
 };
 
 void TestN8OnRequestSubmittedBodyless() {
-    std::cout << "\n[TEST] H2Upstream N8: bodyless GET → OnRequestSubmitted fires (synchronous path)..." << std::endl;
+    std::cout << "\n[TEST] H2Upstream N8: bodyless GET → OnRequestSubmitted fires only after transport drain..." << std::endl;
     try {
         auto cfg = MakeH2Conn();
         // sink declared before conn — outlives ~UpstreamH2Connection FailAllStreams.
@@ -3463,52 +3464,71 @@ void TestN8OnRequestSubmittedBodyless() {
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
-                "H2Upstream N8: bodyless GET → OnRequestSubmitted fires (synchronous path)",
+                "H2Upstream N8: bodyless GET → OnRequestSubmitted fires only after transport drain",
                 false, "Init failed");
             return;
         }
-        // Bodyless GET: nghttp2 sends HEADERS+END_STREAM synchronously inside
-        // SubmitRequest via FlushSend → on_frame_send_callback fires inline.
+        // SubmitRequest serializes HEADERS+END_STREAM into nghttp2's send
+        // buffer. With the deferred-drain contract the sink must NOT
+        // see OnRequestSubmitted until transport drain reports it.
         int32_t sid = conn.SubmitRequest(
             "GET", "http", "example.com", "/", {}, "", &sink);
+        if (sink.submitted_calls != 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N8: bodyless GET → OnRequestSubmitted fires only after transport drain",
+                false,
+                "submitted fired before transport drain: " +
+                    std::to_string(sink.submitted_calls));
+            return;
+        }
+        // Simulate the transport's complete_callback firing after the
+        // serialized bytes hit the wire.
+        conn.OnTransportWriteComplete();
 
         bool pass = (sid > 0) && (sink.submitted_calls == 1);
         std::string err;
         if (sid <= 0) err += "invalid stream_id " + std::to_string(sid) + "; ";
         if (sink.submitted_calls != 1)
-            err += "submitted_calls=" + std::to_string(sink.submitted_calls) + " (expected 1); ";
+            err += "submitted_calls=" + std::to_string(sink.submitted_calls) + " (expected 1 after drain); ";
         TestFramework::RecordTest(
-            "H2Upstream N8: bodyless GET → OnRequestSubmitted fires (synchronous path)", pass, err);
+            "H2Upstream N8: bodyless GET → OnRequestSubmitted fires only after transport drain", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2Upstream N8: bodyless GET → OnRequestSubmitted fires (synchronous path)",
+            "H2Upstream N8: bodyless GET → OnRequestSubmitted fires only after transport drain",
             false, e.what());
     }
 }
 
 // ---------------------------------------------------------------------------
-// TestN8b — POST with body: OnRequestSubmitted fires after DATA+END_STREAM
-// is flushed. With null transport the send is buffered in nghttp2 but the
-// flush still fires the callback.
+// TestN8b — POST with body: OnRequestSubmitted fires exactly once and
+// only after the transport reports drain (deferred-drain contract).
 // ---------------------------------------------------------------------------
 void TestN8bOnRequestSubmittedBodyed() {
-    std::cout << "\n[TEST] H2Upstream N8b: POST with body → OnRequestSubmitted fires once..." << std::endl;
+    std::cout << "\n[TEST] H2Upstream N8b: POST with body → OnRequestSubmitted fires once after drain..." << std::endl;
     try {
         auto cfg = MakeH2Conn();
         RecordingSinkEx sink;
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
-                "H2Upstream N8b: POST with body → OnRequestSubmitted fires once",
+                "H2Upstream N8b: POST with body → OnRequestSubmitted fires once after drain",
                 false, "Init failed");
             return;
         }
-        // POST with body — nghttp2 queues HEADERS then DATA+END_STREAM in one flush.
         int32_t sid = conn.SubmitRequest(
             "POST", "http", "example.com", "/upload",
             {{"content-type", "application/octet-stream"}},
             std::string(128, 'B'),
             &sink);
+        if (sink.submitted_calls != 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N8b: POST with body → OnRequestSubmitted fires once after drain",
+                false,
+                "submitted fired before transport drain: " +
+                    std::to_string(sink.submitted_calls));
+            return;
+        }
+        conn.OnTransportWriteComplete();
 
         bool pass = (sid > 0) && (sink.submitted_calls == 1) && (sink.error_calls == 0);
         std::string err;
@@ -3518,19 +3538,20 @@ void TestN8bOnRequestSubmittedBodyed() {
         if (sink.error_calls != 0)
             err += "unexpected errors; ";
         TestFramework::RecordTest(
-            "H2Upstream N8b: POST with body → OnRequestSubmitted fires once", pass, err);
+            "H2Upstream N8b: POST with body → OnRequestSubmitted fires once after drain", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2Upstream N8b: POST with body → OnRequestSubmitted fires once", false, e.what());
+            "H2Upstream N8b: POST with body → OnRequestSubmitted fires once after drain", false, e.what());
     }
 }
 
 // ---------------------------------------------------------------------------
-// TestN9 — OnRequestSubmitted fires exactly once per stream, not per-flush.
-// Two concurrent streams must each see exactly one call.
+// TestN9 — OnRequestSubmitted fires exactly once per stream and only
+// after the transport reports drain. Two concurrent streams each see
+// exactly one call.
 // ---------------------------------------------------------------------------
 void TestN9OnRequestSubmittedOncePerStream() {
-    std::cout << "\n[TEST] H2Upstream N9: OnRequestSubmitted fires exactly once per stream..." << std::endl;
+    std::cout << "\n[TEST] H2Upstream N9: OnRequestSubmitted fires exactly once per stream after drain..." << std::endl;
     try {
         auto cfg = MakeH2Conn();
         RecordingSinkEx sink_a;
@@ -3538,7 +3559,7 @@ void TestN9OnRequestSubmittedOncePerStream() {
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
-                "H2Upstream N9: OnRequestSubmitted fires exactly once per stream",
+                "H2Upstream N9: OnRequestSubmitted fires exactly once per stream after drain",
                 false, "Init failed");
             return;
         }
@@ -3546,6 +3567,13 @@ void TestN9OnRequestSubmittedOncePerStream() {
             "GET", "http", "example.com", "/a", {}, "", &sink_a);
         int32_t sid_b = conn.SubmitRequest(
             "GET", "http", "example.com", "/b", {}, "", &sink_b);
+        if (sink_a.submitted_calls != 0 || sink_b.submitted_calls != 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N9: OnRequestSubmitted fires exactly once per stream after drain",
+                false, "sink fired before transport drain");
+            return;
+        }
+        conn.OnTransportWriteComplete();
 
         bool pass = (sid_a > 0) && (sid_b > 0) &&
                     (sink_a.submitted_calls == 1) &&
@@ -3556,10 +3584,10 @@ void TestN9OnRequestSubmittedOncePerStream() {
         if (sink_b.submitted_calls != 1)
             err += "sink_b submitted_calls=" + std::to_string(sink_b.submitted_calls) + "; ";
         TestFramework::RecordTest(
-            "H2Upstream N9: OnRequestSubmitted fires exactly once per stream", pass, err);
+            "H2Upstream N9: OnRequestSubmitted fires exactly once per stream after drain", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2Upstream N9: OnRequestSubmitted fires exactly once per stream", false, e.what());
+            "H2Upstream N9: OnRequestSubmitted fires exactly once per stream after drain", false, e.what());
     }
 }
 
@@ -4507,20 +4535,18 @@ void TestN8cNoPoisonOnEarlyHeadersSiblingReuse() {
 }
 
 // ---------------------------------------------------------------------------
-// TestN9b — OnRequestBodyProgress fires through the production
-// OnFrameSendCallback wiring on intermediate DATA frames, NOT just by
-// direct call on the sink. Drives a real SubmitRequest with a body
-// large enough to span multiple DATA frames so nghttp2 emits at least
-// one DATA frame WITHOUT END_STREAM (intermediate) plus one DATA frame
-// WITH END_STREAM (terminal).
+// TestN9b — Large-body submit enqueues multiple frames in the drain
+// queue; OnRequestBodyProgress fires for each intermediate DATA frame
+// AND OnRequestSubmitted fires exactly once — but ALL dispatch is gated
+// on real transport drain (the deferred-drain contract). Sink virtuals
+// must remain silent until OnTransportWriteComplete is called.
 //
-// Default MAX_FRAME_SIZE is 16384 (RFC 9113 §6.5.2). Use a 20000-byte
-// body to guarantee at least 2 DATA frames: the first 16384 bytes
-// without END_STREAM (→ OnRequestBodyProgress), the remaining 3616
-// bytes with END_STREAM (→ OnRequestSubmitted).
+// Default MAX_FRAME_SIZE is 16384 (RFC 9113 §6.5.2). A 20000-byte body
+// guarantees at least 2 DATA frames: intermediate (no END_STREAM) +
+// terminal (END_STREAM).
 // ---------------------------------------------------------------------------
 void TestN9bRequestBodyProgressFiresFromCodec() {
-    std::cout << "\n[TEST] H2Upstream N9b: large-body submit fires OnRequestBodyProgress via codec..." << std::endl;
+    std::cout << "\n[TEST] H2Upstream N9b: large-body submit fires sink virtuals via transport drain..." << std::endl;
     struct ObservingSink : public RecordingSink {
         int progress_calls = 0;
         int submitted_calls = 0;
@@ -4533,35 +4559,182 @@ void TestN9bRequestBodyProgressFiresFromCodec() {
         UpstreamH2Connection conn(nullptr, cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest(
-                "H2Upstream N9b: codec dispatches OnRequestBodyProgress on large body",
+                "H2Upstream N9b: large-body submit fires sink virtuals via transport drain",
                 false, "Init failed");
             return;
         }
-        // 20000 bytes > 1 frame (MAX_FRAME_SIZE=16384) — guarantees
-        // at least one intermediate DATA frame.
         std::string body(20000, 'x');
         int32_t sid = conn.SubmitRequest(
             "POST", "http", "example.com", "/upload", {}, body, &sink);
         if (sid <= 0) {
             TestFramework::RecordTest(
-                "H2Upstream N9b: codec dispatches OnRequestBodyProgress on large body",
+                "H2Upstream N9b: large-body submit fires sink virtuals via transport drain",
                 false, "submit failed");
             return;
         }
-        // After SubmitRequest's inline FlushSend, nghttp2 has emitted
-        // the HEADERS + DATA chunks. With a 20KB body, expect at
-        // least one OnRequestBodyProgress (intermediate DATA without
-        // END_STREAM) and exactly one OnRequestSubmitted (final DATA
-        // with END_STREAM).
+        // Deferred-drain contract: no sink dispatch before transport reports drain.
+        if (sink.progress_calls != 0 || sink.submitted_calls != 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N9b: large-body submit fires sink virtuals via transport drain",
+                false,
+                "sink fired before drain: progress=" +
+                    std::to_string(sink.progress_calls) +
+                    " submitted=" + std::to_string(sink.submitted_calls));
+            return;
+        }
+        conn.OnTransportWriteComplete();
         bool pass = (sink.progress_calls >= 1) &&
                     (sink.submitted_calls == 1);
         TestFramework::RecordTest(
-            "H2Upstream N9b: codec dispatches OnRequestBodyProgress on large body",
+            "H2Upstream N9b: large-body submit fires sink virtuals via transport drain",
             pass, pass ? "" : "progress=" + std::to_string(sink.progress_calls) +
                               " submitted=" + std::to_string(sink.submitted_calls));
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2Upstream N9b: codec dispatches OnRequestBodyProgress on large body",
+            "H2Upstream N9b: large-body submit fires sink virtuals via transport drain",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9dDeferredDrainSemantic — Sink virtuals (OnRequestSubmitted and
+// OnRequestBodyProgress) MUST fire only after the transport reports
+// drain, NOT when nghttp2 serializes the frame into its internal
+// output buffer. Verifies the deferred-drain contract end-to-end:
+// SubmitRequest serializes frames → drain queue accumulates →
+// OnTransportWriteProgress / Complete pop entries and dispatch.
+// ---------------------------------------------------------------------------
+void TestN9dDeferredDrainSemantic() {
+    std::cout << "\n[TEST] H2Upstream N9d: sink virtuals deferred to transport drain..." << std::endl;
+    struct ObservingSink : public RecordingSink {
+        int progress_calls = 0;
+        int submitted_calls = 0;
+        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestSubmitted() override { ++submitted_calls; }
+    };
+    try {
+        auto cfg = MakeH2Conn();
+        ObservingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9d: sink virtuals deferred to transport drain",
+                false, "Init failed");
+            return;
+        }
+
+        // Stage 1: SubmitRequest with a large body — nghttp2 serializes
+        // HEADERS + multiple DATA frames inline. Drain queue accumulates
+        // all of them but NO sink virtuals fire yet.
+        std::string body(20000, 'q');
+        int32_t sid = conn.SubmitRequest(
+            "POST", "http", "example.com", "/upload", {}, body, &sink);
+        if (sid <= 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N9d: sink virtuals deferred to transport drain",
+                false, "submit failed sid=" + std::to_string(sid));
+            return;
+        }
+        const bool pre_drain_silent =
+            (sink.progress_calls == 0) && (sink.submitted_calls == 0);
+
+        // Stage 2: simulate partial drain — write_progress with a
+        // non-zero remaining. The transport is reporting that some of
+        // our queued bytes are still buffered; only the bytes that
+        // drained should fire dispatches.
+        // For a 20KB body, frame sizes are roughly HEADERS(~30) +
+        // DATA(16384) + DATA(3616). Tell the transport "10KB still
+        // buffered" — at least the HEADERS frame should have drained.
+        conn.OnTransportWriteProgress(10000);
+        const int after_partial_progress = sink.progress_calls;
+        const int after_partial_submitted = sink.submitted_calls;
+
+        // Stage 3: full drain — remaining frames dispatch.
+        conn.OnTransportWriteComplete();
+        const bool post_drain_complete =
+            (sink.submitted_calls == 1) && (sink.progress_calls >= 1);
+
+        bool pass = pre_drain_silent && post_drain_complete &&
+                    (after_partial_submitted == 0);
+        std::string err;
+        if (!pre_drain_silent) {
+            err += "sink fired before drain (progress=" +
+                   std::to_string(sink.progress_calls) +
+                   " submitted=" + std::to_string(sink.submitted_calls) +
+                   "); ";
+        }
+        if (after_partial_submitted != 0) {
+            err += "submitted fired during partial drain (submitted=" +
+                   std::to_string(after_partial_submitted) + "); ";
+        }
+        if (!post_drain_complete) {
+            err += "post-drain mismatch (progress=" +
+                   std::to_string(sink.progress_calls) +
+                   " submitted=" + std::to_string(sink.submitted_calls) +
+                   "); ";
+        }
+        (void)after_partial_progress;  // recorded for diagnosis only
+        TestFramework::RecordTest(
+            "H2Upstream N9d: sink virtuals deferred to transport drain",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9d: sink virtuals deferred to transport drain",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestN9eResetStreamDropsDrainEntries — Verifies that resetting a stream
+// before its drain queue entries fire causes those entries to be
+// dropped (not dispatched to a nulled sink). Otherwise FireSinkForDrainEntry
+// after detach + ResetStream would crash on the detached sink slot.
+// ---------------------------------------------------------------------------
+void TestN9eResetStreamDropsDrainEntries() {
+    std::cout << "\n[TEST] H2Upstream N9e: ResetStream drops pending drain entries..." << std::endl;
+    struct ObservingSink : public RecordingSink {
+        int progress_calls = 0;
+        int submitted_calls = 0;
+        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestSubmitted() override { ++submitted_calls; }
+    };
+    try {
+        auto cfg = MakeH2Conn();
+        ObservingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream N9e: ResetStream drops pending drain entries",
+                false, "Init failed");
+            return;
+        }
+        std::string body(20000, 'r');
+        int32_t sid = conn.SubmitRequest(
+            "POST", "http", "example.com", "/upload", {}, body, &sink);
+        if (sid <= 0) {
+            TestFramework::RecordTest(
+                "H2Upstream N9e: ResetStream drops pending drain entries",
+                false, "submit failed");
+            return;
+        }
+        // Reset the stream BEFORE drain runs. The detach pattern nulls
+        // the sink and DropDrainEntriesForStream sweeps the queue.
+        conn.ResetStream(sid);
+        // Now simulate drain — no dispatches should reach the nulled sink.
+        conn.OnTransportWriteComplete();
+
+        bool pass = (sink.progress_calls == 0) &&
+                    (sink.submitted_calls == 0);
+        TestFramework::RecordTest(
+            "H2Upstream N9e: ResetStream drops pending drain entries",
+            pass,
+            pass ? "" : "post-reset dispatch: progress=" +
+                        std::to_string(sink.progress_calls) +
+                        " submitted=" +
+                        std::to_string(sink.submitted_calls));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream N9e: ResetStream drops pending drain entries",
             false, e.what());
     }
 }
@@ -4707,9 +4880,17 @@ void TestN7eWiringEarlyHeadersThenIntermediateDataDispatch() {
                 false, "submit failed sid=" + std::to_string(sid));
             return;
         }
-        // After SubmitRequest's inline FlushSend, the codec has
-        // emitted HEADERS + at least one DATA chunk. Now feed an
-        // early peer-final-headers (413 + END_STREAM) on stream A —
+        // Drain BEFORE feeding the peer wire: under the deferred-drain
+        // contract, sink virtuals dispatch through streams_ lookup, so
+        // they must run while the stream is still live (peer's
+        // END_STREAM on HEADERS would erase the stream from streams_
+        // via OnStreamClose, leaving drain entries orphaned). Real
+        // production sees drain-events interleaved with peer-frame
+        // events on the event loop; this test forces the order
+        // explicitly.
+        conn.OnTransportWriteComplete();
+
+        // Now feed an early peer-final-headers (413 + END_STREAM) —
         // this is the canonical "peer rejects mid-upload" pattern.
         std::vector<uint8_t> wire = H2WireTest::BuildEmptySettings();
         auto early_hdrs = H2WireTest::BuildHeadersFrame(
@@ -4719,12 +4900,8 @@ void TestN7eWiringEarlyHeadersThenIntermediateDataDispatch() {
         ssize_t consumed = conn.HandleBytes(
             reinterpret_cast<const char*>(wire.data()), wire.size());
 
-        // The no-real-transport setup drains the body in the initial
-        // FlushSend before the early-headers wire bytes are fed, so
-        // the post-headers progress count is observable only with a
-        // real socketpair (out of scope here). We lock the wiring:
-        // headers are observed AND ≥1 intermediate DATA progress event
-        // fires. TestN9b/N9c lock the post-completion no-refresh side.
+        // Locks the wiring: headers are observed via HandleBytes AND
+        // ≥1 intermediate DATA progress event fires once drain runs.
         bool pass = (consumed > 0) && sink.headers_seen &&
                     (sink.progress_calls_total >= 1);
         TestFramework::RecordTest(
@@ -4868,6 +5045,8 @@ void RunAllH2UpstreamTests() {
     TestN8cNoPoisonOnEarlyHeadersSiblingReuse();
     TestN9bRequestBodyProgressFiresFromCodec();
     TestN9cDefaultSinkSurvivesNewVirtual();
+    TestN9dDeferredDrainSemantic();
+    TestN9eResetStreamDropsDrainEntries();
     TestN7eWiringEarlyHeadersThenIntermediateDataDispatch();
 
     // TestB-series additions — wire-level

@@ -945,9 +945,12 @@ void ProxyTransaction::DispatchH2() {
         path_with_query.append(query_);
     }
 
-    // Initialize H2 state BEFORE SubmitRequest. Bodyless requests can
-    // inline-flush HEADERS+END_STREAM and fire OnRequestSubmitted
-    // synchronously; the override's `!h2_path_` guard would otherwise
+    // Initialize H2 state BEFORE SubmitRequest. Sink virtuals now fire
+    // from the transport's drain callbacks, but the fast-path
+    // (DoSendRaw direct-write on a healthy socket with empty buffer)
+    // can fire complete_callback SYNCHRONOUSLY inside SendRaw — and
+    // SendRaw is called from FlushSend which is called from
+    // SubmitRequest. The override's `!h2_path_` guard would otherwise
     // drop the kill of the just-queued send-stall closure.
     // Budget mirrors the H1 zero-disable semantic: response_timeout_ms
     // == 0 opts out of the response-wait timer; stall protection stays
@@ -963,8 +966,10 @@ void ProxyTransaction::DispatchH2() {
     h2_last_progress_at_ = std::chrono::steady_clock::now();
     ArmH2SendStallDeadline(h2_stall_budget_ms_);
 
-    // Synchronous on_frame_send (bodyless path) may run inline here,
-    // bumping h2_send_stall_generation_ → kills the closure above.
+    // Fast-path direct-write (DoSendRaw) may run inline here, firing
+    // the transport's complete_callback → OnTransportWriteComplete →
+    // sink->OnRequestSubmitted → bumps h2_send_stall_generation_,
+    // killing the closure above.
     int32_t stream_id = h2->SubmitRequest(
         method_, scheme, authority, path_with_query,
         rewritten_headers_, request_body_, this, client_te_trailers_);
