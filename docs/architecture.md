@@ -28,10 +28,15 @@ The server uses the [Reactor pattern](https://en.wikipedia.org/wiki/Reactor_patt
 ```
 Layer 7: AuthManager, AuthMiddleware,       (inbound middleware stack)
          RateLimitManager, RateLimitZone,
-         TokenBucket, CircuitBreakerManager
-Layer 6: UpstreamManager, UpstreamHostPool, (upstream connection pooling)
+         TokenBucket, CircuitBreakerManager,
+         ObservabilityManager,              (cross-cutting: trace + metrics emission)
+         TracerProvider, MeterProvider
+Layer 6: UpstreamManager, UpstreamHostPool, (upstream connection pooling + proxy engine)
          PoolPartition, UpstreamConnection,
          UpstreamLease, TlsClientContext,
+         ProxyHandler, ProxyTransaction,
+         UpstreamCodec + UpstreamHttpCodec (H1) + UpstreamH2Codec (H2),
+         UpstreamH2Connection, H2ConnectionTable (multiplexed H2 sessions),
          DnsResolver                        (hostname resolution, reload-time re-resolve)
 Layer 5: HttpServer                          (application entry point)
 Layer 4: HttpRouter, WebSocketConnection    (routing, WS message API)
@@ -45,7 +50,7 @@ Layer 1: ConnectionHandler, Channel,        (reactor core)
          Dispatcher, EventHandler
 ```
 
-Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity + DNS resolution). Layer 7 is the inbound traffic-management middleware (auth, rate limiting, circuit breaking). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections.
+Layers 1–2 are the transport. Layers 3–5 are the protocol. Layer 6 is the gateway (upstream connectivity + proxy engine + DNS resolution). Layer 7 is the inbound traffic-management middleware (auth, rate limiting, circuit breaking, observability emission). HTTP/1.x and HTTP/2 are parallel handlers at Layer 3, selected by `ProtocolDetector` at connection time. Both converge on the same `HttpRouter` at Layer 4. ConnectionHandler supports both inbound (server) and outbound (client) connections. Upstream traffic mirrors the layering: the proxy engine dispatches per request through an H1 or H2 codec based on per-upstream `http2.enabled` + ALPN negotiation. H2 upstream sessions follow a donated-lease pattern — one real `UpstreamLease` is held for the multiplexed session lifetime; per-request transactions route as sentinel reuses through the existing session.
 
 `DnsResolver` is owned by `HttpServer` and is used at two points: (1) bind-host resolution during `Start()`, and (2) upstream hostname re-resolution during each `Reload()`. IP-literal upstreams bypass `DnsResolver` entirely.
 
