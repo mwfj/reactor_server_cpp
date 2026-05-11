@@ -148,16 +148,11 @@ private:
     // Called from dispatcher (ProcessFrame) and off-dispatcher under
     // send_mtx_ (SendFrame); Tracer / Span / BSP own internal mutexes.
     //
-    // Parent-span lifetime note: the upgrade SERVER span is finalized
-    // by HttpConnectionHandler BEFORE SetObservabilitySnapshot wires
-    // this connection, so the inbound SERVER span recorded in
-    // `obs_snapshot_->inbound_span` is already Ended by the time
-    // any frame-level span emits. This is semantically legal —
-    // parent-trace-id linking is time-independent — but produces a
-    // visually-surprising trace where the SERVER span "ends" before
-    // its children "start" in Tempo/Jaeger. See
-    // .claude/rules/pitfalls/OBSERVABILITY.md "WS upgrade SERVER
-    // span ends before SetObservabilitySnapshot".
+    // The parent SERVER span is already Ended by the time these spans
+    // emit (finalized at upgrade-101 by HttpConnectionHandler). Children
+    // attach via trace_id, not parent liveness — Tempo/Jaeger render the
+    // ordering as "children after parent end". See
+    // .claude/rules/pitfalls/OBSERVABILITY.md.
     void MaybeEmitMessageSpan(const char* name, WebSocketOpcode opcode,
                               size_t payload_size);
     // Bump reactor.websocket.frames {op, direction}. Same call-site /

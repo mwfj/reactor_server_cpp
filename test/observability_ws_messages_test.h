@@ -213,10 +213,8 @@ int64_t PayloadAttr(const SpanData& s) {
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
-// Happy path — single text frame each way emits one `ws.recv` + one `ws.send`
-// span with correct opcode + payload_size attributes.
-// ---------------------------------------------------------------------------
+// Happy path: text frame each way emits one ws.recv + one ws.send with
+// correct opcode + payload_size attributes.
 void TestTextFrameEmitsSpan() {
     const char* TAG = "ObsWsMsg: text frame emits ws.recv + ws.send spans";
     try {
@@ -287,10 +285,8 @@ void TestTextFrameEmitsSpan() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Control frames (Ping / Close) MUST NOT produce ws.recv / ws.send spans.
-// Only Text/Binary unfragmented frames + Continuation FIN reassembly emit.
-// ---------------------------------------------------------------------------
+// Control frames (Ping / Close) must not emit ws.recv / ws.send spans —
+// only Text/Binary unfragmented + Continuation FIN reassembly do.
 void TestControlFramesSkipSpans() {
     const char* TAG = "ObsWsMsg: ping/close frames do not emit ws.* spans";
     try {
@@ -342,10 +338,8 @@ void TestControlFramesSkipSpans() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// A 3-fragment text message MUST yield exactly ONE ws.recv span at FIN
+// A 3-fragment text message yields exactly ONE ws.recv span at FIN
 // reassembly — not one per fragment.
-// ---------------------------------------------------------------------------
 void TestFragmentedMessageEmitsOneSpan() {
     const char* TAG =
         "ObsWsMsg: fragmented text emits exactly one ws.recv span at FIN";
@@ -408,11 +402,8 @@ void TestFragmentedMessageEmitsOneSpan() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// `traces.websocket_messages = false` (the default) → zero frame-level
-// spans even when text frames flow each direction. Verifies the relaxed-
-// load fast-path returns BEFORE any tracer / span allocation.
-// ---------------------------------------------------------------------------
+// `traces.websocket_messages = false` → zero frame-level spans even when
+// text flows both ways. Exercises the relaxed-load disabled fast path.
 void TestDisabledFlagNoSpans() {
     const char* TAG = "ObsWsMsg: ws_messages=false suppresses ws.recv/ws.send";
     try {
@@ -454,18 +445,10 @@ void TestDisabledFlagNoSpans() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Install-once latch — a second SetObservabilitySnapshot call MUST be
-// rejected, even when the first call was made with a snapshot whose
-// manager weak_ptr would unlock to null at install time. We exercise
-// the canonical rebind-rejection path by calling SetObservabilitySnapshot
-// from inside the WS route handler (which runs on the dispatcher
-// thread, the same thread that owns the connection — safe ordering).
-// The first call already happened inside AttemptWebSocketUpgrade with a
-// real snapshot; the second call with a fresh snapshot from a separate
-// manager must be rejected, and subsequent frame emission must continue
-// to route through the original manager's processor.
-// ---------------------------------------------------------------------------
+// Install-once latch — a second SetObservabilitySnapshot call (made
+// from inside the WS route handler, dispatcher thread) is rejected and
+// subsequent frame emission continues to route through the original
+// manager's processor (not the rebind attempt's).
 void TestRebindRejected() {
     const char* TAG =
         "ObsWsMsg: SetObservabilitySnapshot rebind rejected, original wins";
@@ -541,14 +524,9 @@ void TestRebindRejected() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// `reactor.websocket.frames` counter bumps on every frame, regardless of
-// the per-message spans gate. The closed-enum switch in BumpFrameCounter
-// keeps the {op, direction} label cardinality bounded at 6 × 2 = 12.
-// This test exercises text + ping + close in both directions and
-// asserts the dispatcher path doesn't crash; the per-counter assertion
-// lives in obs_catalog (PrometheusExporter rendering).
-// ---------------------------------------------------------------------------
+// `reactor.websocket.frames` counter bumps unconditionally; this drives
+// text + ping + close in both directions to ensure the dispatcher path
+// doesn't crash. (Counter-value assertions live in obs_catalog.)
 void TestFrameCounterDoesNotCrashOnAllOpcodes() {
     const char* TAG =
         "ObsWsMsg: frame counter handles text + ping + close without crashing";

@@ -767,13 +767,10 @@ void ProxyTransaction::SetupAttemptObservability() {
         // is operator-visible, independent of trace sampling).
         attempt_start_steady_ = std::chrono::steady_clock::now();
         // Bump http.client.active_requests; matching -1 in
-        // FinalizeAttemptSpan. The pair is gated on
-        // attempt_start_steady_ being non-sentinel so retries +
-        // killed-on-shutdown paths stay balanced. Survivors of the
-        // kill loop will leak +1 entries — operator-visible via the
-        // same kill-loop counter that flags the http.server gauge
-        // leak; a follow-up can wire a kill-path -1 once snapshot
-        // carries the upstream label.
+        // FinalizeAttemptSpan, gated on attempt_start_steady_ non-sentinel
+        // so retries + killed-on-shutdown paths stay balanced.
+        // TODO: kill-loop survivors leak +1 until the snapshot carries
+        // the upstream label and the kill path can emit the matching -1.
         const auto& cat = mgr->catalog();
         if (cat.http_client_active_requests != nullptr) {
             cat.http_client_active_requests->Add(
@@ -1270,12 +1267,9 @@ void ProxyTransaction::OnCheckoutError(int error_code) {
         // Use RESULT_POOL_EXHAUSTED → 503 (not 502 which implies upstream failure).
         // Release the breaker slot neutrally — admission never reached upstream.
         ReportBreakerOutcome(RESULT_POOL_EXHAUSTED);
-        // Held-5xx delivery short-circuits OnError → DeliverTerminalError →
-        // FinalizeAttemptSpan; finalize the CLIENT span explicitly BEFORE
-        // delivery so Cleanup's backstop doesn't label it "abandoned".
-        // FinalizeAttemptSpan is no-op if the span isn't allocated, so
-        // calling it speculatively is cheap. The OnError branch below
-        // already finalizes via DeliverTerminalError.
+        // Held-5xx delivery bypasses OnError → DeliverTerminalError, so
+        // finalize the CLIENT span here (same rationale as the CIRCUIT_OPEN
+        // branch above). The fall-through OnError path already finalizes.
         if (pending_retryable_5xx_response_) {
             FinalizeAttemptSpan(/*status_code=*/0,
                                  ErrorTypeForResult(RESULT_POOL_EXHAUSTED));
