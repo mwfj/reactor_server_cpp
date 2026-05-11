@@ -12,16 +12,7 @@
 #include "auth/auth_manager.h"
 #include "observability/common.h"  // forward decl of ObservabilityManager
 
-#include <atomic>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <condition_variable>
-#include <optional>
-#include <set>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
+#include "common.h"
 
 // Forward declarations for upstream pool and proxy
 class UpstreamManager;

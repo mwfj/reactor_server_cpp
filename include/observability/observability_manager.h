@@ -60,7 +60,7 @@ class PeriodicMetricReader;
 // series captures requests that haven't matched a route yet.
 inline std::vector<std::pair<std::string, std::string>>
 MakeActiveRequestsLabels(const std::string& method,
-                          const std::string& route_pattern) {
+                         const std::string& route_pattern) {
     std::vector<std::pair<std::string, std::string>> labels;
     labels.reserve(2);
     if (!method.empty()) {

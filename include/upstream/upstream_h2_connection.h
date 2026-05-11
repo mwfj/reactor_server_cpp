@@ -6,9 +6,7 @@
 #include "upstream/upstream_lease.h"
 #include "upstream/upstream_callbacks.h"
 #include <nghttp2/nghttp2.h>
-#include <chrono>
-#include <optional>
-// <unordered_map>, <memory>, <string>, <cstdint>, <map> provided by common.h
+// <unordered_map>, <memory>, <string>, <cstdint>, <map>, <optional> provided by common.h
 
 class UpstreamConnection;
 class UpstreamH2Codec;

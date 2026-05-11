@@ -5,11 +5,8 @@
 #include "http/http_callbacks.h"
 #include "http/route_trie.h"
 #include "observability/trace_context.h"   // IssueTraceContext (optional<>)
-#include <optional>
-#include <unordered_set>
-#include <mutex>
 // <string>, <vector>, <functional>, <memory>, <unordered_map>, <atomic>
-// provided by common.h (via http_request.h) and route_trie.h
+// <mutex>, <optional>, <unordered_set> provided by common.h (via http_request.h) and route_trie.h
 
 namespace OBSERVABILITY_NAMESPACE {
 class Span;

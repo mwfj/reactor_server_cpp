@@ -347,11 +347,6 @@ The gateway treats the inbound as no parent and starts a fresh trace. Run with d
 | `prometheus.include_target_info` | bool | `true` | YES |
 
 ---
-
-## Phase 3 features
-
-The following hooks landed in the Phase 3 follow-up PR (built on top of the Phase 2 foundation).
-
 ### Per-attempt CLIENT span on proxy
 
 Every upstream attempt for a proxied request gets its own CLIENT span. Retries produce distinct spans linked to the same SERVER parent; the per-attempt span_id is stamped into the outbound `traceparent` so each attempt is independently identifiable in the collector. Terminal outcomes set `http.response.status_code` (success) or `error.type` (e.g. `upstream_timeout`, `connect_failed`, `circuit_open`, `client_disconnect`).

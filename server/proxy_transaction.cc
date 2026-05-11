@@ -364,9 +364,8 @@ void ProxyTransaction::FinalizeAttemptSpan(int status_code,
     // naturally. Reset the sentinel after emit so a second call from
     // Cleanup's dtor backstop (which runs AFTER OnResponseComplete on
     // the success path) doesn't double-record.
-    if (attempt_start_steady_ !=
-        std::chrono::steady_clock::time_point{} &&
-        !IsKilledForShutdown()) {
+    if (attempt_start_steady_ != std::chrono::steady_clock::time_point{} 
+        && !IsKilledForShutdown()) {
         auto* mgr = obs_manager();
         if (mgr) {
             const auto& cat = mgr->catalog();

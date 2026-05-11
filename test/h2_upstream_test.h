@@ -57,20 +57,10 @@
 
 #include <nghttp2/nghttp2.h>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <thread>
-#include <chrono>
-#include <atomic>
+#include "common.h"
 #include <future>
-#include <mutex>
-#include <condition_variable>
-#include <optional>
-#include <limits>
-#include <cstring>
 #include <set>
+#include <limits>
 
 namespace H2UpstreamTests {
 

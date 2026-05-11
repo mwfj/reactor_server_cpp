@@ -5,9 +5,7 @@
 #include "upstream/pool_partition.h"
 #include "config/server_config.h"
 #include "net/dns_resolver.h"
-#include <condition_variable>
-#include <optional>
-// <memory>, <unordered_map>, <atomic>, <mutex> provided by common.h
+// <memory>, <unordered_map>, <atomic>, <mutex>, <optional>, <condition_variable> provided by common.h
 
 class TlsClientContext;
 

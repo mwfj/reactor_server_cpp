@@ -1,9 +1,7 @@
 #include "observability/propagator.h"
 
-#include <algorithm>
-#include <array>
+#include "common.h"
 #include <set>
-#include <string_view>
 
 namespace OBSERVABILITY_NAMESPACE {
 

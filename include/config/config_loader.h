@@ -1,10 +1,7 @@
 #pragma once
 
 #include "config/server_config.h"
-#include <optional>
-#include <string>
-#include <stdexcept>
-#include <unordered_set>
+#include "common.h" // <optional>, <string>, <stdexcept> via common.h
 
 class ConfigLoader {
 public:

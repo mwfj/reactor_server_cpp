@@ -6,7 +6,6 @@
 #include "auth/auth_result.h"
 #include "auth/upstream_http_client.h"
 #include "observability/trace_context.h"  // IssueTraceContext (optional<>)
-#include <optional>
 // <string>, <vector>, <memory>, <functional>, <atomic>, <cstdint> via common.h
 
 namespace AUTH_NAMESPACE {

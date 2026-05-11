@@ -15,8 +15,7 @@
 #include "http/http_response.h"
 #include "observability/observability_snapshot.h"  // UpstreamTransactionLink
 #include "observability/trace_context.h"            // AttemptTraceContext / RequestTraceContext
-#include <optional>
-// <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono> provided by common.h
+// <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono>, <optional> provided by common.h
 
 // Forward declarations
 class UpstreamManager;

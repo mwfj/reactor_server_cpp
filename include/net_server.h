@@ -204,12 +204,6 @@ public:
     // (`IsOnDispatcherThread()` returns false on `conn_dispatcher_`'s own
     // thread), so the drain barrier engages cleanly.
     //
-    // Returns true if the task was enqueued; false if `conn_dispatcher_`
-    // is null (pre-MarkServerReady boot or post-Stop teardown), in which
-    // case the task is dropped and a warn is logged. Callers that key an
-    // idempotency CAS on this call (e.g. `stop_scheduled_`) MUST roll the
-    // CAS back on `false` so a retry can re-arm.
-    //
     // Residual TOCTOU: a `true` return is best-effort — the inner
     // `EnQueue` can no-op silently if the dispatcher stops between
     // the `was_stopped()` recheck here and the dispatcher's queue

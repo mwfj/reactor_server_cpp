@@ -40,10 +40,7 @@
 #include <openssl/evp.h>
 #include <openssl/bio.h>
 
-#include <string>
-#include <memory>
-#include <vector>
-#include <optional>
+#include "common.h"
 
 namespace AuthMultiIssuerTests {
 

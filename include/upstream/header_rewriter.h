@@ -1,8 +1,7 @@
 #pragma once
 
 #include "common.h"
-#include <optional>
-// <string>, <map>, <vector>, <utility> provided by common.h
+// <string>, <map>, <vector>, <utility>, <optional> provided by common.h
 
 // Forward declarations — the auth overlay is OPTIONAL per-call. Keeping
 // the header rewriter in its own translation unit free of auth-specific

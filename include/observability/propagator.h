@@ -23,8 +23,7 @@
 #include "observability/trace_state.h"
 
 #include "../common.h"
-#include <optional>
-// <map>, <string>, <string_view>, <utility>, <vector> via common.h
+// <map>, <string>, <string_view>, <utility>, <vector>, <optional> via common.h
 
 namespace OBSERVABILITY_NAMESPACE {
 
