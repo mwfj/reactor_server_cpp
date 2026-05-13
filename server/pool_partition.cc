@@ -428,22 +428,53 @@ void PoolPartition::DrainH2StreamWaitersForHost(
             return;
         }
         // TODO: wire UpstreamLease H2-kind ctor once ProxyTransaction
-        // migrates to UpstreamLease h2_lease_ (PR-2 follow-up, see
-        // HTTP2_UPSTREAM_PHASE_RECONCILIATION.md §2). Until then there
-        // is no caller of EnqueueH2StreamSlotWaiter in production, so
-        // this branch only fires if a future code path or test hands
-        // an H2_STREAM_SLOT waiter directly to the partition. Failing
-        // explicitly instead of vending an EMPTY lease (which
-        // OnCheckoutReady would treat as RESULT_CHECKOUT_FAILED) keeps
-        // the contract observable rather than producing a misleading
-        // success-then-immediate-failure shape.
-        logging::Get()->warn(
-            "PoolPartition::DrainH2StreamWaitersForHost: H2-lease "
-            "vending not yet wired upstream={}:{} — failing waiter with "
-            "CHECKOUT_CONNECT_FAILED (PR-2 follow-up)", upstream_name, port);
-        if (e.error_callback) {
-            e.error_callback(CHECKOUT_CONNECT_FAILED);
+        // migrates to UpstreamLease h2_lease_. No production caller of
+        // EnqueueH2StreamSlotWaiter today; requeue so a future enqueuer
+        // (or unit-test fixture) does not see spurious connect failures
+        // before the vending path lands. Cold-start dedup for ANY-kind
+        // waiters is covered by DrainAnyWaitersForFastH2.
+        wait_queue_.push_front(std::move(e));
+        return;
+    }
+}
+
+void PoolPartition::DrainAnyWaitersForFastH2() {
+    if (wait_queue_.empty()) return;
+    if (shutting_down_.load(std::memory_order_acquire) ||
+        manager_shutting_down_.load(std::memory_order_acquire)) {
+        return;
+    }
+    auto alive = alive_;
+
+    // Snapshot ANY-kind entries so a synchronous ready_callback (which
+    // re-enters TryDispatchExistingH2Session → DispatchH2 → possibly
+    // mem_recv2 → sink chain) cannot invalidate the iterator.
+    std::vector<WaitEntry> matched;
+    for (auto it = wait_queue_.begin(); it != wait_queue_.end(); ) {
+        if (it->kind == WaiterKind::ANY) {
+            if (IsEntryCancelled(*it)) {
+                it = wait_queue_.erase(it);
+                continue;
+            }
+            matched.push_back(std::move(*it));
+            it = wait_queue_.erase(it);
+        } else {
+            ++it;
         }
+    }
+
+    for (auto& e : matched) {
+        if (!alive->load(std::memory_order_acquire)) return;
+        if (shutting_down_.load(std::memory_order_acquire) ||
+            manager_shutting_down_.load(std::memory_order_acquire)) {
+            return;
+        }
+        // Empty lease — OnCheckoutReady tries TryDispatchExistingH2Session
+        // before falling through to RESULT_CHECKOUT_FAILED. The H2 fast
+        // path uses no pool slot; if the session disappeared between
+        // promotion and this drain, the fallback error path runs the
+        // existing retry logic.
+        if (e.ready_callback) e.ready_callback(UpstreamLease());
     }
 }
 
@@ -892,6 +923,10 @@ UpstreamH2Connection* PoolPartition::AcquireH2Connection(
     h2->AdoptLease(std::move(lease));
     h2->SetPartition(this);
     h2_table_.Insert(upstream_name, std::move(h2));
+    // Other ANY-kind waiters queued during the connect window now have a
+    // multiplexable session — short-circuit them through OnCheckoutReady's
+    // empty-lease H2 fast path. Mirrors the cold-start probe success site.
+    DrainAnyWaitersForFastH2();
     return raw;
 }
 
@@ -1786,10 +1821,27 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         return;
     }
     owned_uc->MarkInUse();
+    // Clear connect-timeout state before promotion. The probe-phase
+    // dispatcher timer still references this fd; without overwriting
+    // SetDeadline + nulling SetDeadlineTimeoutCb the timer's
+    // configured connect_timeout_ms eventually fires, sets *timed_out,
+    // and tears down a healthy multiplexed session.
+    if (auto t = uc_raw->GetTransport()) {
+        static constexpr auto FAR_FUTURE_H2 = std::chrono::hours(24 * 365);
+        t->SetDeadline(std::chrono::steady_clock::now() + FAR_FUTURE_H2);
+        t->SetDeadlineTimeoutCb(nullptr);
+    }
     active_conns_.push_back(std::move(owned_uc));
+    // Bump inflight_leases_ to match the lease handed to the H2 session.
+    // The eventual lease destructor (DestroyOnDispatcher step 5 or dtor
+    // safety-net) routes through ReturnConnection which fetch_sub's once.
+    // Without the matching add here the counter goes negative on every
+    // H2 cold-start promotion.
+    inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
     shell->AdoptLease(UpstreamLease(uc_raw, this, alive_));
 
     h2_table_.Insert(upstream_name, std::move(shell));
+    DrainAnyWaitersForFastH2();
     DrainH2StreamWaitersForHost(upstream_name, port);
 }
 

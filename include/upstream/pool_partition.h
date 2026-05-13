@@ -107,6 +107,14 @@ public:
     void DrainH2StreamWaitersForHost(const std::string& upstream_name,
                                      int port);
 
+    // Walk wait_queue_, fire empty-lease ready_cb for every ANY-kind
+    // entry. Each waiter's ProxyTransaction::OnCheckoutReady redirects
+    // empty-lease to TryDispatchExistingH2Session, multiplexing onto the
+    // session that just promoted. Called from ALPN-h2-success paths
+    // (cold-start dedup with `pool.max_connections` near 1) and from
+    // slot-release walks once a usable session exists.
+    void DrainAnyWaitersForFastH2();
+
     // Walk wait_queue_, fire `error_cb(connect_outcome)` for every
     // H2_STREAM_SLOT entry targeting (upstream_name, port). Called on
     // replacement-connect failure / ALPN-not-h2-under-prefer-always /
@@ -284,13 +292,14 @@ public:
     size_t H2TableCount() const { return h2_table_.TotalConnections(); }
     size_t H2ConnectingCount() const { return h2_connecting_conns_.size(); }
     size_t TotalCount() const {
-        // Multiplexed H2 sessions + in-flight H2 probes count against the
-        // partition's max_connections cap. Draining / pending-destroy
-        // entries are excluded — they no longer accept new work and
-        // would otherwise prevent admission of their replacements.
+        // H2 sessions hold their donated transport in active_conns_; H2
+        // probe shells hold theirs in connecting_conns_. Adding the
+        // h2_table_ / h2_connecting_conns_ sizes here would double-count
+        // every H2 transport against the partition's max_connections cap
+        // — with max_connections=1, a single multiplexed session would
+        // wedge replacement attempts forever.
         return idle_conns_.size() + active_conns_.size() +
-               connecting_conns_.size() + h2_table_.TotalConnections() +
-               h2_connecting_conns_.size();
+               connecting_conns_.size();
     }
     size_t WaitQueueSize() const { return wait_queue_.size(); }
 

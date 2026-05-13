@@ -416,9 +416,11 @@ UpstreamH2Connection::~UpstreamH2Connection() {
         nghttp2_session_del(session_);
         session_ = nullptr;
     }
-    // No MarkClosing here — the dtor scenario is "drop without
-    // teardown"; the lease dtor running on this thread already
-    // routes the transport back via ReturnConnection.
+    // Poison the transport so the eventual ~UpstreamLease lease_
+    // (member destruct order) routes ReturnConnection through
+    // DestroyConnection instead of returning a transport that just
+    // received a GOAWAY frame to the H1 idle pool.
+    if (transport_) transport_->MarkClosing();
 }
 
 bool UpstreamH2Connection::Init() {
@@ -981,6 +983,9 @@ void UpstreamH2Connection::RunDeferredEraseWalk() {
     if (slot_freed && partition_ && transport_ && !dead_ && !goaway_seen_) {
         partition_->DrainH2StreamWaitersForHost(
             partition_->service_name(), transport_->upstream_port());
+        // ANY-kind waiters (TotalCount-cap dedup) can multiplex onto the
+        // freshly-vacated slot via the empty-lease fast path.
+        partition_->DrainAnyWaitersForFastH2();
     }
 }
 

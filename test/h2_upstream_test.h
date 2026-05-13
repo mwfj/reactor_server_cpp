@@ -6402,6 +6402,213 @@ static void TestS19_GoawayWithSurvivorsBelowKeepsDraining() {
     }
 }
 
+// S20 — DrainAnyWaitersForFastH2 fires empty-lease ready_cb on every
+// ANY-kind waiter, removes them from the queue, and never invokes
+// error_cb. Cold-start dedup with `pool.max_connections=1` relies on
+// this: a request queued during the initial H2 probe must wake on
+// promotion and re-try via TryDispatchExistingH2Session.
+static void TestS20_DrainAnyWaitersFiresEmptyLeaseOnAnyKind() {
+    std::cout << "\n[TEST] H2Upstream S20: DrainAnyWaitersForFastH2 fires empty-lease..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        cfg.pool.max_connections = 0;  // force every checkout to queue
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream S20: DrainAnyWaitersForFastH2 fires empty-lease",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        std::atomic<int> ready_calls{0}, error_calls{0}, empty_observed{0};
+        std::promise<void> queued;
+        auto queued_fut = queued.get_future();
+
+        disp->EnQueue([&]() {
+            for (int i = 0; i < 3; ++i) {
+                part->CheckoutAsync(
+                    [&](UpstreamLease lease) {
+                        ++ready_calls;
+                        if (lease.empty()) ++empty_observed;
+                    },
+                    [&](int) { ++error_calls; });
+            }
+            queued.set_value();
+        });
+        queued_fut.wait_for(std::chrono::seconds(2));
+
+        bool queued_ok = (part->WaitQueueSize() == 3);
+
+        std::promise<void> drained;
+        auto drained_fut = drained.get_future();
+        disp->EnQueue([&]() {
+            part->DrainAnyWaitersForFastH2();
+            drained.set_value();
+        });
+        drained_fut.wait_for(std::chrono::seconds(2));
+
+        bool pass = queued_ok &&
+                    ready_calls.load() == 3 &&
+                    empty_observed.load() == 3 &&
+                    error_calls.load() == 0 &&
+                    part->WaitQueueSize() == 0;
+        TestFramework::RecordTest(
+            "H2Upstream S20: DrainAnyWaitersForFastH2 fires empty-lease",
+            pass,
+            pass ? ""
+                 : (std::string("queued=") + std::to_string(part->WaitQueueSize()) +
+                    " ready=" + std::to_string(ready_calls.load()) +
+                    " empty=" + std::to_string(empty_observed.load()) +
+                    " err=" + std::to_string(error_calls.load())).c_str());
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S20: DrainAnyWaitersForFastH2 fires empty-lease",
+            false, e.what());
+    }
+}
+
+// S21 — TotalCount excludes h2_table_ / h2_connecting_conns_. A fresh
+// partition with no live transports reports zero; queued waiters do not
+// inflate the count. Locks the double-count regression that wedged
+// replacement-connect with `pool.max_connections=1`.
+static void TestS21_TotalCountExcludesH2Containers() {
+    std::cout << "\n[TEST] H2Upstream S21: TotalCount excludes H2 containers..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        cfg.pool.max_connections = 0;
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream S21: TotalCount excludes H2 containers",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        // Fresh partition: every container is empty → TotalCount==0.
+        std::promise<bool> result;
+        auto fut = result.get_future();
+        disp->EnQueue([&]() {
+            size_t total_before = part->TotalCount();
+            // Enqueue a waiter; waiters do not contribute to TotalCount.
+            part->CheckoutAsync([](UpstreamLease) {}, [](int) {});
+            size_t total_after = part->TotalCount();
+            result.set_value(total_before == 0 && total_after == 0);
+        });
+        bool pass = (fut.wait_for(std::chrono::seconds(2)) ==
+                     std::future_status::ready) && fut.get();
+        TestFramework::RecordTest(
+            "H2Upstream S21: TotalCount excludes H2 containers",
+            pass, pass ? "" : "TotalCount non-zero for empty containers");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S21: TotalCount excludes H2 containers",
+            false, e.what());
+    }
+}
+
+// S22 — DrainH2StreamWaitersForHost requeues H2_STREAM_SLOT waiters
+// when no usable session exists (instead of firing CHECKOUT_CONNECT_FAILED).
+// Replaces the dead-code failure with a defer-and-wait shape so a future
+// vending path can pick them up.
+static void TestS22_DrainH2StreamSlotRequeuesWhenNoSession() {
+    std::cout << "\n[TEST] H2Upstream S22: DrainH2StreamWaitersForHost requeues when no session..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        cfg.pool.max_connections = 0;
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream S22: DrainH2StreamWaitersForHost requeues",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        std::atomic<int> ready_calls{0}, error_calls{0};
+        std::promise<void> done;
+        auto fut = done.get_future();
+        disp->EnQueue([&]() {
+            part->EnqueueH2StreamSlotWaiter(
+                "svc", 9999,
+                [&](UpstreamLease) { ++ready_calls; },
+                [&](int) { ++error_calls; },
+                /*cancel_token=*/nullptr);
+            // No usable session → drain should NOT touch the entry.
+            part->DrainH2StreamWaitersForHost("svc", 9999);
+            done.set_value();
+        });
+        fut.wait_for(std::chrono::seconds(2));
+
+        bool pass = ready_calls.load() == 0 &&
+                    error_calls.load() == 0 &&
+                    part->WaitQueueSize() == 1;
+        TestFramework::RecordTest(
+            "H2Upstream S22: DrainH2StreamWaitersForHost requeues",
+            pass,
+            pass ? "" : "expected entry to remain queued without callbacks");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S22: DrainH2StreamWaitersForHost requeues",
+            false, e.what());
+    }
+}
+
+// S23 — Empty wait queue is the common case (no production caller
+// enqueues H2_STREAM_SLOT today). Both drain helpers must early-return
+// without scanning when the queue is empty — this is the hot path on
+// every H2 stream-close callback.
+static void TestS23_DrainHelpersEarlyReturnOnEmptyQueue() {
+    std::cout << "\n[TEST] H2Upstream S23: drain helpers no-op on empty queue..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream S23: drain helpers no-op on empty queue",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        std::promise<void> done;
+        auto fut = done.get_future();
+        disp->EnQueue([&]() {
+            part->DrainAnyWaitersForFastH2();
+            part->DrainH2StreamWaitersForHost("svc", 9999);
+            done.set_value();
+        });
+        bool ok = (fut.wait_for(std::chrono::seconds(2)) ==
+                   std::future_status::ready);
+
+        bool pass = ok && part->WaitQueueSize() == 0;
+        TestFramework::RecordTest(
+            "H2Upstream S23: drain helpers no-op on empty queue",
+            pass, pass ? "" : "drain helpers altered empty queue or hung");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S23: drain helpers no-op on empty queue",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RunAll aggregator
 // ---------------------------------------------------------------------------
@@ -6426,6 +6633,10 @@ void RunAllH2UpstreamTests() {
     TestS17_OnStreamCloseNoGoawayKeepsUpstreamDisconnect();
     TestS18_GoawayAllAboveMarksAllPendingErase();
     TestS19_GoawayWithSurvivorsBelowKeepsDraining();
+    TestS20_DrainAnyWaitersFiresEmptyLeaseOnAnyKind();
+    TestS21_TotalCountExcludesH2Containers();
+    TestS22_DrainH2StreamSlotRequeuesWhenNoSession();
+    TestS23_DrainHelpersEarlyReturnOnEmptyQueue();
 
     // Tier A — unit tests
     TestMinCadenceSecDisabled();

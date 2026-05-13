@@ -944,6 +944,13 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
 
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn) {
+        // Empty lease from DrainAnyWaitersForFastH2 — a multiplexed
+        // session became usable while we were queued. Re-try the H2
+        // fast path; on miss (session gone, prefer disagrees, etc.)
+        // fall through to the existing error/retry surface.
+        if (TryDispatchExistingH2Session()) {
+            return;
+        }
         ReleaseBreakerAdmissionNeutral();
         if (DeliverPendingRetryable5xxResponse("checkout_empty_lease")) {
             return;
