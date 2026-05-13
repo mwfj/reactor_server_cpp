@@ -14,21 +14,20 @@
 //   finalizers_in_progress_  — bumped at FinalizeFromSnapshot entry,
 //                              decremented before return; signaled on
 //                              finalizers_done_cv_.
-//   kill_marshals_in_flight_ — RESERVED for a future per-dispatcher
-//                              kill-marshal path. Today
-//                              KillOutstandingSnapshots invokes
-//                              Span::DropWithoutEnd inline from the
-//                              stopper thread (DropWithoutEnd is
-//                              off-thread-safe — flips an atomic flag
-//                              only; vector/shared_ptr cleanup runs in
-//                              the destructor when the last shared_ptr
-//                              releases, bounded by dispatcher stop).
-//                              The counter stays at 0 today and
-//                              is consulted by WaitForAllAsyncDrain so
-//                              the predicate is forward-compatible
-//                              with any future marshal step that bumps
-//                              it before EnQueue + decrements when the
-//                              closure runs.
+//   kill_marshals_in_flight_ — bumped under finalizers_done_mtx_ in
+//                              KillOutstandingSnapshots when a snapshot
+//                              has an `owning_dispatcher` and the kill
+//                              must marshal off-thread; decremented by
+//                              the RAII guard inside the EnQueueDelayed
+//                              closure (also under finalizers_done_mtx_)
+//                              and signaled on finalizers_done_cv_.
+//                              Snapshots with no dispatcher OR whose
+//                              dispatcher is the current loop thread
+//                              run inline and never touch this counter.
+//                              The drain barrier in
+//                              WaitForAllAsyncDrain reads this counter
+//                              to wait for marshaled kill closures to
+//                              complete before declaring drain done.
 //
 // BeginShutdown(t) signals shutdown to the SpanProcessor and the
 // PeriodicMetricReader (when registered via RegisterMetricReader) and
@@ -202,11 +201,14 @@ public:
     void BeginShutdown(std::chrono::milliseconds timeout);
 
     // Iterates live_snapshots_ and CAS-wins a terminal event on every
-    // snapshot that survived the drain. Off-dispatcher marshals via
-    // EnQueue with weak_from_this() capture; self-dispatcher kills run
-    // inline. The kill flag on the linked ProxyTransaction is published
-    // before the EnQueue so terminal callbacks can short-circuit
-    // Span::End on shutdown.
+    // snapshot that survived the drain. Cross-thread snapshots (owning
+    // dispatcher != calling thread) are marshalled via
+    // `EnQueueDelayed(fn, 0ms)` with `kill_marshals_in_flight_` bumped
+    // before enqueue and decremented from inside the closure (RAII guard
+    // covers every exit path). Snapshots with no `owning_dispatcher` or
+    // owned by the stopper thread itself run inline. The kill flag on
+    // the linked ProxyTransaction is published from inside the kill body
+    // so terminal callbacks can short-circuit Span::End on shutdown.
     void KillOutstandingSnapshots(std::chrono::milliseconds grace);
 
     // Apply the live-reloadable subset of `new_config`. Master `enabled`
@@ -255,6 +257,15 @@ public:
         return snapshots_finalized_via_dtor_.load(std::memory_order_acquire);
     }
 
+    // Diagnostic accessor — cumulative count of `http.client.active_requests`
+    // -1s emitted via the kill-loop OR the ObservabilitySnapshot dtor
+    // backstop (combined). Healthy runs keep this at 0; kill paths
+    // increment it by N when N transactions are drained.
+    uint64_t client_active_decremented_via_kill_or_dtor() const noexcept {
+        return client_active_decremented_via_kill_or_dtor_.load(
+            std::memory_order_relaxed);
+    }
+
     // Signaled by every finalize / kill decrement; the call site uses it
     // to wake from the drain wait.
     std::condition_variable& finalizers_done_cv() noexcept {
@@ -271,6 +282,18 @@ private:
                           std::shared_ptr<RandomSource>   random);
 
     void Init();
+
+    // CAS-drains residual http.client.active_requests +1s for a single
+    // snapshot, emitting one aggregated -N. Called from
+    // ~ObservabilitySnapshot (both branches) and KillOutstandingSnapshots.
+    void DrainResidualClientActive(ObservabilitySnapshot& snap) noexcept;
+
+    // Inline kill path — runs the full per-snapshot kill body (link_mtx +
+    // CAS finalize + tx->MarkKilledForShutdown + DropWithoutEnd + drain).
+    // Called from KillOutstandingSnapshots either directly (no dispatcher
+    // or self-dispatcher) or from the EnQueueDelayed closure (cross-thread
+    // marshal).
+    void KillSnapshotInline(ObservabilitySnapshot& snap) noexcept;
 
     std::shared_ptr<const Sampler> BuildSamplerFromConfig() const;
 
@@ -363,22 +386,22 @@ private:
                         std::weak_ptr<ObservabilitySnapshot>>
                                                  live_snapshots_;
     std::atomic<int64_t> inflight_finalizations_{0};
-    // RESERVED — no incrementer/decrementer in production code today.
+    // Cross-thread per-dispatcher kill marshal counter.
     //
-    // `KillOutstandingSnapshots` invokes `Span::DropWithoutEnd` inline
-    // from the stopper thread regardless of the snapshot's
-    // `owning_dispatcher`. This is safe by design: `DropWithoutEnd`
-    // only flips the dropped_ atomic and never reads or writes the
-    // Span's non-atomic state. The CAS-under-`link_mtx_` +
-    // `MarkKilledForShutdown` + `DeregisterAndDecrement` sequence is
-    // invariant-safe across any dispatcher topology.
+    // `KillOutstandingSnapshots` walks live snapshots from the stopper
+    // thread. When a snapshot has an `owning_dispatcher` that differs
+    // from the calling thread, the per-snapshot kill body is marshalled
+    // onto that dispatcher via `EnQueueDelayed(fn, 0ms)`; the bump
+    // happens synchronously before enqueue and the matching decrement
+    // happens from inside the closure (RAII guard ensures every exit
+    // path drains the bump). Snapshots with no `owning_dispatcher` or
+    // owned by the stopper thread itself run inline (counter untouched).
     //
     // The counter is consulted by `HttpServer::WaitForAllAsyncDrain` so
-    // the predicate is forward-compatible with a future per-dispatcher
-    // marshal step (e.g. if `Span::DropWithoutEnd` ever gains non-atomic
-    // mutation that requires owning-dispatcher serialisation). Such a
-    // marshal would bump the counter before `EnQueue` and decrement
-    // when the closure runs.
+    // the drain barrier waits for both in-flight finalizers AND queued
+    // kill marshals before declaring observability quiescent. Bump and
+    // decrement are both serialised against `finalizers_done_mtx_` to
+    // close the lost-wakeup window on `finalizers_done_cv_`.
     std::atomic<int64_t> kill_marshals_in_flight_{0};
     std::atomic<int64_t> finalizers_in_progress_{0};
 
@@ -397,6 +420,13 @@ private:
     // code paths should never trigger this; CI / load tests can read
     // the counter and assert it stays at 0 after every drain.
     std::atomic<int64_t> snapshots_finalized_via_dtor_{0};
+
+    // Diagnostic — cumulative count of http.client.active_requests
+    // -1s emitted via the kill-loop OR the snapshot dtor backstop.
+    // FinalizeAttemptSpan winners (the natural finalize path) do NOT
+    // increment this — only the residual-drain paths. Healthy runs
+    // keep this at 0.
+    std::atomic<uint64_t> client_active_decremented_via_kill_or_dtor_{0};
 
     // Friended so the snapshot dtor (defined in
     // observability_manager.cc) can bump the diagnostic counter

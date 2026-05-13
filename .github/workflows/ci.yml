@@ -210,7 +210,11 @@ jobs:
             obs_auth_trace \
             obs_catalog \
             obs_kill_marshal \
-            obs_ws_messages ; do
+            obs_ws_messages \
+            obs_self_metrics \
+            obs_connection_metrics \
+            obs_pool_gauges \
+            obs_middleware_metrics ; do
             echo "::group::test_runner $suite"
             ./test_runner "$suite"
             echo "::endgroup::"
@@ -306,3 +310,19 @@ jobs:
         # install-once rebind reject — all on dispatcher-driven socket I/O,
         # so kqueue vs epoll scheduling differences can surface here.
         run: ./test_runner obs_ws_messages
+      - name: Test - obs_connection_metrics (transport + protocol gauges)
+        # Boots a real HttpServer and verifies the four connection-level
+        # metrics — reactor.net.connections.{active,accepted},
+        # reactor.http.connections.active{protocol}, and the WS handoff
+        # transition. Socket-bound; the accept/close decrement symmetry is
+        # platform-sensitive on kqueue vs epoll because the EOF coalescing
+        # rules differ.
+        run: ./test_runner obs_connection_metrics
+      - name: Test - obs_pool_gauges (upstream pool gauges + checkout histogram)
+        # Boots a real gateway + backend HttpServer pair. Exercises every
+        # PoolPartition transition site (OnConnectComplete success,
+        # ReturnConnection active->idle, CheckoutAsync idle-reuse,
+        # OnConnectionClosed, EvictExpired, InitiateShutdown) via real
+        # socket I/O — kqueue vs epoll EOF coalescing affects when the
+        # idle keepalive's reap fires.
+        run: ./test_runner obs_pool_gauges

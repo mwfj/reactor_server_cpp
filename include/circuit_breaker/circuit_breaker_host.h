@@ -4,9 +4,14 @@
 #include "config/server_config.h"
 #include "circuit_breaker/circuit_breaker_slice.h"
 #include "circuit_breaker/retry_budget.h"
+#include "observability/common.h"
 // <memory>, <string>, <vector> provided by common.h
 
 class Dispatcher;
+
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+}  // namespace OBSERVABILITY_NAMESPACE
 
 namespace CIRCUIT_BREAKER_NAMESPACE {
 
@@ -57,11 +62,18 @@ public:
     // in the server — typically NetServer's socket worker count or
     // upstream pool's partition count. One slice is created per
     // partition up-front.
+    // `obs_manager` is the gateway-wide observability manager (nullable).
+    // Used at construction time to emit the per-slice baseline `+1` on
+    // reactor.circuit_breaker.state{state=closed}. Not stored beyond the
+    // ctor body once the baseline emit is done, but kept on the host so
+    // future per-host emit sites can reuse it.
     CircuitBreakerHost(std::string service_name,
                        std::string host,
                        int port,
                        size_t partition_count,
-                       const CircuitBreakerConfig& config);
+                       const CircuitBreakerConfig& config,
+                       OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager
+                           = nullptr);
 
     CircuitBreakerHost(const CircuitBreakerHost&) = delete;
     CircuitBreakerHost& operator=(const CircuitBreakerHost&) = delete;

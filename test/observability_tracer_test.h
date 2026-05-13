@@ -52,7 +52,8 @@ struct Bench {
     explicit Bench(std::shared_ptr<const Sampler> sampler =
                        std::make_shared<AlwaysOnSampler>())
         : provider(std::make_unique<TracerProvider>(
-              resource, processor, std::move(sampler), random)) {}
+              resource, processor, std::move(sampler), random,
+              /*manager=*/nullptr)) {}
 
     Tracer* tracer() { return provider->GetTracer("test", "1.0"); }
 };

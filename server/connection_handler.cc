@@ -3,6 +3,9 @@
 #include "tls/tls_connection.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 
 ConnectionHandler::ConnectionHandler(std::shared_ptr<Dispatcher> _dispatcher, std::unique_ptr<SocketHandler> _sock)
     : event_dispatcher_(_dispatcher), sock_(std::move(_sock))
@@ -14,7 +17,59 @@ ConnectionHandler::ConnectionHandler(std::shared_ptr<Dispatcher> _dispatcher, st
 
 // Out-of-line destructor: unique_ptr<TlsConnection> requires complete type.
 // TlsConnection is forward-declared in the header; full definition is available here.
-ConnectionHandler::~ConnectionHandler() = default;
+ConnectionHandler::~ConnectionHandler() {
+    // Symmetric decrements for the accept-time +1 and any
+    // protocol-confirmed +1 still in flight. Run unconditionally — the
+    // latch flag protects against double-decrement, and operating on a
+    // cached instrument pointer keeps the dtor independent of whether
+    // the manager's catalog has been swapped since AttachTransportObservability.
+    if (net_active_incremented_ && net_active_counter_ != nullptr) {
+        net_active_counter_->Add(-1.0, {});
+    }
+    if (http_protocol_label_ != nullptr && http_active_counter_ != nullptr) {
+        http_active_counter_->Add(-1.0,
+            {{"protocol", http_protocol_label_}});
+    }
+}
+
+void ConnectionHandler::AttachTransportObservability(
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* mgr) {
+    if (net_active_incremented_) return;
+    if (mgr == nullptr) return;
+    net_active_incremented_ = true;  // set before side effects (mirrors bound_once_ pattern)
+    const auto& cat = mgr->catalog();
+    net_active_counter_     = cat.reactor_net_connections_active;
+    net_accepted_counter_   = cat.reactor_net_connections_accepted;
+    http_active_counter_    = cat.reactor_http_connections_active;
+    tls_handshakes_counter_ = cat.reactor_tls_handshakes;
+    if (net_active_counter_   != nullptr) net_active_counter_->Add(1.0, {});
+    if (net_accepted_counter_ != nullptr) net_accepted_counter_->Add(1.0, {});
+}
+
+void ConnectionHandler::MarkApplicationProtocolConfirmed(
+        const char* protocol_label) {
+    if (protocol_label == nullptr) return;
+    if (http_protocol_label_ != nullptr) {
+        logging::Get()->error(
+            "MarkApplicationProtocolConfirmed called twice — old={}, new={}, fd={}",
+            http_protocol_label_, protocol_label, fd());
+        return;
+    }
+    http_protocol_label_ = protocol_label;
+    if (http_active_counter_ != nullptr) {
+        http_active_counter_->Add(1.0,
+            {{"protocol", http_protocol_label_}});
+    }
+}
+
+void ConnectionHandler::HandOffToWebSocket() {
+    if (http_protocol_label_ == nullptr) return;
+    if (http_active_counter_ != nullptr) {
+        http_active_counter_->Add(-1.0,
+            {{"protocol", http_protocol_label_}});
+    }
+    http_protocol_label_ = nullptr;
+}
 
 void ConnectionHandler::RegisterCallbacks(){
     // Use weak_ptr to avoid keeping ConnectionHandler alive via callbacks
@@ -132,6 +187,9 @@ void ConnectionHandler::OnMessage(){
         if (result == TlsConnection::TLS_COMPLETE) {
             tls_state_ = TlsState::READY;
             tls_just_ready = true;
+            if (tls_handshakes_counter_ != nullptr) {
+                tls_handshakes_counter_->Add(1.0, {{"outcome", "success"}});
+            }
             // Handshake complete, fall through to read any buffered data
         } else if (result == TlsConnection::TLS_WANT_READ) {
             // Want read — already enabled
@@ -143,6 +201,9 @@ void ConnectionHandler::OnMessage(){
         } else {
             // Handshake failed — use CallCloseCb for proper cleanup
             logging::Get()->warn("TLS handshake failed fd={}", fd());
+            if (tls_handshakes_counter_ != nullptr) {
+                tls_handshakes_counter_->Add(1.0, {{"outcome", "failure"}});
+            }
             CallCloseCb();
             return;
         }
@@ -859,6 +920,9 @@ void ConnectionHandler::CallWriteCb(){
         if (result == TlsConnection::TLS_COMPLETE) {
             tls_state_ = TlsState::READY;
             tls_ready_from_write_ = true;  // signal OnMessage to fire callback
+            if (tls_handshakes_counter_ != nullptr) {
+                tls_handshakes_counter_->Add(1.0, {{"outcome", "success"}});
+            }
             // Handshake complete — OpenSSL may have buffered application data.
             OnMessage();
             // OnMessage may have closed the channel
@@ -875,6 +939,9 @@ void ConnectionHandler::CallWriteCb(){
             return;
         } else {
             // Handshake error — use CallCloseCb for proper cleanup
+            if (tls_handshakes_counter_ != nullptr) {
+                tls_handshakes_counter_->Add(1.0, {{"outcome", "failure"}});
+            }
             CallCloseCb();
             return;
         }

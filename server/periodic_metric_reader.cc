@@ -2,15 +2,21 @@
 
 #include "common.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/histogram.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 
 PeriodicMetricReader::PeriodicMetricReader(
     MeterProvider*                  provider,
     std::shared_ptr<MetricExporter> exporter,
-    MeterReaderOptions              options)
+    MeterReaderOptions              options,
+    ObservabilityManager*           manager)
     : provider_(provider),
       exporter_(std::move(exporter)),
+      manager_(manager),
       interval_ns_(options.export_interval.count() * 1'000'000),
       timeout_ns_(options.export_timeout.count() * 1'000'000) {
     // See BatchSpanProcessor for the rationale on publish-before-launch.
@@ -54,6 +60,7 @@ void PeriodicMetricReader::WorkerLoop() {
             // Snapshot the provider's current series state and hand to
             // exporter. The snapshot is a consistent point-in-time view
             // produced under the provider's series-map lock.
+            const auto t0 = std::chrono::steady_clock::now();
             try {
                 MetricsSnapshot snap = provider_->Snapshot();
                 const auto deadline = std::chrono::steady_clock::now() +
@@ -67,6 +74,27 @@ void PeriodicMetricReader::WorkerLoop() {
             } catch (...) {
                 logging::Get()->error(
                     "PeriodicMetricReader::Export threw unknown exception");
+            }
+            // Self-metric: per-shard atomic write; emits even on
+            // exception so duration always covers the attempt.
+            if (manager_ != nullptr) {
+                const auto& cat = manager_->catalog();
+                if (cat.reactor_otel_export_duration != nullptr) {
+                    const double elapsed_s =
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t0).count();
+                    cat.reactor_otel_export_duration->Record(
+                        elapsed_s, {{"signal", "metrics"}});
+                }
+            }
+        } else {
+            // Self-metric: bump skip counter so operators see SIGHUP-
+            // driven metrics.enabled=false dampening the push side.
+            if (manager_ != nullptr) {
+                const auto& cat = manager_->catalog();
+                if (cat.reactor_otel_metrics_export_skipped != nullptr) {
+                    cat.reactor_otel_metrics_export_skipped->Add(1.0, {});
+                }
             }
         }
 

@@ -2419,6 +2419,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             (parser_.GetRequest().http_minor == 0 || parser_.GetRequest().http_minor == 1)) {
             current_http_minor_.store(parser_.GetRequest().http_minor,
                                        std::memory_order_release);
+            conn_->MarkApplicationProtocolConfirmed("http/1.1");
         }
 
         if (parser_.HasError()) {

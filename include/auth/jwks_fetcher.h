@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "observability/common.h"
 // <string>, <memory>, <functional>, <atomic> via common.h
 
 namespace AUTH_NAMESPACE {
@@ -76,6 +77,16 @@ class JwksFetcher {
     // dispatcher that owns the fetcher.
     void CancelInflight();
 
+    // Wire the observability manager so terminal fetch outcomes emit
+    // reactor.auth.jwks_refreshes{issuer, outcome}. Nullable. Set once
+    // at AuthManager construction time after the issuer's fetcher is
+    // built; never re-set per-fetch. Captured by value into completion
+    // closures so the pointer stays stable across the in-flight window.
+    void SetObservabilityManager(
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept {
+        obs_manager_ = obs_manager;
+    }
+
  private:
     std::string issuer_name_;
     std::shared_ptr<UpstreamHttpClient> client_;
@@ -85,6 +96,12 @@ class JwksFetcher {
 
     // Cancel token for the in-flight call (per current cycle).
     std::shared_ptr<std::atomic<bool>> cancel_token_;
+
+    // Non-owning. Lifetime is bounded by AuthManager (which owns the
+    // Issuer that owns this fetcher). Captured by value into the
+    // dispatcher-thread completion lambda so the indirection is one
+    // pointer load on the emit fast path.
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
 };
 
 }  // namespace AUTH_NAMESPACE

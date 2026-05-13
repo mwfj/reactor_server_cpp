@@ -21,6 +21,12 @@ WebSocketConnection::~WebSocketConnection() {
         active_connections_counter_->Add(-1.0, {});
         active_counted_ = false;
     }
+    if (ws_protocol_active_counted_ &&
+        http_connections_active_counter_ != nullptr) {
+        http_connections_active_counter_->Add(-1.0,
+            {{"protocol", "websocket"}});
+        ws_protocol_active_counted_ = false;
+    }
 }
 
 void WebSocketConnection::OnMessage(MessageCallback callback) { callbacks_.message_callback = std::move(callback); }
@@ -389,11 +395,25 @@ void WebSocketConnection::SetObservabilitySnapshot(
     const auto& cat = obs_manager_->catalog();
     frames_counter_             = cat.reactor_websocket_frames;
     active_connections_counter_ = cat.reactor_websocket_active_connections;
+    http_connections_active_counter_ = cat.reactor_http_connections_active;
     // Bump reactor.websocket.active_connections; the matching -1 runs
     // in the dtor under the `active_counted_` latch.
     if (active_connections_counter_ != nullptr) {
         active_connections_counter_->Add(1.0, {});
         active_counted_ = true;
+    }
+    // Bump reactor.http.connections.active{protocol=websocket}; the
+    // matching -1 runs in the dtor under `ws_protocol_active_counted_`.
+    // WS upgrade transition: SetObservabilitySnapshot (ws +1) runs
+    // BEFORE the upgrade_callback (h1 -1 via HandOffToWebSocket). The
+    // transient window shows sum(http.connections.active{protocol=*})
+    // at +1 above baseline. Both emits run on the same dispatcher
+    // thread, so /metrics scrapes see either pre- or post-transition
+    // state — never the transient.
+    if (http_connections_active_counter_ != nullptr) {
+        http_connections_active_counter_->Add(1.0,
+            {{"protocol", "websocket"}});
+        ws_protocol_active_counted_ = true;
     }
 }
 

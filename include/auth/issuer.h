@@ -168,6 +168,13 @@ class Issuer : public std::enable_shared_from_this<Issuer> {
 
     JwksCache* jwks_cache() noexcept { return jwks_cache_.get(); }
 
+    // Direct accessor for the JWKS fetcher. Used by AuthManager at
+    // construction time to wire the observability manager. Returns
+    // nullptr only for the brief window between Issuer destruction and
+    // the unique_ptr reset — production callers always hold the issuer
+    // alive via shared_ptr.
+    JwksFetcher* jwks_fetcher() noexcept { return jwks_fetcher_.get(); }
+
     // Returns nullptr for JWT-mode issuers (cache is constructed in Start()
     // only when mode == "introspection").
     IntrospectionCache* introspection_cache() noexcept {

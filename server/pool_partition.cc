@@ -8,6 +8,10 @@
 #include "tls/tls_connection.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include "observability/counter.h"
+#include "observability/histogram.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 #include <future>
 
 // ── UpstreamLease out-of-line definitions ──────────────────────────────
@@ -47,13 +51,15 @@ PoolPartition::PoolPartition(
     std::atomic<int64_t>& inflight_leases,
     std::atomic<bool>& manager_shutting_down,
     std::mutex& drain_mtx,
-    std::condition_variable& drain_cv)
+    std::condition_variable& drain_cv,
+    const std::string& service_name)
     : dispatcher_(std::move(dispatcher))
     , upstream_host_(upstream_host)
     , upstream_port_(upstream_port)
     , sni_hostname_(sni_hostname)
     , config_(config)
     , tls_ctx_(std::move(tls_ctx))
+    , service_name_(service_name)
     , resolved_endpoint_(std::move(resolved_endpoint))
     , outstanding_conns_(outstanding_conns)
     , inflight_leases_(inflight_leases)
@@ -118,6 +124,16 @@ PoolPartition::~PoolPartition() {
     auto on_dispatcher = [this]() {
         // On dispatcher thread — single-threaded, no concurrent mutation.
         // Safe to walk containers and touch connection transports.
+        //
+        // Null obs_manager_ FIRST. In HttpServer's declaration order,
+        // observability_manager_ is destroyed BEFORE upstream_manager_
+        // (declared later, destructs first). The production path is safe
+        // (Stop() runs while obs is alive), but this safety-net path fires
+        // after ~ObservabilityManager may have already run. Zeroing the
+        // pointer here ensures every emit helper's null-guard on obs_manager_
+        // fires and no calls reach a destroyed ObservabilityManager.
+        obs_manager_ = nullptr;
+        //
         // Drop H2 sessions FIRST so their nghttp2_session destructors
         // run before the underlying transports get their callbacks
         // nulled (the H2 connection's lease destructor returns the
@@ -265,6 +281,12 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
             std::chrono::steady_clock::now() + FAR_FUTURE_CHECKOUT);
         UpstreamConnection* raw = conn.get();
         active_conns_.push_back(std::move(conn));
+        // idle->active transition: pair both emits before the user callback
+        // so a callback that tears the partition down still leaves the
+        // gauges consistent. Histogram fires with ~0 duration (immediate).
+        EmitIdleGaugeDelta(-1.0);
+        EmitActiveGaugeDelta(+1.0);
+        EmitCheckoutWaitDuration(0.0, "immediate");
         // Bump inflight_leases_ BEFORE handing the lease to the caller.
         // ReturnConnection (called from ~UpstreamLease) decrements.
         inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
@@ -313,17 +335,22 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
     }
 
     // 4. Queue full — reject
+    EmitCheckoutWaitDuration(0.0, "rejected");
     error_cb(CHECKOUT_POOL_EXHAUSTED);
 }
 
 size_t PoolPartition::PurgeCancelledWaitEntries() {
     size_t before = wait_queue_.size();
+    auto now = std::chrono::steady_clock::now();
     // std::deque supports erase via iterators; walk forward and erase
     // cancelled entries in place. Callbacks are NOT fired — a cancelled
     // checkout's owning transaction has already been torn down via the
     // framework abort hook and does not expect any completion.
     for (auto it = wait_queue_.begin(); it != wait_queue_.end(); ) {
         if (IsEntryCancelled(*it)) {
+            auto cancelled_dur = std::chrono::duration_cast<
+                std::chrono::duration<double>>(now - it->queued_at);
+            EmitCheckoutWaitDuration(cancelled_dur.count(), "cancelled");
             it = wait_queue_.erase(it);
         } else {
             ++it;
@@ -374,6 +401,8 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // flag and the partition's enqueued InitiateShutdown can re-enter the pool
     // and start new upstream work after Stop() has begun.
     if (shutting_down_ || manager_shutting_down_.load(std::memory_order_acquire)) {
+        // active -> destroy (connection leaves active; never enters idle)
+        EmitActiveGaugeDelta(-1.0);
         DestroyConnection(std::move(owned));
         return;
     }
@@ -383,6 +412,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // stale request bytes in the transport's output buffer), destroy it instead
     // of returning to idle.
     if (owned->IsClosing()) {
+        EmitActiveGaugeDelta(-1.0);
         DestroyConnection(std::move(owned));
         CreateForWaiters();
         return;
@@ -405,6 +435,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
     // connection is destroyed + a fresh-endpoint replacement is created
     // for any queued waiter via CreateForWaiters.
     if (!ConnectionEndpointMatches(*owned)) {
+        EmitActiveGaugeDelta(-1.0);
         DestroyConnection(std::move(owned));
         CreateForWaiters();
         return;
@@ -419,6 +450,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
 
     // Check if expired
     if (owned->IsExpired(config_.max_lifetime_sec, config_.max_requests_per_conn)) {
+        EmitActiveGaugeDelta(-1.0);
         DestroyConnection(std::move(owned));
         CreateForWaiters();
         return;
@@ -435,8 +467,16 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         // — otherwise a cancelled front-of-queue entry would "consume"
         // the returning connection by being silently dropped while
         // still blocking any live waiter behind it.
-        while (!wait_queue_.empty() && IsEntryCancelled(wait_queue_.front())) {
-            wait_queue_.pop_front();
+        {
+            auto now = std::chrono::steady_clock::now();
+            while (!wait_queue_.empty() &&
+                   IsEntryCancelled(wait_queue_.front())) {
+                auto cancelled_dur =
+                    std::chrono::duration_cast<std::chrono::duration<double>>(
+                        now - wait_queue_.front().queued_at);
+                EmitCheckoutWaitDuration(cancelled_dur.count(), "cancelled");
+                wait_queue_.pop_front();
+            }
         }
         if (!wait_queue_.empty() && ValidateConnection(owned.get())) {
             // Hand directly to the next waiter (validated — not dead/expired)
@@ -445,9 +485,15 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
             owned->GetTransport()->SetDeadline(
                 std::chrono::steady_clock::now() + FAR_FUTURE_HANDOFF);
             UpstreamConnection* raw = owned.get();
+            // Direct handoff: active gauge stays unchanged (same conn in
+            // active container, just transferred to a new lease). Record
+            // wait-time histogram for the queued waiter — outcome=queued_satisfied.
+            auto wait_dur = std::chrono::duration_cast<std::chrono::duration<double>>(
+                std::chrono::steady_clock::now() - wait_queue_.front().queued_at);
             active_conns_.push_back(std::move(owned));
             auto entry = std::move(wait_queue_.front());
             wait_queue_.pop_front();
+            EmitCheckoutWaitDuration(wait_dur.count(), "queued_satisfied");
             // Bump inflight_leases_ BEFORE the handoff. The fetch_sub
             // at the top of ReturnConnection paired with the released
             // lease; this is a brand-new lease handed to a waiter and
@@ -464,6 +510,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
         } else {
             // No waiters, or connection is dead/expired — destroy it.
             // If waiters exist but connection is invalid, create a replacement.
+            EmitActiveGaugeDelta(-1.0);
             DestroyConnection(std::move(owned));
             CreateForWaiters();
         }
@@ -475,8 +522,11 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
                          std::chrono::seconds(config_.idle_timeout_sec);
     owned->GetTransport()->SetDeadline(idle_deadline);
 
-    // Push to front (MRU)
+    // Push to front (MRU). active -> idle: pair emits before potential
+    // ServiceWaitQueue, which itself may pop this very entry back to active.
     idle_conns_.push_front(std::move(owned));
+    EmitActiveGaugeDelta(-1.0);
+    EmitIdleGaugeDelta(+1.0);
 
     // Service any waiting requests
     ServiceWaitQueue();
@@ -510,6 +560,8 @@ void PoolPartition::EvictExpired() {
                                   expired, idle_timeout, alive);
             auto owned = std::move(*it);
             it = idle_conns_.erase(it);
+            // idle -> destroyed
+            EmitIdleGaugeDelta(-1.0);
             DestroyConnection(std::move(owned));
         } else {
             ++it;
@@ -762,6 +814,7 @@ void PoolPartition::InitiateShutdown() {
     while (!idle_conns_.empty()) {
         auto conn = std::move(idle_conns_.front());
         idle_conns_.pop_front();
+        EmitIdleGaugeDelta(-1.0);
         DestroyConnection(std::move(conn));
     }
 
@@ -924,6 +977,14 @@ void PoolPartition::ForceCloseActive() {
         }
         conn->MarkClosing();
         work.push_back(std::move(w));
+    }
+
+    // Active -> zombie: gauge emits -N before the move. The conns no
+    // longer count as active even though they're held alive for lease
+    // safety; zombies aren't tracked by either gauge.
+    const double active_drained = static_cast<double>(active_conns_.size());
+    if (active_drained > 0.0) {
+        EmitActiveGaugeDelta(-active_drained);
     }
 
     // Move to zombie list — kept alive until leases release them.
@@ -1211,6 +1272,14 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
         return;
     }
 
+    // Capture connect duration for the histogram emit below.
+    // created_at_ is set at UpstreamConnection construction, immediately
+    // before the non-blocking ::connect, so this is a tight upper bound
+    // on the wire-level connect time.
+    auto connect_dur_sec = std::chrono::duration_cast<std::chrono::duration<double>>(
+        std::chrono::steady_clock::now() - owned->created_at()).count();
+    if (connect_dur_sec < 0.0) connect_dur_sec = 0.0;
+
     // Check both partition-local flag AND manager-wide flag. The manager flag
     // is set immediately by InitiateShutdown(); the partition flag is set later
     // by the enqueued task. Without checking both, a connect that completes
@@ -1243,6 +1312,11 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
     logging::Get()->debug("Upstream connection ready fd={} {}:{}",
                           raw->fd(), upstream_host_, upstream_port_);
 
+    // Fresh connect succeeded — enters active directly (no prior gauge to
+    // decrement). Histogram records connect time under outcome=created.
+    EmitActiveGaugeDelta(+1.0);
+    EmitCheckoutWaitDuration(connect_dur_sec, "created");
+
     // See the matching site above — bump before handing the lease out.
     inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
     ready_cb(UpstreamLease(raw, this, alive_));
@@ -1262,13 +1336,21 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
     // ForceClose, so the close callback can't re-fire.
     auto owned = ExtractFromConnecting(conn);
     bool was_active = false;
+    bool was_idle = false;
     if (!owned) {
         owned = ExtractFromActive(conn);
         if (owned) was_active = true;
     }
-    if (!owned) owned = ExtractFromIdle(conn);
+    if (!owned) {
+        owned = ExtractFromIdle(conn);
+        if (owned) was_idle = true;
+    }
 
     if (owned) {
+        // Emit gauge -1 for whichever container the conn left.
+        // Connecting->closed has NO gauge (never observable until OnConnectComplete).
+        if (was_active) EmitActiveGaugeDelta(-1.0);
+        else if (was_idle) EmitIdleGaugeDelta(-1.0);
         ClearTransportCallbacks(owned.get());
         auto transport = owned->GetTransport();
         if (transport) {
@@ -1343,9 +1425,16 @@ void PoolPartition::ServiceWaitQueue() {
     // against idle connections / capacity rather than "consuming" a
     // slot with a dead entry. Cancelled entries have no callbacks to
     // fire — the owning transaction's framework abort hook already
-    // handled that side.
+    // handled that side. Emit outcome=cancelled histogram for each
+    // so operators have visibility on cancel volume during normal operation.
     auto drop_cancelled_front = [this]() {
-        while (!wait_queue_.empty() && IsEntryCancelled(wait_queue_.front())) {
+        auto now = std::chrono::steady_clock::now();
+        while (!wait_queue_.empty() &&
+               IsEntryCancelled(wait_queue_.front())) {
+            auto cancelled_dur =
+                std::chrono::duration_cast<std::chrono::duration<double>>(
+                    now - wait_queue_.front().queued_at);
+            EmitCheckoutWaitDuration(cancelled_dur.count(), "cancelled");
             wait_queue_.pop_front();
         }
     };
@@ -1364,11 +1453,14 @@ void PoolPartition::ServiceWaitQueue() {
         // The check is a same-pointer compare today; once step 11 lands
         // it actually fences stale handoffs.
         if (!ConnectionEndpointMatches(*conn)) {
+            // Drained from idle without re-entering active.
+            EmitIdleGaugeDelta(-1.0);
             DestroyConnection(std::move(conn));
             continue;
         }
 
         if (!ValidateConnection(conn.get())) {
+            EmitIdleGaugeDelta(-1.0);
             DestroyConnection(std::move(conn));
             continue;
         }
@@ -1380,7 +1472,14 @@ void PoolPartition::ServiceWaitQueue() {
             std::chrono::steady_clock::now() + FAR_FUTURE_SWQ);
 
         UpstreamConnection* raw = conn.get();
+        // idle -> active transition matches CheckoutAsync idle-reuse.
+        // Record wait time for the front waiter under outcome=queued_satisfied.
+        auto wait_dur = std::chrono::duration_cast<std::chrono::duration<double>>(
+            std::chrono::steady_clock::now() - wait_queue_.front().queued_at);
         active_conns_.push_back(std::move(conn));
+        EmitIdleGaugeDelta(-1.0);
+        EmitActiveGaugeDelta(+1.0);
+        EmitCheckoutWaitDuration(wait_dur.count(), "queued_satisfied");
 
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();
@@ -1504,6 +1603,11 @@ void PoolPartition::PurgeExpiredWaitEntries() {
         // Cancelled entries at the front can be dropped unconditionally —
         // their owning transaction is already gone and expects no callback.
         if (IsEntryCancelled(entry)) {
+            // Record outcome=cancelled with the wait duration; no callback
+            // is fired but the histogram tracks the time spent queued.
+            auto cancelled_dur = std::chrono::duration_cast<
+                std::chrono::duration<double>>(now - entry.queued_at);
+            EmitCheckoutWaitDuration(cancelled_dur.count(), "cancelled");
             wait_queue_.pop_front();
             continue;
         }
@@ -1541,7 +1645,14 @@ void PoolPartition::CreateForWaiters() {
            !wait_queue_.empty() &&
            TotalCount() < partition_max_connections_) {
         // Drop cancelled entries before spending a new connect on them.
+        // Emit outcome=cancelled so operators have visibility on cancel
+        // volume during normal operation (not just tear-down paths).
         if (IsEntryCancelled(wait_queue_.front())) {
+            auto cancelled_dur =
+                std::chrono::duration_cast<std::chrono::duration<double>>(
+                    std::chrono::steady_clock::now() -
+                    wait_queue_.front().queued_at);
+            EmitCheckoutWaitDuration(cancelled_dur.count(), "cancelled");
             wait_queue_.pop_front();
             continue;
         }
@@ -1585,6 +1696,34 @@ void PoolPartition::DestroyConnection(
     conn.reset();
 
     MaybeSignalDrain();
+}
+
+void PoolPartition::EmitIdleGaugeDelta(double delta) {
+    if (!obs_manager_ || service_name_.empty() || delta == 0.0) return;
+    const auto& cat = obs_manager_->catalog();
+    if (cat.reactor_upstream_pool_connections_idle == nullptr) return;
+    cat.reactor_upstream_pool_connections_idle->Add(
+        delta, {{"reactor.upstream.service", service_name_}});
+}
+
+void PoolPartition::EmitActiveGaugeDelta(double delta) {
+    if (!obs_manager_ || service_name_.empty() || delta == 0.0) return;
+    const auto& cat = obs_manager_->catalog();
+    if (cat.reactor_upstream_pool_connections_active == nullptr) return;
+    cat.reactor_upstream_pool_connections_active->Add(
+        delta, {{"reactor.upstream.service", service_name_}});
+}
+
+void PoolPartition::EmitCheckoutWaitDuration(double duration_sec,
+                                              const char* outcome) {
+    if (!obs_manager_ || service_name_.empty() || outcome == nullptr) return;
+    const auto& cat = obs_manager_->catalog();
+    if (cat.reactor_upstream_pool_checkout_wait_duration == nullptr) return;
+    if (duration_sec < 0.0) duration_sec = 0.0;
+    cat.reactor_upstream_pool_checkout_wait_duration->Record(
+        duration_sec,
+        {{"reactor.upstream.service", service_name_},
+         {"outcome", outcome}});
 }
 
 void PoolPartition::MaybeSignalDrain() {

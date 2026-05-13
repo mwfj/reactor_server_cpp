@@ -1,6 +1,7 @@
 #pragma once
 #include "common.h"
 #include "inet_addr.h"
+#include "observability/common.h"
 
 #include <future>
 
@@ -226,6 +227,23 @@ public:
     // queue_depth and in_flight are read under state_->mtx for consistency.
     ResolverSnapshot Snapshot() const;
 
+    // Install a non-owning pointer to the server's ObservabilityManager.
+    // Called once from HttpServer::MarkServerReady after both objects are
+    // constructed. Pre-call, every resolve emit short-circuits (obs_manager_
+    // stays null); post-call each outcome (success / cache_hit / nxdomain /
+    // timeout / servfail / other_error) is reported through
+    // `cat.reactor_dns_resolves`.
+    //
+    // SHUTDOWN CAVEAT: in HttpServer's declaration order, observability_manager_
+    // is declared AFTER dns_resolver_, so reverse-destruction destroys the
+    // observability manager FIRST. Production paths flush observability via
+    // Stop() before either dtor runs; abnormal-path teardown (mid-startup
+    // exception, test fixtures that drop the server without Stop()) relies
+    // on every emit site null-checking obs_manager_ before touching catalog().
+    // Mirrors the lifetime docstring on BatchSpanProcessor::manager().
+    void SetObservabilityManager(
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept;
+
 private:
     struct WorkItem;
     struct PoolState;
@@ -247,6 +265,16 @@ private:
     // state_->mtx inside ResolveAsync, so the test-only setter acquires
     // the same lock to avoid a data race.
     std::size_t                max_queued_items_ = kMaxQueuedItems;
+
+    // Non-owning pointer to the observability manager, installed by
+    // HttpServer::MarkServerReady. Default null — observability is an
+    // opt-in layer. Read by EmitResolveOutcome on every resolution; no
+    // atomic because the setter runs once in MarkServerReady before any
+    // resolve emit can fire (DNS resolves originate from upstream pool
+    // dispatch + literal-only short-circuits, both gated downstream of
+    // the setter). See class-header SHUTDOWN CAVEAT for the destruction-
+    // order invariant.
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
 
     // Lazy pool spawn. Called from ResolveAsync on the first
     // non-literal request. Throws std::runtime_error on pthread_create
@@ -290,6 +318,13 @@ private:
 
     // Blocking getaddrinfo body. Runs on a worker thread.
     static ResolvedEndpoint DoBlockingResolve(const ResolveRequest& req);
+
+    // Emit reactor.dns.resolves{outcome} on every resolution outcome.
+    // Closed-set outcome vocabulary: "success", "nxdomain", "timeout",
+    // "servfail", "other_error". No cardinality cap needed — `outcome`
+    // is a fixed enum. Null-safe: short-circuits when obs_manager_ is
+    // null or the catalog instrument hasn't been registered.
+    void EmitResolveOutcome(const char* outcome) const noexcept;
 
     // Helper result builders.
     static ResolvedEndpoint MakeReadyLiteralResult(const ResolveRequest& req);

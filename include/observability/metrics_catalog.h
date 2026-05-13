@@ -27,6 +27,21 @@ struct MetricsCatalog {
     UpDownCounter* reactor_http_connections_active = nullptr;
     Counter*       reactor_http_connections_accepted = nullptr;
 
+    // Transport-level connection metrics — incremented at accept() time
+    // BEFORE any protocol bytes flow. `reactor.net.connections.active`
+    // is the raw transport gauge (TCP/TLS), independent of whether the
+    // peer ever sends an HTTP/1, HTTP/2, or WS frame; `accepted` is the
+    // monotonic event counter. Both are unlabeled — adding labels would
+    // require synthesizing per-connection state before classification.
+    UpDownCounter* reactor_net_connections_active = nullptr;
+    Counter*       reactor_net_connections_accepted = nullptr;
+
+    // TLS handshake outcome counter — `outcome` ∈ {success, failure}.
+    // Emitted at handshake-state transition: success when DoHandshake()
+    // returns TLS_COMPLETE; failure at the close-callback site driven by
+    // the handshake-failure branch.
+    Counter*       reactor_tls_handshakes = nullptr;
+
     // Client / upstream pool. Instruments are registered at boot so
     // `/metrics` surfaces the series as soon as data points arrive;
     // emit sites for this group are partially deferred — see the
@@ -54,6 +69,7 @@ struct MetricsCatalog {
     // Self-metrics (OTel pipeline introspection) --------------------
     Counter*       reactor_otel_spans_created = nullptr;
     Counter*       reactor_otel_spans_dropped_unsampled = nullptr;
+    Counter*       reactor_otel_spans_dropped_unended = nullptr;
     Counter*       reactor_otel_spans_dropped_queue_full = nullptr;
     Counter*       reactor_otel_spans_exported = nullptr;
     Histogram*     reactor_otel_export_duration = nullptr;

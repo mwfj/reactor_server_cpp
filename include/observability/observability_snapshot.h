@@ -145,6 +145,39 @@ struct ObservabilitySnapshot {
     // ---- Manager + dispatcher pointers ----
     std::weak_ptr<ObservabilityManager>      manager;
     Dispatcher*                              owning_dispatcher = nullptr;
+
+    // Number of outstanding +1s on http.client.active_requests for this
+    // transaction. Incremented once per attempt at SetupAttemptObservability
+    // (retries increment multiple times). Decremented via
+    // TryDecrementIfPositive (below) at FinalizeAttemptSpan AND in
+    // repeated calls from the kill-loop / dtor drain — only the
+    // winning caller emits the matching -1. Acq/rel ordering on the
+    // CAS keeps the natural finalize racer and the kill-loop drain
+    // from emitting duplicate -1s.
+    std::atomic<int> attempt_active_inflight_{0};
+
+    // Captured by SetupAttemptObservability at link time so the kill
+    // loop / dtor can emit the matching -1s with the correct
+    // reactor.upstream.service label. Written under link_mtx for
+    // publication ordering; read by kill loop / dtor under same mutex.
+    std::string upstream_service_for_metrics;  // protected by link_mtx
 };
+
+// Header-private inline helper. Returns true if it successfully
+// decremented the counter (caller emits -1). Returns false when the
+// counter was 0 (no -1 to emit). Safe under concurrent racers — CAS
+// loop ensures only one caller wins each decrement.
+inline bool TryDecrementIfPositive(std::atomic<int>& a) {
+    int cur = a.load(std::memory_order_acquire);
+    while (cur > 0) {
+        if (a.compare_exchange_strong(
+                cur, cur - 1,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 }  // namespace OBSERVABILITY_NAMESPACE

@@ -1,7 +1,53 @@
 #include "rate_limit/rate_limiter.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/histogram.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 #include <cmath>
 #include <limits>
+
+namespace {
+
+// Closed-set decision vocabulary for reactor.rate_limit.decisions. Kept
+// next to RateLimitManager::Check so the emit-site label strings and
+// the decision branches stay locally co-located.
+constexpr const char* kDecisionAdmit       = "admit";
+constexpr const char* kDecisionReject      = "reject";
+constexpr const char* kDecisionDryRunReject = "dry_run_reject";
+
+// Emit a single zone's decision + tokens-after-decision pair. Null-safe
+// against manager / catalog instrument unavailability. Catches every
+// exception — observability emit must not propagate into the request
+// hot path.
+void EmitRateLimitDecision(
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* mgr,
+    const std::string& zone_name,
+    const char* decision,
+    int64_t tokens_after_decision) noexcept
+{
+    if (mgr == nullptr || decision == nullptr || zone_name.empty()) return;
+    const auto& cat = mgr->catalog();
+    try {
+        if (cat.reactor_rate_limit_decisions != nullptr) {
+            cat.reactor_rate_limit_decisions->Add(
+                1.0,
+                {{"zone", zone_name},
+                 {"decision", decision}});
+        }
+        if (cat.reactor_rate_limit_tokens != nullptr) {
+            double tokens = static_cast<double>(tokens_after_decision);
+            if (tokens < 0.0) tokens = 0.0;
+            cat.reactor_rate_limit_tokens->Record(
+                tokens,
+                {{"zone", zone_name}});
+        }
+    } catch (...) {
+        // Defensive: observability is best-effort; never propagate.
+    }
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
@@ -44,6 +90,12 @@ bool RateLimitManager::Check(HttpRequest& request,
         return true;
     }
 
+    // Snapshot obs_manager_ once per Check so every per-zone emit (and
+    // the final denied/admitted emit) routes through the same manager
+    // pointer. Acquire pairs with SetObservabilityManager's release.
+    auto* mgr = obs_manager_.load(std::memory_order_acquire);
+    const bool dry_run_mode = dry_run();
+
     // Track the most restrictive *applicable* zone across all checks.
     // Non-applicable zones (applies_to miss, empty key, etc.) are ignored
     // for header purposes — they did not govern this request.
@@ -67,7 +119,10 @@ bool RateLimitManager::Check(HttpRequest& request,
 
         // Skip zones that didn't apply to this request — they must not
         // drive response headers (would incorrectly advertise limits on
-        // requests those zones never actually governed).
+        // requests those zones never actually governed). Non-applicable
+        // zones are also excluded from the decisions counter — the zone
+        // never governed this request, so there is no "decision" to
+        // record.
         if (!result.applicable) {
             continue;
         }
@@ -83,11 +138,25 @@ bool RateLimitManager::Check(HttpRequest& request,
             best_retry_after = result.retry_after_sec;
             best_rate = result.rate;
             denied = true;
+            // Emit the denying zone's decision: `reject` under enforcement,
+            // `dry_run_reject` under shadow mode. The middleware layer
+            // converts dry_run-Check-false into a let-through, so the
+            // metric must distinguish "would have rejected" from a real
+            // reject for accurate shadow-mode dashboards.
+            EmitRateLimitDecision(
+                mgr, best_name,
+                dry_run_mode ? kDecisionDryRunReject : kDecisionReject,
+                result.remaining);
             break;
         }
 
-        // Allowed: track the most restrictive zone by remaining/limit ratio.
-        // Lower ratio = more restrictive.
+        // Allowed: emit the admit decision for this zone, with tokens
+        // remaining after debit so operators can see bucket-pressure
+        // distribution per zone. Then track the most restrictive zone by
+        // remaining/limit ratio. Lower ratio = more restrictive.
+        EmitRateLimitDecision(mgr, zone->name(), kDecisionAdmit,
+                              result.remaining);
+
         double ratio = (result.limit > 0)
             ? static_cast<double>(result.remaining) / static_cast<double>(result.limit)
             : 1.0;
@@ -254,4 +323,14 @@ size_t RateLimitManager::TotalEntryCount() const {
         total += zone->EntryCount();
     }
     return total;
+}
+
+// ---------------------------------------------------------------------------
+// SetObservabilityManager
+// ---------------------------------------------------------------------------
+
+void RateLimitManager::SetObservabilityManager(
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept
+{
+    obs_manager_.store(obs_manager, std::memory_order_release);
 }

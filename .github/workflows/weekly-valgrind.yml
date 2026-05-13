@@ -92,7 +92,9 @@ jobs:
             obs_self_handler \
             obs_proxy_client \
             obs_auth_trace \
-            obs_catalog ; do
+            obs_catalog \
+            obs_connection_metrics \
+            obs_pool_gauges ; do
             echo "::group::valgrind test_runner $suite"
             valgrind \
               --error-exitcode=1 \

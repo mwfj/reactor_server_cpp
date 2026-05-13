@@ -8,6 +8,8 @@
 #include "auth/auth_manager.h"
 #include "auth/upstream_http_client.h"
 #include "observability/batch_span_processor.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
 #include "observability/observability_manager.h"
 #include "observability/observability_middleware.h"
 #include "observability/observability_snapshot.h"
@@ -961,6 +963,14 @@ void HttpServer::MarkServerReady() {
             // `upstream.host` for effective-SNI derivation.
             upstream_manager_ = std::make_unique<UpstreamManager>(
                 upstream_configs_, dispatchers, upstream_resolved_);
+            // Forward the observability manager into every PoolPartition
+            // BEFORE CommitHttp2Snapshots (which may trigger partition-side
+            // work) so pool gauge emits land on a wired manager. Pre-this-
+            // call partitions stay quiet (obs_manager_ stays null inside
+            // each partition); post-this-call every gauge / histogram emit
+            // routes through the catalog.
+            upstream_manager_->SetObservabilityManager(
+                observability_manager_.get());
             // Initial H2 snapshot bootstrap. Reload uses the same path
             // for live propagation. Disabled-H2 entries publish a
             // shared_ptr<const Http2UpstreamConfig> with enabled=false
@@ -971,6 +981,22 @@ void HttpServer::MarkServerReady() {
             net_server_.Stop();
             throw;
         }
+    }
+
+    // Forward observability into peer subsystems whose emit sites do not
+    // depend on upstream pool existence — DNS resolver (always present)
+    // and rate-limit manager (created above unconditionally). Done after
+    // the upstream block so the wire-up order is consistent regardless
+    // of whether upstreams are configured.
+    if (dns_resolver_) {
+        dns_resolver_->SetObservabilityManager(observability_manager_.get());
+    }
+    if (rate_limit_manager_) {
+        rate_limit_manager_->SetObservabilityManager(
+            observability_manager_.get());
+    }
+
+    if (!upstream_configs_.empty()) {
 
         // Circuit breaker — built alongside the pool. One host per
         // configured upstream (regardless of enabled), with one slice
@@ -984,7 +1010,8 @@ void HttpServer::MarkServerReady() {
         try {
             circuit_breaker_manager_ =
                 std::make_unique<CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager>(
-                    upstream_configs_, dispatchers.size(), dispatchers);
+                    upstream_configs_, dispatchers.size(), dispatchers,
+                    observability_manager_.get());
             upstream_manager_->AttachCircuitBreakerManager(
                 circuit_breaker_manager_.get());
 
@@ -1008,6 +1035,12 @@ void HttpServer::MarkServerReady() {
             // which are stopped before either manager is destroyed. So any live callback
             // invocation sees a valid UpstreamManager.
             UpstreamManager* um = upstream_manager_.get();
+            // Manager pointer for the metric-emit branch of the composed
+            // transition callback. Same lifetime guarantee as `um` — the
+            // observability manager outlives circuit_breaker_manager_ per
+            // HttpServer's declaration order; slice callbacks only fire on
+            // dispatcher threads which stop before either manager dies.
+            auto* obs_mgr = observability_manager_.get();
             for (const auto& u : upstream_configs_) {
                 auto* host = circuit_breaker_manager_->GetHost(u.name);
                 if (!host) continue;
@@ -1025,10 +1058,47 @@ void HttpServer::MarkServerReady() {
                     // outlives every possible callback invocation.
                     auto* slice_ptr = slice;
                     slice->SetTransitionCallback(
-                        [um, service, i, slice_ptr](
+                        [um, service, i, slice_ptr, obs_mgr](
                                 CIRCUIT_BREAKER_NAMESPACE::State old_s,
                                 CIRCUIT_BREAKER_NAMESPACE::State new_s,
                                 const char* trigger) {
+                            // Metric emit — runs FIRST so a future throw
+                            // in the drain path doesn't lose the
+                            // observation. Drops silently when obs is not
+                            // wired (manager null) or the catalog field
+                            // is unbound. The synthetic OPEN→OPEN edge
+                            // (trigger=dry_run_disabled) is treated as a
+                            // real transition for the transitions counter
+                            // but is a no-op for the gauge (old == new).
+                            if (obs_mgr != nullptr) {
+                                const auto& cat = obs_mgr->catalog();
+                                const char* old_label =
+                                    CIRCUIT_BREAKER_NAMESPACE::StateName(old_s);
+                                const char* new_label =
+                                    CIRCUIT_BREAKER_NAMESPACE::StateName(new_s);
+                                if (cat.reactor_circuit_breaker_state
+                                        != nullptr && old_s != new_s) {
+                                    cat.reactor_circuit_breaker_state->Add(
+                                        -1.0,
+                                        {{"service", service},
+                                         {"state", old_label}});
+                                    cat.reactor_circuit_breaker_state->Add(
+                                        +1.0,
+                                        {{"service", service},
+                                         {"state", new_label}});
+                                }
+                                if (cat.reactor_circuit_breaker_transitions
+                                        != nullptr) {
+                                    cat.reactor_circuit_breaker_transitions->Add(
+                                        1.0,
+                                        {{"service", service},
+                                         {"from", old_label},
+                                         {"to", new_label},
+                                         {"trigger",
+                                          trigger != nullptr ? trigger
+                                                             : "unknown"}});
+                                }
+                            }
                             // Three drain triggers, all entering OPEN:
                             //   CLOSED→OPEN  : fresh trip; queued non-
                             //     probe waiters need CHECKOUT_CIRCUIT_OPEN
@@ -1320,7 +1390,8 @@ void HttpServer::MarkServerReady() {
         bsp_opts.retries_max_backoff     = cfg.traces.batch.retries.max_backoff;
 
         auto bsp = std::make_shared<
-            OBSERVABILITY_NAMESPACE::BatchSpanProcessor>(otlp_exporter_, bsp_opts);
+            OBSERVABILITY_NAMESPACE::BatchSpanProcessor>(
+                otlp_exporter_, bsp_opts, observability_manager_.get());
         observability_manager_->SwapToBatchSpanProcessor(bsp);
 
         logging::Get()->info(
@@ -1355,7 +1426,7 @@ void HttpServer::MarkServerReady() {
 
         auto reader = std::make_shared<OBSERVABILITY_NAMESPACE::PeriodicMetricReader>(
             observability_manager_->meter_provider(),
-            metrics_exporter, reader_opts);
+            metrics_exporter, reader_opts, observability_manager_.get());
         observability_manager_->RegisterMetricReader(std::move(reader));
 
         logging::Get()->info(
@@ -3393,15 +3464,16 @@ bool HttpServer::WaitForAllAsyncDrain(
     //                                decremented, so the window where
     //                                inflight==0 but finalizer hasn't
     //                                returned must also be drained.
-    //   - kill_marshals_in_flight_ : RESERVED for a future per-
-    //                                dispatcher kill-marshal step
-    //                                (today the kill loop runs inline
-    //                                from the stopper thread; no
-    //                                incrementer/decrementer exists).
-    //                                The clause is permanently zero
-    //                                today and is kept here so the
-    //                                predicate is forward-compatible
-    //                                with that wiring.
+    //   - kill_marshals_in_flight_ : KillOutstandingSnapshots
+    //                                bumped this counter under
+    //                                finalizers_done_mtx_ for every
+    //                                snapshot that marshalled to its
+    //                                owning_dispatcher via
+    //                                EnQueueDelayed; the closure's RAII
+    //                                guard decrements under the same
+    //                                mutex when the kill body returns.
+    //                                The drain barrier waits for every
+    //                                marshaled closure to complete.
     auto* upm = upstream_manager_.get();
     auto* obs = observability_manager_.get();
     auto predicate = [upm, obs]() {
@@ -4218,6 +4290,13 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             // Decrement here so /stats doesn't count WS as HTTP/1.
             // RemoveConnection checks IsUpgraded() to skip the double-decrement.
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+            // Release the http/1.1 slot on
+            // reactor.http.connections.active. The WS connection emits
+            // its own +1 on `protocol=websocket` once the obs snapshot
+            // is wired in WebSocketConnection::SetObservabilitySnapshot.
+            if (auto c = self->GetConnection()) {
+                c->HandOffToWebSocket();
+            }
             // total_requests_ already counted by request_count_callback
             auto ws_handler = router_.GetWebSocketHandler(request);
             if (ws_handler && self->GetWebSocket()) {
@@ -4248,6 +4327,11 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         logging::Get()->debug("New connection already closing fd={}, skipping", conn->fd());
         return;
     }
+
+    // Wire transport-level observability counters. Idempotent and a no-op
+    // when no manager is installed; the matching -1 against
+    // reactor.net.connections.active fires from ~ConnectionHandler.
+    conn->AttachTransportObservability(observability_manager_.get());
 
     // NOTE: total_accepted_ and active_connections_ are NOT incremented here.
     // They are incremented at map-insertion points (pending_detection_ in this

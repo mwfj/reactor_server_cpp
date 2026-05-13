@@ -2,16 +2,21 @@
 #include "dispatcher.h"
 #include "log/logger.h"
 #include "net/dns_resolver.h"  // FormatAuthority for IPv6 log-label rendering
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 
 #include <future>
 
 namespace CIRCUIT_BREAKER_NAMESPACE {
 
-CircuitBreakerHost::CircuitBreakerHost(std::string service_name,
-                                        std::string host,
-                                        int port,
-                                        size_t partition_count,
-                                        const CircuitBreakerConfig& config)
+CircuitBreakerHost::CircuitBreakerHost(
+        std::string service_name,
+        std::string host,
+        int port,
+        size_t partition_count,
+        const CircuitBreakerConfig& config,
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager)
     : service_name_(std::move(service_name)),
       host_(std::move(host)),
       port_(port),
@@ -44,6 +49,21 @@ CircuitBreakerHost::CircuitBreakerHost(std::string service_name,
                             " partition=" + std::to_string(i);
         slices_.emplace_back(std::make_unique<CircuitBreakerSlice>(
             std::move(label), i, config_));
+
+        // Baseline gauge emit — one +1 per slice on {state=closed}.
+        // Slices start in CLOSED; transitions later issue -1/+1 pairs.
+        // With N partitions, the {state=closed} series begins at N and
+        // sums correctly across every partition's independent transitions.
+        // No-op when observability is disabled (manager null) or the
+        // catalog field is unbound.
+        if (obs_manager != nullptr) {
+            const auto& cat = obs_manager->catalog();
+            if (cat.reactor_circuit_breaker_state != nullptr) {
+                cat.reactor_circuit_breaker_state->Add(
+                    +1.0,
+                    {{"service", service_name_}, {"state", "closed"}});
+            }
+        }
     }
     logging::Get()->debug(
         "CircuitBreakerHost created service={} host={}:{} partitions={} "

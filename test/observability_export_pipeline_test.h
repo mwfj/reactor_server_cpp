@@ -164,7 +164,8 @@ void TestBatchSpanProcessorBatchesAndExports() {
             std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
                 &proc, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
             std::make_shared<AlwaysOnSampler>(),
-            random);
+            random,
+            /*manager=*/nullptr);
         Tracer* t = provider.GetTracer("test");
 
         for (int i = 0; i < 8; ++i) {
@@ -319,7 +320,8 @@ void TestBatchSpanProcessorNonRetryableFailureCountedAndLogged() {
             resource,
             std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
                 &bsp, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
-            std::make_shared<AlwaysOnSampler>(), random);
+            std::make_shared<AlwaysOnSampler>(), random,
+            /*manager=*/nullptr);
         Tracer* t = provider.GetTracer("notretryable_test");
 
         // Submit a batch of 4 spans. Worker drains, exporter returns
@@ -683,7 +685,8 @@ void TestBatchSpanProcessorOverridesForceFlush() {
             resource,
             std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
                 &bsp, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
-            std::make_shared<AlwaysOnSampler>(), random);
+            std::make_shared<AlwaysOnSampler>(), random,
+            /*manager=*/nullptr);
         Tracer* t = provider.GetTracer("flush_test");
         for (int i = 0; i < 3; ++i) { t->StartSpan("op", {})->End(); }
 
@@ -803,7 +806,8 @@ void TestBatchSpanProcessorForceFlushDeadlineContract() {
             resource,
             std::shared_ptr<OBSERVABILITY_NAMESPACE::SpanProcessor>(
                 &bsp, [](OBSERVABILITY_NAMESPACE::SpanProcessor*) {}),
-            std::make_shared<AlwaysOnSampler>(), random);
+            std::make_shared<AlwaysOnSampler>(), random,
+            /*manager=*/nullptr);
         Tracer* t = provider.GetTracer("ff_contract");
 
         // Case 1: deadline=0 returns immediately even with a queued span.

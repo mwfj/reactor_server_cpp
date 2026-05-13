@@ -19,11 +19,14 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
+class ObservabilityManager;
+
 class Meter {
 public:
     Meter(std::shared_ptr<const InstrumentationScope> scope,
           std::shared_ptr<const Resource>             resource,
-          size_t                                       shard_count);
+          size_t                                       shard_count,
+          ObservabilityManager*                        manager);
 
     Meter(const Meter&) = delete;
     Meter& operator=(const Meter&) = delete;
@@ -67,6 +70,18 @@ private:
     std::unordered_map<std::string, std::unique_ptr<Counter>>   counters_;
     std::unordered_map<std::string, std::unique_ptr<UpDownCounter>> updowns_;
     std::unordered_map<std::string, std::unique_ptr<Histogram>> histograms_;
+
+    // Raw pointer; manager storage outlives every Meter (MeterProvider
+    // destructs as part of ~ObservabilityManager's body). Forwarded
+    // into every MetricLabelRegistry constructed by GetCounter /
+    // GetUpDownCounter / GetHistogram so the slow path can emit
+    // `reactor.otel.cardinality_overflow`. See
+    // batch_span_processor.h::manager() docstring for the SHUTDOWN
+    // CAVEAT that applies to any code path consuming manager_->
+    // sub-members.
+    // (Today this dtor is default and emits nothing — caveat applies
+    // only if a future dtor adds emission paths.)
+    ObservabilityManager*                                       manager_ = nullptr;
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

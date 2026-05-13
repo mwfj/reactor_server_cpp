@@ -2,10 +2,15 @@
 
 #include "common.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 
-MetricLabelRegistry::MetricLabelRegistry(Catalog catalog) {
+MetricLabelRegistry::MetricLabelRegistry(Catalog catalog,
+                                          ObservabilityManager* manager)
+    : manager_(manager) {
     allowed_keys_.reserve(catalog.allowed_keys.size());
     for (auto& k : catalog.allowed_keys) {
         allowed_keys_.insert(k);
@@ -54,6 +59,7 @@ LabelSet MetricLabelRegistry::BuildLabelSet(
         // custom labels).
         std::string emitted;
         bool resolved = false;
+        bool overflow_event = false;
         {
             std::shared_lock<std::shared_mutex> g(s.mtx);
             if (s.seen_values.find(value) != s.seen_values.end()) {
@@ -63,6 +69,7 @@ LabelSet MetricLabelRegistry::BuildLabelSet(
                 // Cap latched and value not seen → overflow.
                 emitted = std::string(kOverflowSentinel);
                 resolved = true;
+                overflow_event = true;
             }
         }
         if (!resolved) {
@@ -79,9 +86,24 @@ LabelSet MetricLabelRegistry::BuildLabelSet(
             } else {
                 s.cap_full.store(true, std::memory_order_release);
                 emitted = std::string(kOverflowSentinel);
+                overflow_event = true;
             }
         }
         out.kv.emplace_back(key, std::move(emitted));
+
+        // Emit AFTER all locks released. Recursion termination: the
+        // overflow counter resolves its own `label_key` label through
+        // a MetricLabelRegistry whose allowlist holds a small fixed
+        // vocabulary (the union of catalogued label keys); that slot
+        // cannot itself overflow under normal operation.
+        if (overflow_event && manager_ != nullptr) {
+            const auto& cat = manager_->catalog();
+            if (cat.reactor_otel_cardinality_overflow != nullptr) {
+                cat.reactor_otel_cardinality_overflow->Add(
+                    1.0,
+                    {{"label_key", key}});
+            }
+        }
     }
     out.SortAndHash();
     return out;

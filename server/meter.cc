@@ -6,10 +6,12 @@ namespace OBSERVABILITY_NAMESPACE {
 
 Meter::Meter(std::shared_ptr<const InstrumentationScope>   scope,
               std::shared_ptr<const Resource>              resource,
-              size_t                                       shard_count)
+              size_t                                       shard_count,
+              ObservabilityManager*                        manager)
     : scope_(std::move(scope)),
       resource_(std::move(resource)),
-      shard_count_(shard_count > 0 ? shard_count : 1) {}
+      shard_count_(shard_count > 0 ? shard_count : 1),
+      manager_(manager) {}
 
 Counter* Meter::GetCounter(const std::string& name,
                            const std::string& description,
@@ -18,7 +20,8 @@ Counter* Meter::GetCounter(const std::string& name,
     std::lock_guard<std::mutex> g(inst_mtx_);
     auto it = counters_.find(name);
     if (it != counters_.end()) return it->second.get();
-    auto registry = std::make_shared<MetricLabelRegistry>(std::move(catalog));
+    auto registry = std::make_shared<MetricLabelRegistry>(std::move(catalog),
+                                                            manager_);
     auto inst = std::make_unique<Counter>(
         name, description, unit, std::move(registry), shard_count_);
     Counter* raw = inst.get();
@@ -33,7 +36,8 @@ UpDownCounter* Meter::GetUpDownCounter(const std::string& name,
     std::lock_guard<std::mutex> g(inst_mtx_);
     auto it = updowns_.find(name);
     if (it != updowns_.end()) return it->second.get();
-    auto registry = std::make_shared<MetricLabelRegistry>(std::move(catalog));
+    auto registry = std::make_shared<MetricLabelRegistry>(std::move(catalog),
+                                                            manager_);
     auto inst = std::make_unique<UpDownCounter>(
         name, description, unit, std::move(registry), shard_count_);
     UpDownCounter* raw = inst.get();
@@ -49,7 +53,8 @@ Histogram* Meter::GetHistogram(const std::string& name,
     std::lock_guard<std::mutex> g(inst_mtx_);
     auto it = histograms_.find(name);
     if (it != histograms_.end()) return it->second.get();
-    auto registry = std::make_shared<MetricLabelRegistry>(std::move(catalog));
+    auto registry = std::make_shared<MetricLabelRegistry>(std::move(catalog),
+                                                            manager_);
     auto inst = std::make_unique<Histogram>(
         name, description, unit, std::move(bucket_boundaries),
         std::move(registry), shard_count_);

@@ -1,6 +1,9 @@
 #include "observability/tracer.h"
 
+#include "observability/counter.h"
 #include "observability/instrumentation_scope.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 #include "observability/resource.h"
 #include "observability/span_processor.h"
 
@@ -31,12 +34,14 @@ Tracer::Tracer(std::shared_ptr<const InstrumentationScope> scope,
                std::shared_ptr<const Resource>             resource,
                std::shared_ptr<SpanProcessor>              processor,
                std::shared_ptr<const Sampler>              sampler,
-               std::shared_ptr<RandomSource>               random)
+               std::shared_ptr<RandomSource>               random,
+               ObservabilityManager*                       manager)
     : scope_(std::move(scope)),
       resource_(std::move(resource)),
       processor_(std::move(processor)),
       sampler_(std::move(sampler)),
-      random_(std::move(random)) {}
+      random_(std::move(random)),
+      manager_(manager) {}
 
 void Tracer::SwapSampler(std::shared_ptr<const Sampler> sampler) noexcept {
     AtomicStore(sampler_, std::move(sampler));
@@ -108,6 +113,22 @@ std::shared_ptr<Span> Tracer::StartSpan(std::string name,
     const auto start_time = opts.has_explicit_start_time
         ? opts.start_time
         : std::chrono::system_clock::now();
+
+    // Self-metric bookkeeping — accounted BEFORE the Span ctor so the
+    // counters reflect the sampler decision even if allocation throws.
+    // `manager_` is null for test-only TracerProviders constructed
+    // without a manager; the catalog pointer guards cover the cold
+    // window during Init() before MetricsCatalog::Build runs.
+    if (manager_ != nullptr) {
+        const auto& cat = manager_->catalog();
+        if (cat.reactor_otel_spans_created != nullptr) {
+            cat.reactor_otel_spans_created->Add(1.0, {});
+        }
+        if (decision == SamplingDecision::DROP &&
+            cat.reactor_otel_spans_dropped_unsampled != nullptr) {
+            cat.reactor_otel_spans_dropped_unsampled->Add(1.0, {});
+        }
+    }
 
     // Sampler decision drives two independent gates on the Span:
     //   - record_locally: RECORD_AND_SAMPLE OR RECORD_ONLY → mutators

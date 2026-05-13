@@ -14,6 +14,10 @@
 // Forward declaration
 class TlsClientContext;
 
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+}
+
 class PoolPartition {
 public:
     // Checkout callback aliases — defined in upstream_callbacks.h,
@@ -43,8 +47,17 @@ public:
                   std::atomic<int64_t>& inflight_leases,
                   std::atomic<bool>& manager_shutting_down,
                   std::mutex& drain_mtx,
-                  std::condition_variable& drain_cv);
+                  std::condition_variable& drain_cv,
+                  const std::string& service_name = std::string());
     ~PoolPartition();
+
+    // Late install — UpstreamManager forwards this when MarkServerReady
+    // wires the observability manager. Idempotent; null clears.
+    // Dispatcher-thread-only on the partition's owning dispatcher.
+    void SetObservabilityManager(
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept {
+        obs_manager_ = obs_manager;
+    }
 
     // Non-copyable, non-movable
     PoolPartition(const PoolPartition&) = delete;
@@ -223,6 +236,25 @@ private:
     UpstreamPoolConfig config_;
     std::shared_ptr<TlsClientContext> tls_ctx_;
 
+    // Upstream service name — used as `reactor.upstream.service` label
+    // on pool gauge / histogram emits. Empty when the partition was
+    // constructed without a name (legacy unit-test ctor); emits skip
+    // when empty to avoid emitting metrics under a blank label.
+    std::string service_name_;
+
+    // Non-owning. Installed by UpstreamManager::SetObservabilityManager
+    // (during MarkServerReady) AFTER ObservabilityManager construction.
+    // Lifetime: in HttpServer's declaration order, observability_manager_
+    // is declared AFTER upstream_manager_ (~line 600 vs ~line 551 in
+    // include/http/http_server.h), so reverse-destruction destroys
+    // observability_manager_ FIRST. The production path is safe because
+    // ~HttpServer calls Stop() first, which drives InitiateShutdown
+    // while obs is still alive. In abnormal teardown (mid-startup throw,
+    // test fixture dropped without Stop()), the safety-net ~UpstreamManager
+    // path MUST null-guard: PoolPartition::~PoolPartition nulls this field
+    // before any emit, so the helpers' null-guards on obs_manager_ fire.
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
+
     // C++17 note: `std::atomic_load_explicit(shared_ptr*)` is the
     // standard-compliant form. C++20 deprecates the free-function
     // overloads in favor of `std::atomic<std::shared_ptr<T>>`.
@@ -364,4 +396,16 @@ private:
 
     // Signal drain completion if shutting down and all connections closed
     void MaybeSignalDrain();
+
+    // Pool gauge / histogram emit helpers. No-op when `service_name_` is
+    // empty or `obs_manager_` is null. UpDownCounter::Add takes per-shard
+    // internal locks; the call MUST NOT be issued under a PoolPartition-
+    // owned lock — PoolPartition is dispatcher-thread-only, so no caller
+    // holds one today. Direction: +1 for "enters" gauge, -1 for "leaves".
+    void EmitIdleGaugeDelta(double delta);
+    void EmitActiveGaugeDelta(double delta);
+    // duration_sec ≈ 0 for immediate / rejected; positive for created /
+    // queued_satisfied / cancelled. outcome label allowlist enforced by
+    // the catalog cap (cap=6, see metrics_catalog.cc).
+    void EmitCheckoutWaitDuration(double duration_sec, const char* outcome);
 };

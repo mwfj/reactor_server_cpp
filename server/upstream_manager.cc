@@ -384,6 +384,21 @@ bool UpstreamManager::HasUpstream(const std::string& service_name) const {
     return pools_.find(service_name) != pools_.end();
 }
 
+void UpstreamManager::SetObservabilityManager(
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept
+{
+    obs_manager_ = obs_manager;
+    // Forward into every live partition. pools_ is build-once at ctor and
+    // never modified after, so iterating here is safe from any thread.
+    for (auto& [name, pool] : pools_) {
+        if (!pool) continue;
+        for (size_t i = 0; i < pool->partition_count(); ++i) {
+            auto* p = pool->GetPartition(i);
+            if (p) p->SetObservabilityManager(obs_manager);
+        }
+    }
+}
+
 PoolPartition* UpstreamManager::GetPoolPartition(
         const std::string& service_name,
         size_t dispatcher_index) {

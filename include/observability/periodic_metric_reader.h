@@ -17,11 +17,14 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
+class ObservabilityManager;
+
 class PeriodicMetricReader {
 public:
     PeriodicMetricReader(MeterProvider*                 provider,
                           std::shared_ptr<MetricExporter> exporter,
-                          MeterReaderOptions             options = {});
+                          MeterReaderOptions             options = {},
+                          ObservabilityManager*          manager = nullptr);
 
     PeriodicMetricReader(const PeriodicMetricReader&) = delete;
     PeriodicMetricReader& operator=(const PeriodicMetricReader&) = delete;
@@ -78,11 +81,31 @@ public:
         return exporter_;
     }
 
+    // Self-metric escape hatch — returns the ObservabilityManager pointer
+    // installed at construction time, or null when constructed without
+    // one (test fixtures). See batch_span_processor.h::manager() docstring
+    // for the SHUTDOWN CAVEAT on sub-member usage.
+    ObservabilityManager* manager() const noexcept { return manager_; }
+
 private:
     void WorkerLoop();
 
     MeterProvider*                  provider_;
     std::shared_ptr<MetricExporter> exporter_;
+    // Raw pointer; manager storage outlives PMR (PMR is owned by manager
+    // and destructs as part of ~ObservabilityManager's body).
+    //
+    // SHUTDOWN CAVEAT (PMR-specific): `catalog_` is declared AFTER
+    // metric_reader_ in observability_manager.h and destructs FIRST in
+    // reverse-declaration order — by the time ~PeriodicMetricReader's
+    // drain runs, manager_->catalog() may be null/stale. By contrast,
+    // `meter_provider_` and `tracer_provider_` are declared BEFORE
+    // metric_reader_ and are GUARANTEED live for the entire drain (the
+    // declaration order at observability_manager.h:303-313 exists
+    // precisely so the worker can keep calling meter_provider_->Snapshot()
+    // during teardown). See batch_span_processor.h::manager() for the
+    // broader BSP-specific caveat.
+    ObservabilityManager*           manager_;
 
     std::atomic<int64_t>            interval_ns_;
     std::atomic<int64_t>            timeout_ns_;

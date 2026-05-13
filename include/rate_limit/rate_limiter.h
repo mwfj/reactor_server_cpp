@@ -4,6 +4,7 @@
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "config/server_config.h"
+#include "observability/common.h"
 // <atomic>, <memory>, <mutex>, <vector> provided by common.h (via http_request.h)
 
 class RateLimitManager {
@@ -19,6 +20,24 @@ public:
     // appropriate. Returns true if allowed, false if denied.
     // Thread-safe: reads atomic scalars + snapshot of zone list.
     bool Check(HttpRequest& request, HttpResponse& response);
+
+    // Install a non-owning pointer to the server's ObservabilityManager.
+    // Called once from HttpServer::MarkServerReady after both objects are
+    // constructed. Pre-call, Check() short-circuits its emit path
+    // (obs_manager_ stays null). Post-call each per-zone decision
+    // (admit / reject / dry_run_reject) reports through
+    // `cat.reactor_rate_limit_decisions` and `cat.reactor_rate_limit_tokens`.
+    //
+    // SHUTDOWN CAVEAT: in HttpServer's declaration order,
+    // observability_manager_ is declared AFTER rate_limit_manager_, so
+    // reverse-destruction destroys the observability manager FIRST.
+    // Production paths flush observability via Stop() before either dtor
+    // runs; abnormal-path teardown (mid-startup exception, test fixtures
+    // dropping the server without Stop()) relies on the null-check inside
+    // Check()'s emit branch. Mirrors the lifetime docstring on
+    // BatchSpanProcessor::manager().
+    void SetObservabilityManager(
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept;
 
     // Evict expired entries from zone shards assigned to this dispatcher.
     // Called periodically from the dispatcher timer handler.
@@ -66,4 +85,14 @@ private:
     // --- Stats counters (relaxed atomics) ---
     std::atomic<int64_t> total_allowed_{0};
     std::atomic<int64_t> total_denied_{0};
+
+    // Non-owning pointer to the observability manager. Read on every
+    // Check() in the emit branch; written once by SetObservabilityManager
+    // in MarkServerReady before traffic starts. Atomic so a concurrent
+    // reader in Check() sees a consistent value if reload paths ever
+    // mutate it (current production keeps the manager pinned for the
+    // server's lifetime). See class-header SHUTDOWN CAVEAT for the
+    // destruction-order invariant.
+    std::atomic<OBSERVABILITY_NAMESPACE::ObservabilityManager*>
+        obs_manager_{nullptr};
 };

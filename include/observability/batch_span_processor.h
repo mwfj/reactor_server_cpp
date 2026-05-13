@@ -46,7 +46,8 @@ struct BatchSpanProcessorOptions {
 class BatchSpanProcessor final : public SpanProcessor {
 public:
     BatchSpanProcessor(std::shared_ptr<SpanExporter> exporter,
-                        BatchSpanProcessorOptions    options = {});
+                        BatchSpanProcessorOptions    options = {},
+                        ObservabilityManager*        manager = nullptr);
 
     BatchSpanProcessor(const BatchSpanProcessor&) = delete;
     BatchSpanProcessor& operator=(const BatchSpanProcessor&) = delete;
@@ -56,6 +57,20 @@ public:
     void OnEnd(SpanData data) override;
     void SignalShutdown() override;
     void JoinWorkers(std::chrono::milliseconds deadline) override;
+
+    // Self-metric escape hatch — returns the ObservabilityManager pointer
+    // captured at ctor. The raw pointer itself stays valid for the BSP's
+    // full lifetime (~BatchSpanProcessor runs inside ~ObservabilityManager,
+    // so the manager object's storage outlives this processor).
+    //
+    // SHUTDOWN CAVEAT for self-metric consumers: ~ObservabilityManager
+    // destructs its members in reverse-declaration order. Members declared
+    // AFTER span_processor_ (tracer_provider_, meter_provider_,
+    // metric_reader_, catalog_ — see observability_manager.h) are ALREADY
+    // DESTROYED by the time ~BatchSpanProcessor's JoinWorkers drain runs.
+    // Self-metric callers that touch those sub-members MUST gate against
+    // shutdown (e.g., catalog() can return null/stale).
+    ObservabilityManager* manager() const noexcept override { return manager_; }
 
     // Live-reloadable knobs.
     void Reload(size_t new_max_export_batch_size,
@@ -119,6 +134,8 @@ private:
     std::vector<SpanData> DrainBatch(size_t cap);
 
     std::shared_ptr<SpanExporter>  exporter_;
+    // See manager() accessor for lifetime invariant + shutdown caveat.
+    ObservabilityManager*          manager_;
     BatchSpanProcessorOptions      options_;
     // Atomic snapshot of live-reloadable fields — read-without-lock by
     // the worker on every iteration so reload visibility is immediate.

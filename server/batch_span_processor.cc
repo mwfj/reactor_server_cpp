@@ -2,6 +2,10 @@
 
 #include "common.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/histogram.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 
@@ -33,8 +37,10 @@ private:
 
 BatchSpanProcessor::BatchSpanProcessor(
     std::shared_ptr<SpanExporter> exporter,
-    BatchSpanProcessorOptions    options)
+    BatchSpanProcessorOptions    options,
+    ObservabilityManager*        manager)
     : exporter_(std::move(exporter)),
+      manager_(manager),
       options_(options),
       // Match Reload()'s clamp: a zero batch cap wedges WorkerLoop —
       // its predicate `queue_.size() >= batch_cap` is permanently true,
@@ -80,8 +86,16 @@ void BatchSpanProcessor::OnEnd(SpanData data) {
     if (shutting_down_.load(std::memory_order_acquire)) {
         // Post-shutdown drop — counted as overflow for diagnostics.
         dropped_on_overflow_.fetch_add(1, std::memory_order_relaxed);
+        // Self-metric: per-shard atomic write, no recursion into OnEnd.
+        if (manager_ != nullptr) {
+            const auto& cat = manager_->catalog();
+            if (cat.reactor_otel_spans_dropped_queue_full != nullptr) {
+                cat.reactor_otel_spans_dropped_queue_full->Add(1.0, {});
+            }
+        }
         return;
     }
+    bool overflow_dropped = false;
     {
         std::lock_guard<std::mutex> g(mtx_);
         if (queue_.size() >= options_.max_queue_size) {
@@ -89,8 +103,16 @@ void BatchSpanProcessor::OnEnd(SpanData data) {
             // for live debugging) are preserved.
             queue_.pop_front();
             dropped_on_overflow_.fetch_add(1, std::memory_order_relaxed);
+            overflow_dropped = true;
         }
         queue_.emplace_back(std::move(data));
+    }
+    if (overflow_dropped && manager_ != nullptr) {
+        // Self-metric emitted outside the queue mutex.
+        const auto& cat = manager_->catalog();
+        if (cat.reactor_otel_spans_dropped_queue_full != nullptr) {
+            cat.reactor_otel_spans_dropped_queue_full->Add(1.0, {});
+        }
     }
     cv_.notify_one();
 }
@@ -179,6 +201,8 @@ void BatchSpanProcessor::WorkerLoop() {
                 } else {
                     attempt_batch = std::move(batch);
                 }
+                const auto t0 = std::chrono::steady_clock::now();
+                bool export_threw = false;
                 try {
                     result = exporter_->Export(std::move(attempt_batch),
                                                   deadline);
@@ -189,7 +213,7 @@ void BatchSpanProcessor::WorkerLoop() {
                     dropped_on_export_failure_.fetch_add(
                         static_cast<int64_t>(batch_size),
                         std::memory_order_relaxed);
-                    break;
+                    export_threw = true;
                 } catch (...) {
                     logging::Get()->error(
                         "BatchSpanProcessor::Export threw unknown exception "
@@ -197,8 +221,41 @@ void BatchSpanProcessor::WorkerLoop() {
                     dropped_on_export_failure_.fetch_add(
                         static_cast<int64_t>(batch_size),
                         std::memory_order_relaxed);
-                    break;
+                    export_threw = true;
                 }
+                // Self-metric: per-shard atomic write, no recursion into
+                // OnEnd. Exception paths attribute to non_retryable_fail.
+                if (manager_ != nullptr) {
+                    const auto& cat = manager_->catalog();
+                    if (cat.reactor_otel_export_duration != nullptr) {
+                        const double elapsed_s =
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t0).count();
+                        cat.reactor_otel_export_duration->Record(
+                            elapsed_s, {{"signal", "traces"}});
+                    }
+                    if (cat.reactor_otel_spans_exported != nullptr) {
+                        const char* outcome = nullptr;
+                        if (export_threw) {
+                            outcome = "non_retryable_fail";
+                        } else {
+                            switch (result) {
+                                case ExportResult::kSuccess:
+                                    outcome = "success"; break;
+                                case ExportResult::kFailedRetryable:
+                                    outcome = "retryable_fail"; break;
+                                case ExportResult::kFailedNotRetryable:
+                                    outcome = "non_retryable_fail"; break;
+                            }
+                        }
+                        if (outcome != nullptr) {
+                            cat.reactor_otel_spans_exported->Add(
+                                static_cast<double>(batch_size),
+                                {{"outcome", outcome}});
+                        }
+                    }
+                }
+                if (export_threw) break;
                 if (result == ExportResult::kSuccess) {
                     exported_batches_.fetch_add(1, std::memory_order_relaxed);
                     break;

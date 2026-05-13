@@ -88,7 +88,8 @@ UpstreamHostPool::UpstreamHostPool(
             dispatchers[i], host, port, sni_hostname, resolved_endpoint,
             partition_config, tls_ctx,
             outstanding_conns, inflight_leases,
-            manager_shutting_down, drain_mtx, drain_cv));
+            manager_shutting_down, drain_mtx, drain_cv,
+            service_name));
     }
 
 

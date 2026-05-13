@@ -1,9 +1,13 @@
 #include "auth/jwks_fetcher.h"
 
+#include "auth/auth_metrics.h"
 #include "auth/auth_url_util.h"
 #include "auth/upstream_http_client.h"
 #include "auth/jwks_cache.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 
 // jwt-cpp pulled in AFTER the common.h-driven includes to avoid spdlog's
 // fmt clashing with picojson (we opt out of picojson project-wide).
@@ -27,6 +31,28 @@
 namespace AUTH_NAMESPACE {
 
 namespace {
+
+// Emit reactor.auth.jwks_refreshes{issuer, outcome}. outcome MUST be one of
+// "success", "network_error", "parse_error". Null-safe against
+// manager / catalog instrument unavailability. Catches every exception —
+// observability emit must not propagate into the fetcher's terminal path.
+void EmitJwksRefresh(
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* mgr,
+    const std::string& issuer_name,
+    const char* outcome) noexcept
+{
+    if (mgr == nullptr || outcome == nullptr) return;
+    try {
+        const auto& cat = mgr->catalog();
+        if (cat.reactor_auth_jwks_refreshes == nullptr) return;
+        cat.reactor_auth_jwks_refreshes->Add(
+            1.0,
+            {{"issuer", AUTH_NAMESPACE::IssuerLabelOrUnknown(issuer_name)},
+             {"outcome", outcome}});
+    } catch (...) {
+        // Defensive: observability is best-effort; never propagate.
+    }
+}
 
 // Convert a single JWK into an OpenSSL PEM-encoded public key string.
 // Supports RSA ("kty":"RSA") and EC ("kty":"EC") per RFC 7518.
@@ -218,6 +244,7 @@ void JwksFetcher::StartFetch(const std::string& jwks_uri,
     std::shared_ptr<JwksCache> cache = cache_;
     auto cb = after_cb;
     std::shared_ptr<std::atomic<uint64_t>> owner_generation = owner_generation_;
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs = obs_manager_;
 
     client_->Issue(
         upstream_pool_name_,
@@ -229,7 +256,14 @@ void JwksFetcher::StartFetch(const std::string& jwks_uri,
         // the cache and generation atomic alive until the lambda ends
         // — avoids UAF that would otherwise arise from raw-pointer
         // captures surviving into a teardown window.
-        [cache, issuer_name, generation, owner_generation, cb, token](
+        // `obs` is captured by raw pointer. ObservabilityManager destructs
+        // FIRST (declared LAST on HttpServer per auth_manager.h), so the
+        // pointer can dangle if the lambda fires after manager teardown.
+        // Safety: HttpServer::Stop runs KillAndShutdownObservability and
+        // flips each JwksFetcher's `token` BEFORE manager destruction;
+        // the cancellation short-circuit below fires before reaching any
+        // `obs` deref.
+        [cache, issuer_name, generation, owner_generation, cb, token, obs](
                 UpstreamHttpClient::Response resp) {
             // Terminal callback — guaranteed at most once. Always release
             // the refresh slot, regardless of outcome.
@@ -241,6 +275,9 @@ void JwksFetcher::StartFetch(const std::string& jwks_uri,
                     issuer_name, generation);
                 if (cache) cache->ReleaseRefreshSlot();
                 if (cb) cb(generation);
+                // Cancelled fetches do NOT emit jwks_refreshes — the
+                // outcome is neither success nor a real failure; it's
+                // a reload/Stop drop.
                 return;
             }
             if (!resp.error.empty() || resp.status_code != 200) {
@@ -253,12 +290,14 @@ void JwksFetcher::StartFetch(const std::string& jwks_uri,
                 if (cache) cache->OnFetchError(reason);
                 if (cache) cache->ReleaseRefreshSlot();
                 if (cb) cb(generation);
+                EmitJwksRefresh(obs, issuer_name, "network_error");
                 return;
             }
             std::string parse_reason;
             auto pairs = ParseAndConvert(resp.body, issuer_name, parse_reason);
             if (pairs.empty()) {
                 if (cache) cache->OnFetchError(parse_reason);
+                EmitJwksRefresh(obs, issuer_name, "parse_error");
             } else {
                 // Generation gate: drop the install if the Issuer's
                 // generation advanced while this fetch was in flight
@@ -279,8 +318,12 @@ void JwksFetcher::StartFetch(const std::string& jwks_uri,
                         "captured_gen={} current_gen={}",
                         issuer_name, generation, current_gen);
                     if (cache) cache->OnFetchError("stale_generation");
+                    // Stale-generation drop is closer to "we abandoned
+                    // this fetch" than a fetch failure — same logic as
+                    // cancellation; do not emit a refresh outcome.
                 } else if (cache) {
                     cache->InstallKeys(std::move(pairs));
+                    EmitJwksRefresh(obs, issuer_name, "success");
                 }
             }
             if (cache) cache->ReleaseRefreshSlot();
