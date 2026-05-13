@@ -102,8 +102,16 @@ public:
     // Test-only: adjust the lease counters by signed deltas. Tests that
     // exercise the swap helper in isolation use this to restore a clean
     // baseline before the manager destructor checks invariants.
-    void RebalanceCountersForTesting(int64_t inflight_delta,
-                                     int64_t donated_delta) noexcept {
+    //
+    // WARNING: production use silently corrupts the drain predicate.
+    // The HttpServer::WaitForAllAsyncDrain barrier gates on
+    // `inflight_leases_ == 0`; a non-zero delta from production code
+    // would either prematurely satisfy the predicate (leaks) or wedge
+    // shutdown forever (deadlock). The `_DO_NOT_USE_IN_PRODUCTION`
+    // suffix makes grep-audits trivial — a CI/lint hook can reject any
+    // non-test file that references this symbol.
+    void RebalanceCountersForTesting_DO_NOT_USE_IN_PRODUCTION(
+        int64_t inflight_delta, int64_t donated_delta) noexcept {
         inflight_leases_.fetch_add(inflight_delta,
                                    std::memory_order_acq_rel);
         donated_h2_leases_.fetch_add(donated_delta,

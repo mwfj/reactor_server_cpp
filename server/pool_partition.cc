@@ -8,6 +8,7 @@
 #include "tls/tls_connection.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
+#include <cassert>
 #include <future>
 
 // ── UpstreamLease out-of-line definitions ──────────────────────────────
@@ -31,6 +32,24 @@ void UpstreamLease::Release() {
     // dereference freed memory.
     const bool partition_live = partition_ && partition_alive_ &&
         partition_alive_->load(std::memory_order_acquire);
+
+#ifndef NDEBUG
+    // Dispatcher-thread-only invariant. Release calls into
+    // partition_->ReturnConnection / ReturnH2Stream which mutate
+    // idle_conns_ / active_conns_ / h2_table_ — all dispatcher-locked-
+    // by-convention with no internal mutex. A cross-thread Release would
+    // race those containers. Assert in debug builds only because the
+    // invariant is enforced socially today; if a future async drop site
+    // violates it, this fires loudly.
+    if (partition_live && partition_->dispatcher() &&
+        !partition_->dispatcher()->is_on_loop_thread()) {
+        logging::Get()->error(
+            "UpstreamLease::Release: called off the partition dispatcher "
+            "thread — container mutation race");
+        assert(false &&
+               "UpstreamLease::Release must run on partition dispatcher");
+    }
+#endif
 
     if (kind_ == Kind::H1 && partition_live && conn_) {
         partition_->ReturnConnection(conn_, donated_to_h2_);
@@ -2063,11 +2082,27 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     }
 
     if (!shell) {
-        logging::Get()->error(
-            "OnH2ConnectHandshakeComplete: no shell in stash for {}:{} "
-            "on ALPN-h2 success — failing queued waiters",
-            upstream_name, port);
-        if (uc_raw) {
+        // Distinguish the two shapes for shutdown-ordering forensics:
+        // - shell-only-missing (uc_raw still present): a concurrent
+        //   teardown reached the shell map first; uc_raw needs explicit
+        //   destruction here.
+        // - dual-null (uc_raw also vanished): a concurrent shutdown
+        //   reaped both the shell AND the transport from connecting_conns_
+        //   before this disposition path ran; nothing left to free, and
+        //   FailH2StreamSlotWaiters is a no-op today (no production
+        //   enqueuer) — so this branch returns silently otherwise. Log
+        //   at debug so a future shutdown-ordering regression has a
+        //   diagnostic trail.
+        if (!uc_raw) {
+            logging::Get()->debug(
+                "OnH2ConnectHandshakeComplete: shell AND transport both "
+                "vanished concurrently for {}:{} (likely shutdown race) "
+                "— no resources to free", upstream_name, port);
+        } else {
+            logging::Get()->error(
+                "OnH2ConnectHandshakeComplete: no shell in stash for "
+                "{}:{} on ALPN-h2 success — failing queued waiters",
+                upstream_name, port);
             auto owned = ExtractFromConnecting(uc_raw);
             if (owned) DestroyConnection(std::move(owned));
         }
@@ -2096,6 +2131,13 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
             "threw for {}:{}: {}",
             upstream_name, port, e.what());
         if (uc_raw) ClearTransportCallbacks(uc_raw);
+        // ClearTransportCallbacks alone is not sufficient: SetOnMessageCb
+        // is wired first, so a mid-wire throw can leave an OnMessage
+        // closure live on the transport that captured `shell.get()`.
+        // fail() routes through `shell->DestroyOnDispatcher()` which
+        // flips conn_alive_->false BEFORE freeing the shell; any
+        // surviving callback's alive-token guard short-circuits before
+        // dereferencing the destroyed shell.
         fail(CHECKOUT_CONNECT_FAILED, "h2 wire-callbacks threw");
         return;
     }

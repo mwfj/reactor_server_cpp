@@ -7234,8 +7234,8 @@ static void TestS31_DonatedLeaseFullLifecycle() {
             // → AdoptLease swaps to +1 donated" shape. The fake conn
             // pointer is opaque — Release won't dereference it (just
             // searches active_conns_ which contains other elements).
-            mgr.RebalanceCountersForTesting(/*inflight_delta=*/1,
-                                            /*donated_delta=*/0);
+            mgr.RebalanceCountersForTesting_DO_NOT_USE_IN_PRODUCTION(
+                /*inflight_delta=*/1, /*donated_delta=*/0);
             // AdoptLease with a non-empty lease that points at a
             // sentinel (unowned) UpstreamConnection*. The lease's
             // partition_ + alive token come from the partition's
@@ -7260,8 +7260,8 @@ static void TestS31_DonatedLeaseFullLifecycle() {
             // donated_h2_leases_--. We can't drive that real path here
             // (partition_alive=nullptr short-circuits Release), so
             // simulate the decrement manually.
-            mgr.RebalanceCountersForTesting(/*inflight_delta=*/0,
-                                            /*donated_delta=*/-1);
+            mgr.RebalanceCountersForTesting_DO_NOT_USE_IN_PRODUCTION(
+                /*inflight_delta=*/0, /*donated_delta=*/-1);
 
             int64_t inflight_after_release = mgr.active_leases();
             int64_t donated_after_release = mgr.donated_h2_leases();
