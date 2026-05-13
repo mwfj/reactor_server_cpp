@@ -505,6 +505,14 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
     // cap would fail siblings inside SubmitRequest's IsUsable() gate
     // (returns -1), even though they won the dequeue race. Refuse to
     // admit unless FindUsable still reports a slot is available.
+    //
+    // FIFO preservation: continue (not break) on FindUsable=null lets
+    // entry N+1 fire before entry N stays requeued, which would be an
+    // FIFO inversion. In practice FindUsable is deterministic across
+    // iterations of THIS drain — ready_callback creates no new sessions
+    // and the live h2_table_ entry only sheds capacity, never gains it
+    // — so either every entry sees a usable session (and fires until
+    // cap) or none do (and all requeue). No inversion observable.
     std::deque<WaitEntry> requeue;
     for (auto& e : matched) {
         if (!alive->load(std::memory_order_acquire)) return;
@@ -557,13 +565,25 @@ void PoolPartition::ReapPendingDestroyH2Conns() {
         pending_h2_replacement_targets_.empty()) {
         return;
     }
-    // Snapshot-then-process: a destroy step's callback chain (sink
-    // OnError → ProxyTransaction::Cleanup → ResetStream → late GOAWAY
-    // handling) could re-enter MoveConnToPendingDestroy. Owning the
-    // vector locally prevents iterator invalidation; the new entry
-    // remains in `pending_destroy_h2_conns_` for the next reap.
+    // Snapshot BOTH containers together BEFORE running destroy. A
+    // destroy step's callback chain (sink OnError →
+    // ProxyTransaction::Cleanup → ResetStream → late GOAWAY handling)
+    // could re-enter MoveConnToPendingDestroy, which appends to BOTH
+    // pending_destroy_h2_conns_ and pending_h2_replacement_targets_.
+    // If we snapshot targets AFTER destroy, the newly-appended target
+    // is picked up here while its newly-appended victim sits unmoved
+    // in pending_destroy_h2_conns_ — StartH2ReplacementConnect runs
+    // BEFORE that victim's slot is freed, and under
+    // pool.max_connections=1 the cap-gate rejects the probe and the
+    // target is silently lost.
+    // Both snapshots taken together. Reentrant additions stay in the
+    // members for the NEXT reap, where they get paired correctly
+    // (victim destroyed → slot freed → target drained).
     auto victims = std::move(pending_destroy_h2_conns_);
     pending_destroy_h2_conns_.clear();
+    auto targets = std::move(pending_h2_replacement_targets_);
+    pending_h2_replacement_targets_.clear();
+
     for (auto& c : victims) {
         if (!c) continue;
         c->DestroyOnDispatcher();
@@ -577,11 +597,17 @@ void PoolPartition::ReapPendingDestroyH2Conns() {
     // the TotalCount cap. StartH2ReplacementConnect is idempotent
     // (gates on h2_connecting_conns_ and h2_table_) so a duplicate
     // call is a no-op.
-    auto targets = std::move(pending_h2_replacement_targets_);
-    pending_h2_replacement_targets_.clear();
     for (const auto& key : targets) {
         StartH2ReplacementConnect(key.host, key.port);
     }
+}
+
+void PoolPartition::InsertH2ConnectionForTesting(
+    const std::string& upstream_name,
+    std::unique_ptr<UpstreamH2Connection> conn) {
+    if (!conn) return;
+    conn->SetPartition(this);
+    h2_table_.Insert(upstream_name, std::move(conn));
 }
 
 void PoolPartition::FailH2StreamSlotWaiters(

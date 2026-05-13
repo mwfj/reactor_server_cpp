@@ -326,6 +326,19 @@ public:
     // `service_name_` is ctor-initialised and never mutated.
     const std::string& service_name() const { return service_name_; }
 
+    // Test-only: insert a fully-Init'd `UpstreamH2Connection` (typically
+    // built with a null transport in unit-test fixtures) into the
+    // partition's h2_table_. Production paths funnel through
+    // `AcquireH2Connection` (in-place promotion) and
+    // `OnH2ConnectHandshakeComplete` (cold-start probe success) which
+    // carry the full transport + lease + callback wiring. Tests that
+    // exercise the partition's wait-queue / drain helpers without a
+    // real socket use this entry point to skip the connect probe.
+    // Dispatcher-thread-only — mutates h2_table_ without a barrier.
+    void InsertH2ConnectionForTesting(
+        const std::string& upstream_name,
+        std::unique_ptr<UpstreamH2Connection> conn);
+
 private:
     std::shared_ptr<Dispatcher> dispatcher_;
     // h2_table_ / wait-queue key. NOT upstream_host_ (operator literal,
