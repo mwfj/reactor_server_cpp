@@ -91,6 +91,18 @@ std::unique_ptr<UpstreamH2Connection> H2ConnectionTable::Extract(
     return nullptr;
 }
 
+std::vector<std::unique_ptr<UpstreamH2Connection>>
+H2ConnectionTable::ExtractAll() {
+    std::vector<std::unique_ptr<UpstreamH2Connection>> out;
+    for (auto& [_, conns] : by_upstream_) {
+        for (auto& c : conns) {
+            if (c) out.push_back(std::move(c));
+        }
+    }
+    by_upstream_.clear();
+    return out;
+}
+
 void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
     for (auto& [_, conns] : by_upstream_) {
         auto it = conns.begin();

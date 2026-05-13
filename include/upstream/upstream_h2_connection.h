@@ -143,10 +143,13 @@ public:
     // returns to the pool only after every stream has exited.
     void AdoptLease(UpstreamLease lease);
 
-    // Bind this session to its owning partition. Set once by
-    // AcquireH2Connection right after construction; never reassigned.
-    // Needed by HandleBytes to drive the post-recv pending_destroy
-    // reap and by DestroyOnDispatcher to clean up timer registrations.
+    // Bind this session to its owning partition. Set by every code path
+    // that installs an H2 session: AcquireH2Connection (in-place
+    // promotion), OnH2ConnectHandshakeComplete (cold-start probe
+    // success), and InsertH2ConnectionForTesting. Never reassigned
+    // after install. Needed by HandleBytes to drive the post-recv
+    // pending_destroy reap and by DestroyOnDispatcher to clean up
+    // timer registrations.
     void SetPartition(PoolPartition* partition) { partition_ = partition; }
 
     // Fan out an error to every active stream (transport closed, PING

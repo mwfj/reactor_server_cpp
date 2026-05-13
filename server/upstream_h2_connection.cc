@@ -578,6 +578,13 @@ void UpstreamH2Connection::OnPingAck() {
 }
 
 void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
+    // Defense-in-depth: if the transport was donated to AdoptAsH1Connection
+    // (transferred_ flag), a late GOAWAY frame arriving on the recv path
+    // would otherwise drive MoveConnToPendingDestroy on a session whose
+    // transport is now owned by the H1 idle pool. Today the H2 session is
+    // already torn down before adoption completes, but a future refactor
+    // could reopen this UAF surface.
+    if (transferred_) return;
     auto now = std::chrono::steady_clock::now();
     // Set goaway_seen_=true BEFORE the fan-out below: a sink's OnError
     // closure can synchronously call back into TryDispatchExistingH2Session
@@ -748,16 +755,26 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                 // zero-delay retry classification.
                 int classified = ProxyTransaction::RESULT_UPSTREAM_DISCONNECT;
                 const char* reason_label = "h2 stream closed with error";
+                const char* classification_label = "UPSTREAM_DISCONNECT";
                 if (error_code == NGHTTP2_REFUSED_STREAM) {
                     classified = ProxyTransaction::RESULT_GOAWAY_UNPROCESSED;
                     reason_label = "h2 stream refused — peer did not process";
+                    classification_label = "GOAWAY_UNPROCESSED";
                 } else if (goaway_seen_ &&
                            stream_id <= goaway_last_stream_id_) {
                     classified =
                         ProxyTransaction::RESULT_GOAWAY_MAYBE_PROCESSED;
                     reason_label = "h2 stream closed mid-drain after "
                                    "GOAWAY — peer may have processed";
+                    classification_label = "GOAWAY_MAYBE_PROCESSED";
                 }
+                // Per-branch trace so operators can correlate retry
+                // classification with stream lifecycle from logs alone.
+                logging::Get()->info(
+                    "H2 stream close classified={} stream={} code={} "
+                    "goaway_seen={} goaway_last={}",
+                    classification_label, stream_id, error_code,
+                    goaway_seen_, goaway_last_stream_id_);
                 stream->sink->OnError(
                     classified,
                     std::string(reason_label) + " code=" +

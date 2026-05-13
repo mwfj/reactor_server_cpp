@@ -69,6 +69,14 @@ public:
     // callback).
     std::unique_ptr<UpstreamH2Connection> Extract(UpstreamH2Connection* conn);
 
+    // Move every tracked connection out of the table. Returned vector
+    // owns the conns; the table is left empty. Used by
+    // PoolPartition::InitiateShutdown to retire H2 sessions via
+    // DestroyOnDispatcher on the partition's dispatcher thread so the
+    // donated leases drop and the partition's outstanding_conns_
+    // counter reaches zero before WaitForDrain times out.
+    std::vector<std::unique_ptr<UpstreamH2Connection>> ExtractAll();
+
 private:
     std::unordered_map<std::string,
         std::vector<std::unique_ptr<UpstreamH2Connection>>> by_upstream_;

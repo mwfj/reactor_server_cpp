@@ -6983,6 +6983,142 @@ static void TestS28_ReapSnapshotsBothContainersTogether() {
     }
 }
 
+// S29 — Pending-replacement-target deque IS drained by
+// ReapPendingDestroyH2Conns. Uses the test-only seeder to populate the
+// deque directly (production path is MoveConnToPendingDestroy with a
+// transport-bearing conn, which is hard to fixture without real
+// sockets). Verifies the deque is empty after reap — locks the C3-High
+// snapshot-ordering invariant against future refactors that snapshot
+// targets after destroy (the original bug shape).
+static void TestS29_ReapDrainsSeededReplacementTargets() {
+    std::cout << "\n[TEST] H2Upstream S29: reap drains seeded replacement targets..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        cfg.pool.max_connections = 1;
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream S29: reap drains seeded replacement targets",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        std::promise<std::pair<size_t, size_t>> result;
+        auto fut = result.get_future();
+        disp->EnQueue([&]() {
+            // Seed 3 replacement targets directly into the deque.
+            for (int p : {9000, 9001, 9002}) {
+                part->SeedPendingReplacementTargetForTesting(p);
+            }
+            size_t before = part->PendingReplacementTargetCountForTesting();
+            // ReapPendingDestroyH2Conns must drain the deque even when
+            // pending_destroy_h2_conns_ is empty. StartH2ReplacementConnect
+            // will be called for each entry but will likely no-op on
+            // various gates (no resolved_endpoint_ for the cold-start
+            // probe, etc.) — the test cares only that the deque empties.
+            part->ReapPendingDestroyH2Conns();
+            size_t after = part->PendingReplacementTargetCountForTesting();
+            result.set_value({before, after});
+        });
+        auto [before, after] =
+            (fut.wait_for(std::chrono::seconds(2)) == std::future_status::ready)
+                ? fut.get()
+                : std::pair<size_t, size_t>{999, 999};
+
+        bool pass = before == 3 && after == 0;
+        TestFramework::RecordTest(
+            "H2Upstream S29: reap drains seeded replacement targets",
+            pass,
+            pass ? "" :
+                (std::string("before=") + std::to_string(before) +
+                 " after=" + std::to_string(after)).c_str());
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S29: reap drains seeded replacement targets",
+            false, e.what());
+    }
+}
+
+// S30 — InitiateShutdown retires H2 sessions. Locks the C1-P1
+// regression where idle H2 sessions kept their donated leases alive,
+// holding outstanding_conns_ > 0 and deadlocking WaitForDrain. Inserts
+// a fake (null-transport) H2 session into h2_table_, then verifies
+// InitiateShutdown empties h2_table_ as part of the partition's
+// retirement sweep.
+static void TestS30_InitiateShutdownRetiresH2Sessions() {
+    std::cout << "\n[TEST] H2Upstream S30: InitiateShutdown retires H2 sessions..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        cfg.pool.max_connections = 1;
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream S30: InitiateShutdown retires H2 sessions",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        auto h2_cfg = std::make_shared<Http2UpstreamConfig>();
+        h2_cfg->enabled = true;
+        h2_cfg->max_concurrent_streams_pref = 10;
+        h2_cfg->ping_idle_sec = 0;
+        h2_cfg->ping_timeout_sec = 0;
+        h2_cfg->goaway_drain_timeout_sec = 0;
+        auto h2_conn = std::make_unique<UpstreamH2Connection>(nullptr, h2_cfg);
+        if (!h2_conn->Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S30: InitiateShutdown retires H2 sessions",
+                false, "UpstreamH2Connection::Init failed");
+            return;
+        }
+
+        std::promise<std::tuple<size_t, size_t, size_t>> result;
+        auto fut = result.get_future();
+        disp->EnQueue([&]() {
+            part->InsertH2ConnectionForTesting("svc", std::move(h2_conn));
+            // Pre-shutdown: H2 table has 1 entry.
+            size_t pre = part->H2TableCount();
+            // Drive shutdown. The new H2-retirement block in
+            // InitiateShutdown must walk h2_table_, h2_connecting_conns_,
+            // and pending_destroy_h2_conns_ on the dispatcher.
+            part->InitiateShutdown();
+            // Post-shutdown: H2 table empty + replacement targets empty.
+            size_t post_table = part->H2TableCount();
+            size_t post_targets = part->PendingReplacementTargetCountForTesting();
+            result.set_value({pre, post_table, post_targets});
+        });
+        auto vals =
+            (fut.wait_for(std::chrono::seconds(2)) == std::future_status::ready)
+                ? fut.get()
+                : std::tuple<size_t, size_t, size_t>{999, 999, 999};
+
+        bool pass = std::get<0>(vals) == 1 &&
+                    std::get<1>(vals) == 0 &&
+                    std::get<2>(vals) == 0;
+        TestFramework::RecordTest(
+            "H2Upstream S30: InitiateShutdown retires H2 sessions",
+            pass,
+            pass ? "" :
+                (std::string("pre_table=") + std::to_string(std::get<0>(vals)) +
+                 " post_table=" + std::to_string(std::get<1>(vals)) +
+                 " post_targets=" + std::to_string(std::get<2>(vals))).c_str());
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S30: InitiateShutdown retires H2 sessions",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RunAll aggregator
 // ---------------------------------------------------------------------------
@@ -7016,6 +7152,8 @@ void RunAllH2UpstreamTests() {
     TestS26_CapacityAwareDrainStopsAtCap();
     TestS27_MovePendingDestroyCapturesReplacementTarget();
     TestS28_ReapSnapshotsBothContainersTogether();
+    TestS29_ReapDrainsSeededReplacementTargets();
+    TestS30_InitiateShutdownRetiresH2Sessions();
 
     // Tier A — unit tests
     TestMinCadenceSecDisabled();

@@ -339,6 +339,23 @@ public:
         const std::string& upstream_name,
         std::unique_ptr<UpstreamH2Connection> conn);
 
+    // Test-only: directly seed pending_h2_replacement_targets_. The
+    // production path goes through MoveConnToPendingDestroy(conn), but
+    // that requires a transport-bearing conn (the null-transport
+    // branch correctly skips target capture). Tests that exercise the
+    // paired-snapshot ordering of ReapPendingDestroyH2Conns use this
+    // entry to populate the deque without spinning up a real socket.
+    // Dispatcher-thread-only.
+    void SeedPendingReplacementTargetForTesting(int port);
+
+    // Test-only: observe the current size of
+    // pending_h2_replacement_targets_. Used by regression tests that
+    // need to verify the deque was drained after ReapPendingDestroyH2Conns.
+    // Dispatcher-thread-only.
+    size_t PendingReplacementTargetCountForTesting() const {
+        return pending_h2_replacement_targets_.size();
+    }
+
 private:
     std::shared_ptr<Dispatcher> dispatcher_;
     // h2_table_ / wait-queue key. NOT upstream_host_ (operator literal,

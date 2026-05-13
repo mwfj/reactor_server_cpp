@@ -1,7 +1,5 @@
 #pragma once
 
-#include <functional>
-
 #include "upstream/upstream_response_head.h"
 
 namespace UPSTREAM_CALLBACKS_NAMESPACE {
