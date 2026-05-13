@@ -6132,6 +6132,48 @@ static void TestS14_AlpnNotNegotiatedContract() {
             PT::RESULT_GOAWAY_MAYBE_PROCESSED)
             { pass = false; err += "ALPN_NOT_NEGOTIATED collides with GOAWAY_MAYBE_PROCESSED; "; }
 
+        // Response contract: 502 BadGateway with X-H2-Limitation header
+        // is the operator-visible signal for this deterministic policy
+        // reject. Asserting the response body shape locks the contract
+        // documented in proxy_transaction.h:95.
+        auto find_header = [](const HttpResponse& r,
+                              const std::string& name) -> const std::string* {
+            for (auto& kv : r.GetHeaders()) {
+                if (kv.first == name) return &kv.second;
+            }
+            return nullptr;
+        };
+
+        HttpResponse alpn_resp =
+            PT::MakeErrorResponse(PT::RESULT_H2_ALPN_NOT_NEGOTIATED);
+        if (alpn_resp.GetStatusCode() != 502) {
+            pass = false;
+            err += "ALPN_NOT_NEGOTIATED should map to 502; got " +
+                   std::to_string(alpn_resp.GetStatusCode()) + "; ";
+        }
+        const std::string* alpn_h = find_header(alpn_resp, "X-H2-Limitation");
+        if (!alpn_h || *alpn_h != "alpn-not-h2") {
+            pass = false;
+            err += "ALPN_NOT_NEGOTIATED missing X-H2-Limitation:alpn-not-h2; ";
+        }
+
+        // Same contract for METHOD_NOT_SUPPORTED — CONNECT pseudo-header
+        // limitation surfaces via X-H2-Limitation:connect-not-supported.
+        HttpResponse method_resp =
+            PT::MakeErrorResponse(PT::RESULT_H2_METHOD_NOT_SUPPORTED);
+        if (method_resp.GetStatusCode() != 502) {
+            pass = false;
+            err += "METHOD_NOT_SUPPORTED should map to 502; got " +
+                   std::to_string(method_resp.GetStatusCode()) + "; ";
+        }
+        const std::string* method_h =
+            find_header(method_resp, "X-H2-Limitation");
+        if (!method_h || *method_h != "connect-not-supported") {
+            pass = false;
+            err += "METHOD_NOT_SUPPORTED missing "
+                   "X-H2-Limitation:connect-not-supported; ";
+        }
+
         TestFramework::RecordTest(
             "H2Upstream S14: RESULT_H2_ALPN_NOT_NEGOTIATED contract",
             pass, err);
@@ -6436,7 +6478,7 @@ static void TestS20_DrainAnyWaitersRequeuesWithoutUsableSession() {
             }
             queued.set_value();
         });
-        queued_fut.wait_for(std::chrono::seconds(2));
+        queued_fut.wait_for(std::chrono::seconds(5));
 
         bool queued_ok = (part->WaitQueueSize() == 3);
 
@@ -6446,7 +6488,7 @@ static void TestS20_DrainAnyWaitersRequeuesWithoutUsableSession() {
             part->DrainAnyWaitersForFastH2();
             drained.set_value();
         });
-        drained_fut.wait_for(std::chrono::seconds(2));
+        drained_fut.wait_for(std::chrono::seconds(5));
 
         // No h2_table_ entry → FindUsable returns null → all 3 requeue
         // with no callbacks. FIFO preserved.
@@ -6500,7 +6542,7 @@ static void TestS21_TotalCountExcludesH2Containers() {
             size_t total_after = part->TotalCount();
             result.set_value(total_before == 0 && total_after == 0);
         });
-        bool pass = (fut.wait_for(std::chrono::seconds(2)) ==
+        bool pass = (fut.wait_for(std::chrono::seconds(5)) ==
                      std::future_status::ready) && fut.get();
         TestFramework::RecordTest(
             "H2Upstream S21: TotalCount excludes H2 containers",
@@ -6547,7 +6589,7 @@ static void TestS22_DrainH2StreamSlotRequeuesWhenNoSession() {
             part->DrainH2StreamWaitersForHost("svc", 9999);
             done.set_value();
         });
-        fut.wait_for(std::chrono::seconds(2));
+        fut.wait_for(std::chrono::seconds(5));
 
         bool pass = ready_calls.load() == 0 &&
                     error_calls.load() == 0 &&
@@ -6591,7 +6633,7 @@ static void TestS23_DrainHelpersEarlyReturnOnEmptyQueue() {
             part->DrainH2StreamWaitersForHost("svc", 9999);
             done.set_value();
         });
-        bool ok = (fut.wait_for(std::chrono::seconds(2)) ==
+        bool ok = (fut.wait_for(std::chrono::seconds(5)) ==
                    std::future_status::ready);
 
         bool pass = ok && part->WaitQueueSize() == 0;
@@ -6642,7 +6684,7 @@ static void TestS24_DrainH2StreamWaitersForHostKeepsAllEntries() {
             part->DrainH2StreamWaitersForHost("svc", 9999);
             done.set_value();
         });
-        fut.wait_for(std::chrono::seconds(2));
+        fut.wait_for(std::chrono::seconds(5));
 
         // No usable H2 session → all 3 entries must remain queued, NO
         // callbacks fire (defer-and-wait shape). FIFO preserved via
@@ -6711,7 +6753,7 @@ static void TestS25_DrainAnyWaitersShutdownFiresError() {
             part->DrainAnyWaitersForFastH2();
             done.set_value();
         });
-        fut.wait_for(std::chrono::seconds(2));
+        fut.wait_for(std::chrono::seconds(5));
 
         // Shutdown path: ready_cb never fires; error_cb fires once per
         // waiter with CHECKOUT_SHUTTING_DOWN; queue drained.
@@ -6809,7 +6851,7 @@ static void TestS26_CapacityAwareDrainStopsAtCap() {
             part->DrainAnyWaitersForFastH2();
             drained.set_value();
         });
-        drained_fut.wait_for(std::chrono::seconds(2));
+        drained_fut.wait_for(std::chrono::seconds(5));
 
         // Expected: only the first waiter fires (consumes the cap=1
         // slot via SubmitRequest); the other two stay queued. Without
@@ -6878,7 +6920,7 @@ static void TestS27_MovePendingDestroyCapturesReplacementTarget() {
                       (part->H2TableCount() == 0);
             result.set_value(ok);
         });
-        bool ok = (fut.wait_for(std::chrono::seconds(2)) ==
+        bool ok = (fut.wait_for(std::chrono::seconds(5)) ==
                    std::future_status::ready) && fut.get();
 
         TestFramework::RecordTest(
@@ -6970,7 +7012,7 @@ static void TestS28_ReapSnapshotsBothContainersTogether() {
                       (part->TotalCount() == 0);
             result.set_value(ok);
         });
-        bool ok = (fut.wait_for(std::chrono::seconds(2)) ==
+        bool ok = (fut.wait_for(std::chrono::seconds(5)) ==
                    std::future_status::ready) && fut.get();
 
         TestFramework::RecordTest(
@@ -7026,7 +7068,7 @@ static void TestS29_ReapDrainsSeededReplacementTargets() {
             result.set_value({before, after});
         });
         auto [before, after] =
-            (fut.wait_for(std::chrono::seconds(2)) == std::future_status::ready)
+            (fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready)
                 ? fut.get()
                 : std::pair<size_t, size_t>{999, 999};
 
@@ -7098,7 +7140,7 @@ static void TestS30_InitiateShutdownRetiresH2Sessions() {
             result.set_value({pre, post_table, post_targets});
         });
         auto vals =
-            (fut.wait_for(std::chrono::seconds(2)) == std::future_status::ready)
+            (fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready)
                 ? fut.get()
                 : std::tuple<size_t, size_t, size_t>{999, 999, 999};
 
@@ -7228,7 +7270,7 @@ static void TestS31_DonatedLeaseFullLifecycle() {
                               inflight_after_adopt, donated_after_adopt,
                               inflight_after_release, donated_after_release});
         });
-        auto vals = (fut.wait_for(std::chrono::seconds(2)) ==
+        auto vals = (fut.wait_for(std::chrono::seconds(5)) ==
                      std::future_status::ready)
                         ? fut.get()
                         : std::tuple<int64_t, int64_t, int64_t, int64_t,

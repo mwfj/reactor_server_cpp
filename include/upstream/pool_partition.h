@@ -307,6 +307,13 @@ public:
     size_t ActiveCount() const { return active_conns_.size(); }
     size_t ConnectingCount() const { return connecting_conns_.size(); }
     size_t H2TableCount() const { return h2_table_.TotalConnections(); }
+
+    // Partition liveness token. Captured by callers that outlive a
+    // partition-destroy (delayed dispatcher tasks, donated H2 leases,
+    // ProxyTransaction H2 path). The shared_ptr keeps the atomic alive
+    // even after the partition destructs; observers consult it via
+    // memory_order_acquire load before dereferencing the partition.
+    std::shared_ptr<std::atomic<bool>> alive_token() const { return alive_; }
     size_t H2ConnectingCount() const { return h2_connecting_conns_.size(); }
     size_t TotalCount() const {
         // H2 sessions hold their donated transport in active_conns_; H2

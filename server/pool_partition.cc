@@ -39,6 +39,15 @@ void UpstreamLease::Release() {
                conn_alive_->load(std::memory_order_acquire)) {
         partition_->ReturnH2Stream(h2_conn_, h2_stream_id_,
                                    partition_alive_, conn_alive_);
+    } else if (!partition_live && (kind_ != Kind::EMPTY)) {
+        // Non-empty lease whose partition died before we could return.
+        // Indicates a shutdown-ordering bug upstream of this lease — the
+        // owning subsystem should have drained leases before partition
+        // teardown. Warn so the latency / metric ghost is correlatable.
+        logging::Get()->warn(
+            "UpstreamLease::Release: partition died before lease return "
+            "(kind={}, donated_to_h2={}) — possible shutdown-ordering bug",
+            kind_ == Kind::H1 ? "H1" : "H2", donated_to_h2_ ? 1 : 0);
     }
     kind_ = Kind::EMPTY;
     conn_ = nullptr;
@@ -434,15 +443,23 @@ void PoolPartition::DrainH2StreamWaitersForHost(
     // Reverse iteration on requeue preserves FIFO ordering in the deque.
     std::deque<WaitEntry> requeue;
     bool stopped_early = false;
-    for (auto& e : matched) {
+    for (size_t i = 0; i < matched.size(); ++i) {
+        WaitEntry& e = matched[i];
         if (stopped_early) {
             requeue.push_back(std::move(e));
             continue;
         }
         if (!alive->load(std::memory_order_acquire)) {
-            // Partition destroyed mid-drain — abandon remaining entries.
-            // The destroyed partition's wait_queue_ is unreachable; this
-            // matches the existing alive-check pattern.
+            // Partition destroyed mid-drain — current entry plus every
+            // remaining matched entry is unreachable. Mirrors
+            // DrainAnyWaitersForFastH2's warn so operators can correlate
+            // a future enqueuer's hung waiters with this destruction
+            // window (today no production enqueuer exists).
+            size_t abandoned = matched.size() - i;
+            logging::Get()->warn(
+                "DrainH2StreamWaitersForHost abandoned {} matched "
+                "H2_STREAM_SLOT waiter(s) for {}:{} — partition destroyed "
+                "mid-drain", abandoned, upstream_name, port);
             return;
         }
         if (shutting_down_.load(std::memory_order_acquire) ||
@@ -1821,69 +1838,76 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
     UpstreamConnection* raw_uc = upstream_conn.get();
     connecting_conns_.push_back(std::move(upstream_conn));
 
-    auto timed_out = std::make_shared<bool>(false);
-    conn_handler->SetDeadlineTimeoutCb([timed_out]() {
-        *timed_out = true;
-        return false;
-    });
-
-    // Forward terminal connect-failure outcomes through
-    // OnH2ConnectHandshakeComplete so the ALPN-resolve state machine
-    // owns every disposition. Capture upstream_name + port by value so
-    // the disposition keys match h2_connecting_conns_ regardless of
-    // how `raw_uc->upstream_host()` relates to the service name.
-    conn_handler->SetConnectCompleteCallback(
-        [alive, upstream_name, port, this]
-        (std::shared_ptr<ConnectionHandler> handler) {
-            if (!alive->load(std::memory_order_acquire)) return;
-            // Start TLS handshake. ALPN list set on tls_ctx_ at ctor.
-            try {
-                auto tls = std::make_unique<TlsConnection>(
-                    *tls_ctx_, handler->fd(), sni_hostname_);
-                handler->SetTlsConnection(std::move(tls));
-            } catch (const std::exception& e) {
-                logging::Get()->error(
-                    "OpenNewH2Connection: TLS setup failed {}:{}: {}",
-                    upstream_name, port, e.what());
-                OnH2ConnectHandshakeComplete(
-                    upstream_name, port, CHECKOUT_CONNECT_FAILED, "");
-            }
-            // On success, handshake-complete fires once TLS settles.
-        });
-
-    conn_handler->SetHandshakeCompleteCallback(
-        [alive, raw_uc, upstream_name, port, this]() {
-            if (!alive->load(std::memory_order_acquire)) return;
-            std::string alpn;
-            auto t = raw_uc ? raw_uc->GetTransport() : nullptr;
-            if (t) alpn = t->GetAlpnProtocol();
-            OnH2ConnectHandshakeComplete(
-                upstream_name, port, CHECKOUT_OK, alpn);
-        });
-
-    // SetCloseCb and SetErrorCb share the same outcome classifier —
-    // factor into a callback that both wire identically.
-    auto classify_and_dispatch =
-        [alive, upstream_name, port, timed_out, this]
-        (std::shared_ptr<ConnectionHandler>) {
-            if (!alive->load(std::memory_order_acquire)) return;
-            int code = CHECKOUT_CONNECT_FAILED;
-            if (shutting_down_.load(std::memory_order_acquire) ||
-                manager_shutting_down_.load(std::memory_order_acquire)) {
-                code = CHECKOUT_SHUTTING_DOWN;
-            } else if (*timed_out) {
-                code = CHECKOUT_CONNECT_TIMEOUT;
-            }
-            OnH2ConnectHandshakeComplete(upstream_name, port, code, "");
-        };
-    conn_handler->SetCloseCb(classify_and_dispatch);
-    conn_handler->SetErrorCb(std::move(classify_and_dispatch));
-
+    // Each Set*Cb below moves a std::function whose closure captures
+    // alive / timed_out / raw_uc — at sizes large enough that SBO does
+    // not apply, so the move triggers a heap allocation that can throw
+    // bad_alloc. The try covers every such call (plus
+    // RegisterOutboundCallbacks below) so a throw anywhere routes
+    // through the single catch-handler rollback rather than stranding
+    // partial wiring on the transport with `outstanding_conns_` bumped.
     try {
+        auto timed_out = std::make_shared<bool>(false);
+        conn_handler->SetDeadlineTimeoutCb([timed_out]() {
+            *timed_out = true;
+            return false;
+        });
+
+        // Forward terminal connect-failure outcomes through
+        // OnH2ConnectHandshakeComplete so the ALPN-resolve state machine
+        // owns every disposition. Capture upstream_name + port by value so
+        // the disposition keys match h2_connecting_conns_ regardless of
+        // how `raw_uc->upstream_host()` relates to the service name.
+        conn_handler->SetConnectCompleteCallback(
+            [alive, upstream_name, port, this]
+            (std::shared_ptr<ConnectionHandler> handler) {
+                if (!alive->load(std::memory_order_acquire)) return;
+                // Start TLS handshake. ALPN list set on tls_ctx_ at ctor.
+                try {
+                    auto tls = std::make_unique<TlsConnection>(
+                        *tls_ctx_, handler->fd(), sni_hostname_);
+                    handler->SetTlsConnection(std::move(tls));
+                } catch (const std::exception& e) {
+                    logging::Get()->error(
+                        "OpenNewH2Connection: TLS setup failed {}:{}: {}",
+                        upstream_name, port, e.what());
+                    OnH2ConnectHandshakeComplete(
+                        upstream_name, port, CHECKOUT_CONNECT_FAILED, "");
+                }
+                // On success, handshake-complete fires once TLS settles.
+            });
+
+        conn_handler->SetHandshakeCompleteCallback(
+            [alive, raw_uc, upstream_name, port, this]() {
+                if (!alive->load(std::memory_order_acquire)) return;
+                std::string alpn;
+                auto t = raw_uc ? raw_uc->GetTransport() : nullptr;
+                if (t) alpn = t->GetAlpnProtocol();
+                OnH2ConnectHandshakeComplete(
+                    upstream_name, port, CHECKOUT_OK, alpn);
+            });
+
+        // SetCloseCb and SetErrorCb share the same outcome classifier —
+        // factor into a callback that both wire identically.
+        auto classify_and_dispatch =
+            [alive, upstream_name, port, timed_out, this]
+            (std::shared_ptr<ConnectionHandler>) {
+                if (!alive->load(std::memory_order_acquire)) return;
+                int code = CHECKOUT_CONNECT_FAILED;
+                if (shutting_down_.load(std::memory_order_acquire) ||
+                    manager_shutting_down_.load(std::memory_order_acquire)) {
+                    code = CHECKOUT_SHUTTING_DOWN;
+                } else if (*timed_out) {
+                    code = CHECKOUT_CONNECT_TIMEOUT;
+                }
+                OnH2ConnectHandshakeComplete(upstream_name, port, code, "");
+            };
+        conn_handler->SetCloseCb(classify_and_dispatch);
+        conn_handler->SetErrorCb(std::move(classify_and_dispatch));
+
         conn_handler->RegisterOutboundCallbacks();
     } catch (const std::exception& e) {
         logging::Get()->error(
-            "OpenNewH2Connection: epoll register failed for {}:{}: {}",
+            "OpenNewH2Connection: setup failed for {}:{}: {}",
             upstream_name, port, e.what());
         // The shell `h2` has not been inserted into h2_connecting_conns_
         // yet — drop it before the rollback so its dtor's safety-net
@@ -1978,6 +2002,12 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     const bool got_h2 = (alpn == "h2");
     if (!got_h2) {
         if (prefer == "always") {
+            // TODO: when EnqueueH2StreamSlotWaiter wires up the explicit
+            // H2-stream-slot vending path, replace this generic checkout
+            // failure with a terminal RESULT_H2_ALPN_NOT_NEGOTIATED so
+            // the deterministic operator-config reject does not burn
+            // retry budget. See UPSTREAM_H2_DISPATCH.md pitfall "Async
+            // strict-h2 gate uses generic RESULT_CHECKOUT_FAILED".
             fail(CHECKOUT_CONNECT_FAILED,
                  "alpn_not_h2_under_prefer_always");
             return;
@@ -2053,8 +2083,22 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     // Without this, the freshly-promoted session would have no path for
     // response bytes (no OnMessage → no HandleBytes) and the probe-phase
     // SetCloseCb / SetErrorCb would still point at the failure-disposition
-    // closures (semantically wrong after h2_table_ insertion).
-    WireH2SessionTransportCallbacks(uc_raw, shell.get());
+    // closures (semantically wrong after h2_table_ insertion). Wrapped
+    // in try/catch because each Set*Cb assignment moves a std::function
+    // whose closure can trigger heap allocation that throws bad_alloc;
+    // a mid-wire throw would otherwise orphan uc_raw in connecting_conns_
+    // with outstanding_conns_ leaked.
+    try {
+        WireH2SessionTransportCallbacks(uc_raw, shell.get());
+    } catch (const std::exception& e) {
+        logging::Get()->error(
+            "OnH2ConnectHandshakeComplete: WireH2SessionTransportCallbacks "
+            "threw for {}:{}: {}",
+            upstream_name, port, e.what());
+        if (uc_raw) ClearTransportCallbacks(uc_raw);
+        fail(CHECKOUT_CONNECT_FAILED, "h2 wire-callbacks threw");
+        return;
+    }
 
     if (!shell->Init()) {
         logging::Get()->error(
@@ -2146,16 +2190,33 @@ void PoolPartition::StartH2ReplacementConnect(
     }
     if (TotalCount() >= partition_max_connections_) {
         // Cap-saturated probe rejection is the failure mode that
-        // motivated the pending_h2_replacement_targets_ deque. After
-        // ReapPendingDestroyH2Conns frees the GOAWAY'd session's slot
-        // a deferred retry from the reaper succeeds; reaching this
-        // path AFTER the reap (or in steady-state cap pressure) is
+        // motivated the pending_h2_replacement_targets_ deque. The
+        // OnGoawayReceived call site queues a target via
+        // MoveConnToPendingDestroy BEFORE this inline call — under
+        // pool.max_connections=1 the dying session still occupies the
+        // slot, so this branch is the EXPECTED no-op; the post-recv
+        // ReapPendingDestroyH2Conns retries successfully. Suppress to
+        // debug when the target is already pending (design-target
+        // case). Steady-state cap pressure with no pending target is
         // worth a warn because queued waiters will time out at
         // MAX_QUEUE_AGE otherwise.
-        logging::Get()->warn(
-            "StartH2ReplacementConnect skipped (TotalCount {} >= cap {}) "
-            "upstream={}:{} — queued waiters may time out",
-            TotalCount(), partition_max_connections_, upstream_name, port);
+        const bool already_pending = std::find(
+            pending_h2_replacement_targets_.begin(),
+            pending_h2_replacement_targets_.end(),
+            key) != pending_h2_replacement_targets_.end();
+        if (already_pending) {
+            logging::Get()->debug(
+                "StartH2ReplacementConnect deferred (TotalCount {} >= cap "
+                "{}, target queued for post-reap retry) upstream={}:{}",
+                TotalCount(), partition_max_connections_,
+                upstream_name, port);
+        } else {
+            logging::Get()->warn(
+                "StartH2ReplacementConnect skipped (TotalCount {} >= cap "
+                "{}) upstream={}:{} — queued waiters may time out",
+                TotalCount(), partition_max_connections_,
+                upstream_name, port);
+        }
         return;
     }
 
@@ -2315,10 +2376,10 @@ void PoolPartition::ServiceWaitQueue() {
     while (!wait_queue_.empty() && TotalCount() < partition_max_connections_) {
         // H2_STREAM_SLOT at the front gates the create-new branch
         // entirely — replacement-connect for H2 cold-start lives on the
-        // wait-queue admission path, not here. Breaking preserves FIFO
-        // for any ANY entries queued behind it.
-        // TODO: when StartH2ReplacementConnect lands, invoke it here
-        // when no in-flight H2 probe targets this host:port.
+        // wait-queue admission path (StartH2ReplacementConnect now
+        // exists; H2_STREAM_SLOT vending stays forward-work until
+        // ProxyTransaction migrates to UpstreamLease h2_lease_).
+        // Breaking preserves FIFO for any ANY entries queued behind it.
         if (wait_queue_.front().kind == WaiterKind::H2_STREAM_SLOT) break;
         auto entry = std::move(wait_queue_.front());
         wait_queue_.pop_front();

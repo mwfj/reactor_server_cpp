@@ -1270,6 +1270,7 @@ void ProxyTransaction::DispatchH2() {
     h2_path_ = true;
     h2_conn_ = h2;
     h2_conn_alive_ = h2->alive_token();
+    h2_partition_alive_ = h2->partition_alive_token();
     state_ = State::SENDING_REQUEST;
     h2_response_timeout_armed_ = false;
     h2_request_fully_sent_ = false;
@@ -1301,6 +1302,7 @@ void ProxyTransaction::DispatchH2() {
         h2_request_fully_sent_ = false;
         h2_conn_ = nullptr;
         h2_conn_alive_.reset();
+        h2_partition_alive_.reset();
         logging::Get()->warn(
             "ProxyTransaction H2 submit failed client_fd={} service={} "
             "attempt={}", client_fd_, service_name_, attempt_);
@@ -2604,6 +2606,7 @@ void ProxyTransaction::Cleanup() {
         h2_stream_id_ = -1;
         h2_conn_ = nullptr;
         h2_conn_alive_.reset();
+        h2_partition_alive_.reset();
         // Bump send-stall generation BEFORE the h2_path_ flip so any
         // in-flight send-stall closure no-ops on its eventual fire.
         // Same pattern as h2_response_timeout_generation_ below.
@@ -3569,15 +3572,32 @@ bool ProxyTransaction::IsH2RetryableCode(int result_code) noexcept {
 
 RetryPolicy::RetryCondition ProxyTransaction::MapH2CodeToRetryCondition(
     int result_code) noexcept {
-    // Connect-style: peer demonstrably never processed the request.
-    // First retry runs at zero delay because the upstream is healthy
-    // and the failure is purely a session-lifecycle artifact.
-    if (result_code == RESULT_GOAWAY_UNPROCESSED) {
-        return RetryPolicy::RetryCondition::CONNECT_FAILURE;
+    // Caller is expected to gate on IsH2RetryableCode first, so this
+    // function only ever sees codes from that allowlist. Switch on the
+    // allowlist explicitly with no fallthrough — a future addition to
+    // IsH2RetryableCode that misses this function triggers the error
+    // log instead of silently classifying as UPSTREAM_DISCONNECT.
+    switch (result_code) {
+        case RESULT_GOAWAY_UNPROCESSED:
+            // Connect-style: peer demonstrably never processed the
+            // request. First retry runs at zero delay; breaker neutral.
+            return RetryPolicy::RetryCondition::CONNECT_FAILURE;
+        case RESULT_UPSTREAM_DISCONNECT:
+        case RESULT_GOAWAY_MAYBE_PROCESSED:
+            // Response-level: peer may have processed. Backoff applies
+            // via the policy's idempotency gate.
+            return RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT;
+        default:
+            // Unreachable if IsH2RetryableCode and this switch stay in
+            // sync. Log loud and conservative-default to
+            // UPSTREAM_DISCONNECT so a future regression surfaces in
+            // logs before causing odd retry-cadence behavior.
+            logging::Get()->error(
+                "MapH2CodeToRetryCondition: unexpected result_code={} "
+                "(missing from H2 retry allowlist switch) — defaulting "
+                "to UPSTREAM_DISCONNECT", result_code);
+            return RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT;
     }
-    // Response-level: peer may have processed the request. Backoff
-    // applies (idempotency-gated by the retry policy).
-    return RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT;
 }
 
 void ProxyTransaction::ReportBreakerOutcome(int result_code) {

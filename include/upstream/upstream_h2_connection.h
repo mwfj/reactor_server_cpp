@@ -97,6 +97,13 @@ public:
         return conn_alive_;
     }
 
+    // Partition liveness token. Captured at SetPartition() time so the
+    // shared_ptr stays alive even after the partition destructs. Returns
+    // a null shared_ptr if SetPartition was never called.
+    std::shared_ptr<std::atomic<bool>> partition_alive_token() const {
+        return partition_alive_;
+    }
+
     // Per-upstream H2 sub-config snapshot captured at construction.
     // Reference is valid for the lifetime of *this — `cfg_` is never
     // reassigned. Reload publishes new snapshots via
@@ -150,7 +157,7 @@ public:
     // after install. Needed by HandleBytes to drive the post-recv
     // pending_destroy reap and by DestroyOnDispatcher to clean up
     // timer registrations.
-    void SetPartition(PoolPartition* partition) { partition_ = partition; }
+    void SetPartition(PoolPartition* partition);
 
     // Fan out an error to every active stream (transport closed, PING
     // timeout, session-fatal nghttp2 error). Each stream's sink receives
@@ -305,6 +312,10 @@ private:
     // tests that construct an H2 conn without a real pool. Set by
     // AcquireH2Connection via SetPartition.
     PoolPartition* partition_ = nullptr;
+    // Partition liveness token captured at SetPartition() time. shared_ptr
+    // keeps the atomic alive even after the partition destructs so
+    // borrowers (ProxyTransaction H2 path) can safely consult it.
+    std::shared_ptr<std::atomic<bool>> partition_alive_;
 
     bool goaway_seen_ = false;
     int32_t goaway_last_stream_id_ = -1;

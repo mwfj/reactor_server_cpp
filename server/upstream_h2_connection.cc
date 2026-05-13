@@ -915,6 +915,11 @@ void UpstreamH2Connection::MarkDead() {
     dead_ = true;
 }
 
+void UpstreamH2Connection::SetPartition(PoolPartition* partition) {
+    partition_ = partition;
+    partition_alive_ = partition ? partition->alive_token() : nullptr;
+}
+
 void UpstreamH2Connection::AdoptLease(UpstreamLease lease) {
     // Convert a per-request lease bump into long-lived H2 donation so
     // the drain predicate (which consults inflight_leases_ only) does

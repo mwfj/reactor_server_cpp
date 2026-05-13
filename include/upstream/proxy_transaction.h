@@ -216,18 +216,24 @@ public:
     static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
 
 private:
-    // True iff the H2 conn pointer is set and its alive token still
-    // observes the session as live. Pair-invariant: h2_conn_ and
-    // h2_conn_alive_ are set together and reset together, so the alive
-    // load is the single load-bearing check.
-    //
-    // Partition-alive subsumed: when the owning PoolPartition is torn
-    // down, its dispatcher-lambda clears h2_table_ which destroys each
-    // UpstreamH2Connection, whose dtor flips its alive token false.
-    // So a live H2 conn implies a live partition — no separate check.
+    // True iff the H2 conn pointer is set and BOTH alive tokens still
+    // observe the session as live. Pair-invariant: h2_conn_,
+    // h2_conn_alive_, and h2_partition_alive_ are set together and
+    // reset together. Today partition teardown destroys every H2 conn
+    // first (flipping conn_alive_), so the partition check is
+    // defense-in-depth — but it matches UpstreamLease's two-token
+    // semantic byte-for-byte so the future migration to
+    // UpstreamLease h2_lease_ is a behavioral no-op at this site.
     bool H2ConnAlive() const noexcept {
-        return h2_conn_alive_ &&
-               h2_conn_alive_->load(std::memory_order_acquire);
+        if (!h2_conn_alive_ ||
+            !h2_conn_alive_->load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (!h2_partition_alive_ ||
+            !h2_partition_alive_->load(std::memory_order_acquire)) {
+            return false;
+        }
+        return true;
     }
 
     // Allowlist for H2-path retries from OnError. H1 retries from
@@ -422,6 +428,12 @@ private:
     // short-circuiting safely if the session was destroyed in between.
     UpstreamH2Connection* h2_conn_ = nullptr;
     std::shared_ptr<std::atomic<bool>> h2_conn_alive_;
+    // Partition liveness token captured alongside the conn alive token.
+    // Defense-in-depth: today partition teardown destroys every H2 conn
+    // first (flipping conn_alive_), but checking both makes H2ConnAlive()
+    // symmetric with UpstreamLease::GetH2Connection() — no divergence
+    // when the planned migration to UpstreamLease h2_lease_ lands.
+    std::shared_ptr<std::atomic<bool>> h2_partition_alive_;
     int32_t h2_stream_id_ = -1;
     bool h2_path_ = false;
 

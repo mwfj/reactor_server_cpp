@@ -131,19 +131,21 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
             int timeout = cfg->ping_timeout_sec;
             int goaway_drain = cfg->goaway_drain_timeout_sec;
             if (!c->Tick(now, idle, timeout, goaway_drain)) {
-                // MarkDead BEFORE FailAllStreams: between the failure
-                // fan-out and the table erase below, FindUsable could be
-                // called from another path and would return this conn
-                // with dead_=false / streams_.empty() / IsUsable()=true.
-                // The next SubmitRequest then fails on a poisoned session
-                // and burns retry budget. Pitfall doc: UPSTREAM_PROXY.md
-                // "After any FailAllStreams call site, the connection
-                // MUST be marked dead".
-                c->MarkDead();
-                c->FailAllStreams(-1,
-                                  c->goaway_seen() ? "h2 GOAWAY drain timeout"
-                                                   : "h2 PING timeout");
+                // Move + erase BEFORE FailAllStreams: a sink's OnError
+                // could synchronously re-enter FindUsable on this same
+                // bucket. Removing the dying entry from `conns` first
+                // means reentrants see an empty slot for this key,
+                // preserving iterator validity. MarkDead still runs on
+                // `victim` so any weak_ptr observer sees IsDead()=true.
+                // Pitfall doc: UPSTREAM_PROXY.md "After any
+                // FailAllStreams call site, the connection MUST be
+                // marked dead".
+                auto victim = std::move(*it);
                 it = conns.erase(it);
+                victim->MarkDead();
+                victim->FailAllStreams(
+                    -1, victim->goaway_seen() ? "h2 GOAWAY drain timeout"
+                                              : "h2 PING timeout");
             } else if (c->goaway_seen() && c->active_stream_count() == 0) {
                 // Mark dead before erasing so any weak_ptr observer
                 // racing the destructor sees `IsDead() == true` instead

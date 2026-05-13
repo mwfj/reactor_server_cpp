@@ -98,8 +98,20 @@ public:
     }
     UpstreamConnection* operator->() const { return Get(); }
     explicit operator bool() const {
-        return (kind_ == Kind::H1 && conn_ != nullptr) ||
-               (kind_ == Kind::H2 && h2_conn_ != nullptr);
+        if (kind_ == Kind::H1) return conn_ != nullptr;
+        if (kind_ == Kind::H2) {
+            if (h2_conn_ == nullptr) return false;
+            if (!partition_alive_ ||
+                !partition_alive_->load(std::memory_order_acquire)) {
+                return false;
+            }
+            if (!conn_alive_ ||
+                !conn_alive_->load(std::memory_order_acquire)) {
+                return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     // H2 accessors. Both alive tokens are consulted; either dead → null.
