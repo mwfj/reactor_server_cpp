@@ -913,6 +913,16 @@ void UpstreamH2Connection::MarkDead() {
 }
 
 void UpstreamH2Connection::AdoptLease(UpstreamLease lease) {
+    // Convert a per-request lease bump into long-lived H2 donation so
+    // the drain predicate (which consults inflight_leases_ only) does
+    // not stall observability flush on idle H2 sessions. Skip the swap
+    // for empty leases (no bump to convert) and when partition_ has
+    // not been wired yet (unit tests that construct sessions without
+    // installing them into a partition).
+    if (!lease.empty() && partition_ != nullptr && !lease.IsDonatedToH2()) {
+        partition_->ConvertLeaseBumpToDonatedH2();
+        lease.MarkDonatedToH2();
+    }
     lease_ = std::move(lease);
 }
 

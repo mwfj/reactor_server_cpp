@@ -192,7 +192,7 @@ UpstreamManager::UpstreamManager(
             effective_sni,
             resolved_endpoint,
             upstream.pool, dispatchers, tls_ctx,
-            outstanding_conns_, inflight_leases_,
+            outstanding_conns_, inflight_leases_, donated_h2_leases_,
             shutting_down_, drain_mtx_, drain_cv_);
     }
 

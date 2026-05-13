@@ -212,6 +212,14 @@ public:
     // reaches shells that never called Init() (no nghttp2_session_*
     // to release).
     void MarkTransferred() { transferred_ = true; }
+    // Roll back the transferred_ flag — used by exception-safety
+    // envelopes around adoption call sites. If MarkTransferred fires
+    // before AdoptAsH1Connection / ReclassifyH2WaitersToAny throw, the
+    // safety-net dtor would skip ClearH2TransportCallbacks (transferred_
+    // short-circuit) while the transport's ownership state is
+    // ambiguous. Resetting the flag restores the dtor's full teardown
+    // path.
+    void ClearTransferredForRollback() { transferred_ = false; }
 
     // True while a HandleBytes call is active. Submit / ResetStream check
     // this to defer the inline FlushSend so we never re-enter

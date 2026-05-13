@@ -7119,6 +7119,75 @@ static void TestS30_InitiateShutdownRetiresH2Sessions() {
     }
 }
 
+// S31 — H2 donated leases are tracked in donated_h2_leases_, NOT in
+// inflight_leases_. Locks the C4-P1 regression where HttpServer::Stop's
+// drain predicate (active_leases() == 0) waited forever on idle H2
+// sessions whose donated lease never decremented during normal
+// operation. The test verifies the swap helper that AdoptLease uses
+// internally — moves +1 from inflight to donated, leaving the
+// drain-relevant counter (inflight) unchanged relative to the prior
+// bump.
+static void TestS31_ConvertLeaseBumpToDonatedH2Swaps() {
+    std::cout << "\n[TEST] H2Upstream S31: ConvertLeaseBumpToDonatedH2 swaps counters..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        cfg.pool.max_connections = 1;
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream S31: ConvertLeaseBumpToDonatedH2 swaps counters",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        std::promise<std::tuple<int64_t, int64_t, int64_t, int64_t>> result;
+        auto fut = result.get_future();
+        disp->EnQueue([&]() {
+            int64_t inflight_before = mgr.active_leases();
+            int64_t donated_before = mgr.donated_h2_leases();
+            // The swap helper: -1 inflight, +1 donated. Production
+            // path pairs it with a prior fetch_add(inflight) at
+            // OnH2ConnectHandshakeComplete; here we test the swap in
+            // isolation.
+            part->ConvertLeaseBumpToDonatedH2();
+            int64_t inflight_after = mgr.active_leases();
+            int64_t donated_after = mgr.donated_h2_leases();
+            // Restore counters so the manager dtor sees a clean state.
+            // We did one swap (inflight-1, donated+1); reverse it.
+            mgr.RebalanceCountersForTesting(/*inflight_delta=*/1,
+                                            /*donated_delta=*/-1);
+            result.set_value({inflight_before, donated_before,
+                              inflight_after, donated_after});
+        });
+        auto vals = (fut.wait_for(std::chrono::seconds(2)) ==
+                     std::future_status::ready)
+                        ? fut.get()
+                        : std::tuple<int64_t, int64_t, int64_t, int64_t>{
+                              999, 999, 999, 999};
+        bool pass = std::get<0>(vals) == 0 &&
+                    std::get<1>(vals) == 0 &&
+                    std::get<2>(vals) == -1 &&
+                    std::get<3>(vals) == 1;
+        TestFramework::RecordTest(
+            "H2Upstream S31: ConvertLeaseBumpToDonatedH2 swaps counters",
+            pass,
+            pass ? "" :
+                (std::string("inflight_before=") + std::to_string(std::get<0>(vals)) +
+                 " donated_before=" + std::to_string(std::get<1>(vals)) +
+                 " inflight_after=" + std::to_string(std::get<2>(vals)) +
+                 " donated_after=" + std::to_string(std::get<3>(vals))).c_str());
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S31: ConvertLeaseBumpToDonatedH2 swaps counters",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RunAll aggregator
 // ---------------------------------------------------------------------------
@@ -7154,6 +7223,7 @@ void RunAllH2UpstreamTests() {
     TestS28_ReapSnapshotsBothContainersTogether();
     TestS29_ReapDrainsSeededReplacementTargets();
     TestS30_InitiateShutdownRetiresH2Sessions();
+    TestS31_ConvertLeaseBumpToDonatedH2Swaps();
 
     // Tier A — unit tests
     TestMinCadenceSecDisabled();

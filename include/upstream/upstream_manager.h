@@ -95,6 +95,20 @@ public:
     int64_t active_leases() const noexcept {
         return inflight_leases_.load(std::memory_order_acquire);
     }
+    int64_t donated_h2_leases() const noexcept {
+        return donated_h2_leases_.load(std::memory_order_acquire);
+    }
+
+    // Test-only: adjust the lease counters by signed deltas. Tests that
+    // exercise the swap helper in isolation use this to restore a clean
+    // baseline before the manager destructor checks invariants.
+    void RebalanceCountersForTesting(int64_t inflight_delta,
+                                     int64_t donated_delta) noexcept {
+        inflight_leases_.fetch_add(inflight_delta,
+                                   std::memory_order_acq_rel);
+        donated_h2_leases_.fetch_add(donated_delta,
+                                     std::memory_order_acq_rel);
+    }
     int64_t inflight_transactions() const noexcept {
         return inflight_transactions_.load(std::memory_order_acquire);
     }
@@ -248,7 +262,26 @@ private:
     // lease's destructor returns the connection. Distinct from
     // outstanding_conns_ which counts all live connections (idle
     // keep-alive sockets included).
+    //
+    // Per-request only — H2 donated leases are tracked separately in
+    // donated_h2_leases_. UpstreamH2Connection::AdoptLease converts
+    // the +1 from inflight_leases_ to donated_h2_leases_; the drain
+    // predicate in HttpServer::WaitForAllAsyncDrain consults only
+    // inflight_leases_ so idle H2 sessions do not stall observability
+    // flush.
     std::atomic<int64_t> inflight_leases_{0};
+
+    // Long-lived H2 session ownership of donated transports. Each
+    // multiplexed H2 session holds one donated lease for its entire
+    // lifetime; this counter rises on AdoptLease (in
+    // AcquireH2Connection construct branch and
+    // OnH2ConnectHandshakeComplete) and falls when the lease destructor
+    // routes ReturnConnection with the donated flag set. Excluded from
+    // the shutdown drain predicate — otherwise an idle H2 session keeps
+    // the active_leases counter positive and observability flush burns
+    // its full budget waiting for the lease that only releases when
+    // InitiateShutdown explicitly retires the session.
+    std::atomic<int64_t> donated_h2_leases_{0};
 
     // Bumped from ProxyTransaction::Start, decremented at terminal
     // completion. Read by HttpServer::WaitForAllAsyncDrain alongside

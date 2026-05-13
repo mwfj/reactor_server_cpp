@@ -55,12 +55,14 @@ public:
           h2_stream_id_(other.h2_stream_id_),
           partition_(other.partition_),
           partition_alive_(std::move(other.partition_alive_)),
-          conn_alive_(std::move(other.conn_alive_)) {
+          conn_alive_(std::move(other.conn_alive_)),
+          donated_to_h2_(other.donated_to_h2_) {
         other.kind_ = Kind::EMPTY;
         other.conn_ = nullptr;
         other.h2_conn_ = nullptr;
         other.h2_stream_id_ = -1;
         other.partition_ = nullptr;
+        other.donated_to_h2_ = false;
     }
 
     UpstreamLease& operator=(UpstreamLease&& other) noexcept {
@@ -73,11 +75,13 @@ public:
             partition_ = other.partition_;
             partition_alive_ = std::move(other.partition_alive_);
             conn_alive_ = std::move(other.conn_alive_);
+            donated_to_h2_ = other.donated_to_h2_;
             other.kind_ = Kind::EMPTY;
             other.conn_ = nullptr;
             other.h2_conn_ = nullptr;
             other.h2_stream_id_ = -1;
             other.partition_ = nullptr;
+            other.donated_to_h2_ = false;
         }
         return *this;
     }
@@ -117,6 +121,22 @@ public:
 
     void Release();
 
+    // Called by UpstreamH2Connection::AdoptLease to tag this lease as
+    // long-lived ownership of a donated transport, not a per-request
+    // checkout. The accounting consequences are:
+    //   - UpstreamManager::inflight_leases_ is decremented at adoption
+    //     time (the per-request count drops because the request handed
+    //     off ownership).
+    //   - UpstreamManager::donated_h2_leases_ is incremented.
+    //   - When Release fires, ReturnConnection observes the donated
+    //     flag and decrements donated_h2_leases_ instead of
+    //     inflight_leases_.
+    // The drain predicate in HttpServer::WaitForAllAsyncDrain consults
+    // only inflight_leases_, so a long-lived donation does not stall
+    // observability flush.
+    void MarkDonatedToH2() { donated_to_h2_ = true; }
+    bool IsDonatedToH2() const { return donated_to_h2_; }
+
 private:
     Kind kind_ = Kind::EMPTY;
     UpstreamConnection* conn_ = nullptr;
@@ -125,4 +145,5 @@ private:
     PoolPartition* partition_ = nullptr;
     std::shared_ptr<std::atomic<bool>> partition_alive_;
     std::shared_ptr<std::atomic<bool>> conn_alive_;
+    bool donated_to_h2_ = false;
 };

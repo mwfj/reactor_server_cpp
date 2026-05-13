@@ -52,6 +52,7 @@ public:
                   std::shared_ptr<TlsClientContext> tls_ctx,
                   std::atomic<int64_t>& outstanding_conns,
                   std::atomic<int64_t>& inflight_leases,
+                  std::atomic<int64_t>& donated_h2_leases,
                   std::atomic<bool>& manager_shutting_down,
                   std::mutex& drain_mtx,
                   std::condition_variable& drain_cv);
@@ -79,7 +80,13 @@ public:
                        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr);
 
     // Return a connection to the pool. Called by UpstreamLease destructor.
-    void ReturnConnection(UpstreamConnection* conn);
+    // `was_donated_to_h2` flips the decrement target: donated leases
+    // owned by an H2 session drop the manager's donated_h2_leases_
+    // counter instead of inflight_leases_, so the shutdown drain
+    // predicate (which consults inflight_leases_ only) does not block
+    // on long-lived multiplexed sessions.
+    void ReturnConnection(UpstreamConnection* conn,
+                          bool was_donated_to_h2 = false);
 
     // Return an H2 stream slot to the partition. Alive tokens were
     // validated by the lease before this call.
@@ -326,6 +333,17 @@ public:
     // `service_name_` is ctor-initialised and never mutated.
     const std::string& service_name() const { return service_name_; }
 
+    // Called by UpstreamH2Connection::AdoptLease to convert a per-request
+    // lease bump into long-lived H2 donation. The caller already +1'd
+    // inflight_leases_ (either at CheckoutAsync time, for caller-passed
+    // leases, or at the OnH2ConnectHandshakeComplete manual bump). This
+    // swap is dispatcher-thread-safe because the atomics carry their own
+    // memory ordering.
+    void ConvertLeaseBumpToDonatedH2() {
+        inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
+        donated_h2_leases_.fetch_add(1, std::memory_order_acq_rel);
+    }
+
     // Test-only: insert a fully-Init'd `UpstreamH2Connection` (typically
     // built with a null transport in unit-test fixtures) into the
     // partition's h2_table_. Production paths funnel through
@@ -386,6 +404,7 @@ private:
     // ready_cb is invoked with a fresh lease; decremented in
     // ReturnConnection when the lease's destructor releases.
     std::atomic<int64_t>& inflight_leases_;
+    std::atomic<int64_t>& donated_h2_leases_;
     std::atomic<bool>& manager_shutting_down_;  // Set immediately by manager
     std::mutex& drain_mtx_;
     std::condition_variable& drain_cv_;

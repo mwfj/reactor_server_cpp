@@ -27,6 +27,8 @@ struct hash<HostPortKey> {
     size_t operator()(const HostPortKey& k) const noexcept {
         size_t h1 = std::hash<std::string>{}(k.host);
         size_t h2 = std::hash<int>{}(k.port);
+        // boost::hash_combine pattern (well-known mixing constant
+        // derived from the golden ratio: 2^64 / phi).
         return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
     }
 };

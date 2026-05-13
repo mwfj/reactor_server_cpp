@@ -12,6 +12,7 @@ UpstreamHostPool::UpstreamHostPool(
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
     std::atomic<int64_t>& inflight_leases,
+    std::atomic<int64_t>& donated_h2_leases,
     std::atomic<bool>& manager_shutting_down,
     std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
@@ -87,7 +88,7 @@ UpstreamHostPool::UpstreamHostPool(
         partitions_.push_back(std::make_unique<PoolPartition>(
             dispatchers[i], service_name, host, port, sni_hostname,
             resolved_endpoint, partition_config, tls_ctx,
-            outstanding_conns, inflight_leases,
+            outstanding_conns, inflight_leases, donated_h2_leases,
             manager_shutting_down, drain_mtx, drain_cv));
     }
 

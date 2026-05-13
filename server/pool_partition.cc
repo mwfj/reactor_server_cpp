@@ -33,7 +33,7 @@ void UpstreamLease::Release() {
         partition_alive_->load(std::memory_order_acquire);
 
     if (kind_ == Kind::H1 && partition_live && conn_) {
-        partition_->ReturnConnection(conn_);
+        partition_->ReturnConnection(conn_, donated_to_h2_);
     } else if (kind_ == Kind::H2 && partition_live && h2_conn_ &&
                conn_alive_ &&
                conn_alive_->load(std::memory_order_acquire)) {
@@ -47,6 +47,7 @@ void UpstreamLease::Release() {
     partition_ = nullptr;
     partition_alive_.reset();
     conn_alive_.reset();
+    donated_to_h2_ = false;
 }
 
 // ── PoolPartition ──────────────────────────────────────────────────────
@@ -61,6 +62,7 @@ PoolPartition::PoolPartition(
     std::shared_ptr<TlsClientContext> tls_ctx,
     std::atomic<int64_t>& outstanding_conns,
     std::atomic<int64_t>& inflight_leases,
+    std::atomic<int64_t>& donated_h2_leases,
     std::atomic<bool>& manager_shutting_down,
     std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
@@ -74,6 +76,7 @@ PoolPartition::PoolPartition(
     , resolved_endpoint_(std::move(resolved_endpoint))
     , outstanding_conns_(outstanding_conns)
     , inflight_leases_(inflight_leases)
+    , donated_h2_leases_(donated_h2_leases)
     , manager_shutting_down_(manager_shutting_down)
     , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
@@ -506,13 +509,14 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
     // (returns -1), even though they won the dequeue race. Refuse to
     // admit unless FindUsable still reports a slot is available.
     //
-    // FIFO preservation: continue (not break) on FindUsable=null lets
-    // entry N+1 fire before entry N stays requeued, which would be an
-    // FIFO inversion. In practice FindUsable is deterministic across
-    // iterations of THIS drain — ready_callback creates no new sessions
-    // and the live h2_table_ entry only sheds capacity, never gains it
-    // — so either every entry sees a usable session (and fires until
-    // cap) or none do (and all requeue). No inversion observable.
+    // continue vs break on FindUsable=null: FindUsable is deterministic
+    // across iterations of THIS drain — ready_callback creates no new
+    // sessions and the live h2_table_ entry only sheds capacity, never
+    // gains it. So once FindUsable returns null it stays null; continue
+    // and break are observationally equivalent on the !h2 branch.
+    // continue is chosen for symmetry with the shutdown-flip branch
+    // which DOES need to drain remaining entries into the requeue
+    // deque.
     std::deque<WaitEntry> requeue;
     size_t abandoned_on_partition_destroy = 0;
     for (auto& e : matched) {
@@ -674,14 +678,23 @@ void PoolPartition::FailH2StreamSlotWaiters(
     }
 }
 
-void PoolPartition::ReturnConnection(UpstreamConnection* conn) {
+void PoolPartition::ReturnConnection(UpstreamConnection* conn,
+                                     bool was_donated_to_h2) {
     if (!conn) return;
 
-    // The lease that owned `conn` is being released — decrement
-    // inflight_leases_ once per call regardless of where the connection
-    // ends up (idle pool / destroyed / zombie cleanup). Pairs with the
-    // increment at every ready_cb(UpstreamLease(...)) site above.
-    inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
+    // The lease that owned `conn` is being released. Per-request leases
+    // decrement inflight_leases_ (matches every ready_cb(UpstreamLease)
+    // bump site). Donated H2 leases decrement the separate
+    // donated_h2_leases_ counter — the drain predicate consults only
+    // the per-request counter, so long-lived multiplexed sessions do
+    // not stall observability flush. AdoptLease performs the +1 swap
+    // (inflight_leases_-- and donated_h2_leases_++) so the totals stay
+    // balanced.
+    if (was_donated_to_h2) {
+        donated_h2_leases_.fetch_sub(1, std::memory_order_acq_rel);
+    } else {
+        inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
+    }
 
     // Hoist alive_ onto the stack — the waiter retry loops below call
     // CreateNewConnection, which can synchronously invoke a user error_cb
@@ -833,7 +846,7 @@ void PoolPartition::ReturnH2Stream(
     // is driven by OnStreamClose / ResetStream / RunDeferredEraseWalk
     // — silent no-op here would mask a future caller that DOES vend
     // H2 leases via this API but forgot to drain the waiter queue.
-    // TODO: implement DrainH2StreamWaitersForHost dispatch once the
+    // FIXME: implement DrainH2StreamWaitersForHost dispatch once the
     // h2_lease_ migration on ProxyTransaction lands.
     logging::Get()->error(
         "BUG: PoolPartition::ReturnH2Stream called without a wired "
@@ -1065,8 +1078,10 @@ UpstreamH2Connection* PoolPartition::AcquireH2Connection(
         return nullptr;
     }
 
-    h2->AdoptLease(std::move(lease));
+    // SetPartition BEFORE AdoptLease so the lease-to-donation counter
+    // swap inside AdoptLease can find the manager-level atomic refs.
     h2->SetPartition(this);
+    h2->AdoptLease(std::move(lease));
     h2_table_.Insert(upstream_name, std::move(h2));
     // Drain happens at ProxyTransaction::DispatchH2 AFTER SubmitRequest,
     // not here — firing other ANY-kind waiters before the creator
@@ -1191,6 +1206,14 @@ void PoolPartition::InitiateShutdown() {
     // until ~PoolPartition's dispatcher lambda calls h2_table_.Clear()
     // — but that runs AFTER WaitForDrain blocks on outstanding_conns_,
     // so the manager destructor deadlocks until WAIT_FOR_DRAIN_TIMEOUT.
+    //
+    // Mid-loop bailout safety: if `alive` flips between iterations,
+    // `h2_to_destroy` is a local vector whose unique_ptr dtors run on
+    // this thread at scope exit. Each safety-net dtor performs
+    // memory-only ops (MarkDead, FailAllStreams, terminate_session,
+    // FlushSend, MarkClosing); the only sink-emitter (FlushSend) routes
+    // SendRaw through ConnectionHandler which handles cross-thread via
+    // EnQueue. Safe to bail out — the dtors complete the teardown.
     auto h2_to_destroy = h2_table_.ExtractAll();
     for (auto& conn : h2_to_destroy) {
         if (conn) conn->DestroyOnDispatcher();
@@ -1722,6 +1745,19 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
         manager_shutting_down_.load(std::memory_order_acquire)) {
         return false;
     }
+    // Defensive cap-gate. The documented contract is that callers gate
+    // on TotalCount() before invoking, but this is a public method;
+    // future call sites that forget the gate would otherwise overflow
+    // the partition's connection budget. The two existing call sites
+    // (StartH2ReplacementConnect and the ALPN probe path) already gate
+    // — this check is harmless there and prevents the regression class.
+    if (TotalCount() >= partition_max_connections_) {
+        logging::Get()->warn(
+            "OpenNewH2Connection: TotalCount {} >= cap {} for {}:{} — "
+            "caller forgot the pre-gate; refusing to overflow pool",
+            TotalCount(), partition_max_connections_, upstream_name, port);
+        return false;
+    }
     if (!tls_ctx_) {
         logging::Get()->warn(
             "OpenNewH2Connection: TLS context required for ALPN probe "
@@ -1962,8 +1998,25 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
             return;
         }
         if (shell) shell->MarkTransferred();
-        AdoptAsH1Connection(std::move(owned_uc));
-        ReclassifyH2WaitersToAny(upstream_name, port);
+        // Defense-in-depth: try/catch rolls back transferred_ if
+        // AdoptAsH1Connection or ReclassifyH2WaitersToAny throws.
+        // Without this, the shell's safety-net dtor would skip
+        // ClearH2TransportCallbacks (transferred_=true short-circuit)
+        // while the transport's ownership state is ambiguous —
+        // stale H2 callbacks would survive on a transport that
+        // belongs to neither H1 nor H2.
+        try {
+            AdoptAsH1Connection(std::move(owned_uc));
+            ReclassifyH2WaitersToAny(upstream_name, port);
+        } catch (...) {
+            if (shell) shell->ClearTransferredForRollback();
+            throw;
+        }
+        // Asymmetry note: no inflight_leases_ bump here (unlike the
+        // ALPN-h2 success branch at line ~2063). AdoptAsH1Connection
+        // hands the transport to idle_conns_, not to a borrower — the
+        // matching bump fires later when the H1 idle conn is checked
+        // out via ServiceWaitQueue / CheckoutAsync.
         ServiceWaitQueue();
         return;
     }
@@ -2041,11 +2094,12 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         t->SetDeadlineTimeoutCb(nullptr);
     }
     active_conns_.push_back(std::move(owned_uc));
-    // Bump inflight_leases_ to match the lease handed to the H2 session.
-    // The eventual lease destructor (DestroyOnDispatcher step 5 or dtor
-    // safety-net) routes through ReturnConnection which fetch_sub's once.
-    // Without the matching add here the counter goes negative on every
-    // H2 cold-start promotion.
+    // Bump inflight_leases_ as a "synthetic" per-request handoff —
+    // AdoptLease immediately swaps it into donated_h2_leases_ so the
+    // drain predicate (consults inflight_leases_ only) does not
+    // observe this long-lived session. The matching decrement
+    // happens at lease destruction via ReturnConnection with
+    // was_donated_to_h2=true.
     inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
     shell->AdoptLease(UpstreamLease(uc_raw, this, alive_));
 
