@@ -138,14 +138,6 @@ public:
     // FlushSend.
     void RunDeferredEraseWalk();
 
-    // Held-fallback pause/resume entry points for the held-fallback
-    // retryable-5xx flow. Pause flips the stream's pause_dispatch_ so
-    // OnDataChunkRecv accumulates into paused_buffer_ instead of
-    // dispatching sink->OnBodyChunk. Resume clears the flag and drains
-    // the buffer chunk-by-chunk through the sink.
-    void PauseStream(int32_t stream_id);
-    void ResumeStream(int32_t stream_id);
-
     // Take ownership of the lease that funded this connection's
     // transport. Released in ~UpstreamH2Connection so the transport
     // returns to the pool only after every stream has exited.
@@ -357,21 +349,4 @@ private:
     // virtuals must not fire post-detach.
     void DropDrainEntriesForStream(int32_t stream_id);
 
-    // Drain a stream's paused_buffer_ through its sink in chunks
-    // (PAUSED_DRAIN_CHUNK_BYTES at a time). Honors downstream
-    // backpressure: if sink->OnBodyChunk's send-result reports
-    // ABOVE_HIGH_WATER, install a one-shot replay drain listener that
-    // re-invokes the drain when downstream drains. When paused_buffer_
-    // empties, calls DispatchDeferredCloseIfPending.
-    void DrainPausedBuffer(UpstreamH2Stream* stream);
-    // After DrainPausedBuffer empties paused_buffer_, dispatch the
-    // terminal sink call captured in pending_close_error_code_ AND
-    // enqueue the stream for the deferred-erase walker.
-    void DispatchDeferredCloseIfPending(UpstreamH2Stream* stream);
-    // Returns true if the stream's CONTENT_LENGTH framing demands more
-    // bytes than body_bytes_received_ reports — used as the truncation
-    // backstop in DispatchDeferredCloseIfPending.
-    bool LengthValidationFails(const UpstreamH2Stream* stream) const;
-
-    static constexpr size_t PAUSED_DRAIN_CHUNK_BYTES = 64 * 1024;
 };

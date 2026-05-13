@@ -1025,14 +1025,12 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
                 if (h2) {
                     self->DispatchH2();
                 } else if (prefer_always) {
-                    // Strict-h2 + peer did not negotiate h2 (ALPN missing
-                    // or h1). Pushing H2 framing over an h1-negotiated
-                    // transport produces a wire-level protocol violation;
-                    // operator intent under prefer="always" is "reject
-                    // rather than silently downgrade".
+                    // prefer=always + ALPN!=h2: dedicated terminal so
+                    // routing through OnCheckoutError can't burn the
+                    // retry budget on a deterministic reject.
                     self->ReleaseBreakerAdmissionNeutral();
                     self->OnError(
-                        RESULT_CHECKOUT_FAILED,
+                        RESULT_H2_ALPN_NOT_NEGOTIATED,
                         "prefer=always but peer ALPN!=h2");
                 } else {
                     self->DispatchH1();
@@ -1042,11 +1040,10 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
     }
 
     // Strict-h2 gate on the immediate (already-ready or bare-TCP) path.
-    // The deferred-handshake branch above has its own equivalent gate
-    // inside the ALPN callback.
+    // Deferred-handshake branch above has its own gate.
     if (prefer_always && !want_h2) {
         ReleaseBreakerAdmissionNeutral();
-        OnError(RESULT_CHECKOUT_FAILED,
+        OnError(RESULT_H2_ALPN_NOT_NEGOTIATED,
                 transport->IsTlsReady()
                     ? "prefer=always but peer ALPN!=h2"
                     : "prefer=always requires TLS+ALPN");
@@ -1304,18 +1301,6 @@ void ProxyTransaction::DispatchH2() {
     }
 
     h2_stream_id_ = stream_id;
-}
-
-void ProxyTransaction::SetInReplay(bool in_replay) {
-    in_replay_ = in_replay;
-}
-
-int ProxyTransaction::LastSendResult() const {
-    return h2_last_send_result_;
-}
-
-void ProxyTransaction::InstallReplayDrainListener(std::function<void()> cb) {
-    replay_drain_listener_ = std::move(cb);
 }
 
 void ProxyTransaction::OnCheckoutError(int error_code) {
@@ -1766,9 +1751,6 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
 
     auto result = stream_sender_.SendData(data, len);
     HandleStreamSendResult(result);
-    // Track the latest send-result for the H2 replay drain so
-    // LastSendResult() reflects live downstream backpressure.
-    h2_last_send_result_ = static_cast<int>(result);
     if (result == HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
         poison_connection_ = true;
         ReleaseBreakerAdmissionNeutral();
@@ -1917,9 +1899,10 @@ void ProxyTransaction::OnError(int result_code,
     // Centralized neutral breaker release for deterministic policy
     // rejects. Idempotent — ReleaseBreakerAdmissionNeutral is a no-op
     // when no admission is held. Runs BEFORE the H2 retryable-
-    // disconnect routing below so RESULT_H2_METHOD_NOT_SUPPORTED
-    // doesn't leak into MaybeRetry.
-    if (result_code == RESULT_H2_METHOD_NOT_SUPPORTED) {
+    // disconnect routing below so these terminal codes don't leak
+    // into MaybeRetry.
+    if (result_code == RESULT_H2_METHOD_NOT_SUPPORTED ||
+        result_code == RESULT_H2_ALPN_NOT_NEGOTIATED) {
         ReleaseBreakerAdmissionNeutral();
     }
 
@@ -3372,6 +3355,14 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         resp.Header("X-H2-Limitation", "connect-not-supported");
         return resp;
     }
+    if (result_code == RESULT_H2_ALPN_NOT_NEGOTIATED) {
+        // Operator configured `http2.prefer = "always"` but peer did
+        // not negotiate h2 via ALPN. Deterministic policy reject —
+        // self-identifying header analogous to connect-not-supported.
+        HttpResponse resp = HttpResponse::BadGateway();
+        resp.Header("X-H2-Limitation", "alpn-not-h2");
+        return resp;
+    }
     if (result_code == RESULT_CHECKOUT_FAILED ||
         result_code == RESULT_SEND_FAILED ||
         result_code == RESULT_PARSE_ERROR ||
@@ -3543,11 +3534,12 @@ void ProxyTransaction::ReleaseBreakerAdmissionNeutral() {
 }
 
 bool ProxyTransaction::IsH2RetryableCode(int result_code) noexcept {
+    // RESULT_TRUNCATED_RESPONSE: terminal per the constant's public
+    // contract — retrying would double-deliver streamed bytes.
     switch (result_code) {
         case RESULT_UPSTREAM_DISCONNECT:
         case RESULT_GOAWAY_UNPROCESSED:
         case RESULT_GOAWAY_MAYBE_PROCESSED:
-        case RESULT_TRUNCATED_RESPONSE:
             return true;
         default:
             return false;
@@ -3618,7 +3610,9 @@ void ProxyTransaction::ReportBreakerOutcome(int result_code) {
             return;
 
         case RESULT_H2_METHOD_NOT_SUPPORTED:
-            // Deterministic policy reject (CONNECT on H2 upstream) —
+        case RESULT_H2_ALPN_NOT_NEGOTIATED:
+            // Deterministic policy rejects (CONNECT on H2 upstream, or
+            // operator-configured prefer=always with peer ALPN!=h2) —
             // no upstream contact, so no health signal. The OnError
             // pre-routing hook already calls
             // ReleaseBreakerAdmissionNeutral; this case is the

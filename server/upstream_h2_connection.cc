@@ -242,28 +242,6 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
 
     stream->body_bytes_received += static_cast<int64_t>(len);
 
-    if (stream->pause_dispatch_) {
-        // Held-fallback: accumulate without dispatching. Cap the local
-        // buffer at the same ceiling the H1 codec enforces on response
-        // bodies — beyond that, the gateway can't safely replay.
-        if (stream->paused_buffer_.size() + len >
-                UpstreamHttpCodec::MAX_RESPONSE_BODY_SIZE) {
-            auto* sink = stream->sink;
-            stream->sink = nullptr;
-            if (sink) {
-                sink->OnError(ProxyTransaction::RESULT_RESPONSE_TOO_LARGE,
-                              "paused buffer cap exceeded");
-            }
-            self->ResetStream(stream_id);
-            return 0;
-        }
-        stream->paused_buffer_.append(
-            reinterpret_cast<const char*>(data), len);
-        stream->sink->AppendHeldRetryable5xxBody(
-            reinterpret_cast<const char*>(data), len);
-        return 0;
-    }
-
     const bool keep = stream->sink->OnBodyChunk(
         reinterpret_cast<const char*>(data), len);
     if (!keep) {
@@ -649,21 +627,19 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
             }
         }
         if (stream && stream->sink) {
-            stream->sink->OnError(
+            // Detach before OnError — see UPSTREAM_PROXY.md "Sink ptr
+            // stale across RST_STREAM → OnStreamClose race".
+            auto* sink = stream->sink;
+            stream->sink = nullptr;
+            sink->OnError(
                 ProxyTransaction::RESULT_GOAWAY_UNPROCESSED,
                 "h2 stream above GOAWAY last_stream_id — peer did not process");
         }
     }
 
-    // GOAWAY-idle replacement: no streams remain (genuine idle) OR every
-    // surviving stream has id > last_stream_id (just marked pending_erase
-    // above and will be reaped by RunDeferredEraseWalk). active_streams_
-    // is NOT yet decremented for the just-pending entries — that happens
-    // in RunDeferredEraseWalk after this returns — so the gate must count
-    // survivors with id <= last_stream_id directly. A sink's reentrant
-    // ResetStream may have shrunk streams_ during the fan-out, but any
-    // stream still present with id <= last_stream_id is genuinely draining
-    // and the replacement should wait for it.
+    // GOAWAY-idle replacement: trigger when no surviving stream has
+    // id ≤ last_stream_id. Count post-fan-out so sink-reentrant
+    // ResetStream / SubmitRequest mutations to streams_ are observed.
     size_t survivors_below = 0;
     for (auto& kv : streams_) {
         if (kv.first <= last_stream_id && kv.second &&
@@ -672,10 +648,11 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
         }
     }
     if (survivors_below == 0 && partition_ && transport_) {
-        std::string host = transport_->upstream_host();
-        int port = transport_->upstream_port();
+        // h2_table_ keys on service_name(), not transport upstream_host
+        // (logging literal).
         partition_->MoveConnToPendingDestroy(this);
-        partition_->StartH2ReplacementConnect(host, port);
+        partition_->StartH2ReplacementConnect(
+            partition_->service_name(), transport_->upstream_port());
     }
 }
 
@@ -690,18 +667,6 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
         // stream-close notification is informational and must not
         // double-dispatch.
         if (stream && stream->pending_erase_) return;
-        // Held-fallback: terminal sink dispatch is deferred until
-        // DrainPausedBuffer empties paused_buffer_ and
-        // DispatchDeferredCloseIfPending fires.
-        if (stream && stream->pause_dispatch_) {
-            stream->peer_already_closed_ = true;
-            stream->stream_closed_pending_ = true;
-            stream->pending_close_error_code_ = error_code;
-            if (stream->sink) {
-                stream->sink->MarkHeldRetryable5xxBodyComplete();
-            }
-            return;
-        }
         if (stream) {
             stream->peer_already_closed_ = true;
             stream->pending_erase_ = true;
@@ -765,14 +730,35 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                 // int) falls through ProxyTransaction::MakeErrorResponse's
                 // RESULT_* allowlist to InternalError() — surfacing a 500
                 // for what is fundamentally an upstream/transport failure.
-                // RESULT_UPSTREAM_DISCONNECT maps to 502 BadGateway and is
-                // retryable: covers REFUSED_STREAM (peer didn't process,
-                // safe to retry), CANCEL (peer aborted), PROTOCOL_ERROR /
-                // INTERNAL_ERROR (upstream-side malformed response —
-                // distinct from a local PARSE_ERROR which is also 502).
+                //
+                // GOAWAY-drained classification: if the peer has sent
+                // GOAWAY and this stream's id is ≤ last_stream_id (i.e.,
+                // the stream survived OnGoawayReceived's above-last
+                // fan-out and was draining naturally), classify the
+                // late-error as RESULT_GOAWAY_MAYBE_PROCESSED — RFC 9113
+                // §6.8 says the peer MAY have processed it. The retry
+                // path is identical to UPSTREAM_DISCONNECT shape-wise,
+                // but breaker-neutral so ordinary peer drain doesn't
+                // count as upstream health failure (a peer rolling
+                // sessions for deploy / idle-timeout / scaling is not
+                // an upstream-health signal). REFUSED_STREAM specifically
+                // is "peer didn't process" — promote to UNPROCESSED for
+                // zero-delay retry classification.
+                int classified = ProxyTransaction::RESULT_UPSTREAM_DISCONNECT;
+                const char* reason_label = "h2 stream closed with error";
+                if (error_code == NGHTTP2_REFUSED_STREAM) {
+                    classified = ProxyTransaction::RESULT_GOAWAY_UNPROCESSED;
+                    reason_label = "h2 stream refused — peer did not process";
+                } else if (goaway_seen_ &&
+                           stream_id <= goaway_last_stream_id_) {
+                    classified =
+                        ProxyTransaction::RESULT_GOAWAY_MAYBE_PROCESSED;
+                    reason_label = "h2 stream closed mid-drain after "
+                                   "GOAWAY — peer may have processed";
+                }
                 stream->sink->OnError(
-                    ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
-                    "h2 stream closed with error code=" +
+                    classified,
+                    std::string(reason_label) + " code=" +
                         std::to_string(error_code));
             }
         }
@@ -965,23 +951,14 @@ void UpstreamH2Connection::DetachSink(int32_t stream_id) {
     auto it = streams_.find(stream_id);
     if (it == streams_.end() || !it->second) return;
     it->second->sink = nullptr;
-    // Held-fallback teardown: drop any buffered body and clear the pause
-    // flag so a late OnDataChunkRecv against this stream cannot re-buffer
-    // bytes against a null sink. stream_closed_pending_ is treated as
-    // peer-closed for enqueue purposes — the stream is terminal.
-    if (it->second->pause_dispatch_ || !it->second->paused_buffer_.empty()) {
-        it->second->pause_dispatch_ = false;
-        it->second->paused_buffer_.clear();
-    }
-    const bool reapable =
-        it->second->peer_already_closed_ || it->second->stream_closed_pending_;
-    if (reapable && !it->second->pending_erase_) {
+    if (it->second->peer_already_closed_ && !it->second->pending_erase_) {
         it->second->pending_erase_ = true;
         pending_erase_streams_.push_back(stream_id);
     }
 }
 
 void UpstreamH2Connection::RunDeferredEraseWalk() {
+    bool slot_freed = false;
     while (!pending_erase_streams_.empty()) {
         int32_t sid = pending_erase_streams_.front();
         pending_erase_streams_.pop_front();
@@ -995,97 +972,16 @@ void UpstreamH2Connection::RunDeferredEraseWalk() {
                 "sid={} — invariant violated", sid);
         } else {
             --active_streams_;
+            slot_freed = true;
         }
     }
-}
-
-void UpstreamH2Connection::PauseStream(int32_t stream_id) {
-    auto it = streams_.find(stream_id);
-    if (it == streams_.end() || !it->second) {
-        logging::Get()->debug(
-            "UpstreamH2Connection::PauseStream: no stream sid={}", stream_id);
-        return;
+    // Wake H2_STREAM_SLOT waiters when a slot frees. TODO: no enqueuer
+    // in production yet (waits on ProxyTransaction → UpstreamLease
+    // h2_lease_ migration).
+    if (slot_freed && partition_ && transport_ && !dead_ && !goaway_seen_) {
+        partition_->DrainH2StreamWaitersForHost(
+            partition_->service_name(), transport_->upstream_port());
     }
-    it->second->pause_dispatch_ = true;
-}
-
-void UpstreamH2Connection::ResumeStream(int32_t stream_id) {
-    auto it = streams_.find(stream_id);
-    if (it == streams_.end() || !it->second) {
-        logging::Get()->debug(
-            "UpstreamH2Connection::ResumeStream: no stream sid={}", stream_id);
-        return;
-    }
-    it->second->pause_dispatch_ = false;
-    DrainPausedBuffer(it->second.get());
-}
-
-void UpstreamH2Connection::DrainPausedBuffer(UpstreamH2Stream* stream) {
-    if (!stream) return;
-    if (!stream->sink) {
-        stream->paused_buffer_.clear();
-        DispatchDeferredCloseIfPending(stream);
-        return;
-    }
-    stream->sink->SetInReplay(true);
-    while (!stream->paused_buffer_.empty()) {
-        const size_t chunk = std::min(stream->paused_buffer_.size(),
-                                      PAUSED_DRAIN_CHUNK_BYTES);
-        const bool keep = stream->sink->OnBodyChunk(
-            stream->paused_buffer_.data(), chunk);
-        if (!keep) {
-            stream->sink->SetInReplay(false);
-            stream->sink = nullptr;
-            stream->paused_buffer_.clear();
-            ResetStream(stream->stream_id);
-            return;
-        }
-        stream->paused_buffer_.erase(0, chunk);
-        const int send_result = stream->sink->LastSendResult();
-        if (send_result > 0 && !stream->paused_buffer_.empty()) {
-            auto self_id = stream->stream_id;
-            stream->sink->InstallReplayDrainListener([this, self_id]() {
-                if (auto* s = GetStream(self_id)) DrainPausedBuffer(s);
-            });
-            stream->sink->SetInReplay(false);
-            return;
-        }
-    }
-    stream->sink->SetInReplay(false);
-    DispatchDeferredCloseIfPending(stream);
-}
-
-void UpstreamH2Connection::DispatchDeferredCloseIfPending(
-        UpstreamH2Stream* stream) {
-    if (!stream || !stream->stream_closed_pending_) return;
-    if (stream->pending_erase_) return;
-    const uint32_t err = stream->pending_close_error_code_;
-    auto* sink = stream->sink;
-    if (sink) {
-        if (err == NGHTTP2_NO_ERROR) {
-            if (LengthValidationFails(stream)) {
-                sink->OnError(ProxyTransaction::RESULT_TRUNCATED_RESPONSE,
-                              "Content-Length short read");
-            } else {
-                sink->OnComplete();
-            }
-        } else {
-            sink->OnError(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
-                          "h2 stream closed with error after held drain");
-        }
-    }
-    stream->pending_erase_ = true;
-    pending_erase_streams_.push_back(stream->stream_id);
-}
-
-bool UpstreamH2Connection::LengthValidationFails(
-        const UpstreamH2Stream* stream) const {
-    if (!stream) return false;
-    using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
-    if (stream->response_head.framing != Framing::CONTENT_LENGTH) return false;
-    if (stream->response_head.expected_length < 0) return false;
-    return stream->body_bytes_received <
-           stream->response_head.expected_length;
 }
 
 void UpstreamH2Connection::EnqueueFrameForDrain(int32_t stream_id,

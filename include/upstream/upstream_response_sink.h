@@ -35,18 +35,6 @@ public:
     // machine; the codec dispatches unconditionally.
     virtual void OnRequestBodyProgress() {}
 
-    // Held-fallback live mirror. Append returns true if the sink is
-    // currently capturing the body for possible replay.
-    virtual bool AppendHeldRetryable5xxBody(const char* /*data*/,
-                                            size_t /*len*/) {
-        return false;
-    }
-    virtual void MarkHeldRetryable5xxBodyComplete() {}
-
-    // Replay control surface for the buffered drain.
-    virtual void SetInReplay(bool /*in_replay*/) {}
-    virtual int LastSendResult() const { return 0; }
-    virtual void InstallReplayDrainListener(std::function<void()> /*cb*/) {}
 };
 
 }  // namespace UPSTREAM_CALLBACKS_NAMESPACE

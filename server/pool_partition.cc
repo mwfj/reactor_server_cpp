@@ -53,6 +53,7 @@ void UpstreamLease::Release() {
 
 PoolPartition::PoolPartition(
     std::shared_ptr<Dispatcher> dispatcher,
+    const std::string& service_name,
     const std::string& upstream_host, int upstream_port,
     const std::string& sni_hostname,
     std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint,
@@ -64,6 +65,7 @@ PoolPartition::PoolPartition(
     std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
     : dispatcher_(std::move(dispatcher))
+    , service_name_(service_name)
     , upstream_host_(upstream_host)
     , upstream_port_(upstream_port)
     , sni_hostname_(sni_hostname)
@@ -348,7 +350,7 @@ size_t PoolPartition::PurgeCancelledWaitEntries() {
 }
 
 void PoolPartition::EnqueueH2StreamSlotWaiter(
-    const std::string& host, int port,
+    const std::string& upstream_name, int port,
     ReadyCallback ready_cb, ErrorCallback error_cb,
     std::shared_ptr<std::atomic<bool>> cancel_token) {
     if (shutting_down_.load(std::memory_order_acquire) ||
@@ -361,8 +363,8 @@ void PoolPartition::EnqueueH2StreamSlotWaiter(
         if (wait_queue_.size() >= MAX_WAIT_QUEUE_SIZE) {
             logging::Get()->warn(
                 "PoolPartition::EnqueueH2StreamSlotWaiter: queue full "
-                "({}/{}) host={}:{}",
-                wait_queue_.size(), MAX_WAIT_QUEUE_SIZE, host, port);
+                "({}/{}) upstream={}:{}",
+                wait_queue_.size(), MAX_WAIT_QUEUE_SIZE, upstream_name, port);
             if (error_cb) error_cb(CHECKOUT_QUEUE_FULL);
             return;
         }
@@ -373,14 +375,19 @@ void PoolPartition::EnqueueH2StreamSlotWaiter(
     e.queued_at = std::chrono::steady_clock::now();
     e.cancel_token = std::move(cancel_token);
     e.kind = WaiterKind::H2_STREAM_SLOT;
-    e.host = host;
+    e.upstream_name = upstream_name;
     e.port = port;
     wait_queue_.push_back(std::move(e));
     ScheduleWaitQueuePurge();
 }
 
 void PoolPartition::DrainH2StreamWaitersForHost(
-    const std::string& host, int port) {
+    const std::string& upstream_name, int port) {
+    // Hot path: RunDeferredEraseWalk calls this on every H2 stream-close.
+    // No production caller enqueues H2_STREAM_SLOT waiters today, so the
+    // wait_queue_ holds ANY-kind entries only — skip the scan + atomic
+    // loads when nothing could possibly match.
+    if (wait_queue_.empty()) return;
     if (shutting_down_.load(std::memory_order_acquire) ||
         manager_shutting_down_.load(std::memory_order_acquire)) {
         return;
@@ -394,7 +401,7 @@ void PoolPartition::DrainH2StreamWaitersForHost(
     std::vector<WaitEntry> matched;
     for (auto it = wait_queue_.begin(); it != wait_queue_.end(); ) {
         if (it->kind == WaiterKind::H2_STREAM_SLOT &&
-            it->host == host && it->port == port) {
+            it->upstream_name == upstream_name && it->port == port) {
             if (IsEntryCancelled(*it)) {
                 it = wait_queue_.erase(it);
                 continue;
@@ -412,7 +419,7 @@ void PoolPartition::DrainH2StreamWaitersForHost(
             manager_shutting_down_.load(std::memory_order_acquire)) {
             return;
         }
-        UpstreamH2Connection* h2 = h2_table_.FindUsable(host);
+        UpstreamH2Connection* h2 = h2_table_.FindUsable(upstream_name);
         if (!h2 || !h2->IsUsable()) {
             // No usable session right now — re-queue and stop draining.
             // The next slot-free (OnStreamClose / RunDeferredEraseWalk)
@@ -432,8 +439,8 @@ void PoolPartition::DrainH2StreamWaitersForHost(
         // success-then-immediate-failure shape.
         logging::Get()->warn(
             "PoolPartition::DrainH2StreamWaitersForHost: H2-lease "
-            "vending not yet wired host={}:{} — failing waiter with "
-            "CHECKOUT_CONNECT_FAILED (PR-2 follow-up)", host, port);
+            "vending not yet wired upstream={}:{} — failing waiter with "
+            "CHECKOUT_CONNECT_FAILED (PR-2 follow-up)", upstream_name, port);
         if (e.error_callback) {
             e.error_callback(CHECKOUT_CONNECT_FAILED);
         }
@@ -469,13 +476,13 @@ void PoolPartition::ReapPendingDestroyH2Conns() {
 }
 
 void PoolPartition::FailH2StreamSlotWaiters(
-    const std::string& host, int port, int connect_outcome,
+    const std::string& upstream_name, int port, int connect_outcome,
     const std::string& reason) {
     auto alive = alive_;
     std::vector<WaitEntry> matched;
     for (auto it = wait_queue_.begin(); it != wait_queue_.end(); ) {
         if (it->kind == WaiterKind::H2_STREAM_SLOT &&
-            it->host == host && it->port == port) {
+            it->upstream_name == upstream_name && it->port == port) {
             if (IsEntryCancelled(*it)) {
                 it = wait_queue_.erase(it);
                 continue;
@@ -489,8 +496,8 @@ void PoolPartition::FailH2StreamSlotWaiters(
     if (!matched.empty()) {
         logging::Get()->warn(
             "PoolPartition::FailH2StreamSlotWaiters: failing {} waiter(s) "
-            "host={}:{} outcome={} reason={}",
-            matched.size(), host, port, connect_outcome, reason);
+            "upstream={}:{} outcome={} reason={}",
+            matched.size(), upstream_name, port, connect_outcome, reason);
     }
     for (auto& e : matched) {
         if (!alive->load(std::memory_order_acquire)) return;
@@ -1497,7 +1504,8 @@ void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
     }
 }
 
-bool PoolPartition::OpenNewH2Connection(const std::string& host, int port) {
+bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
+                                         int port) {
     if (shutting_down_.load(std::memory_order_acquire) ||
         manager_shutting_down_.load(std::memory_order_acquire)) {
         return false;
@@ -1505,7 +1513,7 @@ bool PoolPartition::OpenNewH2Connection(const std::string& host, int port) {
     if (!tls_ctx_) {
         logging::Get()->warn(
             "OpenNewH2Connection: TLS context required for ALPN probe "
-            "host={}:{}", host, port);
+            "upstream={}:{}", upstream_name, port);
         return false;
     }
     auto endpoint = std::atomic_load_explicit(
@@ -1513,7 +1521,7 @@ bool PoolPartition::OpenNewH2Connection(const std::string& host, int port) {
     if (!endpoint || !endpoint->addr.is_valid()) {
         logging::Get()->error(
             "OpenNewH2Connection: invalid resolved endpoint for {}:{}",
-            host, port);
+            upstream_name, port);
         return false;
     }
     auto cfg = LoadHttp2ConfigSnapshot();
@@ -1526,14 +1534,14 @@ bool PoolPartition::OpenNewH2Connection(const std::string& host, int port) {
     if (fd < 0) {
         logging::Get()->error(
             "OpenNewH2Connection: socket() failed for {}:{} (family={})",
-            host, port, static_cast<int>(family));
+            upstream_name, port, static_cast<int>(family));
         return false;
     }
     int connect_result = ::connect(fd, addr.Addr(), addr.Len());
     if (connect_result < 0 && errno != EINPROGRESS && errno != EINTR) {
         int saved_errno = errno;
         logging::Get()->warn("OpenNewH2Connection: connect() failed {}:{}: "
-                             "{} (errno={})", host, port,
+                             "{} (errno={})", upstream_name, port,
                              logging::SafeStrerror(saved_errno), saved_errno);
         ::close(fd);
         return false;
@@ -1548,8 +1556,12 @@ bool PoolPartition::OpenNewH2Connection(const std::string& host, int port) {
                     std::chrono::milliseconds(config_.connect_timeout_ms);
     conn_handler->SetDeadline(deadline);
 
+    // UpstreamConnection records the operator host string (logging /
+    // captured_endpoint), not the service name. Pass `upstream_host_`
+    // here — `upstream_name` is the h2_table_ / wait-queue key, used
+    // separately in the callback closures below.
     auto upstream_conn = std::make_unique<UpstreamConnection>(
-        conn_handler, host, port, endpoint);
+        conn_handler, upstream_host_, port, endpoint);
     auto h2 = std::make_unique<UpstreamH2Connection>(upstream_conn.get(), cfg);
     h2->SetPartition(this);
     auto alive = h2->alive_token();
@@ -1571,13 +1583,14 @@ bool PoolPartition::OpenNewH2Connection(const std::string& host, int port) {
 
     // Forward terminal connect-failure outcomes through
     // OnH2ConnectHandshakeComplete so the ALPN-resolve state machine
-    // owns every disposition.
+    // owns every disposition. Capture upstream_name + port by value so
+    // the disposition keys match h2_connecting_conns_ regardless of
+    // how `raw_uc->upstream_host()` relates to the service name.
     conn_handler->SetConnectCompleteCallback(
-        [alive, raw_uc, this]
+        [alive, upstream_name, port, this]
         (std::shared_ptr<ConnectionHandler> handler) {
             if (!alive->load(std::memory_order_acquire)) return;
-            // Start TLS handshake. ALPN list was set on tls_ctx_ at
-            // partition construction (per-upstream H2 sub-config).
+            // Start TLS handshake. ALPN list set on tls_ctx_ at ctor.
             try {
                 auto tls = std::make_unique<TlsConnection>(
                     *tls_ctx_, handler->fd(), sni_hostname_);
@@ -1585,27 +1598,27 @@ bool PoolPartition::OpenNewH2Connection(const std::string& host, int port) {
             } catch (const std::exception& e) {
                 logging::Get()->error(
                     "OpenNewH2Connection: TLS setup failed {}:{}: {}",
-                    raw_uc->upstream_host(), raw_uc->upstream_port(), e.what());
+                    upstream_name, port, e.what());
                 OnH2ConnectHandshakeComplete(
-                    raw_uc->upstream_host(), raw_uc->upstream_port(),
-                    CHECKOUT_CONNECT_FAILED, "");
-                return;
+                    upstream_name, port, CHECKOUT_CONNECT_FAILED, "");
             }
-            // Handshake-complete fires once TLS settles.
+            // On success, handshake-complete fires once TLS settles.
         });
 
     conn_handler->SetHandshakeCompleteCallback(
-        [alive, raw_uc, this]() {
+        [alive, raw_uc, upstream_name, port, this]() {
             if (!alive->load(std::memory_order_acquire)) return;
             std::string alpn;
             auto t = raw_uc ? raw_uc->GetTransport() : nullptr;
             if (t) alpn = t->GetAlpnProtocol();
             OnH2ConnectHandshakeComplete(
-                raw_uc->upstream_host(), raw_uc->upstream_port(), CHECKOUT_OK, alpn);
+                upstream_name, port, CHECKOUT_OK, alpn);
         });
 
-    conn_handler->SetCloseCb(
-        [alive, raw_uc, timed_out, this]
+    // SetCloseCb and SetErrorCb share the same outcome classifier —
+    // factor into a callback that both wire identically.
+    auto classify_and_dispatch =
+        [alive, upstream_name, port, timed_out, this]
         (std::shared_ptr<ConnectionHandler>) {
             if (!alive->load(std::memory_order_acquire)) return;
             int code = CHECKOUT_CONNECT_FAILED;
@@ -1615,30 +1628,17 @@ bool PoolPartition::OpenNewH2Connection(const std::string& host, int port) {
             } else if (*timed_out) {
                 code = CHECKOUT_CONNECT_TIMEOUT;
             }
-            OnH2ConnectHandshakeComplete(
-                raw_uc->upstream_host(), raw_uc->upstream_port(), code, "");
-        });
-    conn_handler->SetErrorCb(
-        [alive, raw_uc, timed_out, this]
-        (std::shared_ptr<ConnectionHandler>) {
-            if (!alive->load(std::memory_order_acquire)) return;
-            int code = CHECKOUT_CONNECT_FAILED;
-            if (shutting_down_.load(std::memory_order_acquire) ||
-                manager_shutting_down_.load(std::memory_order_acquire)) {
-                code = CHECKOUT_SHUTTING_DOWN;
-            } else if (*timed_out) {
-                code = CHECKOUT_CONNECT_TIMEOUT;
-            }
-            OnH2ConnectHandshakeComplete(
-                raw_uc->upstream_host(), raw_uc->upstream_port(), code, "");
-        });
+            OnH2ConnectHandshakeComplete(upstream_name, port, code, "");
+        };
+    conn_handler->SetCloseCb(classify_and_dispatch);
+    conn_handler->SetErrorCb(std::move(classify_and_dispatch));
 
     try {
         conn_handler->RegisterOutboundCallbacks();
     } catch (const std::exception& e) {
         logging::Get()->error(
             "OpenNewH2Connection: epoll register failed for {}:{}: {}",
-            host, port, e.what());
+            upstream_name, port, e.what());
         // The shell `h2` has not been inserted into h2_connecting_conns_
         // yet — drop it before the rollback so its dtor's safety-net
         // does not race with the synchronous close-callback chain that
@@ -1653,14 +1653,15 @@ bool PoolPartition::OpenNewH2Connection(const std::string& host, int port) {
         return false;
     }
 
-    h2_connecting_conns_[HostPortKey{host, port}] = std::move(h2);
+    h2_connecting_conns_[HostPortKey{upstream_name, port}] = std::move(h2);
     return true;
 }
 
 void PoolPartition::OnH2ConnectHandshakeComplete(
-    const std::string& host, int port, int outcome, const std::string& alpn)
+    const std::string& upstream_name, int port, int outcome,
+    const std::string& alpn)
 {
-    HostPortKey key{host, port};
+    HostPortKey key{upstream_name, port};
 
     auto cfg = LoadHttp2ConfigSnapshot();
     const std::string prefer = cfg ? cfg->prefer : std::string("auto");
@@ -1686,7 +1687,7 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
             auto owned = ExtractFromConnecting(uc_raw);
             if (owned) DestroyConnection(std::move(owned));
         }
-        FailH2StreamSlotWaiters(host, port, code, reason);
+        FailH2StreamSlotWaiters(upstream_name, port, code, reason);
     };
 
     if (outcome == CHECKOUT_SHUTTING_DOWN) {
@@ -1708,18 +1709,19 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         // prefer=auto: hand the negotiated h1 transport to the H1 idle
         // pool so a subsequent H1 dispatch can borrow it without a
         // second TCP/TLS handshake. Queued H2_STREAM_SLOT waiters for
-        // this host are reclassified to ANY-kind so ServiceWaitQueue
+        // this upstream are reclassified to ANY-kind so ServiceWaitQueue
         // can match them against the freshly-adopted idle conn.
         auto owned_uc = uc_raw ? ExtractFromConnecting(uc_raw) : nullptr;
         if (!owned_uc) {
             if (shell) shell->DestroyOnDispatcher();
-            FailH2StreamSlotWaiters(host, port, CHECKOUT_CONNECT_FAILED,
+            FailH2StreamSlotWaiters(upstream_name, port,
+                                    CHECKOUT_CONNECT_FAILED,
                                     "transport vanished pre-h1-adoption");
             return;
         }
         if (shell) shell->MarkTransferred();
         AdoptAsH1Connection(std::move(owned_uc));
-        ReclassifyH2WaitersToAny(host, port);
+        ReclassifyH2WaitersToAny(upstream_name, port);
         ServiceWaitQueue();
         return;
     }
@@ -1727,12 +1729,13 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     if (!shell) {
         logging::Get()->error(
             "OnH2ConnectHandshakeComplete: no shell in stash for {}:{} "
-            "on ALPN-h2 success — failing queued waiters", host, port);
+            "on ALPN-h2 success — failing queued waiters",
+            upstream_name, port);
         if (uc_raw) {
             auto owned = ExtractFromConnecting(uc_raw);
             if (owned) DestroyConnection(std::move(owned));
         }
-        FailH2StreamSlotWaiters(host, port, CHECKOUT_CONNECT_FAILED,
+        FailH2StreamSlotWaiters(upstream_name, port, CHECKOUT_CONNECT_FAILED,
                                 "h2 shell missing on alpn-h2 success");
         return;
     }
@@ -1749,7 +1752,8 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
 
     if (!shell->Init()) {
         logging::Get()->error(
-            "OnH2ConnectHandshakeComplete: Init failed for {}:{}", host, port);
+            "OnH2ConnectHandshakeComplete: Init failed for {}:{}",
+            upstream_name, port);
         // ClearTransportCallbacks before the fail path: we just installed
         // OnMessage/Close/Error/WriteProgress/Completion above and Init
         // failure means the H2 session is going away — its dtor would
@@ -1770,14 +1774,14 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     if (!owned_uc) {
         logging::Get()->error(
             "OnH2ConnectHandshakeComplete: transport vanished from "
-            "connecting_conns_ for {}:{} mid-resolve", host, port);
+            "connecting_conns_ for {}:{} mid-resolve", upstream_name, port);
         // Roll back the just-installed transport callbacks — without
         // this, dtor's alive-flip races the lapse of `shell` and the
         // transport (now nowhere in our containers) would still hold
         // closures referring to the dying session.
         if (uc_raw) ClearTransportCallbacks(uc_raw);
         shell->DestroyOnDispatcher();
-        FailH2StreamSlotWaiters(host, port, CHECKOUT_CONNECT_FAILED,
+        FailH2StreamSlotWaiters(upstream_name, port, CHECKOUT_CONNECT_FAILED,
                                 "transport vanished mid-h2-resolve");
         return;
     }
@@ -1785,23 +1789,23 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     active_conns_.push_back(std::move(owned_uc));
     shell->AdoptLease(UpstreamLease(uc_raw, this, alive_));
 
-    h2_table_.Insert(host, std::move(shell));
-    DrainH2StreamWaitersForHost(host, port);
+    h2_table_.Insert(upstream_name, std::move(shell));
+    DrainH2StreamWaitersForHost(upstream_name, port);
 }
 
 void PoolPartition::StartH2ReplacementConnect(
-    const std::string& host, int port)
+    const std::string& upstream_name, int port)
 {
     if (shutting_down_.load(std::memory_order_acquire) ||
         manager_shutting_down_.load(std::memory_order_acquire)) {
         return;
     }
-    HostPortKey key{host, port};
+    HostPortKey key{upstream_name, port};
     if (h2_connecting_conns_.count(key) > 0) return;
-    if (h2_table_.FindUsable(host) != nullptr) return;
+    if (h2_table_.FindUsable(upstream_name) != nullptr) return;
     if (TotalCount() >= partition_max_connections_) return;
 
-    OpenNewH2Connection(host, port);
+    OpenNewH2Connection(upstream_name, port);
 }
 
 void PoolPartition::AdoptAsH1Connection(
@@ -1826,10 +1830,10 @@ void PoolPartition::AdoptAsH1Connection(
 }
 
 void PoolPartition::ReclassifyH2WaitersToAny(
-    const std::string& host, int port) {
+    const std::string& upstream_name, int port) {
     for (auto& entry : wait_queue_) {
         if (entry.kind == WaiterKind::H2_STREAM_SLOT &&
-            entry.host == host && entry.port == port) {
+            entry.upstream_name == upstream_name && entry.port == port) {
             entry.kind = WaiterKind::ANY;
         }
     }

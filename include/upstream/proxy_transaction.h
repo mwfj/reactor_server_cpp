@@ -88,6 +88,13 @@ public:
     // retryable for idempotent methods, response-level backoff,
     // breaker-neutral. Maps to 502 BadGateway in MakeErrorResponse.
     static constexpr int RESULT_GOAWAY_MAYBE_PROCESSED = -13;
+    // `prefer = "always"` configured but peer did not negotiate h2 via
+    // ALPN. Deterministic policy reject — no upstream contact, no
+    // retry. Terminal — breaker-neutral (same shape as
+    // RESULT_H2_METHOD_NOT_SUPPORTED). Maps to 502 BadGateway with
+    // `X-H2-Limitation: alpn-not-h2` in MakeErrorResponse so operators
+    // see a distinct signal from generic checkout-failure.
+    static constexpr int RESULT_H2_ALPN_NOT_NEGOTIATED = -14;
 
     // Constructor copies all needed fields from client_request (method, path,
     // query, headers, body, params, dispatcher_index, client_ip, client_tls,
@@ -186,10 +193,6 @@ public:
         return (response_timeout_ms > 0) ? response_timeout_ms
                                          : SEND_STALL_FALLBACK_MS;
     }
-
-    void SetInReplay(bool in_replay) override;
-    int LastSendResult() const override;
-    void InstallReplayDrainListener(std::function<void()> cb) override;
 
     bool OnHeaders(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override;
@@ -566,10 +569,6 @@ private:
     bool pending_retryable_5xx_body_complete_ = false;
     bool holding_retryable_5xx_response_ = false;
     bool held_retryable_5xx_saw_eof_ = false;
-
-    bool in_replay_ = false;
-    int h2_last_send_result_ = 0;
-    std::function<void()> replay_drain_listener_;
 
     // Internal methods
     void AttemptCheckout();

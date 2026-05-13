@@ -44,6 +44,7 @@ public:
     static constexpr int CHECKOUT_QUEUE_FULL      = -7;
 
     PoolPartition(std::shared_ptr<Dispatcher> dispatcher,
+                  const std::string& service_name,
                   const std::string& upstream_host, int upstream_port,
                   const std::string& sni_hostname,
                   std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint,
@@ -90,23 +91,27 @@ public:
 
     // Push an H2_STREAM_SLOT entry onto the wait queue. Called from
     // CheckoutAsync's H2-cold-start path and from H2 capacity-defer
-    // sites.
+    // sites. `upstream_name` is the partition's service identifier
+    // (matches `service_name()`), NOT the operator host string —
+    // wait-queue admission and `h2_table_` lookups key on the same
+    // name future transactions use.
     void EnqueueH2StreamSlotWaiter(
-        const std::string& host, int port,
+        const std::string& upstream_name, int port,
         ReadyCallback ready_cb, ErrorCallback error_cb,
         std::shared_ptr<std::atomic<bool>> cancel_token);
 
     // Walk wait_queue_, admit every H2_STREAM_SLOT entry targeting
-    // (host, port) onto a usable H2 connection. Called by
+    // (upstream_name, port) onto a usable H2 connection. Called by
     // UpstreamH2Connection::RunDeferredEraseWalk when a slot frees, and
     // by ALPN-h2-success paths once a fresh session is in h2_table_.
-    void DrainH2StreamWaitersForHost(const std::string& host, int port);
+    void DrainH2StreamWaitersForHost(const std::string& upstream_name,
+                                     int port);
 
     // Walk wait_queue_, fire `error_cb(connect_outcome)` for every
-    // H2_STREAM_SLOT entry targeting (host, port). Called on
+    // H2_STREAM_SLOT entry targeting (upstream_name, port). Called on
     // replacement-connect failure / ALPN-not-h2-under-prefer-always /
     // shutdown teardown of in-flight probes.
-    void FailH2StreamSlotWaiters(const std::string& host, int port,
+    void FailH2StreamSlotWaiters(const std::string& upstream_name, int port,
                                  int connect_outcome,
                                  const std::string& reason);
 
@@ -122,12 +127,15 @@ public:
     // (HandleBytes post-flush) and from shutdown paths.
     void ReapPendingDestroyH2Conns();
 
-    // Idempotent replacement-connect: skip if (host, port) already has
-    // an in-flight probe in h2_connecting_conns_, an active session in
-    // h2_table_, or the pool is at cap. Called from
+    // Idempotent replacement-connect: skip if (upstream_name, port)
+    // already has an in-flight probe in h2_connecting_conns_, an active
+    // session in h2_table_, or the pool is at cap. Called from
     // OnGoawayReceived's GOAWAY-idle branch to start a fresh session
-    // before existing waiters time out.
-    void StartH2ReplacementConnect(const std::string& host, int port);
+    // before existing waiters time out. `upstream_name` MUST match the
+    // partition's `service_name()` so the promoted session lives under
+    // the same h2_table_ key future transactions look up via
+    // `AcquireH2Connection(service_name_, ...)`.
+    void StartH2ReplacementConnect(const std::string& upstream_name, int port);
 
     // ALPN-h1 adoption: claim an H2 probe's transport for the H1 idle
     // pool. Called from OnH2ConnectHandshakeComplete's ALPN-h1 branch
@@ -137,10 +145,10 @@ public:
     // accounted for it; ownership simply transfers.
     void AdoptAsH1Connection(std::unique_ptr<UpstreamConnection> conn);
 
-    // Flip every H2_STREAM_SLOT waiter targeting (host, port) to
-    // kind=ANY so the next ServiceWaitQueue idle-pop admits them from
-    // the adopted H1 idle pool. Called after AdoptAsH1Connection.
-    void ReclassifyH2WaitersToAny(const std::string& host, int port);
+    // Flip every H2_STREAM_SLOT waiter targeting (upstream_name, port)
+    // to kind=ANY so the next ServiceWaitQueue idle-pop admits them
+    // from the adopted H1 idle pool. Called after AdoptAsH1Connection.
+    void ReclassifyH2WaitersToAny(const std::string& upstream_name, int port);
 
     // Evict expired idle connections. Called by timer handler.
     void EvictExpired();
@@ -302,8 +310,19 @@ public:
         return sni_hostname_;
     }
 
+    // The caller-facing service identifier this partition was constructed
+    // for. Used by `UpstreamH2Connection`'s replacement-connect path to
+    // key future probes / h2_table_ inserts under the same name future
+    // transactions look up. Safe to call from any thread —
+    // `service_name_` is ctor-initialised and never mutated.
+    const std::string& service_name() const { return service_name_; }
+
 private:
     std::shared_ptr<Dispatcher> dispatcher_;
+    // h2_table_ / wait-queue key. NOT upstream_host_ (operator literal,
+    // logging only) — promoted sessions must live under the same name
+    // future transactions look up via AcquireH2Connection(service_name).
+    std::string service_name_;
     std::string upstream_host_;     // Original operator host (hostname OR literal). LOGGING ONLY — connect reads resolved_endpoint_.
     int upstream_port_;              // Original operator port. Logs / fallback SNI port.
     std::string sni_hostname_;       // Empty = use upstream_host_ for SNI
@@ -367,9 +386,12 @@ private:
         std::shared_ptr<std::atomic<bool>> cancel_token;
         WaiterKind kind = WaiterKind::ANY;
         // Populated when kind == H2_STREAM_SLOT for replacement-connect
-        // targeting and DrainH2StreamWaitersForHost lookups. Ignored
-        // when kind == ANY.
-        std::string host;
+        // targeting and DrainH2StreamWaitersForHost lookups. Stores the
+        // partition's service identifier (`service_name()`), NOT the
+        // operator host string — h2_table_ keys on the same name future
+        // transactions use via `AcquireH2Connection(service_name_, ...)`.
+        // Ignored when kind == ANY.
+        std::string upstream_name;
         int port = 0;
     };
     std::deque<WaitEntry> wait_queue_;
@@ -453,23 +475,26 @@ private:
     void ServiceWaitQueue();
     void PurgeExpiredWaitEntries();
 
-    // Initiate a fresh H2 connect probe to (host, port). Mirrors
-    // CreateNewConnection for the TCP/TLS connect machinery but wires
-    // a TLS handshake-complete hook that resolves the ALPN outcome and
-    // calls OnH2ConnectHandshakeComplete. Pre-condition: caller has
-    // already gated on cap (TotalCount() < partition_max_connections_)
-    // and shutdown, AND verified `h2_connecting_conns_.count(key)==0`
-    // to avoid duplicate probes. TLS is required (h2c is not supported
-    // for cold-start probes); returns false if tls_ctx_ is null.
-    bool OpenNewH2Connection(const std::string& host, int port);
+    // Initiate a fresh H2 connect probe to the partition's resolved
+    // endpoint. Mirrors CreateNewConnection for the TCP/TLS connect
+    // machinery but wires a TLS handshake-complete hook that resolves
+    // the ALPN outcome and calls OnH2ConnectHandshakeComplete.
+    // `upstream_name` MUST match the partition's `service_name()` so
+    // the eventual h2_table_ insert lives under the same key future
+    // transactions look up. Pre-condition: caller has already gated on
+    // cap (TotalCount() < partition_max_connections_) and shutdown, AND
+    // verified `h2_connecting_conns_.count(key)==0` to avoid duplicate
+    // probes. TLS is required (h2c is not supported for cold-start
+    // probes); returns false if tls_ctx_ is null.
+    bool OpenNewH2Connection(const std::string& upstream_name, int port);
 
     // ALPN-resolve state machine. Called from the H2 shell's transport
     // handshake-complete / close / error callbacks. `outcome` is one of
     // the CHECKOUT_* sentinels (OK on TLS-handshake-success; FAILED /
     // TIMEOUT / SHUTTING_DOWN on the failure paths). `alpn` is the
     // negotiated ALPN string on the success path, empty on failure.
-    void OnH2ConnectHandshakeComplete(const std::string& host, int port,
-                                      int outcome,
+    void OnH2ConnectHandshakeComplete(const std::string& upstream_name,
+                                      int port, int outcome,
                                       const std::string& alpn);
 
 

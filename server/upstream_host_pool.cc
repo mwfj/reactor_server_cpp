@@ -85,8 +85,8 @@ UpstreamHostPool::UpstreamHostPool(
         // at construction. By-value capture here hands each partition an already-refcount-held pointer so
         // destruction order within the pool doesn't matter.
         partitions_.push_back(std::make_unique<PoolPartition>(
-            dispatchers[i], host, port, sni_hostname, resolved_endpoint,
-            partition_config, tls_ctx,
+            dispatchers[i], service_name, host, port, sni_hostname,
+            resolved_endpoint, partition_config, tls_ctx,
             outstanding_conns, inflight_leases,
             manager_shutting_down, drain_mtx, drain_cv));
     }

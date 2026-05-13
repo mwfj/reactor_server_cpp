@@ -5744,9 +5744,7 @@ static void TestS1_StreamLifecycleFieldsDefault() {
     std::cout << "\n[TEST] H2Upstream S1: UpstreamH2Stream lifecycle fields default..." << std::endl;
     try {
         UpstreamH2Stream s;
-        bool pass = !s.peer_already_closed_ && !s.pending_erase_ &&
-                    !s.pause_dispatch_ && s.paused_buffer_.empty() &&
-                    !s.stream_closed_pending_ && s.pending_close_error_code_ == 0;
+        bool pass = !s.peer_already_closed_ && !s.pending_erase_;
         TestFramework::RecordTest(
             "H2Upstream S1: UpstreamH2Stream lifecycle fields default",
             pass, pass ? "" : "default state mismatch");
@@ -5815,45 +5813,6 @@ static void TestS3_RunDeferredEraseWalkIdempotent() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "H2Upstream S3: RunDeferredEraseWalk idempotent on empty queue",
-            false, e.what());
-    }
-}
-
-static void TestS4_PauseStreamResumeStreamToggle() {
-    std::cout << "\n[TEST] H2Upstream S4: PauseStream/ResumeStream toggle stream flag..." << std::endl;
-    try {
-        // Sink must outlive the connection (defensive dtor fan-out).
-        RecordingSink sink;
-        auto cfg = std::make_shared<Http2UpstreamConfig>();
-        cfg->enabled = true;
-        cfg->max_concurrent_streams_pref = 10;
-        UpstreamH2Connection conn(nullptr, cfg);
-        if (!conn.Init()) {
-            TestFramework::RecordTest(
-                "H2Upstream S4: PauseStream/ResumeStream toggle stream flag",
-                false, "Init failed");
-            return;
-        }
-        int32_t sid = conn.SubmitRequest(
-            "GET", "http", "example.com", "/", {}, "", &sink);
-        if (sid < 0) {
-            TestFramework::RecordTest(
-                "H2Upstream S4: PauseStream/ResumeStream toggle stream flag",
-                false, "Submit failed");
-            return;
-        }
-        conn.PauseStream(sid);
-        bool paused = conn.GetStream(sid) && conn.GetStream(sid)->pause_dispatch_;
-        conn.ResumeStream(sid);
-        bool resumed = conn.GetStream(sid) && !conn.GetStream(sid)->pause_dispatch_;
-        bool pass = paused && resumed;
-        TestFramework::RecordTest(
-            "H2Upstream S4: PauseStream/ResumeStream toggle stream flag",
-            pass,
-            pass ? "" : "pause_dispatch_ did not toggle as expected");
-    } catch (const std::exception& e) {
-        TestFramework::RecordTest(
-            "H2Upstream S4: PauseStream/ResumeStream toggle stream flag",
             false, e.what());
     }
 }
@@ -6112,8 +6071,6 @@ static void TestS13_H2RetryClassification() {
             { pass = false; err += "GOAWAY_UNPROCESSED not retryable; "; }
         if (!PT::IsH2RetryableCode(PT::RESULT_GOAWAY_MAYBE_PROCESSED))
             { pass = false; err += "GOAWAY_MAYBE_PROCESSED not retryable; "; }
-        if (!PT::IsH2RetryableCode(PT::RESULT_TRUNCATED_RESPONSE))
-            { pass = false; err += "TRUNCATED_RESPONSE not retryable; "; }
 
         // Non-retryable codes.
         if (PT::IsH2RetryableCode(PT::RESULT_SUCCESS))
@@ -6122,6 +6079,14 @@ static void TestS13_H2RetryClassification() {
             { pass = false; err += "H2_METHOD_NOT_SUPPORTED marked retryable; "; }
         if (PT::IsH2RetryableCode(PT::RESULT_CIRCUIT_OPEN))
             { pass = false; err += "CIRCUIT_OPEN marked retryable; "; }
+        // RESULT_TRUNCATED_RESPONSE MUST be terminal per its public
+        // contract — held-fallback (buffer-and-replay) is a known
+        // limitation, see HTTP2_UPSTREAM_PHASE_RECONCILIATION.md §2.5.
+        // Marking it retryable without held-fallback would double-deliver
+        // bytes on streaming responses.
+        if (PT::IsH2RetryableCode(PT::RESULT_TRUNCATED_RESPONSE))
+            { pass = false; err += "TRUNCATED_RESPONSE must be terminal "
+                                   "(see contract on the constant); "; }
 
         // GOAWAY_UNPROCESSED → CONNECT_FAILURE (zero-delay first retry).
         if (PT::MapH2CodeToRetryCondition(PT::RESULT_GOAWAY_UNPROCESSED)
@@ -6131,9 +6096,6 @@ static void TestS13_H2RetryClassification() {
         if (PT::MapH2CodeToRetryCondition(PT::RESULT_GOAWAY_MAYBE_PROCESSED)
             != RC::UPSTREAM_DISCONNECT)
             { pass = false; err += "GOAWAY_MAYBE_PROCESSED should map to UPSTREAM_DISCONNECT; "; }
-        if (PT::MapH2CodeToRetryCondition(PT::RESULT_TRUNCATED_RESPONSE)
-            != RC::UPSTREAM_DISCONNECT)
-            { pass = false; err += "TRUNCATED_RESPONSE should map to UPSTREAM_DISCONNECT; "; }
         if (PT::MapH2CodeToRetryCondition(PT::RESULT_UPSTREAM_DISCONNECT)
             != RC::UPSTREAM_DISCONNECT)
             { pass = false; err += "UPSTREAM_DISCONNECT should map to UPSTREAM_DISCONNECT; "; }
@@ -6143,6 +6105,300 @@ static void TestS13_H2RetryClassification() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest("H2Upstream S13: H2 retry classification",
                                   false, e.what());
+    }
+}
+
+// RESULT_H2_ALPN_NOT_NEGOTIATED contract: terminal + breaker-neutral +
+// BadGateway with X-H2-Limitation header. Mirrors the
+// RESULT_H2_METHOD_NOT_SUPPORTED shape. Locks the dedicated result
+// against future refactors that might route it through CHECKOUT_FAILED's
+// retry classification.
+static void TestS14_AlpnNotNegotiatedContract() {
+    std::cout << "\n[TEST] H2Upstream S14: RESULT_H2_ALPN_NOT_NEGOTIATED contract..." << std::endl;
+    try {
+        using PT = ProxyTransaction;
+        bool pass = true;
+        std::string err;
+
+        // Terminal: not in the H2 retry allowlist.
+        if (PT::IsH2RetryableCode(PT::RESULT_H2_ALPN_NOT_NEGOTIATED))
+            { pass = false; err += "ALPN_NOT_NEGOTIATED must be terminal; "; }
+
+        // Distinct value from existing terminals (catch accidental
+        // duplicate-constant copy-paste regressions).
+        if (PT::RESULT_H2_ALPN_NOT_NEGOTIATED ==
+            PT::RESULT_H2_METHOD_NOT_SUPPORTED)
+            { pass = false; err += "ALPN_NOT_NEGOTIATED collides with METHOD_NOT_SUPPORTED; "; }
+        if (PT::RESULT_H2_ALPN_NOT_NEGOTIATED ==
+            PT::RESULT_GOAWAY_MAYBE_PROCESSED)
+            { pass = false; err += "ALPN_NOT_NEGOTIATED collides with GOAWAY_MAYBE_PROCESSED; "; }
+
+        TestFramework::RecordTest(
+            "H2Upstream S14: RESULT_H2_ALPN_NOT_NEGOTIATED contract",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S14: RESULT_H2_ALPN_NOT_NEGOTIATED contract",
+            false, e.what());
+    }
+}
+
+// REFUSED_STREAM error_code (peer rejected the stream — provably
+// unprocessed) maps to RESULT_GOAWAY_UNPROCESSED so the retry path
+// uses CONNECT_FAILURE classification (zero-delay first retry) and
+// breaker accounting stays neutral. Pre-fix this collapsed to the
+// generic RESULT_UPSTREAM_DISCONNECT bucket, counting peer-RST as
+// upstream health failure.
+static void TestS15_OnStreamCloseRefusedStreamMapsToGoawayUnprocessed() {
+    std::cout << "\n[TEST] H2Upstream S15: OnStreamClose REFUSED_STREAM maps to GOAWAY_UNPROCESSED..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S15: REFUSED_STREAM → RESULT_GOAWAY_UNPROCESSED",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &sink);
+        if (sid != 1) {
+            TestFramework::RecordTest(
+                "H2Upstream S15: REFUSED_STREAM → RESULT_GOAWAY_UNPROCESSED",
+                false, "Unexpected sid=" + std::to_string(sid));
+            return;
+        }
+
+        // No GOAWAY received — but error_code REFUSED_STREAM by itself
+        // is enough to classify as unprocessed.
+        conn.OnStreamClose(sid, NGHTTP2_REFUSED_STREAM);
+
+        bool pass = (sink.error_calls == 1 &&
+                     sink.last_error_code ==
+                         ProxyTransaction::RESULT_GOAWAY_UNPROCESSED);
+        TestFramework::RecordTest(
+            "H2Upstream S15: REFUSED_STREAM → RESULT_GOAWAY_UNPROCESSED",
+            pass,
+            pass ? "" :
+                "expected error_code=RESULT_GOAWAY_UNPROCESSED; got "
+                "err_calls=" + std::to_string(sink.error_calls) +
+                " code=" + std::to_string(sink.last_error_code));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S15: REFUSED_STREAM → RESULT_GOAWAY_UNPROCESSED",
+            false, e.what());
+    }
+}
+
+// Stream at id <= goaway_last_stream_id (was draining naturally,
+// survived OnGoawayReceived's above-last fan-out) that later closes
+// with a non-NO_ERROR code MUST classify as
+// RESULT_GOAWAY_MAYBE_PROCESSED (breaker-neutral) instead of
+// RESULT_UPSTREAM_DISCONNECT (upstream-health failure). Pre-fix this
+// counted ordinary peer drain as upstream health failure.
+static void TestS16_OnStreamCloseAfterGoawayMapsToMaybeProcessed() {
+    std::cout << "\n[TEST] H2Upstream S16: OnStreamClose post-GOAWAY drain error → MAYBE_PROCESSED..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S16: post-GOAWAY drain error → MAYBE_PROCESSED",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &sink);
+        if (sid != 1) {
+            TestFramework::RecordTest(
+                "H2Upstream S16: post-GOAWAY drain error → MAYBE_PROCESSED",
+                false, "Unexpected sid=" + std::to_string(sid));
+            return;
+        }
+
+        // GOAWAY says: I processed up to sid=1. Our stream survives the
+        // above-last fan-out (its id matches last_stream_id, not above).
+        conn.OnGoawayReceived(/*last_stream_id=*/1);
+
+        // Sink was NOT touched by the fan-out.
+        if (sink.error_calls != 0) {
+            TestFramework::RecordTest(
+                "H2Upstream S16: post-GOAWAY drain error → MAYBE_PROCESSED",
+                false, "fan-out incorrectly touched in-drain stream");
+            return;
+        }
+
+        // Peer drops the stream with an error code (e.g.
+        // INTERNAL_ERROR) — we don't know if it processed our request.
+        conn.OnStreamClose(sid, NGHTTP2_INTERNAL_ERROR);
+
+        bool pass = (sink.error_calls == 1 &&
+                     sink.last_error_code ==
+                         ProxyTransaction::RESULT_GOAWAY_MAYBE_PROCESSED);
+        TestFramework::RecordTest(
+            "H2Upstream S16: post-GOAWAY drain error → MAYBE_PROCESSED",
+            pass,
+            pass ? "" :
+                "expected error_code=RESULT_GOAWAY_MAYBE_PROCESSED; "
+                "got err_calls=" + std::to_string(sink.error_calls) +
+                " code=" + std::to_string(sink.last_error_code));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S16: post-GOAWAY drain error → MAYBE_PROCESSED",
+            false, e.what());
+    }
+}
+
+// Pre-fix: OnStreamClose without GOAWAY (transport drop / peer abort)
+// for a generic error code still maps to RESULT_UPSTREAM_DISCONNECT
+// — the upstream-health bucket. Locks in that the GOAWAY-keyed
+// reclassification is GATED on goaway_seen_ && id<=last_stream_id, not
+// applied to all error closes.
+static void TestS17_OnStreamCloseNoGoawayKeepsUpstreamDisconnect() {
+    std::cout << "\n[TEST] H2Upstream S17: OnStreamClose without GOAWAY keeps UPSTREAM_DISCONNECT..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        RecordingSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S17: no-GOAWAY drain error keeps UPSTREAM_DISCONNECT",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &sink);
+        if (sid != 1) {
+            TestFramework::RecordTest(
+                "H2Upstream S17: no-GOAWAY drain error keeps UPSTREAM_DISCONNECT",
+                false, "Unexpected sid=" + std::to_string(sid));
+            return;
+        }
+
+        conn.OnStreamClose(sid, NGHTTP2_INTERNAL_ERROR);
+
+        bool pass = (sink.error_calls == 1 &&
+                     sink.last_error_code ==
+                         ProxyTransaction::RESULT_UPSTREAM_DISCONNECT);
+        TestFramework::RecordTest(
+            "H2Upstream S17: no-GOAWAY drain error keeps UPSTREAM_DISCONNECT",
+            pass,
+            pass ? "" :
+                "expected RESULT_UPSTREAM_DISCONNECT; got code=" +
+                std::to_string(sink.last_error_code));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S17: no-GOAWAY drain error keeps UPSTREAM_DISCONNECT",
+            false, e.what());
+    }
+}
+
+// GOAWAY-idle gate fires replacement-trigger conditions when every
+// active stream's id is above last_stream_id. Pre-fix the gate read
+// `active_streams_ == 0` directly — but active_streams_ is only
+// decremented in RunDeferredEraseWalk, after OnGoawayReceived returns.
+// So the all-above case (which is exactly when replacement is most
+// needed) silently skipped. The survivors_below count fixes it. This
+// test exercises the bookkeeping without a partition_ — verifies
+// pending_erase_ is set for every above-last stream AND that no
+// below-last stream is touched.
+static void TestS18_GoawayAllAboveMarksAllPendingErase() {
+    std::cout << "\n[TEST] H2Upstream S18: GOAWAY all-above marks all pending_erase..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        RecordingSink sa, sb, sc;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S18: GOAWAY all-above pending_erase",
+                false, "Init failed");
+            return;
+        }
+        int32_t a = conn.SubmitRequest("GET", "http", "x", "/a", {}, "", &sa);
+        int32_t b = conn.SubmitRequest("GET", "http", "x", "/b", {}, "", &sb);
+        int32_t c = conn.SubmitRequest("GET", "http", "x", "/c", {}, "", &sc);
+        if (a != 1 || b != 3 || c != 5) {
+            TestFramework::RecordTest(
+                "H2Upstream S18: GOAWAY all-above pending_erase",
+                false, "Unexpected sids: " + std::to_string(a) + "," +
+                       std::to_string(b) + "," + std::to_string(c));
+            return;
+        }
+        // last_stream_id=0 — every active stream's id > 0 → all
+        // above-last → all marked pending_erase via the fan-out.
+        conn.OnGoawayReceived(/*last_stream_id=*/0);
+
+        bool all_pending_erase =
+            conn.GetStream(a) && conn.GetStream(a)->pending_erase_ &&
+            conn.GetStream(b) && conn.GetStream(b)->pending_erase_ &&
+            conn.GetStream(c) && conn.GetStream(c)->pending_erase_;
+        bool all_unprocessed =
+            sa.last_error_code == ProxyTransaction::RESULT_GOAWAY_UNPROCESSED &&
+            sb.last_error_code == ProxyTransaction::RESULT_GOAWAY_UNPROCESSED &&
+            sc.last_error_code == ProxyTransaction::RESULT_GOAWAY_UNPROCESSED;
+        bool pass = all_pending_erase && all_unprocessed;
+        TestFramework::RecordTest(
+            "H2Upstream S18: GOAWAY all-above pending_erase",
+            pass, pass ? "" : "expected all streams pending_erase + "
+                              "RESULT_GOAWAY_UNPROCESSED");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S18: GOAWAY all-above pending_erase",
+            false, e.what());
+    }
+}
+
+// GOAWAY with last_stream_id matching one of our submitted streams
+// keeps the in-range stream draining naturally. Locks the boundary
+// semantic of the survivors_below count.
+static void TestS19_GoawayWithSurvivorsBelowKeepsDraining() {
+    std::cout << "\n[TEST] H2Upstream S19: GOAWAY with in-drain stream keeps it untouched..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        RecordingSink sa, sb;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S19: GOAWAY survivors_below keeps draining",
+                false, "Init failed");
+            return;
+        }
+        int32_t a = conn.SubmitRequest("GET", "http", "x", "/a", {}, "", &sa);
+        int32_t b = conn.SubmitRequest("GET", "http", "x", "/b", {}, "", &sb);
+        if (a != 1 || b != 3) {
+            TestFramework::RecordTest(
+                "H2Upstream S19: GOAWAY survivors_below keeps draining",
+                false, "Unexpected sids");
+            return;
+        }
+        // last_stream_id=1 — a is at-or-below (drains), b is above
+        // (failed unprocessed). Stream a's sink is NOT touched.
+        conn.OnGoawayReceived(/*last_stream_id=*/1);
+        bool a_clean = (sa.error_calls == 0 && sa.complete_calls == 0);
+        bool b_unprocessed = (sb.error_calls == 1 &&
+            sb.last_error_code == ProxyTransaction::RESULT_GOAWAY_UNPROCESSED);
+        bool a_not_pending_erase =
+            conn.GetStream(a) && !conn.GetStream(a)->pending_erase_;
+        bool pass = a_clean && b_unprocessed && a_not_pending_erase;
+        TestFramework::RecordTest(
+            "H2Upstream S19: GOAWAY survivors_below keeps draining",
+            pass, pass ? "" : "expected a untouched + b unprocessed");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S19: GOAWAY survivors_below keeps draining",
+            false, e.what());
     }
 }
 
@@ -6156,7 +6412,6 @@ void RunAllH2UpstreamTests() {
     TestS1_StreamLifecycleFieldsDefault();
     TestS2_DetachSinkBeforePeerCloseKeepsEntry();
     TestS3_RunDeferredEraseWalkIdempotent();
-    TestS4_PauseStreamResumeStreamToggle();
     TestS6_AliveTokenInitiallyTrue();
     TestS7_ActiveStreamsIncrementOnSubmit();
     TestS8_ActiveStreamsDecrementInDeferredWalk();
@@ -6165,6 +6420,12 @@ void RunAllH2UpstreamTests() {
     TestS11_DestroyOnDispatcherFlipsAliveAndIsIdempotent();
     TestS12_DtorShortCircuitAfterDestroyOnDispatcher();
     TestS13_H2RetryClassification();
+    TestS14_AlpnNotNegotiatedContract();
+    TestS15_OnStreamCloseRefusedStreamMapsToGoawayUnprocessed();
+    TestS16_OnStreamCloseAfterGoawayMapsToMaybeProcessed();
+    TestS17_OnStreamCloseNoGoawayKeepsUpstreamDisconnect();
+    TestS18_GoawayAllAboveMarksAllPendingErase();
+    TestS19_GoawayWithSurvivorsBelowKeepsDraining();
 
     // Tier A — unit tests
     TestMinCadenceSecDisabled();
