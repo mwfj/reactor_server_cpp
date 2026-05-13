@@ -518,22 +518,20 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
     // which DOES need to drain remaining entries into the requeue
     // deque.
     std::deque<WaitEntry> requeue;
-    size_t abandoned_on_partition_destroy = 0;
-    for (auto& e : matched) {
+    for (size_t i = 0; i < matched.size(); ++i) {
+        WaitEntry& e = matched[i];
         if (!alive->load(std::memory_order_acquire)) {
-            // Partition destroyed mid-drain — every remaining matched
-            // entry (and the one whose alive flip we observed here) is
-            // unreachable: their ready/error_callbacks may close over
-            // freed partition state. Warn so operators see how many
-            // ProxyTransactions hung until response timeout.
-            abandoned_on_partition_destroy =
-                1 /*this entry*/ + (matched.size() -
-                    static_cast<size_t>(&e - matched.data()) - 1);
+            // Partition destroyed mid-drain — current entry plus every
+            // remaining matched entry is unreachable: their
+            // ready/error_callbacks may close over freed partition
+            // state. Warn so operators see how many ProxyTransactions
+            // hung until response timeout.
+            size_t abandoned = matched.size() - i;
             logging::Get()->warn(
                 "DrainAnyWaitersForFastH2 abandoned {} matched ANY "
                 "waiter(s) — partition destroyed mid-drain; affected "
                 "ProxyTransactions will hang until response timeout",
-                abandoned_on_partition_destroy);
+                abandoned);
             return;
         }
         if (shutting_down_.load(std::memory_order_acquire) ||
@@ -1997,21 +1995,34 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
                                     "transport vanished pre-h1-adoption");
             return;
         }
-        if (shell) shell->MarkTransferred();
-        // Defense-in-depth: try/catch rolls back transferred_ if
-        // AdoptAsH1Connection or ReclassifyH2WaitersToAny throws.
-        // Without this, the shell's safety-net dtor would skip
-        // ClearH2TransportCallbacks (transferred_=true short-circuit)
-        // while the transport's ownership state is ambiguous —
-        // stale H2 callbacks would survive on a transport that
-        // belongs to neither H1 nor H2.
+        // Exception-safe adoption sequence:
+        //  1. AdoptAsH1Connection takes `owned_uc` by REFERENCE and
+        //     commits via push_back at the end. If it throws (e.g.
+        //     push_back bad_alloc, callback wiring fails), owned_uc
+        //     still owns the transport — the caller must destroy it
+        //     AND null shell->transport_ to prevent the shell's
+        //     safety-net dtor from dereferencing a freed transport.
+        //  2. MarkTransferred fires ONLY after the commit succeeds.
+        //     A late ReclassifyH2WaitersToAny throw after MarkTransferred
+        //     is harmless: the H2 shell's dtor short-circuits via
+        //     transferred_, the transport is alive in idle_conns_.
         try {
-            AdoptAsH1Connection(std::move(owned_uc));
-            ReclassifyH2WaitersToAny(upstream_name, port);
+            AdoptAsH1Connection(owned_uc);  // by ref; commits at end
         } catch (...) {
-            if (shell) shell->ClearTransferredForRollback();
+            // Adoption failed pre-commit. owned_uc still owns the
+            // transport. Null the shell's dangling pointer, destroy
+            // the transport, tear down the shell. Rethrow.
+            if (shell) shell->ClearTransportForRollback();
+            if (owned_uc) DestroyConnection(std::move(owned_uc));
+            if (shell) shell->DestroyOnDispatcher();
             throw;
         }
+        // Adoption committed. Signal "shell no longer owns the
+        // transport" so the safety-net dtor's ClearH2TransportCallbacks
+        // does not wipe the callbacks WirePoolCallbacks just installed
+        // on the idle conn.
+        if (shell) shell->MarkTransferred();
+        ReclassifyH2WaitersToAny(upstream_name, port);
         // Asymmetry note: no inflight_leases_ bump here (unlike the
         // ALPN-h2 success branch at line ~2063). AdoptAsH1Connection
         // hands the transport to idle_conns_, not to a borrower — the
@@ -2152,23 +2163,29 @@ void PoolPartition::StartH2ReplacementConnect(
 }
 
 void PoolPartition::AdoptAsH1Connection(
-    std::unique_ptr<UpstreamConnection> conn) {
+    std::unique_ptr<UpstreamConnection>& conn) {
     if (!conn) return;
-    // Re-wire callbacks for H1 use. The H2 probe's
-    // SetConnectCompleteCallback / SetHandshakeCompleteCallback have
-    // already fired and been cleared by ClearH2TransportCallbacks (via
-    // shell->DestroyOnDispatcher's step 2). WirePoolCallbacks restores
-    // the H1 close/error handlers + on-message routing.
+    // Pre-commit work first. Any throw here leaves `conn` unchanged
+    // (caller still owns it) so the H2 shell's transport_ raw pointer
+    // does not dangle while the caller's catch routes the transport
+    // through DestroyConnection. WirePoolCallbacks's std::function
+    // assignments and SetDeadline are the realistic throw sites
+    // (std::bad_alloc on SBO→heap promotion is unlikely but
+    // possible).
     WirePoolCallbacks(conn.get());
 
-    // Suppress the server-wide idle timeout — the borrower will set a
-    // per-request deadline. Mirrors the post-OnConnectComplete shape.
     static constexpr auto FAR_FUTURE_ADOPT = std::chrono::hours(24 * 365);
     if (auto t = conn->GetTransport()) {
         t->SetDeadline(
             std::chrono::steady_clock::now() + FAR_FUTURE_ADOPT);
     }
     conn->MarkIdle();
+
+    // Commit point. push_back's strong throw guarantee + unique_ptr's
+    // noexcept move-constructor mean either push_back's allocation
+    // succeeds (conn becomes empty, idle_conns_ grew by one) or
+    // throws bad_alloc (conn unchanged, idle_conns_ unchanged). No
+    // partial-state outcome possible.
     idle_conns_.push_back(std::move(conn));
 }
 

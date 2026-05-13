@@ -221,6 +221,16 @@ public:
     // path.
     void ClearTransferredForRollback() { transferred_ = false; }
 
+    // Null the raw `transport_` pointer. Used by ALPN-h1 adoption
+    // catch handlers when AdoptAsH1Connection throws BEFORE committing
+    // the move into idle_conns_: the caller is about to DestroyConnection
+    // the still-owned `owned_uc`, which would leave shell->transport_
+    // dangling. Nulling it here makes the safety-net dtor's
+    // ClearH2TransportCallbacks(transport_->GetTransport())
+    // evaluate to nullptr (no-op) so the dtor finishes cleanly.
+    // Dispatcher-thread-only.
+    void ClearTransportForRollback() { transport_ = nullptr; }
+
     // True while a HandleBytes call is active. Submit / ResetStream check
     // this to defer the inline FlushSend so we never re-enter
     // nghttp2_session_mem_send2 from inside an mem_recv2 callback chain.

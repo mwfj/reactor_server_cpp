@@ -1232,9 +1232,10 @@ void ProxyTransaction::DispatchH2() {
         // H1 request on the parallel codec path). Warn so operators can
         // chase the rewriter regression instead of debugging from the
         // 502 alone, then synthesize a defensive :authority.
-        logging::Get()->warn(
+        logging::Get()->error(
             "ProxyTransaction H2 :authority fallback fired (rewritten Host "
-            "empty) client_fd={} service={} — using upstream_host derivation",
+            "empty) client_fd={} service={} — using upstream_host derivation. "
+            "This indicates a HeaderRewriter contract regression.",
             client_fd_, service_name_);
         const std::string& host_src =
             (upstream_tls_ && !sni_hostname_.empty())

@@ -354,7 +354,10 @@ void UpstreamH2Connection::DestroyOnDispatcher() {
     // Step 3: remove any deadline-timer registration for this fd so
     // a late timer fire cannot fan out to the dying session. The
     // *IfMatch variant guards against fd-reuse — a different conn
-    // sharing the recycled fd must not have its timer dropped.
+    // sharing the recycled fd must not have its timer dropped. Skips
+    // cleanly if partition_ or dispatcher is null (e.g. dtor path
+    // after partition teardown): the transport's own teardown still
+    // closes the fd which removes it from the timer wheel.
     if (partition_ && t) {
         if (auto dispatcher = partition_->dispatcher()) {
             dispatcher->RemoveTimerConnectionIfMatch(t->fd(), t);

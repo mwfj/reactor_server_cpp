@@ -220,6 +220,11 @@ private:
     // observes the session as live. Pair-invariant: h2_conn_ and
     // h2_conn_alive_ are set together and reset together, so the alive
     // load is the single load-bearing check.
+    //
+    // Partition-alive subsumed: when the owning PoolPartition is torn
+    // down, its dispatcher-lambda clears h2_table_ which destroys each
+    // UpstreamH2Connection, whose dtor flips its alive token false.
+    // So a live H2 conn implies a live partition — no separate check.
     bool H2ConnAlive() const noexcept {
         return h2_conn_alive_ &&
                h2_conn_alive_->load(std::memory_order_acquire);

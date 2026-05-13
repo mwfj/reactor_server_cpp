@@ -158,7 +158,17 @@ public:
     // idle, sets a far-future deadline, and pushes into idle_conns_.
     // outstanding_conns_ is NOT touched — the H2 probe already
     // accounted for it; ownership simply transfers.
-    void AdoptAsH1Connection(std::unique_ptr<UpstreamConnection> conn);
+    // Adopts a TLS-completed transport (negotiated ALPN=h1 under
+    // prefer=auto) into the H1 idle pool. By-reference signature with
+    // commit-at-end semantics: if any pre-commit step throws (callback
+    // wiring, deadline set), `conn` is unchanged so the caller can
+    // route it through DestroyConnection. The commit point is
+    // `idle_conns_.push_back(std::move(conn))` which, when paired with
+    // unique_ptr's noexcept move-constructor, gives strong throw
+    // safety — push_back's allocation failure leaves conn intact.
+    // Callers wrapping this in a try/catch + ClearTransportForRollback
+    // dance get a clean tear-down path on adoption failure.
+    void AdoptAsH1Connection(std::unique_ptr<UpstreamConnection>& conn);
 
     // Flip every H2_STREAM_SLOT waiter targeting (upstream_name, port)
     // to kind=ANY so the next ServiceWaitQueue idle-pop admits them
