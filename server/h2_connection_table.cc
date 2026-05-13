@@ -3,7 +3,7 @@
 
 namespace {
 
-bool IsExpired(const std::shared_ptr<UpstreamH2Connection>& c) {
+bool IsExpired(const std::unique_ptr<UpstreamH2Connection>& c) {
     if (!c) return true;
     // A connection is reapable only when it cannot serve traffic AND
     // has no in-flight streams to drain. Dead+empty and goaway+empty
@@ -49,7 +49,7 @@ size_t H2ConnectionTable::ReapDrained() {
     return removed;
 }
 
-std::shared_ptr<UpstreamH2Connection> H2ConnectionTable::FindUsable(
+UpstreamH2Connection* H2ConnectionTable::FindUsable(
     const std::string& upstream_name)
 {
     auto it = by_upstream_.find(upstream_name);
@@ -62,17 +62,33 @@ std::shared_ptr<UpstreamH2Connection> H2ConnectionTable::FindUsable(
     conns.erase(end, conns.end());
 
     for (auto& c : conns) {
-        if (c && c->IsUsable()) return c;
+        if (c && c->IsUsable()) return c.get();
     }
     return nullptr;
 }
 
 void H2ConnectionTable::Insert(
     const std::string& upstream_name,
-    std::shared_ptr<UpstreamH2Connection> conn)
+    std::unique_ptr<UpstreamH2Connection> conn)
 {
     if (!conn) return;
     by_upstream_[upstream_name].push_back(std::move(conn));
+}
+
+std::unique_ptr<UpstreamH2Connection> H2ConnectionTable::Extract(
+    UpstreamH2Connection* conn)
+{
+    if (!conn) return nullptr;
+    for (auto& [_, conns] : by_upstream_) {
+        for (auto it = conns.begin(); it != conns.end(); ++it) {
+            if (it->get() == conn) {
+                auto out = std::move(*it);
+                conns.erase(it);
+                return out;
+            }
+        }
+    }
+    return nullptr;
 }
 
 void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {

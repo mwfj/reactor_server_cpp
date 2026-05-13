@@ -1154,6 +1154,11 @@ void ProxyTransaction::DispatchH2() {
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
     }
+    if (auto live_cfg = partition->LoadHttp2ConfigSnapshot()) {
+        h2_held_fallback_enabled_ = live_cfg->held_fallback_enabled;
+    } else {
+        h2_held_fallback_enabled_ = false;
+    }
     // Protocol decision finalized — the span was stamped above before
     // any early-return failure path. Reaching here means the H2 session
     // acquisition succeeded; continue the dispatch using the same span.
@@ -1225,7 +1230,8 @@ void ProxyTransaction::DispatchH2() {
     // == 0 opts out of the response-wait timer; stall protection stays
     // on via SEND_STALL_FALLBACK_MS.
     h2_path_ = true;
-    h2_conn_weak_ = h2;
+    h2_conn_ = h2;
+    h2_conn_alive_ = h2->alive_token();
     state_ = State::SENDING_REQUEST;
     h2_response_timeout_armed_ = false;
     h2_request_fully_sent_ = false;
@@ -1255,7 +1261,8 @@ void ProxyTransaction::DispatchH2() {
         h2_path_ = false;
         h2_response_timeout_armed_ = false;
         h2_request_fully_sent_ = false;
-        h2_conn_weak_.reset();
+        h2_conn_ = nullptr;
+        h2_conn_alive_.reset();
         logging::Get()->warn(
             "ProxyTransaction H2 submit failed client_fd={} service={} "
             "attempt={}", client_fd_, service_name_, attempt_);
@@ -1264,6 +1271,52 @@ void ProxyTransaction::DispatchH2() {
     }
 
     h2_stream_id_ = stream_id;
+}
+
+void ProxyTransaction::PauseH2StreamDispatch(int32_t stream_id) {
+    if (!H2ConnAlive()) {
+        logging::Get()->warn(
+            "ProxyTransaction::PauseH2StreamDispatch: H2 conn gone fd={} sid={}",
+            client_fd_, stream_id);
+        return;
+    }
+    h2_conn_->PauseStream(stream_id);
+}
+
+void ProxyTransaction::ResumeH2StreamDispatch(int32_t stream_id) {
+    if (!H2ConnAlive()) {
+        logging::Get()->warn(
+            "ProxyTransaction::ResumeH2StreamDispatch: H2 conn gone fd={} sid={}",
+            client_fd_, stream_id);
+        return;
+    }
+    h2_conn_->ResumeStream(stream_id);
+}
+
+bool ProxyTransaction::AppendHeldRetryable5xxBody(const char* data,
+                                                  size_t len) {
+    if (!h2_held_fallback_enabled_) return false;
+    if (!pending_retryable_5xx_response_) return false;
+    pending_retryable_5xx_body_.append(data, len);
+    return true;
+}
+
+void ProxyTransaction::MarkHeldRetryable5xxBodyComplete() {
+    if (!h2_held_fallback_enabled_) return;
+    if (!pending_retryable_5xx_response_) return;
+    pending_retryable_5xx_body_complete_ = true;
+}
+
+void ProxyTransaction::SetInReplay(bool in_replay) {
+    in_replay_ = in_replay;
+}
+
+int ProxyTransaction::LastSendResult() const {
+    return h2_last_send_result_;
+}
+
+void ProxyTransaction::InstallReplayDrainListener(std::function<void()> cb) {
+    replay_drain_listener_ = std::move(cb);
 }
 
 void ProxyTransaction::OnCheckoutError(int error_code) {
@@ -1714,6 +1767,9 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
 
     auto result = stream_sender_.SendData(data, len);
     HandleStreamSendResult(result);
+    // Track the latest send-result for the H2 replay drain so
+    // LastSendResult() reflects live downstream backpressure.
+    h2_last_send_result_ = static_cast<int>(result);
     if (result == HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::SendResult::CLOSED) {
         poison_connection_ = true;
         ReleaseBreakerAdmissionNeutral();
@@ -1871,23 +1927,19 @@ void ProxyTransaction::OnError(int result_code,
     // H2 transport-level failures arrive here through sink->OnError —
     // unlike H1, which detects transport failure inside OnUpstreamData
     // and calls MaybeRetry(UPSTREAM_DISCONNECT) directly before the sink
-    // ever sees an error. Bring H2 to feature parity: when the result is
-    // a retryable disconnect AND no response has been committed AND the
-    // transaction is not already terminal, route through MaybeRetry so
-    // the retry policy fires (idempotent method, attempt budget, retry
-    // budget all honored). The state guard guards against a late
-    // OnError fired from a stream-close callback that the partition
-    // didn't manage to suppress, after a previous attempt's terminal
-    // delivery (Cleanup → ResetStream → sink=nullptr is the primary
-    // defense; the local guard makes the invariant explicit). Cleanup()
-    // inside MaybeRetry's success branch tears down the H2 stream
-    // state; its retry-not-allowed branch falls through to
-    // DeliverTerminalError.
+    // ever sees an error. Bring H2 to feature parity: route every
+    // H2-retryable code through MaybeRetry. The state guard rejects a
+    // late OnError fired from a stream-close callback after a previous
+    // attempt's terminal delivery (Cleanup → ResetStream → sink=nullptr
+    // is the primary defense; the local guard makes the invariant
+    // explicit). Cleanup() inside MaybeRetry's success branch tears
+    // down the H2 stream state; its retry-not-allowed branch falls
+    // through to DeliverTerminalError.
     if (h2_path_ && !response_committed_ &&
         state_ != State::FAILED && state_ != State::COMPLETE &&
-        result_code == RESULT_UPSTREAM_DISCONNECT) {
+        IsH2RetryableCode(result_code)) {
         ReportBreakerOutcome(result_code);
-        MaybeRetry(RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
+        MaybeRetry(MapH2CodeToRetryCondition(result_code));
         return;
     }
 
@@ -2087,12 +2139,16 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             // retry-rejection delivers the headers-only snapshot rather than
             // the full upstream 5xx body — same trade-off the H2 OnHeaders
             // synchronous-decision path already accepts.
-            if (h2_path_) {
+            if (h2_path_ && !h2_held_fallback_enabled_) {
                 pending_retryable_5xx_body_complete_ = true;
             }
             holding_retryable_5xx_response_ =
                 !pending_retryable_5xx_body_complete_;
             held_retryable_5xx_saw_eof_ = false;
+            if (h2_path_ && h2_held_fallback_enabled_ && h2_stream_id_ >= 0 &&
+                holding_retryable_5xx_response_) {
+                PauseH2StreamDispatch(h2_stream_id_);
+            }
         } else {
             ClearPendingRetryable5xxResponse();
         }
@@ -2538,13 +2594,12 @@ void ProxyTransaction::Cleanup() {
     // callbacks or release a lease (the lease was donated to the H2
     // connection at dispatch time).
     if (h2_path_) {
-        if (h2_stream_id_ >= 0) {
-            if (auto h2 = h2_conn_weak_.lock()) {
-                h2->ResetStream(h2_stream_id_);
-            }
+        if (h2_stream_id_ >= 0 && H2ConnAlive()) {
+            h2_conn_->ResetStream(h2_stream_id_);
         }
         h2_stream_id_ = -1;
-        h2_conn_weak_.reset();
+        h2_conn_ = nullptr;
+        h2_conn_alive_.reset();
         // Bump send-stall generation BEFORE the h2_path_ flip so any
         // in-flight send-stall closure no-ops on its eventual fire.
         // Same pattern as h2_response_timeout_generation_ below.
@@ -2716,6 +2771,9 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
     holding_retryable_5xx_response_ = false;
     bool saw_eof = held_retryable_5xx_saw_eof_;
     held_retryable_5xx_saw_eof_ = false;
+    if (h2_path_ && h2_held_fallback_enabled_ && h2_stream_id_ >= 0) {
+        ResumeH2StreamDispatch(h2_stream_id_);
+    }
     ClearPendingRetryable5xxResponse();
     state_ = State::RECEIVING_BODY;
 
@@ -2794,6 +2852,10 @@ void ProxyTransaction::BeginRetryAttemptFromHeld5xx() {
 
     holding_retryable_5xx_response_ = false;
     held_retryable_5xx_saw_eof_ = false;
+    if (h2_path_ && h2_held_fallback_enabled_ && h2_stream_id_ >= 0 &&
+        H2ConnAlive()) {
+        h2_conn_->DetachSink(h2_stream_id_);
+    }
     ReleaseHeldRetryable5xxTransport();
     ResetForRetryAttempt();
     ActivateAttemptTracking();
@@ -3321,7 +3383,9 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         result_code == RESULT_SEND_FAILED ||
         result_code == RESULT_PARSE_ERROR ||
         result_code == RESULT_UPSTREAM_DISCONNECT ||
-        result_code == RESULT_TRUNCATED_RESPONSE) {
+        result_code == RESULT_TRUNCATED_RESPONSE ||
+        result_code == RESULT_GOAWAY_UNPROCESSED ||
+        result_code == RESULT_GOAWAY_MAYBE_PROCESSED) {
         return HttpResponse::BadGateway();
     }
     return HttpResponse::InternalError();
@@ -3485,6 +3549,31 @@ void ProxyTransaction::ReleaseBreakerAdmissionNeutral() {
     slice_->ReportNeutral(probe, gen);
 }
 
+bool ProxyTransaction::IsH2RetryableCode(int result_code) noexcept {
+    switch (result_code) {
+        case RESULT_UPSTREAM_DISCONNECT:
+        case RESULT_GOAWAY_UNPROCESSED:
+        case RESULT_GOAWAY_MAYBE_PROCESSED:
+        case RESULT_TRUNCATED_RESPONSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+RetryPolicy::RetryCondition ProxyTransaction::MapH2CodeToRetryCondition(
+    int result_code) noexcept {
+    // Connect-style: peer demonstrably never processed the request.
+    // First retry runs at zero delay because the upstream is healthy
+    // and the failure is purely a session-lifecycle artifact.
+    if (result_code == RESULT_GOAWAY_UNPROCESSED) {
+        return RetryPolicy::RetryCondition::CONNECT_FAILURE;
+    }
+    // Response-level: peer may have processed the request. Backoff
+    // applies (idempotency-gated by the retry policy).
+    return RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT;
+}
+
 void ProxyTransaction::ReportBreakerOutcome(int result_code) {
     // No slice, or already reported: bail. admission_generation_==0 is
     // the sentinel — slice domain generations start at 1, so a 0 gen
@@ -3541,6 +3630,18 @@ void ProxyTransaction::ReportBreakerOutcome(int result_code) {
             // pre-routing hook already calls
             // ReleaseBreakerAdmissionNeutral; this case is the
             // defensive fallback if a code path slips past the hook.
+            slice_->ReportNeutral(probe, gen);
+            return;
+
+        case RESULT_GOAWAY_UNPROCESSED:
+        case RESULT_GOAWAY_MAYBE_PROCESSED:
+            // RFC 9113 §6.8: GOAWAY signals connection-lifecycle, not
+            // upstream health. Counting it as a failure would trip
+            // breakers when the peer is rolling sessions for ordinary
+            // reasons (graceful drain, deploy, idle timeout). The
+            // MAYBE_PROCESSED variant is identical for breaker
+            // purposes — the per-attempt retry budget enforces the
+            // idempotency gate, not the breaker.
             slice_->ReportNeutral(probe, gen);
             return;
 

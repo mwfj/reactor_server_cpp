@@ -77,6 +77,17 @@ public:
     // serving CONNECT here would emit a malformed request. Terminal —
     // deterministic policy reject (502 BadGateway + X-H2-Limitation header).
     static constexpr int RESULT_H2_METHOD_NOT_SUPPORTED = -11;
+    // Peer sent GOAWAY with last_stream_id < our stream_id. Per RFC 9113
+    // §6.8 the peer provably did not process this request — connect-style
+    // retryable, breaker-neutral. Maps to 502 BadGateway in
+    // MakeErrorResponse.
+    static constexpr int RESULT_GOAWAY_UNPROCESSED  = -12;
+    // Peer sent GOAWAY with last_stream_id >= our stream_id, then
+    // dropped the stream before delivering a complete response.
+    // Per RFC 9113 §6.8 we don't know whether the peer processed it —
+    // retryable for idempotent methods, response-level backoff,
+    // breaker-neutral. Maps to 502 BadGateway in MakeErrorResponse.
+    static constexpr int RESULT_GOAWAY_MAYBE_PROCESSED = -13;
 
     // Constructor copies all needed fields from client_request (method, path,
     // query, headers, body, params, dispatcher_index, client_ip, client_tls,
@@ -176,6 +187,12 @@ public:
                                          : SEND_STALL_FALLBACK_MS;
     }
 
+    bool AppendHeldRetryable5xxBody(const char* data, size_t len) override;
+    void MarkHeldRetryable5xxBodyComplete() override;
+    void SetInReplay(bool in_replay) override;
+    int LastSendResult() const override;
+    void InstallReplayDrainListener(std::function<void()> cb) override;
+
     bool OnHeaders(
         const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead& head) override;
     bool OnBodyChunk(const char* data, size_t len) override;
@@ -198,6 +215,28 @@ public:
     static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
 
 private:
+    // True iff the H2 conn pointer is set and its alive token still
+    // observes the session as live. Pair-invariant: h2_conn_ and
+    // h2_conn_alive_ are set together and reset together, so the alive
+    // load is the single load-bearing check.
+    bool H2ConnAlive() const noexcept {
+        return h2_conn_alive_ &&
+               h2_conn_alive_->load(std::memory_order_acquire);
+    }
+
+    // Allowlist for H2-path retries from OnError. H1 retries from
+    // OnUpstreamData; H2 retries flow through OnError because the H2
+    // codec surfaces every transport-level failure via sink->OnError
+    // rather than the parser-driven H1 path.
+    static bool IsH2RetryableCode(int result_code) noexcept;
+    // Map an H2-retryable result code to the RetryPolicy condition.
+    // Connect-style codes (peer never processed the stream) map to
+    // CONNECT_FAILURE so the first retry runs at zero delay; the rest
+    // route through UPSTREAM_DISCONNECT for the response-level backoff
+    // policy.
+    static RetryPolicy::RetryCondition MapH2CodeToRetryCondition(
+        int result_code) noexcept;
+
     // Bump h2_send_stall_generation_ and queue a fresh send-stall
     // closure for the full budget. Called from DispatchH2 at attempt
     // start. OnRequestBodyProgress does NOT call this directly —
@@ -371,11 +410,18 @@ private:
 
     // H2 dispatch state. `h2_path_` flips true once DispatchH2 has
     // successfully submitted a stream; cleanup paths gate H1-specific
-    // teardown on `!h2_path_`. The weak_ptr lets a mid-flight Cleanup
-    // / Cancel issue RST_STREAM if the H2 session is still alive.
-    std::weak_ptr<UpstreamH2Connection> h2_conn_weak_;
+    // teardown on `!h2_path_`. The dual-token shape (raw pointer +
+    // shared alive-flag) lets a mid-flight Cleanup / Cancel issue
+    // RST_STREAM if the H2 session is still alive, while
+    // short-circuiting safely if the session was destroyed in between.
+    UpstreamH2Connection* h2_conn_ = nullptr;
+    std::shared_ptr<std::atomic<bool>> h2_conn_alive_;
     int32_t h2_stream_id_ = -1;
     bool h2_path_ = false;
+
+    // Cached per-attempt from partition->LoadHttp2ConfigSnapshot() —
+    // not from the H2 conn's frozen snapshot.
+    bool h2_held_fallback_enabled_ = false;
 
     // True iff the inbound request carried `te: trailers` (RFC 7230 §4.3
     // / RFC 9113 §8.2.2 — required by gRPC clients to negotiate trailer
@@ -527,6 +573,10 @@ private:
     bool holding_retryable_5xx_response_ = false;
     bool held_retryable_5xx_saw_eof_ = false;
 
+    bool in_replay_ = false;
+    int h2_last_send_result_ = 0;
+    std::function<void()> replay_drain_listener_;
+
     // Internal methods
     void AttemptCheckout();
     bool PrepareAttemptAdmission();
@@ -565,6 +615,9 @@ private:
     // freshest published value (a SIGHUP between the handshake-defer
     // capture site and the actual dispatch can publish a new snapshot).
     void DispatchH2();
+
+    void PauseH2StreamDispatch(int32_t stream_id);
+    void ResumeH2StreamDispatch(int32_t stream_id);
 
     void SendUpstreamRequest();
     void OnUpstreamData(std::shared_ptr<ConnectionHandler> conn, std::string& data);

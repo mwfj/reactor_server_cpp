@@ -21,6 +21,8 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/upstream_host_pool.h"
 #include "upstream/pool_partition.h"
+#include "upstream/upstream_h2_connection.h"
+#include "upstream/host_port_key.h"
 #include "net/dns_resolver.h"
 #include "socket_handler.h"
 #include "connection_handler.h"
@@ -1010,6 +1012,90 @@ void TestUpstreamLeaseMoveAssignment() {
     }
 }
 
+// Default-constructed lease reports kind == EMPTY and accessors return null.
+void TestUpstreamLeaseKindEmpty() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: kind EMPTY..." << std::endl;
+    try {
+        UpstreamLease lease;
+        bool pass = (lease.kind() == UpstreamLease::Kind::EMPTY) &&
+                    lease.empty() &&
+                    !static_cast<bool>(lease) &&
+                    lease.Get() == nullptr &&
+                    lease.GetH2Connection() == nullptr &&
+                    lease.GetH2StreamId() == -1;
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind EMPTY",
+                                  pass, pass ? "" : "accessors disagree");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind EMPTY", false, e.what());
+    }
+}
+
+// H1 ctor stamps kind == H1; H2 accessors return null even on a live H1 lease.
+void TestUpstreamLeaseKindH1() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: kind H1..." << std::endl;
+    try {
+        int sv[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+            throw std::runtime_error("socketpair failed");
+        ::close(sv[1]);
+        auto sock = std::make_unique<SocketHandler>(sv[0]);
+        auto conn_handler = std::make_shared<ConnectionHandler>(nullptr, std::move(sock));
+        auto uc = std::make_unique<UpstreamConnection>(conn_handler, "127.0.0.1", 9999);
+        UpstreamLease lease(uc.get(), nullptr, nullptr);
+        bool pass = (lease.kind() == UpstreamLease::Kind::H1) &&
+                    static_cast<bool>(lease) &&
+                    lease.Get() == uc.get() &&
+                    lease.GetH2Connection() == nullptr &&
+                    lease.GetH2StreamId() == -1;
+        lease.Release();
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind H1",
+                                  pass, pass ? "" : "kind/accessors mismatch");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind H1", false, e.what());
+    }
+}
+
+// H2 ctor stamps kind == H2; alive-token gates `GetH2Connection`.
+void TestUpstreamLeaseKindH2AliveGates() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: kind H2 alive gates..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 4;
+        auto conn = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+        auto partition_alive = std::make_shared<std::atomic<bool>>(true);
+        auto conn_alive = conn->alive_token();
+
+        UpstreamLease lease(conn.get(), /*stream_id=*/3, nullptr,
+                            partition_alive, conn_alive);
+        bool pass = (lease.kind() == UpstreamLease::Kind::H2) &&
+                    static_cast<bool>(lease) &&
+                    lease.GetH2Connection() == conn.get() &&
+                    lease.GetH2StreamId() == 3 &&
+                    lease.Get() == nullptr;
+
+        // Flip the partition alive flag — H2 conn accessor must return null.
+        partition_alive->store(false, std::memory_order_release);
+        if (lease.GetH2Connection() != nullptr) {
+            pass = false;
+        }
+
+        // Reset partition alive but kill the conn alive — same result.
+        partition_alive->store(true, std::memory_order_release);
+        conn_alive->store(false, std::memory_order_release);
+        if (lease.GetH2Connection() != nullptr) {
+            pass = false;
+        }
+
+        lease.Release();
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind H2 alive gates",
+                                  pass, pass ? "" : "H2 alive token gate broken");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind H2 alive gates",
+                                  false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Section 5: Integration — UpstreamManager with a real Dispatcher
 //
@@ -1376,20 +1462,57 @@ void TestPoolPartitionErrorCodes() {
         if (PoolPartition::CHECKOUT_CONNECT_TIMEOUT >= 0) { pass = false; err += "CONNECT_TIMEOUT; "; }
         if (PoolPartition::CHECKOUT_SHUTTING_DOWN   >= 0) { pass = false; err += "SHUTTING_DOWN; "; }
         if (PoolPartition::CHECKOUT_QUEUE_TIMEOUT   >= 0) { pass = false; err += "QUEUE_TIMEOUT; "; }
+        if (PoolPartition::CHECKOUT_QUEUE_FULL      >= 0) { pass = false; err += "QUEUE_FULL; "; }
+        // CHECKOUT_OK is the lone non-negative success sentinel.
+        if (PoolPartition::CHECKOUT_OK              != 0) { pass = false; err += "OK should be zero; "; }
 
         // All error codes must be distinct.
         std::set<int> codes{
+            PoolPartition::CHECKOUT_OK,
             PoolPartition::CHECKOUT_POOL_EXHAUSTED,
             PoolPartition::CHECKOUT_CONNECT_FAILED,
             PoolPartition::CHECKOUT_CONNECT_TIMEOUT,
             PoolPartition::CHECKOUT_SHUTTING_DOWN,
-            PoolPartition::CHECKOUT_QUEUE_TIMEOUT
+            PoolPartition::CHECKOUT_QUEUE_TIMEOUT,
+            PoolPartition::CHECKOUT_QUEUE_FULL
         };
-        if (codes.size() != 5) { pass = false; err += "error codes not distinct; "; }
+        if (codes.size() != 7) { pass = false; err += "error codes not distinct; "; }
 
         TestFramework::RecordTest("UpstreamPool PoolPartition: error code values", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("UpstreamPool PoolPartition: error code values", false, e.what());
+    }
+}
+
+// HostPortKey is used as a key in h2_connecting_conns_. Verify
+// equality + hash distribution so collisions on common shapes don't
+// blow up.
+void TestHostPortKeyHashAndEquality() {
+    std::cout << "\n[TEST] UpstreamPool HostPortKey: hash + equality..." << std::endl;
+    try {
+        HostPortKey a{"example.com", 443};
+        HostPortKey b{"example.com", 443};
+        HostPortKey c{"example.com", 80};
+        HostPortKey d{"example.org", 443};
+
+        std::hash<HostPortKey> h;
+        bool pass = (a == b) && (a != c) && (a != d) &&
+                    (h(a) == h(b)) &&
+                    (h(a) != h(c)) &&
+                    (h(a) != h(d));
+
+        // Smoke-test usability in an unordered_map.
+        std::unordered_map<HostPortKey, int> m;
+        m[a] = 1;
+        m[c] = 2;
+        m[d] = 3;
+        if (m.size() != 3 || m[b] != 1) pass = false;
+
+        TestFramework::RecordTest("UpstreamPool HostPortKey: hash + equality",
+                                  pass, pass ? "" : "hash collision or equality mismatch");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("UpstreamPool HostPortKey: hash + equality",
+                                  false, e.what());
     }
 }
 
@@ -2205,6 +2328,9 @@ void RunAllTests() {
     TestUpstreamLeaseMoveSematics();
     TestUpstreamLeaseExplicitRelease();
     TestUpstreamLeaseMoveAssignment();
+    TestUpstreamLeaseKindEmpty();
+    TestUpstreamLeaseKindH1();
+    TestUpstreamLeaseKindH2AliveGates();
 
     // Section 5: Integration (UpstreamManager + real Dispatcher)
     TestUpstreamManagerHasUpstream();
@@ -2216,6 +2342,7 @@ void RunAllTests() {
 
     // Section 6: PoolPartition error codes
     TestPoolPartitionErrorCodes();
+    TestHostPortKeyHashAndEquality();
 
     // Section 7: UpstreamHostPool
     TestUpstreamHostPoolPartitionCount();

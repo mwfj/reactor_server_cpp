@@ -1,51 +1,82 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 
-// Forward declarations — no heavy includes needed for this lightweight RAII handle
 class UpstreamConnection;
+class UpstreamH2Connection;
+class UpstreamH2Stream;
 class PoolPartition;
 
-// Lightweight move-only RAII handle for a checked-out upstream connection.
-// The pool always retains ownership of the UpstreamConnection. This handle
-// holds a raw pointer and auto-returns the connection on destruction.
+// Move-only RAII handle for a checked-out upstream resource. Two flavors:
 //
-// Thread safety: must only be used and destroyed on the dispatcher thread
-// that issued the checkout. If the lease must be destroyed on another thread,
-// call Release() explicitly first or route through EnQueue.
+//   Kind::H1 — owns a transport (`UpstreamConnection*`) for a single
+//              request/response. Release calls `ReturnConnection`.
+//   Kind::H2 — owns a stream slot on a multiplexed session
+//              (`UpstreamH2Connection*` + nghttp2 stream_id). Release calls
+//              `ReturnH2Stream`. Carries TWO alive tokens (partition + conn)
+//              because the H2 conn can be destroyed under the lease while
+//              the partition is still alive (DestroyOnDispatcher).
 //
-// Partition lifetime: the lease keeps a shared_ptr copy of PoolPartition's
-// `alive_` flag. If the partition is destroyed before this lease is released
-// (e.g. standalone UpstreamManager::~UpstreamManager runs with an outstanding
-// lease), Release()/the destructor detect `alive=false` and skip the
-// ReturnConnection call — avoiding a use-after-free on the freed partition.
+// Dispatcher-thread-only — construction, use, destruction all run on the
+// dispatcher that issued the checkout. Cross-thread destruction must
+// Release() explicitly on the dispatcher first.
 class UpstreamLease {
 public:
+    enum class Kind { EMPTY, H1, H2 };
+
     UpstreamLease() = default;
 
     UpstreamLease(UpstreamConnection* conn, PoolPartition* partition,
-                  std::shared_ptr<std::atomic<bool>> alive)
-        : conn_(conn), partition_(partition), alive_(std::move(alive)) {}
+                  std::shared_ptr<std::atomic<bool>> partition_alive)
+        : kind_(Kind::H1),
+          conn_(conn),
+          partition_(partition),
+          partition_alive_(std::move(partition_alive)) {}
 
-    ~UpstreamLease();  // Out-of-line: calls PoolPartition::ReturnConnection
+    UpstreamLease(UpstreamH2Connection* h2_conn, int32_t stream_id,
+                  PoolPartition* partition,
+                  std::shared_ptr<std::atomic<bool>> partition_alive,
+                  std::shared_ptr<std::atomic<bool>> conn_alive)
+        : kind_(Kind::H2),
+          h2_conn_(h2_conn),
+          h2_stream_id_(stream_id),
+          partition_(partition),
+          partition_alive_(std::move(partition_alive)),
+          conn_alive_(std::move(conn_alive)) {}
 
-    // Move-only (exactly one return per checkout)
+    ~UpstreamLease();
+
     UpstreamLease(UpstreamLease&& other) noexcept
-        : conn_(other.conn_),
+        : kind_(other.kind_),
+          conn_(other.conn_),
+          h2_conn_(other.h2_conn_),
+          h2_stream_id_(other.h2_stream_id_),
           partition_(other.partition_),
-          alive_(std::move(other.alive_)) {
+          partition_alive_(std::move(other.partition_alive_)),
+          conn_alive_(std::move(other.conn_alive_)) {
+        other.kind_ = Kind::EMPTY;
         other.conn_ = nullptr;
+        other.h2_conn_ = nullptr;
+        other.h2_stream_id_ = -1;
         other.partition_ = nullptr;
     }
 
     UpstreamLease& operator=(UpstreamLease&& other) noexcept {
         if (this != &other) {
             Release();
+            kind_ = other.kind_;
             conn_ = other.conn_;
+            h2_conn_ = other.h2_conn_;
+            h2_stream_id_ = other.h2_stream_id_;
             partition_ = other.partition_;
-            alive_ = std::move(other.alive_);
+            partition_alive_ = std::move(other.partition_alive_);
+            conn_alive_ = std::move(other.conn_alive_);
+            other.kind_ = Kind::EMPTY;
             other.conn_ = nullptr;
+            other.h2_conn_ = nullptr;
+            other.h2_stream_id_ = -1;
             other.partition_ = nullptr;
         }
         return *this;
@@ -54,19 +85,44 @@ public:
     UpstreamLease(const UpstreamLease&) = delete;
     UpstreamLease& operator=(const UpstreamLease&) = delete;
 
-    // Access the underlying connection (nullptr if empty/released)
-    UpstreamConnection* Get() const { return conn_; }
-    UpstreamConnection* operator->() const { return conn_; }
-    explicit operator bool() const { return conn_ != nullptr; }
+    Kind kind() const { return kind_; }
+    bool empty() const { return kind_ == Kind::EMPTY; }
 
-    // Explicit release — returns connection to pool early (before destruction)
+    // H1 accessors. `Get()` / `operator->()` return nullptr when not H1.
+    UpstreamConnection* Get() const {
+        return kind_ == Kind::H1 ? conn_ : nullptr;
+    }
+    UpstreamConnection* operator->() const { return Get(); }
+    explicit operator bool() const {
+        return (kind_ == Kind::H1 && conn_ != nullptr) ||
+               (kind_ == Kind::H2 && h2_conn_ != nullptr);
+    }
+
+    // H2 accessors. Both alive tokens are consulted; either dead → null.
+    UpstreamH2Connection* GetH2Connection() const {
+        if (kind_ != Kind::H2) return nullptr;
+        if (!partition_alive_ ||
+            !partition_alive_->load(std::memory_order_acquire)) return nullptr;
+        if (!conn_alive_ ||
+            !conn_alive_->load(std::memory_order_acquire)) return nullptr;
+        return h2_conn_;
+    }
+    int32_t GetH2StreamId() const {
+        return kind_ == Kind::H2 ? h2_stream_id_ : -1;
+    }
+    // Returns the stream entry if both alive tokens are live AND the conn
+    // still holds the entry. Defined out-of-line because it dereferences
+    // UpstreamH2Connection.
+    UpstreamH2Stream* GetH2Stream() const;
+
     void Release();
 
 private:
+    Kind kind_ = Kind::EMPTY;
     UpstreamConnection* conn_ = nullptr;
+    UpstreamH2Connection* h2_conn_ = nullptr;
+    int32_t h2_stream_id_ = -1;
     PoolPartition* partition_ = nullptr;
-    // Copy of PoolPartition::alive_. Set to false in ~PoolPartition BEFORE
-    // any partition member is freed. Checked in Release() to detect whether
-    // the partition is still reachable.
-    std::shared_ptr<std::atomic<bool>> alive_;
+    std::shared_ptr<std::atomic<bool>> partition_alive_;
+    std::shared_ptr<std::atomic<bool>> conn_alive_;
 };

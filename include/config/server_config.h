@@ -50,7 +50,8 @@ struct Http2Config {
 //   Live:         max_concurrent_streams_pref, initial_window_size,
 //                 max_frame_size, header_table_size, max_header_list_size,
 //                 ping_idle_sec, ping_timeout_sec,
-//                 goaway_drain_timeout_sec, saturation_open_pct
+//                 goaway_drain_timeout_sec, saturation_open_pct,
+//                 held_fallback_enabled
 struct Http2UpstreamConfig {
     bool enabled = false;
     std::string prefer = "auto";                 // "auto" | "always" | "never"
@@ -63,6 +64,7 @@ struct Http2UpstreamConfig {
     int ping_timeout_sec = 10;                   // close conn if no PONG within this
     int goaway_drain_timeout_sec = 30;           // bound on graceful drain
     int saturation_open_pct = 0;                 // 0 disables saturation routing
+    bool held_fallback_enabled = false;          // gate held-fallback retry on H2
 
     // Full equality: every field. Used by tests + serialization round-trips.
     bool operator==(const Http2UpstreamConfig& o) const {
@@ -75,7 +77,8 @@ struct Http2UpstreamConfig {
                ping_idle_sec == o.ping_idle_sec &&
                ping_timeout_sec == o.ping_timeout_sec &&
                goaway_drain_timeout_sec == o.goaway_drain_timeout_sec &&
-               saturation_open_pct == o.saturation_open_pct;
+               saturation_open_pct == o.saturation_open_pct &&
+               held_fallback_enabled == o.held_fallback_enabled;
     }
     bool operator!=(const Http2UpstreamConfig& o) const { return !(*this == o); }
 

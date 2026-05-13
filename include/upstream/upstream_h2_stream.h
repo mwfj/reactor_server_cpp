@@ -59,6 +59,20 @@ struct UpstreamH2Stream {
     // catch peers that lie about Content-Length.
     int64_t body_bytes_received = 0;
 
+    // Set by OnStreamClose; read by DetachSink to gate walker enqueue.
+    bool peer_already_closed_ = false;
+    // Marker for the deferred-erase walker.
+    bool pending_erase_ = false;
+
+    // When true, OnDataChunkRecv appends to paused_buffer_ instead of
+    // dispatching to sink->OnBodyChunk.
+    bool pause_dispatch_ = false;
+    std::string paused_buffer_;
+    // Set on OnStreamClose while pause_dispatch_ is true. Terminal sink
+    // dispatch is deferred until paused_buffer_ drains.
+    bool stream_closed_pending_ = false;
+    uint32_t pending_close_error_code_ = 0;
+
     UpstreamH2Stream() = default;
     UpstreamH2Stream(const UpstreamH2Stream&) = delete;
     UpstreamH2Stream& operator=(const UpstreamH2Stream&) = delete;

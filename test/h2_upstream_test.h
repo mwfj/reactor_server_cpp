@@ -395,8 +395,8 @@ void TestFindUsableUnknownUpstream() {
         H2ConnectionTable table;
         // Insert for "svc-a" but query "svc-b"
         auto cfg = std::make_shared<Http2UpstreamConfig>();
-        auto conn = std::make_shared<UpstreamH2Connection>(nullptr, cfg);
-        table.Insert("svc-a", conn);
+        auto conn = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+        table.Insert("svc-a", std::move(conn));
         auto result = table.FindUsable("svc-b");
         bool pass = (result == nullptr);
         TestFramework::RecordTest("H2Upstream A4b: FindUsable unknown upstream returns null",
@@ -414,12 +414,12 @@ void TestFindUsableReapsDrainedEntry() {
     try {
         H2ConnectionTable table;
         auto cfg = std::make_shared<Http2UpstreamConfig>();
-        auto conn = std::make_shared<UpstreamH2Connection>(nullptr, cfg);
+        auto conn = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
         // Mark the connection as GOAWAY-received with no active streams —
         // this is the "drained" condition that FindUsable reaps inline.
         conn->OnGoawayReceived(0);  // sets goaway_seen_=true, active_stream_count remains 0
 
-        table.Insert("svc", conn);
+        table.Insert("svc", std::move(conn));
         if (table.TotalConnections() != 1) {
             TestFramework::RecordTest("H2Upstream A4c: FindUsable reaps drained (GOAWAY + no streams) entries",
                                        false, "precondition failed: TotalConnections != 1");
@@ -463,8 +463,8 @@ void TestReapDrainedNonDrainedPreserved() {
         H2ConnectionTable table;
         auto cfg = std::make_shared<Http2UpstreamConfig>();
         // Connection has no GOAWAY and no session — not drained
-        auto conn = std::make_shared<UpstreamH2Connection>(nullptr, cfg);
-        table.Insert("svc", conn);
+        auto conn = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+        table.Insert("svc", std::move(conn));
 
         size_t removed = table.ReapDrained();
         bool pass = (removed == 0 && table.ConnectionsForUpstream("svc") == 1);
@@ -483,9 +483,9 @@ void TestClearEmptiesTable() {
     try {
         H2ConnectionTable table;
         auto cfg = std::make_shared<Http2UpstreamConfig>();
-        table.Insert("svc-a", std::make_shared<UpstreamH2Connection>(nullptr, cfg));
-        table.Insert("svc-b", std::make_shared<UpstreamH2Connection>(nullptr, cfg));
-        table.Insert("svc-a", std::make_shared<UpstreamH2Connection>(nullptr, cfg));
+        table.Insert("svc-a", std::make_unique<UpstreamH2Connection>(nullptr, cfg));
+        table.Insert("svc-b", std::make_unique<UpstreamH2Connection>(nullptr, cfg));
+        table.Insert("svc-a", std::make_unique<UpstreamH2Connection>(nullptr, cfg));
 
         if (table.TotalConnections() != 3) {
             TestFramework::RecordTest("H2Upstream A6: Clear empties table",
@@ -501,6 +501,80 @@ void TestClearEmptiesTable() {
     }
 }
 
+// Extract() transfers ownership of the matching unique_ptr out of the
+// table; non-matching pointers return null without disturbing storage.
+void TestExtractTransfersOwnership() {
+    std::cout << "\n[TEST] H2Upstream A6b: Extract transfers ownership of matching entry..." << std::endl;
+    try {
+        H2ConnectionTable table;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        auto owned_a = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+        auto owned_b = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+        UpstreamH2Connection* raw_a = owned_a.get();
+        UpstreamH2Connection* raw_b = owned_b.get();
+
+        table.Insert("svc", std::move(owned_a));
+        table.Insert("svc", std::move(owned_b));
+
+        bool pass = true;
+        std::string err;
+        if (table.TotalConnections() != 2) {
+            pass = false; err += "precondition: 2 entries; ";
+        }
+
+        auto extracted = table.Extract(raw_a);
+        if (!extracted || extracted.get() != raw_a) {
+            pass = false; err += "Extract did not return raw_a; ";
+        }
+        if (table.TotalConnections() != 1) {
+            pass = false; err += "table count should drop to 1; ";
+        }
+
+        // Non-matching raw pointer must return null without mutating
+        // the table.
+        UpstreamH2Connection* dangling = raw_a;  // already extracted
+        auto miss = table.Extract(dangling);
+        if (miss) { pass = false; err += "Extract of already-extracted ptr should be null; "; }
+        if (table.TotalConnections() != 1) {
+            pass = false; err += "miss must not mutate table; ";
+        }
+
+        // raw_b is still tracked; extracting it drains the table.
+        auto ex_b = table.Extract(raw_b);
+        if (!ex_b || ex_b.get() != raw_b) {
+            pass = false; err += "raw_b extract failed; ";
+        }
+        if (table.TotalConnections() != 0) {
+            pass = false; err += "table should be empty; ";
+        }
+
+        TestFramework::RecordTest(
+            "H2Upstream A6b: Extract transfers ownership of matching entry",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream A6b: Extract transfers ownership of matching entry",
+            false, e.what());
+    }
+}
+
+// Extract(nullptr) is a defined no-op.
+void TestExtractNullIsNoop() {
+    std::cout << "\n[TEST] H2Upstream A6c: Extract(nullptr) is no-op..." << std::endl;
+    try {
+        H2ConnectionTable table;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        table.Insert("svc", std::make_unique<UpstreamH2Connection>(nullptr, cfg));
+        auto result = table.Extract(nullptr);
+        bool pass = (result == nullptr) && table.TotalConnections() == 1;
+        TestFramework::RecordTest("H2Upstream A6c: Extract(nullptr) is no-op",
+                                  pass, pass ? "" : "null extract mutated table");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2Upstream A6c: Extract(nullptr) is no-op",
+                                  false, e.what());
+    }
+}
+
 // A7 — H2ConnectionTable::TickAll with PING-timeout connection
 // We test the reap path: after TickAll, connections whose Tick returns false
 // (session_ == nullptr → false) are erased. Since Init() was never called,
@@ -511,8 +585,8 @@ void TestTickAllRemovesDeadConnections() {
         H2ConnectionTable table;
         auto cfg = std::make_shared<Http2UpstreamConfig>();
         // With no session_ (no Init()), Tick() returns false immediately
-        auto conn = std::make_shared<UpstreamH2Connection>(nullptr, cfg);
-        table.Insert("svc", conn);
+        auto conn = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+        table.Insert("svc", std::move(conn));
 
         if (table.TotalConnections() != 1) {
             TestFramework::RecordTest("H2Upstream A7: TickAll removes connections whose Tick returns false",
@@ -539,8 +613,8 @@ void TestTickAllKeepsLiveConnections() {
         // After TickAll both should be removed — this verifies the loop processes all.
         H2ConnectionTable table;
         auto cfg = std::make_shared<Http2UpstreamConfig>();
-        table.Insert("svc", std::make_shared<UpstreamH2Connection>(nullptr, cfg));
-        table.Insert("svc", std::make_shared<UpstreamH2Connection>(nullptr, cfg));
+        table.Insert("svc", std::make_unique<UpstreamH2Connection>(nullptr, cfg));
+        table.Insert("svc", std::make_unique<UpstreamH2Connection>(nullptr, cfg));
 
         auto now = std::chrono::steady_clock::now();
         table.TickAll(now);
@@ -1841,7 +1915,7 @@ void TestB12TickGoawayDrainTimeout() {
 // processed by the peer and MUST be failed immediately with a retryable
 // error so the proxy retry policy fires. Submit two streams, then send
 // GOAWAY with last_stream_id naming only the first; the second's sink
-// should observe exactly one OnError call carrying RESULT_UPSTREAM_DISCONNECT.
+// should observe exactly one OnError call carrying RESULT_GOAWAY_UNPROCESSED.
 // Streams inside the processed range continue draining (no extra error
 // fire on stream 1).
 void TestB12bGoawayFailsStreamsAbovePeerLastId() {
@@ -1882,7 +1956,7 @@ void TestB12bGoawayFailsStreamsAbovePeerLastId() {
         bool b_failed_once = (sink_b.error_calls == 1 &&
                               sink_b.complete_calls == 0);
         bool b_code_correct =
-            (sink_b.last_error_code == ProxyTransaction::RESULT_UPSTREAM_DISCONNECT);
+            (sink_b.last_error_code == ProxyTransaction::RESULT_GOAWAY_UNPROCESSED);
 
         bool pass = a_untouched && b_failed_once && b_code_correct;
         TestFramework::RecordTest(
@@ -1890,7 +1964,7 @@ void TestB12bGoawayFailsStreamsAbovePeerLastId() {
             pass,
             pass ? ""
                  : ("expected a:err=0+complete=0, b:err=1+code=" +
-                    std::to_string(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT) +
+                    std::to_string(ProxyTransaction::RESULT_GOAWAY_UNPROCESSED) +
                     "; got a:err=" + std::to_string(sink_a.error_calls) +
                     "/complete=" + std::to_string(sink_a.complete_calls) +
                     ", b:err=" + std::to_string(sink_b.error_calls) +
@@ -2548,9 +2622,9 @@ void TestTableMultiUpstream() {
         H2ConnectionTable table;
         auto cfg = std::make_shared<Http2UpstreamConfig>();
 
-        table.Insert("svc-a", std::make_shared<UpstreamH2Connection>(nullptr, cfg));
-        table.Insert("svc-a", std::make_shared<UpstreamH2Connection>(nullptr, cfg));
-        table.Insert("svc-b", std::make_shared<UpstreamH2Connection>(nullptr, cfg));
+        table.Insert("svc-a", std::make_unique<UpstreamH2Connection>(nullptr, cfg));
+        table.Insert("svc-a", std::make_unique<UpstreamH2Connection>(nullptr, cfg));
+        table.Insert("svc-b", std::make_unique<UpstreamH2Connection>(nullptr, cfg));
 
         bool pass = true;
         std::string err;
@@ -4243,7 +4317,7 @@ void TestB16DataPaddingStripped() {
 // ---------------------------------------------------------------------------
 // TestB17 — GOAWAY + in-flight stream: server sends GOAWAY with
 // last_stream_id=0 (rejects our stream 1), then our stream sees OnError
-// (UPSTREAM_DISCONNECT). Connection IsUsable becomes false. No crash.
+// (RESULT_GOAWAY_UNPROCESSED). Connection IsUsable becomes false. No crash.
 // ---------------------------------------------------------------------------
 void TestB17GoawayWithActiveStream() {
     std::cout << "\n[TEST] H2Upstream B17: GOAWAY rejects active stream → OnError, !IsUsable..." << std::endl;
@@ -5663,11 +5737,460 @@ void TestN7eWiringEarlyHeadersThenIntermediateDataDispatch() {
 }
 
 // ---------------------------------------------------------------------------
+// H2 stream lifecycle scaffolding (DetachSink, deferred-erase walker)
+// ---------------------------------------------------------------------------
+
+static void TestS1_StreamLifecycleFieldsDefault() {
+    std::cout << "\n[TEST] H2Upstream S1: UpstreamH2Stream lifecycle fields default..." << std::endl;
+    try {
+        UpstreamH2Stream s;
+        bool pass = !s.peer_already_closed_ && !s.pending_erase_ &&
+                    !s.pause_dispatch_ && s.paused_buffer_.empty() &&
+                    !s.stream_closed_pending_ && s.pending_close_error_code_ == 0;
+        TestFramework::RecordTest(
+            "H2Upstream S1: UpstreamH2Stream lifecycle fields default",
+            pass, pass ? "" : "default state mismatch");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S1: UpstreamH2Stream lifecycle fields default",
+            false, e.what());
+    }
+}
+
+static void TestS2_DetachSinkBeforePeerCloseKeepsEntry() {
+    std::cout << "\n[TEST] H2Upstream S2: DetachSink before peer-close keeps stream entry..." << std::endl;
+    try {
+        // Sink must outlive the connection (defensive dtor fan-out).
+        RecordingSink sink;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S2: DetachSink before peer-close keeps stream entry",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &sink);
+        if (sid < 0) {
+            TestFramework::RecordTest(
+                "H2Upstream S2: DetachSink before peer-close keeps stream entry",
+                false, "Submit failed");
+            return;
+        }
+        conn.DetachSink(sid);
+        auto* s = conn.GetStream(sid);
+        bool pass = (s != nullptr) && (s->sink == nullptr) && !s->pending_erase_;
+        TestFramework::RecordTest(
+            "H2Upstream S2: DetachSink before peer-close keeps stream entry",
+            pass,
+            pass ? "" : "stream lifecycle state unexpected after DetachSink");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S2: DetachSink before peer-close keeps stream entry",
+            false, e.what());
+    }
+}
+
+static void TestS3_RunDeferredEraseWalkIdempotent() {
+    std::cout << "\n[TEST] H2Upstream S3: RunDeferredEraseWalk idempotent on empty queue..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S3: RunDeferredEraseWalk idempotent on empty queue",
+                false, "Init failed");
+            return;
+        }
+        conn.RunDeferredEraseWalk();
+        conn.RunDeferredEraseWalk();
+        TestFramework::RecordTest(
+            "H2Upstream S3: RunDeferredEraseWalk idempotent on empty queue",
+            true, "");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S3: RunDeferredEraseWalk idempotent on empty queue",
+            false, e.what());
+    }
+}
+
+static void TestS4_PauseStreamResumeStreamToggle() {
+    std::cout << "\n[TEST] H2Upstream S4: PauseStream/ResumeStream toggle stream flag..." << std::endl;
+    try {
+        // Sink must outlive the connection (defensive dtor fan-out).
+        RecordingSink sink;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S4: PauseStream/ResumeStream toggle stream flag",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &sink);
+        if (sid < 0) {
+            TestFramework::RecordTest(
+                "H2Upstream S4: PauseStream/ResumeStream toggle stream flag",
+                false, "Submit failed");
+            return;
+        }
+        conn.PauseStream(sid);
+        bool paused = conn.GetStream(sid) && conn.GetStream(sid)->pause_dispatch_;
+        conn.ResumeStream(sid);
+        bool resumed = conn.GetStream(sid) && !conn.GetStream(sid)->pause_dispatch_;
+        bool pass = paused && resumed;
+        TestFramework::RecordTest(
+            "H2Upstream S4: PauseStream/ResumeStream toggle stream flag",
+            pass,
+            pass ? "" : "pause_dispatch_ did not toggle as expected");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S4: PauseStream/ResumeStream toggle stream flag",
+            false, e.what());
+    }
+}
+
+// alive_token() returns a live shared_ptr seeded true at construction.
+static void TestS6_AliveTokenInitiallyTrue() {
+    std::cout << "\n[TEST] H2Upstream S6: alive_token initially true..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        UpstreamH2Connection conn(nullptr, cfg);
+        auto tok = conn.alive_token();
+        bool pass = (tok != nullptr) && tok->load(std::memory_order_acquire);
+        TestFramework::RecordTest(
+            "H2Upstream S6: alive_token initially true",
+            pass, pass ? "" : "alive_token null or false at construction");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S6: alive_token initially true", false, e.what());
+    }
+}
+
+// active_streams_ increments on Submit, decrements only via deferred walk.
+static void TestS7_ActiveStreamsIncrementOnSubmit() {
+    std::cout << "\n[TEST] H2Upstream S7: active_streams increments on SubmitRequest..." << std::endl;
+    try {
+        RecordingSink sink;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S7: active_streams increments on SubmitRequest",
+                false, "Init failed");
+            return;
+        }
+        size_t before = conn.active_stream_count();
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &sink);
+        size_t after = conn.active_stream_count();
+        bool pass = (sid > 0) && (before == 0) && (after == 1);
+        TestFramework::RecordTest(
+            "H2Upstream S7: active_streams increments on SubmitRequest",
+            pass,
+            pass ? "" : "before=" + std::to_string(before) +
+                        " after=" + std::to_string(after) +
+                        " sid=" + std::to_string(sid));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S7: active_streams increments on SubmitRequest",
+            false, e.what());
+    }
+}
+
+// RunDeferredEraseWalk is the sole per-stream decrement site.
+static void TestS8_ActiveStreamsDecrementInDeferredWalk() {
+    std::cout << "\n[TEST] H2Upstream S8: active_streams decrements only in deferred walk..." << std::endl;
+    try {
+        RecordingSink sink;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S8: active_streams decrements only in deferred walk",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid = conn.SubmitRequest(
+            "GET", "http", "example.com", "/", {}, "", &sink);
+        if (sid < 0) {
+            TestFramework::RecordTest(
+                "H2Upstream S8: active_streams decrements only in deferred walk",
+                false, "Submit failed");
+            return;
+        }
+        size_t after_submit = conn.active_stream_count();
+        // DetachSink with peer_already_closed enqueues for the walker.
+        auto* s = conn.GetStream(sid);
+        if (s) s->peer_already_closed_ = true;
+        conn.DetachSink(sid);
+        size_t after_detach = conn.active_stream_count();
+        conn.RunDeferredEraseWalk();
+        size_t after_walk = conn.active_stream_count();
+        bool pass = (after_submit == 1) && (after_detach == 1) && (after_walk == 0);
+        TestFramework::RecordTest(
+            "H2Upstream S8: active_streams decrements only in deferred walk",
+            pass,
+            pass ? "" : "after_submit=" + std::to_string(after_submit) +
+                        " after_detach=" + std::to_string(after_detach) +
+                        " after_walk=" + std::to_string(after_walk));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S8: active_streams decrements only in deferred walk",
+            false, e.what());
+    }
+}
+
+// FailAllStreams bulk-resets active_streams_ to 0 alongside streams_.clear().
+static void TestS9_ActiveStreamsBulkResetByFailAll() {
+    std::cout << "\n[TEST] H2Upstream S9: FailAllStreams bulk-resets active_streams to 0..." << std::endl;
+    try {
+        RecordingSink s1, s2;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S9: FailAllStreams bulk-resets active_streams to 0",
+                false, "Init failed");
+            return;
+        }
+        int32_t sid1 = conn.SubmitRequest("GET", "http", "x", "/", {}, "", &s1);
+        int32_t sid2 = conn.SubmitRequest("GET", "http", "x", "/", {}, "", &s2);
+        size_t after_two = conn.active_stream_count();
+        conn.FailAllStreams(
+            ProxyTransaction::RESULT_UPSTREAM_DISCONNECT, "test");
+        size_t after_fail = conn.active_stream_count();
+        bool pass = (sid1 > 0) && (sid2 > 0) &&
+                    (after_two == 2) && (after_fail == 0);
+        TestFramework::RecordTest(
+            "H2Upstream S9: FailAllStreams bulk-resets active_streams to 0",
+            pass,
+            pass ? "" : "after_two=" + std::to_string(after_two) +
+                        " after_fail=" + std::to_string(after_fail));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S9: FailAllStreams bulk-resets active_streams to 0",
+            false, e.what());
+    }
+}
+
+// IsUsable rejects once active_streams_ hits the configured cap.
+static void TestS10_IsUsableHonorsActiveStreamsCap() {
+    std::cout << "\n[TEST] H2Upstream S10: IsUsable honors active_streams cap..." << std::endl;
+    try {
+        RecordingSink s1, s2;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 1;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream S10: IsUsable honors active_streams cap",
+                false, "Init failed");
+            return;
+        }
+        bool before = conn.IsUsable();
+        int32_t sid = conn.SubmitRequest("GET", "http", "x", "/", {}, "", &s1);
+        bool after_one = conn.IsUsable();
+        bool pass = before && (sid > 0) && !after_one;
+        TestFramework::RecordTest(
+            "H2Upstream S10: IsUsable honors active_streams cap",
+            pass,
+            pass ? "" : "before=" + std::to_string(before) +
+                        " after_one=" + std::to_string(after_one) +
+                        " sid=" + std::to_string(sid));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S10: IsUsable honors active_streams cap",
+            false, e.what());
+    }
+}
+
+// DestroyOnDispatcher flips alive, nulls callbacks, and is idempotent.
+static void TestS11_DestroyOnDispatcherFlipsAliveAndIsIdempotent() {
+    std::cout << "\n[TEST] H2Upstream S11: DestroyOnDispatcher idempotent + alive-flip..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 4;
+        auto conn = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+        auto alive = conn->alive_token();
+
+        bool initially_alive = alive && alive->load(std::memory_order_acquire);
+        conn->DestroyOnDispatcher();
+        bool dead_after_first = alive && !alive->load(std::memory_order_acquire);
+        // Second call is a no-op — must not crash and must keep alive=false.
+        conn->DestroyOnDispatcher();
+        bool dead_after_second = alive && !alive->load(std::memory_order_acquire);
+
+        bool pass = initially_alive && dead_after_first && dead_after_second;
+        TestFramework::RecordTest(
+            "H2Upstream S11: DestroyOnDispatcher idempotent + alive-flip",
+            pass,
+            pass ? "" : "initially_alive=" + std::to_string(initially_alive) +
+                        " dead_after_first=" + std::to_string(dead_after_first) +
+                        " dead_after_second=" + std::to_string(dead_after_second));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S11: DestroyOnDispatcher idempotent + alive-flip",
+            false, e.what());
+    }
+}
+
+// Dtor on a connection that already ran DestroyOnDispatcher is a no-op
+// — verifies the safety-net short-circuit. A regression would re-fire
+// FailAllStreams on the (now-empty) stream table; this test holds a
+// sink that would observe the spurious OnError.
+static void TestS12_DtorShortCircuitAfterDestroyOnDispatcher() {
+    std::cout << "\n[TEST] H2Upstream S12: dtor short-circuits after DestroyOnDispatcher..." << std::endl;
+    try {
+        RecordingSink sink;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 4;
+        {
+            UpstreamH2Connection conn(nullptr, cfg);
+            if (!conn.Init()) {
+                TestFramework::RecordTest(
+                    "H2Upstream S12: dtor short-circuits after DestroyOnDispatcher",
+                    false, "Init failed");
+                return;
+            }
+            int32_t sid = conn.SubmitRequest(
+                "GET", "http", "example.com", "/", {}, "", &sink);
+            if (sid < 0) {
+                TestFramework::RecordTest(
+                    "H2Upstream S12: dtor short-circuits after DestroyOnDispatcher",
+                    false, "Submit failed");
+                return;
+            }
+            conn.DestroyOnDispatcher();
+            // DestroyOnDispatcher's FailAllStreams fires sink.OnError once.
+            // Dtor runs as `conn` leaves scope and must NOT re-fire.
+        }
+        bool pass = (sink.error_calls == 1);
+        TestFramework::RecordTest(
+            "H2Upstream S12: dtor short-circuits after DestroyOnDispatcher",
+            pass, pass ? "" : "expected 1 OnError; got " + std::to_string(sink.error_calls));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S12: dtor short-circuits after DestroyOnDispatcher",
+            false, e.what());
+    }
+}
+
+// H2 retry allowlist + retry-condition classification.
+static void TestS13_H2RetryClassification() {
+    std::cout << "\n[TEST] H2Upstream S13: IsH2RetryableCode + MapH2CodeToRetryCondition..." << std::endl;
+    try {
+        using PT = ProxyTransaction;
+        using RC = RetryPolicy::RetryCondition;
+
+        bool pass = true;
+        std::string err;
+
+        // Retryable codes.
+        if (!PT::IsH2RetryableCode(PT::RESULT_UPSTREAM_DISCONNECT))
+            { pass = false; err += "UPSTREAM_DISCONNECT not retryable; "; }
+        if (!PT::IsH2RetryableCode(PT::RESULT_GOAWAY_UNPROCESSED))
+            { pass = false; err += "GOAWAY_UNPROCESSED not retryable; "; }
+        if (!PT::IsH2RetryableCode(PT::RESULT_GOAWAY_MAYBE_PROCESSED))
+            { pass = false; err += "GOAWAY_MAYBE_PROCESSED not retryable; "; }
+        if (!PT::IsH2RetryableCode(PT::RESULT_TRUNCATED_RESPONSE))
+            { pass = false; err += "TRUNCATED_RESPONSE not retryable; "; }
+
+        // Non-retryable codes.
+        if (PT::IsH2RetryableCode(PT::RESULT_SUCCESS))
+            { pass = false; err += "SUCCESS marked retryable; "; }
+        if (PT::IsH2RetryableCode(PT::RESULT_H2_METHOD_NOT_SUPPORTED))
+            { pass = false; err += "H2_METHOD_NOT_SUPPORTED marked retryable; "; }
+        if (PT::IsH2RetryableCode(PT::RESULT_CIRCUIT_OPEN))
+            { pass = false; err += "CIRCUIT_OPEN marked retryable; "; }
+
+        // GOAWAY_UNPROCESSED → CONNECT_FAILURE (zero-delay first retry).
+        if (PT::MapH2CodeToRetryCondition(PT::RESULT_GOAWAY_UNPROCESSED)
+            != RC::CONNECT_FAILURE)
+            { pass = false; err += "GOAWAY_UNPROCESSED should map to CONNECT_FAILURE; "; }
+        // Response-level codes → UPSTREAM_DISCONNECT.
+        if (PT::MapH2CodeToRetryCondition(PT::RESULT_GOAWAY_MAYBE_PROCESSED)
+            != RC::UPSTREAM_DISCONNECT)
+            { pass = false; err += "GOAWAY_MAYBE_PROCESSED should map to UPSTREAM_DISCONNECT; "; }
+        if (PT::MapH2CodeToRetryCondition(PT::RESULT_TRUNCATED_RESPONSE)
+            != RC::UPSTREAM_DISCONNECT)
+            { pass = false; err += "TRUNCATED_RESPONSE should map to UPSTREAM_DISCONNECT; "; }
+        if (PT::MapH2CodeToRetryCondition(PT::RESULT_UPSTREAM_DISCONNECT)
+            != RC::UPSTREAM_DISCONNECT)
+            { pass = false; err += "UPSTREAM_DISCONNECT should map to UPSTREAM_DISCONNECT; "; }
+
+        TestFramework::RecordTest("H2Upstream S13: H2 retry classification",
+                                  pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("H2Upstream S13: H2 retry classification",
+                                  false, e.what());
+    }
+}
+
+static void TestS5_HeldFallbackConfigDefaultsAndEquality() {
+    std::cout << "\n[TEST] H2Upstream S5: held_fallback_enabled defaults + (in)equality + LiveEqual..." << std::endl;
+    try {
+        Http2UpstreamConfig a;
+        Http2UpstreamConfig b;
+        bool default_off = (a.held_fallback_enabled == false);
+        bool equal_default = (a == b);
+        b.held_fallback_enabled = true;
+        bool diff_now = (a != b);
+        bool live_equal_ignores = a.LiveEqual(b);
+        bool pass = default_off && equal_default && diff_now && live_equal_ignores;
+        TestFramework::RecordTest(
+            "H2Upstream S5: held_fallback_enabled defaults + (in)equality + LiveEqual",
+            pass,
+            pass ? "" : "default_off=" + std::to_string(default_off) +
+                        " equal_default=" + std::to_string(equal_default) +
+                        " diff_now=" + std::to_string(diff_now) +
+                        " live_equal_ignores=" + std::to_string(live_equal_ignores));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S5: held_fallback_enabled defaults + (in)equality + LiveEqual",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RunAll aggregator
 // ---------------------------------------------------------------------------
 
 void RunAllH2UpstreamTests() {
     std::cout << "\n=== H2 Upstream Tests ===" << std::endl;
+
+    TestS1_StreamLifecycleFieldsDefault();
+    TestS2_DetachSinkBeforePeerCloseKeepsEntry();
+    TestS3_RunDeferredEraseWalkIdempotent();
+    TestS4_PauseStreamResumeStreamToggle();
+    TestS5_HeldFallbackConfigDefaultsAndEquality();
+    TestS6_AliveTokenInitiallyTrue();
+    TestS7_ActiveStreamsIncrementOnSubmit();
+    TestS8_ActiveStreamsDecrementInDeferredWalk();
+    TestS9_ActiveStreamsBulkResetByFailAll();
+    TestS10_IsUsableHonorsActiveStreamsCap();
+    TestS11_DestroyOnDispatcherFlipsAliveAndIsIdempotent();
+    TestS12_DtorShortCircuitAfterDestroyOnDispatcher();
+    TestS13_H2RetryClassification();
 
     // Tier A — unit tests
     TestMinCadenceSecDisabled();
@@ -5691,6 +6214,8 @@ void RunAllH2UpstreamTests() {
     TestReapDrainedNonDrainedPreserved();
 
     TestClearEmptiesTable();
+    TestExtractTransfersOwnership();
+    TestExtractNullIsNoop();
 
     TestTickAllRemovesDeadConnections();
     TestTickAllKeepsLiveConnections();
