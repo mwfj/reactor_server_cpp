@@ -187,8 +187,6 @@ public:
                                          : SEND_STALL_FALLBACK_MS;
     }
 
-    bool AppendHeldRetryable5xxBody(const char* data, size_t len) override;
-    void MarkHeldRetryable5xxBodyComplete() override;
     void SetInReplay(bool in_replay) override;
     int LastSendResult() const override;
     void InstallReplayDrainListener(std::function<void()> cb) override;
@@ -419,10 +417,6 @@ private:
     int32_t h2_stream_id_ = -1;
     bool h2_path_ = false;
 
-    // Cached per-attempt from partition->LoadHttp2ConfigSnapshot() —
-    // not from the H2 conn's frozen snapshot.
-    bool h2_held_fallback_enabled_ = false;
-
     // True iff the inbound request carried `te: trailers` (RFC 7230 §4.3
     // / RFC 9113 §8.2.2 — required by gRPC clients to negotiate trailer
     // support). Captured at construction BEFORE HeaderRewriter strips
@@ -615,9 +609,6 @@ private:
     // freshest published value (a SIGHUP between the handshake-defer
     // capture site and the actual dispatch can publish a new snapshot).
     void DispatchH2();
-
-    void PauseH2StreamDispatch(int32_t stream_id);
-    void ResumeH2StreamDispatch(int32_t stream_id);
 
     void SendUpstreamRequest();
     void OnUpstreamData(std::shared_ptr<ConnectionHandler> conn, std::string& data);

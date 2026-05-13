@@ -6146,31 +6146,6 @@ static void TestS13_H2RetryClassification() {
     }
 }
 
-static void TestS5_HeldFallbackConfigDefaultsAndEquality() {
-    std::cout << "\n[TEST] H2Upstream S5: held_fallback_enabled defaults + (in)equality + LiveEqual..." << std::endl;
-    try {
-        Http2UpstreamConfig a;
-        Http2UpstreamConfig b;
-        bool default_off = (a.held_fallback_enabled == false);
-        bool equal_default = (a == b);
-        b.held_fallback_enabled = true;
-        bool diff_now = (a != b);
-        bool live_equal_ignores = a.LiveEqual(b);
-        bool pass = default_off && equal_default && diff_now && live_equal_ignores;
-        TestFramework::RecordTest(
-            "H2Upstream S5: held_fallback_enabled defaults + (in)equality + LiveEqual",
-            pass,
-            pass ? "" : "default_off=" + std::to_string(default_off) +
-                        " equal_default=" + std::to_string(equal_default) +
-                        " diff_now=" + std::to_string(diff_now) +
-                        " live_equal_ignores=" + std::to_string(live_equal_ignores));
-    } catch (const std::exception& e) {
-        TestFramework::RecordTest(
-            "H2Upstream S5: held_fallback_enabled defaults + (in)equality + LiveEqual",
-            false, e.what());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // RunAll aggregator
 // ---------------------------------------------------------------------------
@@ -6182,7 +6157,6 @@ void RunAllH2UpstreamTests() {
     TestS2_DetachSinkBeforePeerCloseKeepsEntry();
     TestS3_RunDeferredEraseWalkIdempotent();
     TestS4_PauseStreamResumeStreamToggle();
-    TestS5_HeldFallbackConfigDefaultsAndEquality();
     TestS6_AliveTokenInitiallyTrue();
     TestS7_ActiveStreamsIncrementOnSubmit();
     TestS8_ActiveStreamsDecrementInDeferredWalk();

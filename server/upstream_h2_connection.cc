@@ -625,7 +625,6 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
     // in immediately instead of waiting for transport close or the
     // per-attempt response timeout. Streams with id <= last_stream_id
     // continue draining naturally.
-    if (streams_.empty()) return;
     std::vector<int32_t> to_fail;
     to_fail.reserve(streams_.size());
     for (auto& kv : streams_) {
@@ -656,11 +655,23 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
         }
     }
 
-    // GOAWAY-idle: no surviving streams ≤ last_stream_id. Stash for
-    // destroy at the post-recv tick and start a fresh probe so queued
-    // H2_STREAM_SLOT waiters can land on a new session before their
-    // queue-timeout fires.
-    if (active_streams_ == 0 && partition_ && transport_) {
+    // GOAWAY-idle replacement: no streams remain (genuine idle) OR every
+    // surviving stream has id > last_stream_id (just marked pending_erase
+    // above and will be reaped by RunDeferredEraseWalk). active_streams_
+    // is NOT yet decremented for the just-pending entries — that happens
+    // in RunDeferredEraseWalk after this returns — so the gate must count
+    // survivors with id <= last_stream_id directly. A sink's reentrant
+    // ResetStream may have shrunk streams_ during the fan-out, but any
+    // stream still present with id <= last_stream_id is genuinely draining
+    // and the replacement should wait for it.
+    size_t survivors_below = 0;
+    for (auto& kv : streams_) {
+        if (kv.first <= last_stream_id && kv.second &&
+            !kv.second->pending_erase_) {
+            ++survivors_below;
+        }
+    }
+    if (survivors_below == 0 && partition_ && transport_) {
         std::string host = transport_->upstream_host();
         int port = transport_->upstream_port();
         partition_->MoveConnToPendingDestroy(this);

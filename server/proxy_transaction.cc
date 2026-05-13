@@ -984,16 +984,18 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
 
     bool want_h2 = false;
     bool defer_for_handshake = false;
+    const bool prefer_always = (cfg && cfg->enabled && cfg->prefer == "always");
     if (cfg && cfg->enabled) {
         const std::string& prefer = cfg->prefer;
-        if (prefer == "always") {
-            want_h2 = true;
-        } else if (prefer == "auto") {
+        if (prefer == "always" || prefer == "auto") {
             if (transport->IsTlsReady()) {
                 want_h2 = (transport->GetAlpnProtocol() == "h2");
             } else if (transport->HasTls()) {
                 defer_for_handshake = true;
             }
+            // Bare TCP under prefer=always cannot satisfy strict h2 —
+            // there is no ALPN signal. want_h2 stays false; the strict-fail
+            // gate below converts that into an explicit CHECKOUT_FAILED.
         }
     }
 
@@ -1015,14 +1017,39 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
                               "upstream disconnected during TLS handshake");
             });
         transport->SetHandshakeCompleteCallback(
-            [wk_self, wk_t]() {
+            [wk_self, wk_t, prefer_always]() {
                 auto self = wk_self.lock();
                 if (!self || self->cancelled_) return;
                 auto t = wk_t.lock();
                 bool h2 = t && (t->GetAlpnProtocol() == "h2");
-                if (h2) self->DispatchH2();
-                else    self->DispatchH1();
+                if (h2) {
+                    self->DispatchH2();
+                } else if (prefer_always) {
+                    // Strict-h2 + peer did not negotiate h2 (ALPN missing
+                    // or h1). Pushing H2 framing over an h1-negotiated
+                    // transport produces a wire-level protocol violation;
+                    // operator intent under prefer="always" is "reject
+                    // rather than silently downgrade".
+                    self->ReleaseBreakerAdmissionNeutral();
+                    self->OnError(
+                        RESULT_CHECKOUT_FAILED,
+                        "prefer=always but peer ALPN!=h2");
+                } else {
+                    self->DispatchH1();
+                }
             });
+        return;
+    }
+
+    // Strict-h2 gate on the immediate (already-ready or bare-TCP) path.
+    // The deferred-handshake branch above has its own equivalent gate
+    // inside the ALPN callback.
+    if (prefer_always && !want_h2) {
+        ReleaseBreakerAdmissionNeutral();
+        OnError(RESULT_CHECKOUT_FAILED,
+                transport->IsTlsReady()
+                    ? "prefer=always but peer ALPN!=h2"
+                    : "prefer=always requires TLS+ALPN");
         return;
     }
 
@@ -1154,11 +1181,6 @@ void ProxyTransaction::DispatchH2() {
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
     }
-    if (auto live_cfg = partition->LoadHttp2ConfigSnapshot()) {
-        h2_held_fallback_enabled_ = live_cfg->held_fallback_enabled;
-    } else {
-        h2_held_fallback_enabled_ = false;
-    }
     // Protocol decision finalized — the span was stamped above before
     // any early-return failure path. Reaching here means the H2 session
     // acquisition succeeded; continue the dispatch using the same span.
@@ -1199,6 +1221,17 @@ void ProxyTransaction::DispatchH2() {
     if (host_it != rewritten_headers_.end() && !host_it->second.empty()) {
         authority = host_it->second;
     } else {
+        // Rewriter contract drift: HeaderRewriter::RewriteRequest is
+        // expected to emit a Host derived from upstream_host_ / SNI / IPv6
+        // brackets / default-port elision. An empty Host here would
+        // produce an :authority that nghttp2 rejects (and a wire-invalid
+        // H1 request on the parallel codec path). Warn so operators can
+        // chase the rewriter regression instead of debugging from the
+        // 502 alone, then synthesize a defensive :authority.
+        logging::Get()->warn(
+            "ProxyTransaction H2 :authority fallback fired (rewritten Host "
+            "empty) client_fd={} service={} — using upstream_host derivation",
+            client_fd_, service_name_);
         const std::string& host_src =
             (upstream_tls_ && !sni_hostname_.empty())
                 ? sni_hostname_
@@ -1271,40 +1304,6 @@ void ProxyTransaction::DispatchH2() {
     }
 
     h2_stream_id_ = stream_id;
-}
-
-void ProxyTransaction::PauseH2StreamDispatch(int32_t stream_id) {
-    if (!H2ConnAlive()) {
-        logging::Get()->warn(
-            "ProxyTransaction::PauseH2StreamDispatch: H2 conn gone fd={} sid={}",
-            client_fd_, stream_id);
-        return;
-    }
-    h2_conn_->PauseStream(stream_id);
-}
-
-void ProxyTransaction::ResumeH2StreamDispatch(int32_t stream_id) {
-    if (!H2ConnAlive()) {
-        logging::Get()->warn(
-            "ProxyTransaction::ResumeH2StreamDispatch: H2 conn gone fd={} sid={}",
-            client_fd_, stream_id);
-        return;
-    }
-    h2_conn_->ResumeStream(stream_id);
-}
-
-bool ProxyTransaction::AppendHeldRetryable5xxBody(const char* data,
-                                                  size_t len) {
-    if (!h2_held_fallback_enabled_) return false;
-    if (!pending_retryable_5xx_response_) return false;
-    pending_retryable_5xx_body_.append(data, len);
-    return true;
-}
-
-void ProxyTransaction::MarkHeldRetryable5xxBodyComplete() {
-    if (!h2_held_fallback_enabled_) return;
-    if (!pending_retryable_5xx_response_) return;
-    pending_retryable_5xx_body_complete_ = true;
 }
 
 void ProxyTransaction::SetInReplay(bool in_replay) {
@@ -2139,16 +2138,17 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             // retry-rejection delivers the headers-only snapshot rather than
             // the full upstream 5xx body — same trade-off the H2 OnHeaders
             // synchronous-decision path already accepts.
-            if (h2_path_ && !h2_held_fallback_enabled_) {
+            if (h2_path_) {
+                // H2 retry path never holds the prior 5xx body — there is
+                // no equivalent of H1's lease+PauseParsing+IncReadDisable
+                // backpressure for multiplexed streams (sibling streams
+                // must keep flowing), so force-complete the pending
+                // body so MaybeRetry's Cleanup-driven path runs cleanly.
                 pending_retryable_5xx_body_complete_ = true;
             }
             holding_retryable_5xx_response_ =
                 !pending_retryable_5xx_body_complete_;
             held_retryable_5xx_saw_eof_ = false;
-            if (h2_path_ && h2_held_fallback_enabled_ && h2_stream_id_ >= 0 &&
-                holding_retryable_5xx_response_) {
-                PauseH2StreamDispatch(h2_stream_id_);
-            }
         } else {
             ClearPendingRetryable5xxResponse();
         }
@@ -2771,9 +2771,6 @@ bool ProxyTransaction::ResumeHeldRetryable5xxResponse(
     holding_retryable_5xx_response_ = false;
     bool saw_eof = held_retryable_5xx_saw_eof_;
     held_retryable_5xx_saw_eof_ = false;
-    if (h2_path_ && h2_held_fallback_enabled_ && h2_stream_id_ >= 0) {
-        ResumeH2StreamDispatch(h2_stream_id_);
-    }
     ClearPendingRetryable5xxResponse();
     state_ = State::RECEIVING_BODY;
 
@@ -2852,10 +2849,6 @@ void ProxyTransaction::BeginRetryAttemptFromHeld5xx() {
 
     holding_retryable_5xx_response_ = false;
     held_retryable_5xx_saw_eof_ = false;
-    if (h2_path_ && h2_held_fallback_enabled_ && h2_stream_id_ >= 0 &&
-        H2ConnAlive()) {
-        h2_conn_->DetachSink(h2_stream_id_);
-    }
     ReleaseHeldRetryable5xxTransport();
     ResetForRetryAttempt();
     ActivateAttemptTracking();

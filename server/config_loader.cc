@@ -975,13 +975,6 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     h2, "saturation_open_pct",
                     upstream.http2.saturation_open_pct,
                     up_ctx + ".http2");
-                if (h2.contains("held_fallback_enabled")) {
-                    if (!h2["held_fallback_enabled"].is_boolean())
-                        throw std::runtime_error(
-                            "upstream http2.held_fallback_enabled must be a boolean");
-                    upstream.http2.held_fallback_enabled =
-                        h2["held_fallback_enabled"].get<bool>();
-                }
             }
 
             config.upstreams.push_back(std::move(upstream));

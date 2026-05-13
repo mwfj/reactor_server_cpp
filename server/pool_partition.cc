@@ -420,13 +420,22 @@ void PoolPartition::DrainH2StreamWaitersForHost(
             wait_queue_.push_front(std::move(e));
             return;
         }
-        // TODO: wire UpstreamLease H2 ctor once the codec emits the
-        // stream slot. For now the admitted waiter fires its ready_cb
-        // with an EMPTY lease — its dispatch path observes
-        // h2_table_.FindUsable on its own. The H2 lease shape will
-        // bind here when ProxyTransaction migrates to H2-kind leases.
-        if (e.ready_callback) {
-            e.ready_callback(UpstreamLease{});
+        // TODO: wire UpstreamLease H2-kind ctor once ProxyTransaction
+        // migrates to UpstreamLease h2_lease_ (PR-2 follow-up, see
+        // HTTP2_UPSTREAM_PHASE_RECONCILIATION.md §2). Until then there
+        // is no caller of EnqueueH2StreamSlotWaiter in production, so
+        // this branch only fires if a future code path or test hands
+        // an H2_STREAM_SLOT waiter directly to the partition. Failing
+        // explicitly instead of vending an EMPTY lease (which
+        // OnCheckoutReady would treat as RESULT_CHECKOUT_FAILED) keeps
+        // the contract observable rather than producing a misleading
+        // success-then-immediate-failure shape.
+        logging::Get()->warn(
+            "PoolPartition::DrainH2StreamWaitersForHost: H2-lease "
+            "vending not yet wired host={}:{} — failing waiter with "
+            "CHECKOUT_CONNECT_FAILED (PR-2 follow-up)", host, port);
+        if (e.error_callback) {
+            e.error_callback(CHECKOUT_CONNECT_FAILED);
         }
     }
 }
@@ -731,29 +740,12 @@ UpstreamH2Connection* PoolPartition::FindUsableH2Connection(
     return nullptr;
 }
 
-UpstreamH2Connection* PoolPartition::AcquireH2Connection(
-    const std::string& upstream_name, UpstreamLease& lease)
+void PoolPartition::WireH2SessionTransportCallbacks(
+    UpstreamConnection* up, UpstreamH2Connection* raw)
 {
-    // Reuse a multiplexed session if one is still healthy AND its
-    // transport matches the partition's currently-published endpoint.
-    // Same FindUsableH2Connection helper that ProxyTransaction's
-    // pre-checkout fast path uses — caller's lease (if any) is
-    // untouched on the reuse branch. See FindUsableH2Connection's
-    // doc comment for the H1-keepalive-parity / dead-conn reap chain.
-    if (auto* existing = FindUsableH2Connection(upstream_name)) {
-        return existing;
-    }
-
-    auto cfg = LoadHttp2ConfigSnapshot();
-    if (!cfg || !cfg->enabled) return nullptr;
-
-    auto* up = lease.Get();
-    if (!up) return nullptr;
+    if (!up || !raw) return;
     auto transport = up->GetTransport();
-    if (!transport) return nullptr;
-
-    auto h2 = std::make_unique<UpstreamH2Connection>(up, cfg);
-    UpstreamH2Connection* raw = h2.get();
+    if (!transport) return;
     auto alive = raw->alive_token();
 
     // Drop any one-shot connect/handshake closures inherited from the
@@ -851,6 +843,33 @@ UpstreamH2Connection* PoolPartition::AcquireH2Connection(
             if (!alive->load(std::memory_order_acquire)) return;
             raw->OnTransportWriteComplete();
         });
+}
+
+UpstreamH2Connection* PoolPartition::AcquireH2Connection(
+    const std::string& upstream_name, UpstreamLease& lease)
+{
+    // Reuse a multiplexed session if one is still healthy AND its
+    // transport matches the partition's currently-published endpoint.
+    // Same FindUsableH2Connection helper that ProxyTransaction's
+    // pre-checkout fast path uses — caller's lease (if any) is
+    // untouched on the reuse branch. See FindUsableH2Connection's
+    // doc comment for the H1-keepalive-parity / dead-conn reap chain.
+    if (auto* existing = FindUsableH2Connection(upstream_name)) {
+        return existing;
+    }
+
+    auto cfg = LoadHttp2ConfigSnapshot();
+    if (!cfg || !cfg->enabled) return nullptr;
+
+    auto* up = lease.Get();
+    if (!up) return nullptr;
+    auto transport = up->GetTransport();
+    if (!transport) return nullptr;
+
+    auto h2 = std::make_unique<UpstreamH2Connection>(up, cfg);
+    UpstreamH2Connection* raw = h2.get();
+
+    WireH2SessionTransportCallbacks(up, raw);
 
     if (!h2->Init()) {
         logging::Get()->warn(
@@ -1718,9 +1737,26 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         return;
     }
 
+    // Wire the multiplexed-H2-session transport callbacks BEFORE Init().
+    // Init()'s preface flush can fire complete_callback synchronously on
+    // a writable transport (DoSendRaw direct-write path) — the same
+    // contract AcquireH2Connection's in-place promotion path observes.
+    // Without this, the freshly-promoted session would have no path for
+    // response bytes (no OnMessage → no HandleBytes) and the probe-phase
+    // SetCloseCb / SetErrorCb would still point at the failure-disposition
+    // closures (semantically wrong after h2_table_ insertion).
+    WireH2SessionTransportCallbacks(uc_raw, shell.get());
+
     if (!shell->Init()) {
         logging::Get()->error(
             "OnH2ConnectHandshakeComplete: Init failed for {}:{}", host, port);
+        // ClearTransportCallbacks before the fail path: we just installed
+        // OnMessage/Close/Error/WriteProgress/Completion above and Init
+        // failure means the H2 session is going away — its dtor would
+        // null these, but doing it inline closes the race-window where
+        // a synchronous close-callback chain from DestroyConnection could
+        // re-enter the just-installed routed callbacks.
+        if (uc_raw) ClearTransportCallbacks(uc_raw);
         fail(CHECKOUT_CONNECT_FAILED, "h2 session init failed");
         return;
     }
@@ -1735,6 +1771,11 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         logging::Get()->error(
             "OnH2ConnectHandshakeComplete: transport vanished from "
             "connecting_conns_ for {}:{} mid-resolve", host, port);
+        // Roll back the just-installed transport callbacks — without
+        // this, dtor's alive-flip races the lapse of `shell` and the
+        // transport (now nowhere in our containers) would still hold
+        // closures referring to the dying session.
+        if (uc_raw) ClearTransportCallbacks(uc_raw);
         shell->DestroyOnDispatcher();
         FailH2StreamSlotWaiters(host, port, CHECKOUT_CONNECT_FAILED,
                                 "transport vanished mid-h2-resolve");

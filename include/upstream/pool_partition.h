@@ -489,6 +489,15 @@ private:
     // overwritten the callbacks during their request.
     void WirePoolCallbacks(UpstreamConnection* conn);
 
+    // Install the multiplexed-H2-session transport callbacks (OnMessage,
+    // Close, Error, WriteProgress, Completion). Both the in-place promotion
+    // path (AcquireH2Connection) and the cold-start probe-success path
+    // (OnH2ConnectHandshakeComplete ALPN-h2 branch) must wire these
+    // BEFORE Init() — Init's preface flush can fire the completion
+    // callback synchronously on a writable transport.
+    void WireH2SessionTransportCallbacks(UpstreamConnection* up,
+                                         UpstreamH2Connection* raw);
+
     // Increment inflight_tasks_ and return an RAII guard that decrements it
     // on destruction. Capture the returned shared_ptr into any lambda
     // enqueued on the dispatcher: if EnQueue accepts the lambda, the guard
