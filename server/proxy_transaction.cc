@@ -1303,11 +1303,24 @@ void ProxyTransaction::DispatchH2() {
         logging::Get()->warn(
             "ProxyTransaction H2 submit failed client_fd={} service={} "
             "attempt={}", client_fd_, service_name_, attempt_);
+        // Drain queued ANY waiters: the session stays in h2_table_ so a
+        // sibling waiter may still multiplex. Capacity-aware drain
+        // requeues if IsUsable() reports the session is full.
+        partition->DrainAnyWaitersForFastH2();
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
     }
 
     h2_stream_id_ = stream_id;
+
+    // Wake any ANY-kind waiters that queued during the connect window.
+    // Done HERE (not inside AcquireH2Connection's construct branch) so
+    // the just-consumed stream slot is visible to FindUsable's
+    // IsUsable() check inside DrainAnyWaitersForFastH2 — otherwise a
+    // queued waiter would synchronously dispatch + SubmitRequest, win
+    // the only stream slot under max_concurrent_streams=1, and force
+    // this transaction's own SubmitRequest above to fail.
+    partition->DrainAnyWaitersForFastH2();
 }
 
 void ProxyTransaction::OnCheckoutError(int error_code) {

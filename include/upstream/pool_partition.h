@@ -466,6 +466,17 @@ private:
     // inside the recv chain.
     std::vector<std::unique_ptr<UpstreamH2Connection>> pending_destroy_h2_conns_;
 
+    // Replacement-connect targets deferred from OnGoawayReceived. Under
+    // max_connections=1 (and any tight cap where the GOAWAY'd session
+    // currently occupies the slot), OnGoawayReceived's immediate
+    // StartH2ReplacementConnect call short-circuits on the TotalCount
+    // cap because the dying transport still lives in active_conns_.
+    // ReapPendingDestroyH2Conns frees the slot, then drains this list
+    // by re-invoking StartH2ReplacementConnect. Captured at
+    // MoveConnToPendingDestroy time so the (service_name, port) tuple
+    // survives the H2 shell's destruction.
+    std::deque<HostPortKey> pending_h2_replacement_targets_;
+
     // True when a self-rescheduling wait-queue purge chain is already
     // scheduled. Prevents spawning duplicate chains per queued waiter.
     // Cleared when the chain terminates (queue empty or shutdown).

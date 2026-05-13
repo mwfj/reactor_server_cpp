@@ -146,6 +146,17 @@ PoolPartition::~PoolPartition() {
         // independent of SendRaw's was_stopped() drop — closes the
         // door on a future SendRaw refactor that removes that check.
         h2_table_.Clear();
+        // Drop H2 cold-start probe shells and pending-destroy stash on
+        // the dispatcher thread so each shell's ~UpstreamH2Connection
+        // safety-net path (transport callback unwire + MarkClosing +
+        // FlushSend of any terminate_session GOAWAY) runs here rather
+        // than spilling to whatever thread happens to call ~PoolPartition.
+        // The underlying transports live in connecting_conns_ /
+        // active_conns_ (cleared right below) so transport_->MarkClosing
+        // inside the H2 dtors does not UAF.
+        h2_connecting_conns_.clear();
+        pending_destroy_h2_conns_.clear();
+        pending_h2_replacement_targets_.clear();
         auto clear = [](auto& container) {
             for (auto& c : container) {
                 if (!c) continue;
@@ -413,19 +424,40 @@ void PoolPartition::DrainH2StreamWaitersForHost(
         }
     }
 
+    // Walk matched entries. The vending path for H2_STREAM_SLOT is not
+    // wired yet (no production EnqueueH2StreamSlotWaiter caller), so the
+    // body is currently a defer-and-requeue: each entry returns to the
+    // queue head until a future caller fires the actual lease handoff.
+    // Reverse iteration on requeue preserves FIFO ordering in the deque.
+    std::deque<WaitEntry> requeue;
+    bool stopped_early = false;
     for (auto& e : matched) {
-        if (!alive->load(std::memory_order_acquire)) return;
+        if (stopped_early) {
+            requeue.push_back(std::move(e));
+            continue;
+        }
+        if (!alive->load(std::memory_order_acquire)) {
+            // Partition destroyed mid-drain — abandon remaining entries.
+            // The destroyed partition's wait_queue_ is unreachable; this
+            // matches the existing alive-check pattern.
+            return;
+        }
         if (shutting_down_.load(std::memory_order_acquire) ||
             manager_shutting_down_.load(std::memory_order_acquire)) {
-            return;
+            // Push back what we've already moved out so shutdown drain
+            // sees them and fires CHECKOUT_SHUTTING_DOWN uniformly.
+            requeue.push_back(std::move(e));
+            stopped_early = true;
+            continue;
         }
         UpstreamH2Connection* h2 = h2_table_.FindUsable(upstream_name);
         if (!h2 || !h2->IsUsable()) {
-            // No usable session right now — re-queue and stop draining.
-            // The next slot-free (OnStreamClose / RunDeferredEraseWalk)
-            // or fresh H2 connect will re-enter this path.
-            wait_queue_.push_front(std::move(e));
-            return;
+            // No usable session right now — requeue everything we still
+            // have. The next slot-free (RunDeferredEraseWalk) or fresh
+            // H2 connect will re-enter this path.
+            requeue.push_back(std::move(e));
+            stopped_early = true;
+            continue;
         }
         // TODO: wire UpstreamLease H2-kind ctor once ProxyTransaction
         // migrates to UpstreamLease h2_lease_. No production caller of
@@ -433,8 +465,12 @@ void PoolPartition::DrainH2StreamWaitersForHost(
         // (or unit-test fixture) does not see spurious connect failures
         // before the vending path lands. Cold-start dedup for ANY-kind
         // waiters is covered by DrainAnyWaitersForFastH2.
-        wait_queue_.push_front(std::move(e));
-        return;
+        requeue.push_back(std::move(e));
+        stopped_early = true;
+    }
+    // Restore FIFO order at front of queue.
+    for (auto it = requeue.rbegin(); it != requeue.rend(); ++it) {
+        wait_queue_.push_front(std::move(*it));
     }
 }
 
@@ -463,18 +499,36 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
         }
     }
 
+    // Capacity-aware fan-out. Each fired waiter synchronously dispatches
+    // through TryDispatchExistingH2Session → SubmitRequest which bumps
+    // active_streams_. Over-firing under a tight max_concurrent_streams
+    // cap would fail siblings inside SubmitRequest's IsUsable() gate
+    // (returns -1), even though they won the dequeue race. Refuse to
+    // admit unless FindUsable still reports a slot is available.
+    std::deque<WaitEntry> requeue;
     for (auto& e : matched) {
         if (!alive->load(std::memory_order_acquire)) return;
         if (shutting_down_.load(std::memory_order_acquire) ||
             manager_shutting_down_.load(std::memory_order_acquire)) {
-            return;
+            requeue.push_back(std::move(e));
+            continue;
         }
-        // Empty lease — OnCheckoutReady tries TryDispatchExistingH2Session
-        // before falling through to RESULT_CHECKOUT_FAILED. The H2 fast
-        // path uses no pool slot; if the session disappeared between
-        // promotion and this drain, the fallback error path runs the
-        // existing retry logic.
+        UpstreamH2Connection* h2 = h2_table_.FindUsable(service_name_);
+        if (!h2) {
+            // No usable session right now (no session, all dead, or
+            // cap reached by a sibling already served this drain).
+            // Re-queue and wait for the next slot-free / cold-start
+            // signal to re-enter this path.
+            requeue.push_back(std::move(e));
+            continue;
+        }
         if (e.ready_callback) e.ready_callback(UpstreamLease());
+    }
+
+    // Restore FIFO: push_front in reverse so first requeued ends up
+    // at wait_queue_.front().
+    for (auto it = requeue.rbegin(); it != requeue.rend(); ++it) {
+        wait_queue_.push_front(std::move(*it));
     }
 }
 
@@ -486,11 +540,23 @@ void PoolPartition::MoveConnToPendingDestroy(UpstreamH2Connection* conn) {
             "PoolPartition::MoveConnToPendingDestroy: conn not tracked");
         return;
     }
+    // Capture the replacement target BEFORE the destroy path runs —
+    // the transport still has its port at this moment, and the H2
+    // session lives under service_name_ in h2_table_. The reap below
+    // frees the active_conns_ slot; only then can a fresh probe pass
+    // the TotalCount cap.
+    if (auto t = conn->transport()) {
+        pending_h2_replacement_targets_.push_back(
+            HostPortKey{service_name_, t->upstream_port()});
+    }
     pending_destroy_h2_conns_.push_back(std::move(owned));
 }
 
 void PoolPartition::ReapPendingDestroyH2Conns() {
-    if (pending_destroy_h2_conns_.empty()) return;
+    if (pending_destroy_h2_conns_.empty() &&
+        pending_h2_replacement_targets_.empty()) {
+        return;
+    }
     // Snapshot-then-process: a destroy step's callback chain (sink
     // OnError → ProxyTransaction::Cleanup → ResetStream → late GOAWAY
     // handling) could re-enter MoveConnToPendingDestroy. Owning the
@@ -503,6 +569,18 @@ void PoolPartition::ReapPendingDestroyH2Conns() {
         c->DestroyOnDispatcher();
         // Unique_ptr lapses at scope end — dtor sees
         // destroyed_on_dispatcher_=true and short-circuits.
+    }
+
+    // Slot is now free (DestroyOnDispatcher → lease_.reset →
+    // ReturnConnection → ExtractFromActive). Re-issue the
+    // replacement-connect that OnGoawayReceived short-circuited on
+    // the TotalCount cap. StartH2ReplacementConnect is idempotent
+    // (gates on h2_connecting_conns_ and h2_table_) so a duplicate
+    // call is a no-op.
+    auto targets = std::move(pending_h2_replacement_targets_);
+    pending_h2_replacement_targets_.clear();
+    for (const auto& key : targets) {
+        StartH2ReplacementConnect(key.host, key.port);
     }
 }
 
@@ -690,12 +768,19 @@ void PoolPartition::ReturnH2Stream(
     UpstreamH2Connection* h2_conn, int32_t stream_id,
     std::shared_ptr<std::atomic<bool>> /*partition_alive*/,
     std::shared_ptr<std::atomic<bool>> /*conn_alive*/) {
-    // TODO: dispatch DrainH2StreamWaitersForHost so queued
-    // H2_STREAM_SLOT waiters get admitted on slot release. Stream
-    // teardown is otherwise driven by OnStreamClose / ResetStream /
-    // RunDeferredEraseWalk, not this entry point.
-    (void)h2_conn;
-    (void)stream_id;
+    // Reaching this entry means an UpstreamLease::Kind::H2 destructor
+    // ran without a wired H2-lease vending path. Stream teardown today
+    // is driven by OnStreamClose / ResetStream / RunDeferredEraseWalk
+    // — silent no-op here would mask a future caller that DOES vend
+    // H2 leases via this API but forgot to drain the waiter queue.
+    // TODO: implement DrainH2StreamWaitersForHost dispatch once the
+    // h2_lease_ migration on ProxyTransaction lands.
+    logging::Get()->error(
+        "BUG: PoolPartition::ReturnH2Stream called without a wired "
+        "H2-lease vending path (h2_conn={}, stream_id={}) — H2 stream "
+        "slot release dropped; queued H2_STREAM_SLOT waiters will not "
+        "be admitted.",
+        static_cast<const void*>(h2_conn), stream_id);
 }
 
 void PoolPartition::EvictExpired() {
@@ -923,10 +1008,10 @@ UpstreamH2Connection* PoolPartition::AcquireH2Connection(
     h2->AdoptLease(std::move(lease));
     h2->SetPartition(this);
     h2_table_.Insert(upstream_name, std::move(h2));
-    // Other ANY-kind waiters queued during the connect window now have a
-    // multiplexable session — short-circuit them through OnCheckoutReady's
-    // empty-lease H2 fast path. Mirrors the cold-start probe success site.
-    DrainAnyWaitersForFastH2();
+    // Drain happens at ProxyTransaction::DispatchH2 AFTER SubmitRequest,
+    // not here — firing other ANY-kind waiters before the creator
+    // submits would let them race through TryDispatchExistingH2Session
+    // and consume the only stream slot under max_concurrent_streams=1.
     return raw;
 }
 
@@ -1810,10 +1895,12 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         logging::Get()->error(
             "OnH2ConnectHandshakeComplete: transport vanished from "
             "connecting_conns_ for {}:{} mid-resolve", upstream_name, port);
-        // Roll back the just-installed transport callbacks — without
-        // this, dtor's alive-flip races the lapse of `shell` and the
-        // transport (now nowhere in our containers) would still hold
-        // closures referring to the dying session.
+        // Unreachable today (dispatcher-thread-only extract/destroy);
+        // kept as defense-in-depth against a future async-extract
+        // refactor where the alive-token gate would matter. Roll back
+        // the just-installed transport callbacks so a stray close-
+        // callback chain from DestroyOnDispatcher cannot re-enter
+        // routed closures pointing at the dying session.
         if (uc_raw) ClearTransportCallbacks(uc_raw);
         shell->DestroyOnDispatcher();
         FailH2StreamSlotWaiters(upstream_name, port, CHECKOUT_CONNECT_FAILED,
