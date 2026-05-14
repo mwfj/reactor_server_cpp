@@ -371,12 +371,21 @@ void UpstreamH2Connection::DestroyOnDispatcher() {
     // terminate / FlushSend cannot land on a transport that's already
     // observed CLOSING. Sinks are nulled defensively to prevent any
     // OnError fan-out from reentering the partition mid-teardown.
+    //
+    // Skip terminate_session + FlushSend when the peer already sent
+    // GOAWAY — emitting our own GOAWAY back is pure wasted work on a
+    // transport that's about to be MarkClosing'd and torn down; the
+    // frame would push onto a soon-dead transport's send buffer with
+    // no chance to reach the wire. nghttp2_session_del still runs
+    // unconditionally to free the session struct.
     if (session_) {
         MarkDead();
         FailAllStreams(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                        "h2 session destroyed");
-        nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
-        FlushSend();
+        if (!goaway_seen_) {
+            nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
+            FlushSend();
+        }
         nghttp2_session_del(session_);
         session_ = nullptr;
     }
@@ -417,8 +426,12 @@ UpstreamH2Connection::~UpstreamH2Connection() {
         MarkDead();
         FailAllStreams(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                        "h2 session destroyed");
-        nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
-        FlushSend();
+        // Skip the GOAWAY emit when the peer already GOAWAY'd — same
+        // wasted-work elision as DestroyOnDispatcher.
+        if (!goaway_seen_) {
+            nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
+            FlushSend();
+        }
         nghttp2_session_del(session_);
         session_ = nullptr;
     }
@@ -479,14 +492,25 @@ ssize_t UpstreamH2Connection::HandleBytes(const char* data, size_t len) {
     if (consumed < 0) {
         logging::Get()->warn(
             "UpstreamH2Connection: mem_recv2 failed rv={}", consumed);
+        // Still drain deferred-erase + pending-destroy work even on a
+        // recv failure — the recv chain may have queued pending_erase_
+        // entries or moved conns to pending_destroy_h2_conns_ before
+        // failing. Skipping these would orphan the deque walks until
+        // partition teardown.
+        RunDeferredEraseWalk();
+        if (partition_) partition_->ReapPendingDestroyH2Conns();
         return consumed;
     }
-    if (!FlushSend()) return -1;
+    bool flush_ok = FlushSend();
+    // Run the deque drains regardless of FlushSend result: a failed
+    // flush still leaves any deferred-erase / pending-destroy work
+    // queued by the just-completed recv chain. Orphaning these would
+    // strand H2 sessions in pending_destroy_h2_conns_ until partition
+    // teardown and leak the matching pending_h2_replacement_targets_
+    // entries, starving queued waiters.
     RunDeferredEraseWalk();
-    // Reap any conns that GOAWAY-drained during this recv chain. Lives
-    // here (not inside MoveConnToPendingDestroy) so the destroy never
-    // runs while nghttp2 callbacks are mid-iteration over streams_.
     if (partition_) partition_->ReapPendingDestroyH2Conns();
+    if (!flush_ok) return -1;
     return consumed;
 }
 

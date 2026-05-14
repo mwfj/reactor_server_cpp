@@ -6814,6 +6814,14 @@ static void TestS26_CapacityAwareDrainStopsAtCap() {
         UpstreamH2Connection* h2_raw = h2_conn.get();
 
         std::atomic<int> ready_calls{0}, error_calls{0};
+        // Records which waiter index fired its ready_callback. FIFO
+        // contract: the first enqueued waiter (index 0) must win the
+        // sole cap-1 slot — NOT any of the later-enqueued waiters.
+        // Without indexed lambdas the test passes even when the drain
+        // accidentally fires the LAST waiter, leaving the FIFO claim
+        // "preserved via reverse-iteration push_front" unverified.
+        std::mutex fire_mtx;
+        std::vector<int> fire_order;
         std::promise<void> drained;
         auto drained_fut = drained.get_future();
 
@@ -6828,8 +6836,12 @@ static void TestS26_CapacityAwareDrainStopsAtCap() {
             // active_streams_ and trips IsUsable() to false at cap=1).
             for (int i = 0; i < 3; ++i) {
                 part->CheckoutAsync(
-                    [&](UpstreamLease) {
+                    [&, i](UpstreamLease) {
                         ++ready_calls;
+                        {
+                            std::lock_guard<std::mutex> lock(fire_mtx);
+                            fire_order.push_back(i);
+                        }
                         // Mimic SubmitRequest: real production code
                         // does this synchronously inside OnCheckoutReady.
                         h2_raw->SubmitRequest("GET", "http", "h", "/",
@@ -6847,19 +6859,32 @@ static void TestS26_CapacityAwareDrainStopsAtCap() {
         // slot via SubmitRequest); the other two stay queued. Without
         // the capacity-aware drain, all 3 ready_callbacks would fire
         // and SubmitRequest would return -1 for the second and third.
+        // FIFO claim: the firing waiter MUST be index 0.
+        std::vector<int> order_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(fire_mtx);
+            order_snapshot = fire_order;
+        }
+        bool fifo_ok = order_snapshot.size() == 1 && order_snapshot[0] == 0;
         bool pass = ready_calls.load() == 1 &&
                     error_calls.load() == 0 &&
-                    part->WaitQueueSize() == 2;
+                    part->WaitQueueSize() == 2 &&
+                    fifo_ok;
+        std::string fire_str;
+        for (int idx : order_snapshot) {
+            fire_str += std::to_string(idx) + ",";
+        }
         TestFramework::RecordTest(
-            "H2Upstream S26: capacity-aware ANY drain stops at cap",
+            "H2Upstream S26: capacity-aware ANY drain stops at cap (FIFO)",
             pass,
             pass ? "" :
                 (std::string("ready=") + std::to_string(ready_calls.load()) +
                  " err=" + std::to_string(error_calls.load()) +
-                 " queued=" + std::to_string(part->WaitQueueSize())).c_str());
+                 " queued=" + std::to_string(part->WaitQueueSize()) +
+                 " fire_order=[" + fire_str + "]").c_str());
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H2Upstream S26: capacity-aware ANY drain stops at cap",
+            "H2Upstream S26: capacity-aware ANY drain stops at cap (FIFO)",
             false, e.what());
     }
 }
@@ -7290,6 +7315,97 @@ static void TestS31_DonatedLeaseFullLifecycle() {
     }
 }
 
+// S31b — Drive a REAL UpstreamLease destruction with IsDonatedToH2()=true
+// through ReturnConnection. S31 uses RebalanceCountersForTesting to
+// simulate the release decrement; this test forces the actual production
+// code path so a regression where ReturnConnection routes the donated
+// counter through inflight_leases_ (or vice versa) gets caught.
+//
+// The lease is constructed with a sentinel UpstreamConnection* pointer
+// (not in active_conns_) so ExtractFromActive returns null after the
+// counter decrement runs at the top of ReturnConnection — exactly what
+// we want to assert.
+static void TestS31b_RealDonatedReleasePath() {
+    std::cout << "\n[TEST] H2Upstream S31b: real donated lease release drops donated counter..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        cfg.pool.max_connections = 1;
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream S31b: real donated lease release drops donated counter",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        std::promise<std::tuple<int64_t, int64_t, int64_t, int64_t>> result;
+        auto fut = result.get_future();
+        disp->EnQueue([&]() {
+            // Stage 1: pretend AdoptLease already happened — bump
+            // donated_h2_leases_ to 1 via the test helper. (Without
+            // this, the release would underflow.)
+            mgr.RebalanceCountersForTesting_DO_NOT_USE_IN_PRODUCTION(
+                /*inflight_delta=*/0, /*donated_delta=*/1);
+            int64_t inflight_before = mgr.active_leases();
+            int64_t donated_before = mgr.donated_h2_leases();
+
+            // Stage 2: construct a real UpstreamLease pointing at the
+            // partition with a sentinel conn pointer; mark it donated;
+            // then let it destruct. Release() runs the production
+            // code path: partition_live=true → on-dispatcher → H1
+            // branch → partition_->ReturnConnection(conn_, /*donated=*/true)
+            // → fetch_sub on donated_h2_leases_. The conn pointer is
+            // never dereferenced because ExtractFromActive returns
+            // null (conn not in active_conns_) — but the decrement
+            // already happened at the top of ReturnConnection.
+            {
+                UpstreamConnection* sentinel_conn =
+                    reinterpret_cast<UpstreamConnection*>(
+                        static_cast<uintptr_t>(0x1));
+                UpstreamLease lease(sentinel_conn, part,
+                                    part->alive_token(),
+                                    part->OffDispatcherReleaseDropsPtr(),
+                                    part->dispatcher_ptr());
+                lease.MarkDonatedToH2();
+                // Scope exits → ~UpstreamLease → Release.
+            }
+
+            int64_t inflight_after = mgr.active_leases();
+            int64_t donated_after = mgr.donated_h2_leases();
+            result.set_value({inflight_before, donated_before,
+                              inflight_after, donated_after});
+        });
+        auto vals = (fut.wait_for(std::chrono::seconds(5)) ==
+                     std::future_status::ready)
+                        ? fut.get()
+                        : std::tuple<int64_t, int64_t, int64_t,
+                                     int64_t>{9, 9, 9, 9};
+
+        // Expected:
+        //   before: inflight=0  donated=1  (post-RebalanceForTesting)
+        //   after:  inflight=0  donated=0  (Release decremented donated, NOT inflight)
+        bool pass = std::get<0>(vals) == 0 && std::get<1>(vals) == 1 &&
+                    std::get<2>(vals) == 0 && std::get<3>(vals) == 0;
+        TestFramework::RecordTest(
+            "H2Upstream S31b: real donated lease release drops donated counter",
+            pass,
+            pass ? "" :
+                (std::string("before=(") + std::to_string(std::get<0>(vals)) +
+                 "," + std::to_string(std::get<1>(vals)) +
+                 ") after=(" + std::to_string(std::get<2>(vals)) +
+                 "," + std::to_string(std::get<3>(vals)) + ")").c_str());
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S31b: real donated lease release drops donated counter",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RunAll aggregator
 // ---------------------------------------------------------------------------
@@ -7326,6 +7442,7 @@ void RunAllH2UpstreamTests() {
     TestS29_ReapDrainsSeededReplacementTargets();
     TestS30_InitiateShutdownRetiresH2Sessions();
     TestS31_DonatedLeaseFullLifecycle();
+    TestS31b_RealDonatedReleasePath();
 
     // Tier A — unit tests
     TestMinCadenceSecDisabled();

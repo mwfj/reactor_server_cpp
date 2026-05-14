@@ -3568,6 +3568,21 @@ void ProxyTransaction::ReleaseBreakerAdmissionNeutral() {
 bool ProxyTransaction::IsH2RetryableCode(int result_code) noexcept {
     // RESULT_TRUNCATED_RESPONSE: terminal per the constant's public
     // contract — retrying would double-deliver streamed bytes.
+    //
+    // RESULT_RESPONSE_TIMEOUT: intentionally NOT in this allowlist.
+    // Today's two H2 timeout paths bypass IsH2RetryableCode entirely:
+    //   (a) The response-wait closure routes retry-eligible states
+    //       (SENDING_REQUEST / AWAITING_RESPONSE / RECEIVING_BODY)
+    //       through MaybeRetry(RESPONSE_TIMEOUT) directly without
+    //       going through OnError → IsH2RetryableCode.
+    //   (b) Per-stream idle/budget timeouts only fire post-commit, so
+    //       response_committed_ already gates retry off before any
+    //       OnError dispatch.
+    // INVARIANT: no caller routes RESULT_RESPONSE_TIMEOUT through
+    // OnError on the H2 path with `!response_committed_`. Before
+    // landing such a call site, ALSO add the code here AND to
+    // MapH2CodeToRetryCondition — otherwise retry silently drops
+    // even when retry_on_timeout=true.
     switch (result_code) {
         case RESULT_UPSTREAM_DISCONNECT:
         case RESULT_GOAWAY_UNPROCESSED:
