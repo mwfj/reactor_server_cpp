@@ -3600,11 +3600,20 @@ void HttpServer::KillAndShutdownObservability(
     // overflow. Today's NoopSpanProcessor masks the loss; the moment
     // BatchSpanProcessor wires in, this becomes user-visible data
     // loss.
+    //
+    // ALSO wait for kill_marshals_in_flight to drain. KillOutstandingSnapshots
+    // enqueues cross-dispatcher kill bodies via EnQueueDelayed(0ms) and
+    // returns immediately; the closures publish the matching -1s for
+    // http.server.active_requests / http.client.active_requests and bump
+    // reactor.otel.snapshots_killed_on_timeout from inside the queued task.
+    // Without this gate, BeginShutdown can run before those closures
+    // execute → the final PMR export ships stale or positive gauges.
     auto* obs = observability_manager_.get();
     {
         std::unique_lock<std::mutex> lck(obs->finalizers_done_mtx());
         obs->finalizers_done_cv().wait_until(lck, deadline, [obs]() {
-            return obs->finalizers_in_progress() == 0;
+            return obs->finalizers_in_progress() == 0 &&
+                   obs->kill_marshals_in_flight() == 0;
         });
     }
     observability_manager_->BeginShutdown(remaining());
@@ -4451,9 +4460,12 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         }
         if (stale_h1) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
-            // Only decrement HTTP/1 counter if NOT upgraded — the upgrade
-            // callback already decremented at upgrade time.
-            if (!stale_h1->IsUpgraded()) {
+            // Match RemoveConnection's combined guard so a stale-eviction
+            // racing async-resume rollback (upgraded_=false but
+            // legacy_h1_decremented_=true) doesn't double-decrement.
+            // The upgrade_callback's fetch_sub already balanced the counter.
+            if (!stale_h1->IsUpgraded() &&
+                !stale_h1->LegacyH1StatsDecremented()) {
                 active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
             }
         }
@@ -4582,6 +4594,14 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         // notify the old WS handler and replace with a fresh one.
         if (http_conn->GetConnection() != conn) {
             bool was_upgraded = http_conn->IsUpgraded();
+            // Capture LegacyH1StatsDecremented before http_conn is reset
+            // so the combined guard below mirrors RemoveConnection's
+            // exactly. Without this, an async-resume rollback that left
+            // upgraded_=false but legacy_h1_decremented_=true (the
+            // upgrade_callback already did the fetch_sub) would
+            // re-decrement here → counter goes negative.
+            bool was_legacy_h1_decremented =
+                http_conn->LegacyH1StatsDecremented();
             SafeNotifyWsClose(http_conn);
             {
                 auto c = http_conn->GetConnection();
@@ -4600,7 +4620,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             }
             if (evicted_stale_h1) {
                 active_connections_.fetch_sub(1, std::memory_order_relaxed);
-                if (!was_upgraded) {
+                if (!was_upgraded && !was_legacy_h1_decremented) {
                     active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
                 }
             }

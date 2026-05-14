@@ -45,7 +45,12 @@ void PeriodicMetricReader::WorkerLoop() {
         const bool shutdown = shutting_down_.load(std::memory_order_acquire);
         lk.unlock();
 
-        if (!provider_ || !exporter_) {
+        // Load provider_ atomically every iteration so DisarmProvider()
+        // (called from ~ObservabilityManager) becomes visible promptly.
+        // External holders can keep this PMR alive past manager teardown;
+        // the disarm makes the dereference below safe.
+        auto* prov = provider_.load(std::memory_order_acquire);
+        if (!prov || !exporter_) {
             if (shutdown) break;
             continue;
         }
@@ -62,7 +67,7 @@ void PeriodicMetricReader::WorkerLoop() {
             // produced under the provider's series-map lock.
             const auto t0 = std::chrono::steady_clock::now();
             try {
-                MetricsSnapshot snap = provider_->Snapshot();
+                MetricsSnapshot snap = prov->Snapshot();
                 const auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::nanoseconds(
                         timeout_ns_.load(std::memory_order_acquire));

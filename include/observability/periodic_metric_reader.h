@@ -98,10 +98,28 @@ public:
         manager_.store(nullptr, std::memory_order_release);
     }
 
+    // Atomically null the MeterProvider pointer so the worker's
+    // Snapshot path observes nullptr on its next iteration and skips
+    // the dereference. Symmetric to DisarmManager. Required because
+    // RegisterMetricReader takes a shared_ptr<PeriodicMetricReader>;
+    // an external holder (test fixture, future code) can keep PMR
+    // alive past ~ObservabilityManager and the worker would otherwise
+    // dereference a dead meter_provider_. Idempotent.
+    void DisarmProvider() noexcept {
+        provider_.store(nullptr, std::memory_order_release);
+    }
+
 private:
     void WorkerLoop();
 
-    MeterProvider*                  provider_;
+    // Atomic so DisarmProvider()'s release-store is visible to the worker
+    // on its next iteration. After the declaration reorder in
+    // observability_manager.h, meter_provider_ is declared BEFORE
+    // metric_reader_ — reverse-destruction joins this reader BEFORE
+    // meter_provider_ dies on the manager-owned path. DisarmProvider()
+    // is the safety net for the external-holder case where a PMR
+    // shared_ptr outlives the manager.
+    std::atomic<MeterProvider*>     provider_;
     std::shared_ptr<MetricExporter> exporter_;
     // Atomic so DisarmManager()'s release-store is visible to the worker
     // and any synchronous emit path. After the tracer_provider_ reorder

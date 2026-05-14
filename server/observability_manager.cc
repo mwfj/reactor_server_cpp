@@ -105,6 +105,13 @@ ObservabilityManager::~ObservabilityManager() {
     }
     if (metric_reader_) {
         metric_reader_->DisarmManager();
+        // Also disarm the raw MeterProvider* the worker dereferences in
+        // Snapshot(). RegisterMetricReader takes shared_ptr, so an
+        // external holder can keep PMR alive past member destruction;
+        // without this, the worker would touch dead meter_provider_
+        // memory before the destructor's bounded join completes (or
+        // immediately, if the join times out).
+        metric_reader_->DisarmProvider();
     }
 }
 
