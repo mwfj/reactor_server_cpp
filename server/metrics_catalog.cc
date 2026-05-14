@@ -155,7 +155,8 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
                      {{"reactor.upstream.service", kDefaultGenericCap}}));
 
     // outcome cardinality: immediate, created, queued_satisfied, rejected,
-    // cancelled — bounded set with one slot of headroom (cap=6).
+    // cancelled, queue_timeout (waited past connect_timeout_ms) — bounded
+    // set with two slots of headroom (cap=8).
     out.reactor_upstream_pool_checkout_wait_duration = meter->GetHistogram(
         "reactor.upstream.pool.checkout.wait.duration",
         "Pool checkout wait time in seconds",
@@ -163,7 +164,7 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         ToVec(kLatencyBuckets),
         MakeCatalog({"reactor.upstream.service", "outcome"},
                      {{"reactor.upstream.service", kDefaultGenericCap},
-                      {"outcome", 6}}));
+                      {"outcome", 8}}));
 
     // Middleware (auth + rate limit + circuit breaker + ws) ---------
     // `issuer` values are operator-config-bounded (issuer names from

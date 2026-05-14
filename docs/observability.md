@@ -427,7 +427,7 @@ Pool saturation gauges with the closed `outcome` vocabulary for checkout-wait hi
 |---|---|---|---|
 | `reactor.upstream.pool.connections.idle` | UpDownCounter | `reactor.upstream.service` | Idle conns in the pool, ready for checkout. Sustained 0 = pool under-provisioned. |
 | `reactor.upstream.pool.connections.active` | UpDownCounter | `reactor.upstream.service` | In-use conns. Sustained `active == max_connections` = pool saturated; checkout will queue or reject. |
-| `reactor.upstream.pool.checkout.wait.duration` | Histogram (seconds) | `reactor.upstream.service`, `outcome` ∈ `{immediate, queued_satisfied, cancelled, rejected, created}` | Per-checkout latency by exit path. `immediate` = idle reuse hit; `created` = had to spawn a new conn (includes connect latency); `queued_satisfied` = waited for an existing conn to return; `cancelled` / `rejected` = checkout failed without serving traffic. |
+| `reactor.upstream.pool.checkout.wait.duration` | Histogram (seconds) | `reactor.upstream.service`, `outcome` ∈ `{immediate, queued_satisfied, cancelled, rejected, created, queue_timeout}` | Per-checkout latency by exit path. `immediate` = idle reuse hit; `created` = had to spawn a new conn (includes connect latency); `queued_satisfied` = waited for an existing conn to return; `cancelled` = waiter's owning transaction dropped before service; `rejected` = pool queue cap hit at submit time; `queue_timeout` = waited longer than `pool.connect_timeout_ms` without ever being served. |
 | `http.client.active_requests` | UpDownCounter | `reactor.upstream.service` | In-flight per-attempt requests against the upstream. Includes RETRIES — N attempts on a single transaction produce N concurrent `+1`s. Returns to zero on natural finalize, kill loop, or dtor backstop via CAS-safe drain. |
 
 **Operator interpretation tips:**
@@ -476,7 +476,7 @@ Authoritative source for in-the-loop traffic-management telemetry. `/stats` JSON
 
 | Metric | Type | Labels | Vocabulary |
 |---|---|---|---|
-| `reactor.auth.requests` | Counter | `outcome`, `issuer`, `reason` | `outcome ∈ {admit, deny}`; ALLOW emits `reason=ok`; deny `reason ∈ {missing_token, expired_token, malformed_token, signature_invalid, jwt_verify_failed, aud_mismatch, iss_mismatch, introspection_inactive, introspection_error, policy_denied, cache_miss_no_issuer, other}` |
+| `reactor.auth.requests` | Counter | `outcome`, `issuer`, `reason` | `outcome ∈ {allow, deny, undetermined}`; ALLOW emits `reason=ok`; deny `reason ∈ {missing_token, expired_token, malformed_token, signature_invalid, jwt_verify_failed, aud_mismatch, iss_mismatch, introspection_inactive, introspection_error, policy_denied, cache_miss_no_issuer, other}`; undetermined fires when an on-undetermined policy can't classify (IdP unreachable, cache miss, etc.) |
 | `reactor.auth.cache.lookups` | Counter | `outcome`, `issuer` | `outcome ∈ {hit, miss, stale_serve, refresh_fail}` |
 | `reactor.auth.jwks.refreshes` | Counter | `issuer`, `outcome` | `outcome ∈ {success, network_error, parse_error}` |
 

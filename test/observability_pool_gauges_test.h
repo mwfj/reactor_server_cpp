@@ -991,6 +991,129 @@ inline void TestClientActiveRequestsNoDoubleDecrement() {
     }
 }
 
+// ---------------------------------------------------------------------
+// Test — queue-timeout completion path emits checkout.wait.duration
+// with outcome=queue_timeout. Phase 4 contract is "every CheckoutAsync
+// completion path records the histogram"; PurgeExpiredWaitEntries
+// pops timed-out waiters and historically skipped the emit.
+//
+// Setup: max_connections=1 forces queue contention; connect_timeout_ms
+// is intentionally short so req2's wait crosses the threshold before
+// req1 returns the conn. The emit fires BEFORE the wait-entry's
+// error_cb (which can synchronously tear down the partition), so the
+// histogram observation is recorded even on a partition-shutdown race.
+// ---------------------------------------------------------------------
+inline void TestPoolCheckoutWaitDurationQueueTimeout() {
+    const char* TAG = "ObsPool: checkout.wait.duration {outcome=queue_timeout} on queue timeout";
+    try {
+        // Backend deliberately holds the request long enough that req2's
+        // queue wait crosses connect_timeout_ms while req1 is still in
+        // flight. PurgeExpiredWaitEntries fires from ReturnConnection
+        // (when req1's conn comes back) and from the periodic eviction
+        // tick — whichever wins, req2's outcome is queue_timeout.
+        HttpServer backend("127.0.0.1", 0);
+        backend.Get("/slow", [](const HttpRequest&, HttpResponse& resp) {
+            // Hold the conn well past the gateway's queue timeout so req2
+            // reliably observes max_connections exhausted while queued.
+            std::this_thread::sleep_for(std::chrono::milliseconds(3500));
+            resp.Status(200).Body("ok", "text/plain");
+        });
+        TestServerRunner<HttpServer> backend_runner(backend);
+        int backend_port = backend_runner.GetPort();
+
+        GatewayFixture gw_fix("obs-pool-queue-timeout");
+        ServerConfig gw_cfg;
+        gw_cfg.bind_host = "127.0.0.1";
+        gw_cfg.bind_port = 0;
+        // worker_threads=1 yields one partition per upstream — req1 and
+        // req2 race for the SAME pool slot, forcing req2 to queue. With
+        // worker_threads >= 2, each dispatcher has its own partition and
+        // both requests get their own connection (no queueing).
+        gw_cfg.worker_threads = 1;
+        gw_cfg.http2.enabled = false;
+        auto u = MakePoolUpstreamConfig("svc", "127.0.0.1", backend_port, "/slow");
+        u.pool.max_connections      = 1;
+        u.pool.max_idle_connections = 1;
+        // Config validation requires connect_timeout_ms >= 1000ms (timer
+        // resolution is 1s). Backend holds the conn for 3.5s so req2's
+        // queue wait reliably crosses the 1s threshold before req1 returns.
+        u.pool.connect_timeout_ms   = 1000;
+        // Response timeout must be long enough that req2 isn't killed by
+        // the response-deadline before the queue-timeout fires.
+        u.proxy.response_timeout_ms = 8000;
+        gw_cfg.upstreams.push_back(u);
+
+        HttpServer gateway(gw_cfg);
+        gateway.SetObservabilityManager(gw_fix.manager);
+        TestServerRunner<HttpServer> gw_runner(gateway);
+        int gw_port = gw_runner.GetPort();
+
+        // Open raw TCP connections for BOTH req1 and req2 and keep them
+        // alive (no draining). SendOneRequest's DrainSocket has a 800ms
+        // hardcoded read timeout, after which it closes the fd; that
+        // close races the queue purge timer (cadence 1s for our 1000ms
+        // queue timeout) and classifies the waiter as cancelled
+        // (CHECKOUT_QUEUE_TIMEOUT never fires). Keeping the client fds
+        // open lets the purge timer win unambiguously.
+        const std::string req =
+            "GET /slow HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+        int fd1 = ConnectTcp(gw_port);
+        bool send1_ok = (fd1 >= 0) && SendAll(fd1, req);
+
+        // Give the gateway time to dispatch req1, allocate the pool slot,
+        // and connect to the backend. Once req1's upstream conn is in
+        // connecting_conns_ / active_conns_, the partition's TotalCount
+        // equals max_connections (1) and any subsequent checkout queues.
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        int fd2 = ConnectTcp(gw_port);
+        bool send2_ok = (fd2 >= 0) && SendAll(fd2, req);
+
+        // Wait long enough for the queue purge timer to fire on req2.
+        // EvictExpired cadence is 1s; req2 enters the queue at t≈500ms
+        // and crosses the 1000ms threshold by t≈1500ms; the next timer
+        // tick at t≈2000ms emits queue_timeout. WaitFor below polls
+        // every short interval until the histogram bumps or 6s elapses.
+        bool hist_ok = WaitFor([&]() {
+            auto snap = gw_fix.manager->meter_provider()->Snapshot();
+            return HistogramCountByTwoLabels(snap,
+                "reactor.upstream.pool.checkout.wait.duration",
+                "reactor.upstream.service", "svc",
+                "outcome", "queue_timeout") >= 1;
+        }, 6000);
+
+        // Close both fds. The gateway sees EOF on req2's client conn
+        // (the proxy transaction for req2 already error-finalized via
+        // the queue timeout); req1's close lets the backend's still-
+        // sleeping handler eventually wake to a torn-down upstream
+        // (its 200 response is dropped — the test does not assert on
+        // req1's HTTP outcome, only on the histogram emit).
+        if (fd2 >= 0) ::close(fd2);
+        if (fd1 >= 0) ::close(fd1);
+        (void)send1_ok;
+        (void)send2_ok;
+
+        auto snap = gw_fix.manager->meter_provider()->Snapshot();
+        uint64_t qt = HistogramCountByTwoLabels(snap,
+            "reactor.upstream.pool.checkout.wait.duration",
+            "reactor.upstream.service", "svc",
+            "outcome", "queue_timeout");
+
+        bool pass = hist_ok && qt >= 1;
+        std::string err;
+        if (!pass) {
+            err = "queue_timeout count=" + std::to_string(qt) +
+                  " (expected >=1)";
+        }
+        TestFramework::RecordTest(TAG, pass, err,
+                                   TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(TAG, false, e.what(),
+                                   TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n========================================" << std::endl;
     std::cout << "Running ObservabilityPoolGauges tests..." << std::endl;
@@ -1004,6 +1127,7 @@ inline void RunAllTests() {
     TestClientActiveRequestsKillPath();
     TestClientActiveRequestsHappyPathDrainsCounter();
     TestClientActiveRequestsNoDoubleDecrement();
+    TestPoolCheckoutWaitDurationQueueTimeout();
 }
 
 }  // namespace ObservabilityPoolGaugesTests

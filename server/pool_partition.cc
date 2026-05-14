@@ -1628,6 +1628,17 @@ void PoolPartition::PurgeExpiredWaitEntries() {
         auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - entry.queued_at);
         if (waited.count() >= config_.connect_timeout_ms) {
+            // Emit the wait-duration histogram BEFORE the callback so a
+            // partition teardown triggered by error_cb (the callback can
+            // synchronously call manager_->InitiateShutdown via the
+            // transaction's abort hook) doesn't drop the observation.
+            // outcome=queue_timeout distinguishes "waited past
+            // connect_timeout_ms" from outcome=rejected (queue cap hit
+            // at submit time) and outcome=cancelled (waiter's transaction
+            // dropped before service).
+            auto waited_sec = std::chrono::duration_cast<
+                std::chrono::duration<double>>(now - entry.queued_at);
+            EmitCheckoutWaitDuration(waited_sec.count(), "queue_timeout");
             auto error_cb = std::move(entry.error_callback);
             wait_queue_.pop_front();
             error_cb(CHECKOUT_QUEUE_TIMEOUT);
