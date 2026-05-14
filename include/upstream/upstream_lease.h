@@ -28,23 +28,36 @@ public:
 
     UpstreamLease() = default;
 
+    // `off_dispatcher_release_drops` is the heap-owned counter captured
+    // at construction so that off-dispatcher Release() can bump it
+    // without dereferencing `partition` (which may be racing
+    // destruction). Null is accepted for test fixtures and for any
+    // lease constructed outside the production partition vending path.
     UpstreamLease(UpstreamConnection* conn, PoolPartition* partition,
-                  std::shared_ptr<std::atomic<bool>> partition_alive)
+                  std::shared_ptr<std::atomic<bool>> partition_alive,
+                  std::shared_ptr<std::atomic<int64_t>>
+                      off_dispatcher_release_drops = nullptr)
         : kind_(Kind::H1),
           conn_(conn),
           partition_(partition),
-          partition_alive_(std::move(partition_alive)) {}
+          partition_alive_(std::move(partition_alive)),
+          off_dispatcher_release_drops_(
+              std::move(off_dispatcher_release_drops)) {}
 
     UpstreamLease(UpstreamH2Connection* h2_conn, int32_t stream_id,
                   PoolPartition* partition,
                   std::shared_ptr<std::atomic<bool>> partition_alive,
-                  std::shared_ptr<std::atomic<bool>> conn_alive)
+                  std::shared_ptr<std::atomic<bool>> conn_alive,
+                  std::shared_ptr<std::atomic<int64_t>>
+                      off_dispatcher_release_drops = nullptr)
         : kind_(Kind::H2),
           h2_conn_(h2_conn),
           h2_stream_id_(stream_id),
           partition_(partition),
           partition_alive_(std::move(partition_alive)),
-          conn_alive_(std::move(conn_alive)) {}
+          conn_alive_(std::move(conn_alive)),
+          off_dispatcher_release_drops_(
+              std::move(off_dispatcher_release_drops)) {}
 
     ~UpstreamLease();
 
@@ -56,6 +69,8 @@ public:
           partition_(other.partition_),
           partition_alive_(std::move(other.partition_alive_)),
           conn_alive_(std::move(other.conn_alive_)),
+          off_dispatcher_release_drops_(
+              std::move(other.off_dispatcher_release_drops_)),
           donated_to_h2_(other.donated_to_h2_) {
         other.kind_ = Kind::EMPTY;
         other.conn_ = nullptr;
@@ -75,6 +90,8 @@ public:
             partition_ = other.partition_;
             partition_alive_ = std::move(other.partition_alive_);
             conn_alive_ = std::move(other.conn_alive_);
+            off_dispatcher_release_drops_ =
+                std::move(other.off_dispatcher_release_drops_);
             donated_to_h2_ = other.donated_to_h2_;
             other.kind_ = Kind::EMPTY;
             other.conn_ = nullptr;
@@ -169,5 +186,9 @@ private:
     PoolPartition* partition_ = nullptr;
     std::shared_ptr<std::atomic<bool>> partition_alive_;
     std::shared_ptr<std::atomic<bool>> conn_alive_;
+    // Heap-owned counter captured at construction. Outlives the
+    // partition so off-dispatcher Release() can bump it without
+    // dereferencing partition_ (which would race destruction).
+    std::shared_ptr<std::atomic<int64_t>> off_dispatcher_release_drops_;
     bool donated_to_h2_ = false;
 };

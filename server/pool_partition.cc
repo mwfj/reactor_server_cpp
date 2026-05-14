@@ -64,7 +64,12 @@ void UpstreamLease::Release() {
             "container/counter race",
             kind_ == Kind::H1 ? "H1"
                               : kind_ == Kind::H2 ? "H2" : "EMPTY");
-#ifndef NDEBUG
+        // The debug-assert is a developer aid for catching cross-thread
+        // misuse during development. Test builds (REACTOR_BUILDING_TESTS)
+        // deliberately exercise this path to lock the warn-log + counter-
+        // bump + skip-mutation contract, so the assert is suppressed
+        // there — the release-build behavior IS the production contract.
+#if !defined(NDEBUG) && !defined(REACTOR_BUILDING_TESTS)
         assert(false &&
                "UpstreamLease::Release must run on partition dispatcher");
 #endif
@@ -73,9 +78,17 @@ void UpstreamLease::Release() {
     if (off_dispatcher) {
         // Skip partition mutation entirely. Counter corruption is the
         // worse failure mode; a lost return is bounded (single lease).
-        // Bump the manager-level counter so /stats surfaces the leak
-        // and operators can correlate shutdown-drain delays.
-        partition_->IncOffDispatcherReleaseDrops();
+        // Bump the heap-owned counter (captured at lease construction)
+        // so /stats surfaces the leak and operators can correlate
+        // shutdown-drain delays. Critically: the counter is reached
+        // via shared_ptr — NOT via partition_->... — so the bump is
+        // safe even if the partition is mid-destruction. Bumping
+        // through partition_ here would race the destructor between
+        // the partition_alive observation above and this line.
+        if (off_dispatcher_release_drops_) {
+            off_dispatcher_release_drops_->fetch_add(
+                1, std::memory_order_acq_rel);
+        }
     } else if (kind_ == Kind::H1 && partition_live && conn_) {
         partition_->ReturnConnection(conn_, donated_to_h2_);
     } else if (kind_ == Kind::H2 && partition_live && h2_conn_ &&
@@ -100,6 +113,7 @@ void UpstreamLease::Release() {
     partition_ = nullptr;
     partition_alive_.reset();
     conn_alive_.reset();
+    off_dispatcher_release_drops_.reset();
     donated_to_h2_ = false;
 }
 
@@ -116,7 +130,7 @@ PoolPartition::PoolPartition(
     std::atomic<int64_t>& outstanding_conns,
     std::atomic<int64_t>& inflight_leases,
     std::atomic<int64_t>& donated_h2_leases,
-    std::atomic<int64_t>& off_dispatcher_release_drops,
+    std::shared_ptr<std::atomic<int64_t>> off_dispatcher_release_drops,
     std::atomic<bool>& manager_shutting_down,
     std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
@@ -131,7 +145,7 @@ PoolPartition::PoolPartition(
     , outstanding_conns_(outstanding_conns)
     , inflight_leases_(inflight_leases)
     , donated_h2_leases_(donated_h2_leases)
-    , off_dispatcher_release_drops_(off_dispatcher_release_drops)
+    , off_dispatcher_release_drops_(std::move(off_dispatcher_release_drops))
     , manager_shutting_down_(manager_shutting_down)
     , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
@@ -325,7 +339,7 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         // Bump inflight_leases_ BEFORE handing the lease to the caller.
         // ReturnConnection (called from ~UpstreamLease) decrements.
         inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
-        ready_cb(UpstreamLease(raw, this, alive_));
+        ready_cb(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_));
         return;
     }
 
@@ -851,7 +865,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn,
             // the observability shutdown drain never observes
             // active_leases() == 0.
             inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
-            entry.ready_callback(UpstreamLease(raw, this, alive_));
+            entry.ready_callback(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_));
             // No member access follows (function returns), but keep the
             // check for defense-in-depth against future refactors.
             if (!alive->load(std::memory_order_acquire)) return;
@@ -1717,7 +1731,7 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
 
     // See the matching site above — bump before handing the lease out.
     inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
-    ready_cb(UpstreamLease(raw, this, alive_));
+    ready_cb(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_));
 }
 
 void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
@@ -2195,7 +2209,8 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     // happens at lease destruction via ReturnConnection with
     // was_donated_to_h2=true.
     inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
-    shell->AdoptLease(UpstreamLease(uc_raw, this, alive_));
+    shell->AdoptLease(UpstreamLease(uc_raw, this, alive_,
+                                    off_dispatcher_release_drops_));
 
     h2_table_.Insert(upstream_name, std::move(shell));
     DrainAnyWaitersForFastH2();
@@ -2385,7 +2400,7 @@ void PoolPartition::ServiceWaitQueue() {
         // the eventual lease release drives active_leases() negative
         // and stalls graceful shutdown's drain wait.
         inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
-        entry.ready_callback(UpstreamLease(raw, this, alive_));
+        entry.ready_callback(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_));
         if (!alive->load(std::memory_order_acquire)) return;
         // ready_callback can synchronously start server shutdown
         // (e.g. a first-request callback that calls HttpServer::Stop

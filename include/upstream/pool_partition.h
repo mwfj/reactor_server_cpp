@@ -53,7 +53,8 @@ public:
                   std::atomic<int64_t>& outstanding_conns,
                   std::atomic<int64_t>& inflight_leases,
                   std::atomic<int64_t>& donated_h2_leases,
-                  std::atomic<int64_t>& off_dispatcher_release_drops,
+                  std::shared_ptr<std::atomic<int64_t>>
+                      off_dispatcher_release_drops,
                   std::atomic<bool>& manager_shutting_down,
                   std::mutex& drain_mtx,
                   std::condition_variable& drain_cv);
@@ -324,13 +325,14 @@ public:
         inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
     }
 
-    // Bumped by UpstreamLease::Release() when invoked off the partition
-    // dispatcher thread (the partition mutation is skipped to avoid a
-    // container race). Operator signal that a leased counter bump went
-    // unreturned. Surfaced via UpstreamManager::off_dispatcher_release_drops().
-    void IncOffDispatcherReleaseDrops() noexcept {
-        off_dispatcher_release_drops_.fetch_add(
-            1, std::memory_order_acq_rel);
+    // Accessor used by UpstreamLease construction sites — the heap-owned
+    // counter is captured by every lease so off-dispatcher Release()
+    // can bump it without dereferencing the partition (which may be
+    // mid-destruction). Returns the partition-stored shared_ptr (same
+    // heap object as UpstreamManager's owning pointer).
+    std::shared_ptr<std::atomic<int64_t>> OffDispatcherReleaseDropsPtr()
+        const noexcept {
+        return off_dispatcher_release_drops_;
     }
 
 #ifdef REACTOR_BUILDING_TESTS
@@ -396,7 +398,12 @@ private:
     // ReturnConnection when the lease's destructor releases.
     std::atomic<int64_t>& inflight_leases_;
     std::atomic<int64_t>& donated_h2_leases_;
-    std::atomic<int64_t>& off_dispatcher_release_drops_;
+    // Heap-owned counter shared with UpstreamManager and every
+    // UpstreamLease vended by this partition. shared_ptr (not
+    // reference) so the lease can capture it independently of the
+    // partition's lifetime — Release() bumps via the captured pointer
+    // even if the partition is concurrently destructing.
+    std::shared_ptr<std::atomic<int64_t>> off_dispatcher_release_drops_;
     std::atomic<bool>& manager_shutting_down_;  // Set immediately by manager
     std::mutex& drain_mtx_;
     std::condition_variable& drain_cv_;

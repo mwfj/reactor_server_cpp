@@ -104,13 +104,14 @@ public:
     // bump that the drain predicate will never observe — operator
     // signal that shutdown drain risks wedging until timeout. Should
     // remain zero in healthy production; bumps surface via /stats.
+    //
+    // The counter is heap-owned (shared_ptr<atomic>) so it outlives
+    // the partition: an off-dispatcher Release reaching for the
+    // counter via the lease's captured shared_ptr is safe even when
+    // the partition is concurrently destructing. See UpstreamLease.
     int64_t off_dispatcher_release_drops() const noexcept {
-        return off_dispatcher_release_drops_.load(
+        return off_dispatcher_release_drops_ptr_->load(
             std::memory_order_acquire);
-    }
-    void IncOffDispatcherReleaseDrops() noexcept {
-        off_dispatcher_release_drops_.fetch_add(
-            1, std::memory_order_acq_rel);
     }
 
 #ifdef REACTOR_BUILDING_TESTS
@@ -297,7 +298,16 @@ private:
     // mutation to avoid container races). Operators monitor via /stats;
     // a non-zero value means shutdown drain may wedge until timeout
     // OR /stats active_leases reports stale.
-    std::atomic<int64_t> off_dispatcher_release_drops_{0};
+    //
+    // Heap-owned via shared_ptr so every UpstreamLease can capture it at
+    // construction. The lease's captured shared_ptr keeps the atomic
+    // alive even if the partition is destroyed mid-Release, which
+    // eliminates the partition-deref race that a reference-typed
+    // counter would have. The manager keeps the only strong reference
+    // here for the manager-level accessor; partitions and leases each
+    // hold their own copies and contribute to the refcount.
+    std::shared_ptr<std::atomic<int64_t>> off_dispatcher_release_drops_ptr_ =
+        std::make_shared<std::atomic<int64_t>>(0);
 
     // Bumped from ProxyTransaction::Start, decremented at terminal
     // completion. Read by HttpServer::WaitForAllAsyncDrain alongside
