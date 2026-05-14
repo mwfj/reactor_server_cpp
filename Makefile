@@ -183,7 +183,7 @@ OBSERVABILITY_HEADERS = $(LIB_DIR)/observability/common.h $(LIB_DIR)/observabili
 HTTP2_HEADERS = $(LIB_DIR)/http2/http2_callbacks.h $(LIB_DIR)/http2/http2_connection_handler.h $(LIB_DIR)/http2/http2_constants.h $(LIB_DIR)/http2/http2_session.h $(LIB_DIR)/http2/http2_stream.h $(LIB_DIR)/http2/protocol_detector.h
 WS_HEADERS = $(LIB_DIR)/ws/websocket_connection.h $(LIB_DIR)/ws/websocket_frame.h $(LIB_DIR)/ws/websocket_handshake.h $(LIB_DIR)/ws/websocket_parser.h $(LIB_DIR)/ws/utf8_validate.h
 TLS_HEADERS = $(LIB_DIR)/tls/tls_context.h $(LIB_DIR)/tls/tls_connection.h $(LIB_DIR)/tls/tls_client_context.h
-UPSTREAM_HEADERS = $(LIB_DIR)/upstream/upstream_manager.h $(LIB_DIR)/upstream/upstream_host_pool.h $(LIB_DIR)/upstream/pool_partition.h $(LIB_DIR)/upstream/upstream_connection.h $(LIB_DIR)/upstream/upstream_lease.h $(LIB_DIR)/upstream/upstream_codec.h $(LIB_DIR)/upstream/upstream_http_codec.h $(LIB_DIR)/upstream/upstream_h2_codec.h $(LIB_DIR)/upstream/upstream_h2_stream.h $(LIB_DIR)/upstream/upstream_h2_connection.h $(LIB_DIR)/upstream/h2_connection_table.h $(LIB_DIR)/upstream/h2_settings.h $(LIB_DIR)/upstream/http_request_serializer.h $(LIB_DIR)/upstream/header_rewriter.h $(LIB_DIR)/upstream/retry_policy.h $(LIB_DIR)/upstream/proxy_transaction.h $(LIB_DIR)/upstream/proxy_handler.h $(LIB_DIR)/upstream/upstream_response.h $(LIB_DIR)/upstream/upstream_callbacks.h
+UPSTREAM_HEADERS = $(LIB_DIR)/upstream/upstream_manager.h $(LIB_DIR)/upstream/upstream_host_pool.h $(LIB_DIR)/upstream/pool_partition.h $(LIB_DIR)/upstream/upstream_connection.h $(LIB_DIR)/upstream/upstream_lease.h $(LIB_DIR)/upstream/upstream_codec.h $(LIB_DIR)/upstream/upstream_http_codec.h $(LIB_DIR)/upstream/upstream_h2_codec.h $(LIB_DIR)/upstream/upstream_h2_stream.h $(LIB_DIR)/upstream/upstream_h2_connection.h $(LIB_DIR)/upstream/h2_connection_table.h $(LIB_DIR)/upstream/host_port_key.h $(LIB_DIR)/upstream/h2_settings.h $(LIB_DIR)/upstream/http_request_serializer.h $(LIB_DIR)/upstream/header_rewriter.h $(LIB_DIR)/upstream/retry_policy.h $(LIB_DIR)/upstream/proxy_transaction.h $(LIB_DIR)/upstream/proxy_handler.h $(LIB_DIR)/upstream/upstream_response.h $(LIB_DIR)/upstream/upstream_callbacks.h
 RATE_LIMIT_HEADERS = $(LIB_DIR)/rate_limit/token_bucket.h $(LIB_DIR)/rate_limit/rate_limit_zone.h $(LIB_DIR)/rate_limit/rate_limiter.h
 CIRCUIT_BREAKER_HEADERS = $(LIB_DIR)/circuit_breaker/circuit_breaker_state.h $(LIB_DIR)/circuit_breaker/circuit_breaker_window.h $(LIB_DIR)/circuit_breaker/circuit_breaker_slice.h $(LIB_DIR)/circuit_breaker/retry_budget.h $(LIB_DIR)/circuit_breaker/circuit_breaker_host.h $(LIB_DIR)/circuit_breaker/circuit_breaker_manager.h
 # Auth headers. The vendored jwt-cpp headers are pulled into the dependency
@@ -209,9 +209,11 @@ $(THIRD_PARTY_DIR)/llhttp/%.o: $(THIRD_PARTY_DIR)/llhttp/%.c
 $(THIRD_PARTY_DIR)/nghttp2/%.o: $(THIRD_PARTY_DIR)/nghttp2/%.c
 	$(CC) $(NGHTTP2_CFLAGS) -c $< -o $@
 
-# Build the test executable
+# Build the test executable. -DREACTOR_BUILDING_TESTS exposes the
+# *_ForTesting / *_DO_NOT_USE_IN_PRODUCTION helpers (intentionally
+# absent from the production server build).
 $(TARGET): $(TEST_SRCS) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
-	$(CXX) $(CXXFLAGS) $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(LDFLAGS) -o $(TARGET)
+	$(CXX) $(CXXFLAGS) -DREACTOR_BUILDING_TESTS $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(LDFLAGS) -o $(TARGET)
 
 # Build the production server binary
 $(SERVER_TARGET): $(LIB_SRCS) $(MAIN_SRC) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
@@ -519,7 +521,7 @@ TSAN_TARGET   = test_runner_tsan
 
 $(TSAN_TARGET): $(TEST_SRCS) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
 	@echo "Building TSAN test runner ($(TSAN_TARGET))..."
-	$(CXX) $(TSAN_CXXFLAGS) $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(TSAN_LDFLAGS) -o $(TSAN_TARGET)
+	$(CXX) $(TSAN_CXXFLAGS) -DREACTOR_BUILDING_TESTS $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(TSAN_LDFLAGS) -o $(TSAN_TARGET)
 
 test_dual_stack_tsan: $(TSAN_TARGET)
 	@echo "Running dual-stack TSAN tests (stop/reload/destruction) under ThreadSanitizer..."

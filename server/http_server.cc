@@ -897,6 +897,22 @@ HttpServer::GetAuthSnapshot() const {
 }
 
 void HttpServer::MarkServerReady() {
+    // Late stop gate: Start()'s Phase-A/B/C gates protect everything up
+    // to net_server_.Start(). The ready callback (firing this method)
+    // runs after net_server_'s reactor threads come up, which can be
+    // AFTER a concurrent Stop() has already published stopping_=true
+    // and stored server_ready_=false. Without this gate, the final
+    // server_ready_.store(true) below silently overwrites Stop()'s
+    // false store — test `DualStack: stopping_ release-store visible
+    // before mutex acquire` flagged the race at ~1/10 rounds.
+    // Acquire-load pairs with Stop's release-store on stopping_.
+    if (stopping_.load(std::memory_order_acquire)) {
+        logging::Get()->info(
+            "MarkServerReady: stop requested before ready callback fired; "
+            "skipping middleware install and server_ready_ flip");
+        return;
+    }
+
     // Bypass RejectIfServerLive for the internal registration pass below.
     // MarkServerReady runs on the dispatcher thread and is the ONLY
     // legitimate mutator of router_/pending_proxy_routes_ between Start()
@@ -1457,6 +1473,20 @@ void HttpServer::MarkServerReady() {
 
     start_time_ = std::chrono::steady_clock::now();
     server_ready_.store(true, std::memory_order_release);
+
+    // Roll-back: the entry gate above can race a Stop that starts
+    // AFTER our check but lands its server_ready_=false store BEFORE
+    // ours. The acquire-load here pairs with Stop's release-store on
+    // stopping_; if true, our true-store was the late writer and we
+    // restore the correct end-state. Idempotent — Stop only ever
+    // writes false to server_ready_, so a redundant false-store from
+    // here is harmless.
+    if (stopping_.load(std::memory_order_acquire)) {
+        server_ready_.store(false, std::memory_order_release);
+        logging::Get()->info(
+            "MarkServerReady: stop landed mid-bootstrap; rolled back "
+            "server_ready_ to false");
+    }
 }
 
 void HttpServer::CompensateH2Streams(

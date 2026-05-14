@@ -59,6 +59,11 @@ struct UpstreamH2Stream {
     // catch peers that lie about Content-Length.
     int64_t body_bytes_received = 0;
 
+    // Set by OnStreamClose; read by DetachSink to gate walker enqueue.
+    bool peer_already_closed_ = false;
+    // Marker for the deferred-erase walker.
+    bool pending_erase_ = false;
+
     UpstreamH2Stream() = default;
     UpstreamH2Stream(const UpstreamH2Stream&) = delete;
     UpstreamH2Stream& operator=(const UpstreamH2Stream&) = delete;

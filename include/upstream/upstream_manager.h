@@ -99,6 +99,40 @@ public:
     int64_t active_leases() const noexcept {
         return inflight_leases_.load(std::memory_order_acquire);
     }
+    int64_t donated_h2_leases() const noexcept {
+        return donated_h2_leases_.load(std::memory_order_acquire);
+    }
+    // Count of `UpstreamLease::Release()` calls that observed an
+    // off-dispatcher invocation and skipped the partition mutation.
+    // Each increment represents a leaked inflight/donated counter
+    // bump that the drain predicate will never observe — operator
+    // signal that shutdown drain risks wedging until timeout. Should
+    // remain zero in healthy production; bumps surface via /stats.
+    //
+    // The counter is heap-owned (shared_ptr<atomic>) so it outlives
+    // the partition: an off-dispatcher Release reaching for the
+    // counter via the lease's captured shared_ptr is safe even when
+    // the partition is concurrently destructing. See UpstreamLease.
+    int64_t off_dispatcher_release_drops() const noexcept {
+        return off_dispatcher_release_drops_ptr_->load(
+            std::memory_order_acquire);
+    }
+
+#ifdef REACTOR_BUILDING_TESTS
+    // Test-only: adjust the lease counters by signed deltas. Tests that
+    // exercise the swap helper in isolation use this to restore a clean
+    // baseline before the manager destructor checks invariants.
+    // Compile-only-in-test-builds (Makefile -DREACTOR_BUILDING_TESTS on
+    // the test_runner target); production code cannot reference this
+    // symbol because it isn't declared in the production build.
+    void RebalanceCountersForTesting_DO_NOT_USE_IN_PRODUCTION(
+        int64_t inflight_delta, int64_t donated_delta) noexcept {
+        inflight_leases_.fetch_add(inflight_delta,
+                                   std::memory_order_acq_rel);
+        donated_h2_leases_.fetch_add(donated_delta,
+                                     std::memory_order_acq_rel);
+    }
+#endif
     int64_t inflight_transactions() const noexcept {
         return inflight_transactions_.load(std::memory_order_acquire);
     }
@@ -148,16 +182,6 @@ public:
     // Called by HttpServer::Reload while holding reload_mtx_.
     void UpdateResolvedEndpoints(
         const NET_DNS_NAMESPACE::ResolvedMap& merged);
-
-    // Single-key staged-lookup helper. Production reload uses
-    // CommitHttp2Snapshots() which builds an O(N) name→config map once
-    // and applies in O(K+P); this single-key variant is retained for
-    // unit-test coverage of the lookup semantics (live-only narrow,
-    // missing-from-staged returns nullopt). Pure lookup — does not
-    // mutate partition state. Safe from any thread.
-    std::optional<Http2UpstreamConfig> LookupStagedH2ForLivePartitionForTesting(
-        const std::string& upstream_name,
-        const std::vector<UpstreamConfig>& staged_upstreams) const;
 
     // Reload-time enumerator: pairs every live PoolPartition with its
     // upstream service name. Pointers stay valid until UpstreamManager
@@ -275,7 +299,42 @@ private:
     // lease's destructor returns the connection. Distinct from
     // outstanding_conns_ which counts all live connections (idle
     // keep-alive sockets included).
+    //
+    // Per-request only — H2 donated leases are tracked separately in
+    // donated_h2_leases_. UpstreamH2Connection::AdoptLease converts
+    // the +1 from inflight_leases_ to donated_h2_leases_; the drain
+    // predicate in HttpServer::WaitForAllAsyncDrain consults only
+    // inflight_leases_ so idle H2 sessions do not stall observability
+    // flush.
     std::atomic<int64_t> inflight_leases_{0};
+
+    // Long-lived H2 session ownership of donated transports. Each
+    // multiplexed H2 session holds one donated lease for its entire
+    // lifetime; this counter rises on AdoptLease (in
+    // AcquireH2Connection construct branch and
+    // OnH2ConnectHandshakeComplete) and falls when the lease destructor
+    // routes ReturnConnection with the donated flag set. Excluded from
+    // the shutdown drain predicate — otherwise an idle H2 session keeps
+    // the active_leases counter positive and observability flush burns
+    // its full budget waiting for the lease that only releases when
+    // InitiateShutdown explicitly retires the session.
+    std::atomic<int64_t> donated_h2_leases_{0};
+
+    // Off-dispatcher Release safety counter. Each increment indicates a
+    // single leaked inflight/donated bump (Release skipped the partition
+    // mutation to avoid container races). Operators monitor via /stats;
+    // a non-zero value means shutdown drain may wedge until timeout
+    // OR /stats active_leases reports stale.
+    //
+    // Heap-owned via shared_ptr so every UpstreamLease can capture it at
+    // construction. The lease's captured shared_ptr keeps the atomic
+    // alive even if the partition is destroyed mid-Release, which
+    // eliminates the partition-deref race that a reference-typed
+    // counter would have. The manager keeps the only strong reference
+    // here for the manager-level accessor; partitions and leases each
+    // hold their own copies and contribute to the refcount.
+    std::shared_ptr<std::atomic<int64_t>> off_dispatcher_release_drops_ptr_ =
+        std::make_shared<std::atomic<int64_t>>(0);
 
     // Bumped from ProxyTransaction::Start, decremented at terminal
     // completion. Read by HttpServer::WaitForAllAsyncDrain alongside

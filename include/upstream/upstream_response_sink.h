@@ -32,6 +32,7 @@ public:
     // H2 only. Sinks should gate refresh logic on their own state
     // machine; the codec dispatches unconditionally.
     virtual void OnRequestBodyProgress() {}
+
 };
 
 }  // namespace UPSTREAM_CALLBACKS_NAMESPACE

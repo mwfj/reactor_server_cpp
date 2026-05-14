@@ -4,7 +4,10 @@
 #include "upstream/upstream_connection.h"
 #include "upstream/upstream_http_codec.h"
 #include "upstream/header_rewriter.h"
+#include "upstream/pool_partition.h"
 #include "connection_handler.h"
+#include "dispatcher.h"
+#include "http/http_status.h"
 #include "log/logger.h"
 #include <charconv>
 #include <cstring>
@@ -215,17 +218,20 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
     // Detach sink before OnError so a synchronous teardown chain
     // (sink OnError → Cleanup → ResetStream) does not re-dispatch on
-    // an already-failed path.
-    auto reject_truncation = [&](const char* msg) {
+    // an already-failed path. RESULT_PARSE_ERROR (not _TRUNCATED) —
+    // these branches catch OVER-read (body on NO_BODY, body exceeds
+    // CL); RESULT_TRUNCATED_RESPONSE is reserved for under-read at
+    // OnStreamClose's CL short-read backstop.
+    auto reject_overrun = [&](const char* msg) {
         auto* sink = stream->sink;
         stream->sink = nullptr;
         if (sink) {
-            sink->OnError(ProxyTransaction::RESULT_TRUNCATED_RESPONSE, msg);
+            sink->OnError(ProxyTransaction::RESULT_PARSE_ERROR, msg);
         }
         self->ResetStream(stream_id);
     };
     if (stream->response_head.framing == Framing::NO_BODY && len > 0) {
-        reject_truncation("body bytes on NO_BODY response");
+        reject_overrun("body bytes on NO_BODY response");
         return 0;
     }
     if (stream->response_head.framing == Framing::CONTENT_LENGTH &&
@@ -233,11 +239,12 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
         static_cast<int64_t>(len) >
             stream->response_head.expected_length -
             stream->body_bytes_received) {
-        reject_truncation("body exceeds Content-Length");
+        reject_overrun("body exceeds Content-Length");
         return 0;
     }
 
     stream->body_bytes_received += static_cast<int64_t>(len);
+
     const bool keep = stream->sink->OnBodyChunk(
         reinterpret_cast<const char*>(data), len);
     if (!keep) {
@@ -314,49 +321,125 @@ struct ReceiveDataGuard {
 UpstreamH2Connection::UpstreamH2Connection(
     UpstreamConnection* transport,
     std::shared_ptr<const Http2UpstreamConfig> cfg)
-    : transport_(transport), cfg_(std::move(cfg))
+    : transport_(transport),
+      cfg_(std::move(cfg)),
+      conn_alive_(std::make_shared<std::atomic<bool>>(true))
 {
     last_activity_at_ = std::chrono::steady_clock::now();
 }
 
-UpstreamH2Connection::~UpstreamH2Connection() {
-    // Null H2-session-bound transport callbacks FIRST so incoming bytes
-    // arriving mid-dtor cannot reenter HandleBytes and trigger a
-    // FlushSend on a session that's about to be torn down. This also
-    // closes the door on the pool re-wire path (WirePoolCallbacks)
-    // observing closures that capture a now-expired weak_ptr to *this.
-    if (transport_) {
-        if (auto t = transport_->GetTransport()) {
-            t->SetOnMessageCb(nullptr);
-            t->SetCloseCb(nullptr);
-            t->SetErrorCb(nullptr);
-            // Write-progress / completion hooks installed by
-            // AcquireH2Connection — must also be cleared before the
-            // transport returns to the pool, otherwise the next
-            // borrower inherits closures pointing at a destroyed
-            // session.
-            t->SetWriteProgressCb(nullptr);
-            t->SetCompletionCb(nullptr);
+void ClearH2TransportCallbacks(ConnectionHandler* transport) {
+    if (!transport) return;
+    transport->SetOnMessageCb(nullptr);
+    transport->SetCloseCb(nullptr);
+    transport->SetErrorCb(nullptr);
+    transport->SetWriteProgressCb(nullptr);
+    transport->SetCompletionCb(nullptr);
+    transport->SetConnectCompleteCallback(nullptr);
+    transport->SetHandshakeCompleteCallback(nullptr);
+    transport->SetDeadlineTimeoutCb(nullptr);
+}
+
+void UpstreamH2Connection::DestroyOnDispatcher() {
+    if (transferred_) return;
+    if (destroyed_on_dispatcher_.load(std::memory_order_acquire)) return;
+
+    // Step 1: alive flip — any in-flight dual-token capture observes
+    // !alive on its next acquire-load and short-circuits.
+    if (conn_alive_) {
+        conn_alive_->store(false, std::memory_order_release);
+    }
+
+    // Step 2: null every transport callback the H2 session installed.
+    auto t = transport_ ? transport_->GetTransport() : nullptr;
+    ClearH2TransportCallbacks(t.get());
+
+    // Step 3: remove any deadline-timer registration for this fd so
+    // a late timer fire cannot fan out to the dying session. The
+    // *IfMatch variant guards against fd-reuse — a different conn
+    // sharing the recycled fd must not have its timer dropped. Skips
+    // cleanly if partition_ or dispatcher is null (e.g. dtor path
+    // after partition teardown): the transport's own teardown still
+    // closes the fd which removes it from the timer wheel.
+    if (partition_ && t) {
+        if (auto dispatcher = partition_->dispatcher()) {
+            dispatcher->RemoveTimerConnectionIfMatch(t->fd(), t);
         }
     }
+
+    // Tear down the nghttp2 session BEFORE step 4-5 so a synchronous
+    // terminate / FlushSend cannot land on a transport that's already
+    // observed CLOSING. Sinks are nulled defensively to prevent any
+    // OnError fan-out from reentering the partition mid-teardown.
+    //
+    // Skip terminate_session + FlushSend when the peer already sent
+    // GOAWAY — emitting our own GOAWAY back is pure wasted work on a
+    // transport that's about to be MarkClosing'd and torn down; the
+    // frame would push onto a soon-dead transport's send buffer with
+    // no chance to reach the wire. nghttp2_session_del still runs
+    // unconditionally to free the session struct.
     if (session_) {
-        // Defense-in-depth: callers may destroy with active streams
-        // (future evict+replace path, unit test, etc.); FailAllStreams
-        // prevents sink leak. MarkDead first so any reentrant call
-        // from a sink's OnError closure observes IsUsable()==false
-        // and does not attempt further work on the session about to
-        // be torn down below.
         MarkDead();
         FailAllStreams(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
                        "h2 session destroyed");
-        // Best-effort polite shutdown. Failure is non-fatal — the
-        // transport will be torn down regardless when the lease ends.
-        nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
-        FlushSend();
+        if (!goaway_seen_) {
+            nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
+            FlushSend();
+        }
         nghttp2_session_del(session_);
         session_ = nullptr;
     }
-    // Lease destructor returns the underlying transport to the pool.
+
+    // Step 4: poison the transport so ReturnConnection routes through
+    // DestroyConnection (transport teardown + outstanding_conns_
+    // decrement) instead of the idle-pool return path.
+    if (transport_) transport_->MarkClosing();
+
+    // Step 5: drop the donated lease. ~UpstreamLease fires
+    // partition_->ReturnConnection(transport_), which observes the
+    // poisoned CLOSING state and runs the eviction path.
+    if (lease_) lease_.reset();
+
+    // Step 6: gate the dtor's safety net so the eventual unique_ptr
+    // drop is a no-op.
+    destroyed_on_dispatcher_.store(true, std::memory_order_release);
+}
+
+UpstreamH2Connection::~UpstreamH2Connection() {
+    // Adoption hand-off already consumed the transport — the H1
+    // adoption owns the pool accounting now.
+    if (transferred_) return;
+    // DestroyOnDispatcher already ran the polite teardown.
+    if (destroyed_on_dispatcher_.load(std::memory_order_acquire)) return;
+
+    // Safety-net path: dropped without explicit teardown (unit tests,
+    // future evict-replace path). Mirror the 6-step ordering but
+    // without the partition-thread DCHECK — the dtor may run from any
+    // thread when the unique_ptr is dropped, and the callback-null /
+    // lease-reset operations are memory-only and thread-safe.
+    if (conn_alive_) {
+        conn_alive_->store(false, std::memory_order_release);
+    }
+    auto t = transport_ ? transport_->GetTransport() : nullptr;
+    ClearH2TransportCallbacks(t.get());
+    if (session_) {
+        MarkDead();
+        FailAllStreams(ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                       "h2 session destroyed");
+        // Skip the GOAWAY emit when the peer already GOAWAY'd — same
+        // wasted-work elision as DestroyOnDispatcher.
+        if (!goaway_seen_) {
+            nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
+            FlushSend();
+        }
+        nghttp2_session_del(session_);
+        session_ = nullptr;
+    }
+    // Poison the transport so the eventual ~UpstreamLease lease_
+    // (member destruct order) routes ReturnConnection through
+    // DestroyConnection instead of returning a transport that just
+    // received a GOAWAY frame to the H1 idle pool.
+    if (transport_) transport_->MarkClosing();
 }
 
 bool UpstreamH2Connection::Init() {
@@ -409,9 +492,25 @@ ssize_t UpstreamH2Connection::HandleBytes(const char* data, size_t len) {
     if (consumed < 0) {
         logging::Get()->warn(
             "UpstreamH2Connection: mem_recv2 failed rv={}", consumed);
+        // Still drain deferred-erase + pending-destroy work even on a
+        // recv failure — the recv chain may have queued pending_erase_
+        // entries or moved conns to pending_destroy_h2_conns_ before
+        // failing. Skipping these would orphan the deque walks until
+        // partition teardown.
+        RunDeferredEraseWalk();
+        if (partition_) partition_->ReapPendingDestroyH2Conns();
         return consumed;
     }
-    if (!FlushSend()) return -1;
+    bool flush_ok = FlushSend();
+    // Run the deque drains regardless of FlushSend result: a failed
+    // flush still leaves any deferred-erase / pending-destroy work
+    // queued by the just-completed recv chain. Orphaning these would
+    // strand H2 sessions in pending_destroy_h2_conns_ until partition
+    // teardown and leak the matching pending_h2_replacement_targets_
+    // entries, starving queued waiters.
+    RunDeferredEraseWalk();
+    if (partition_) partition_->ReapPendingDestroyH2Conns();
+    if (!flush_ok) return -1;
     return consumed;
 }
 
@@ -509,6 +608,13 @@ void UpstreamH2Connection::OnPingAck() {
 }
 
 void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
+    // Defense-in-depth: if the transport was donated to AdoptAsH1Connection
+    // (transferred_ flag), a late GOAWAY frame arriving on the recv path
+    // would otherwise drive MoveConnToPendingDestroy on a session whose
+    // transport is now owned by the H1 idle pool. Today the H2 session is
+    // already torn down before adoption completes, but a future refactor
+    // could reopen this UAF surface.
+    if (transferred_) return;
     auto now = std::chrono::steady_clock::now();
     // Set goaway_seen_=true BEFORE the fan-out below: a sink's OnError
     // closure can synchronously call back into TryDispatchExistingH2Session
@@ -536,7 +642,6 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
     // in immediately instead of waiting for transport close or the
     // per-attempt response timeout. Streams with id <= last_stream_id
     // continue draining naturally.
-    if (streams_.empty()) return;
     std::vector<int32_t> to_fail;
     to_fail.reserve(streams_.size());
     for (auto& kv : streams_) {
@@ -553,12 +658,51 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
         auto it = streams_.find(sid);
         if (it == streams_.end()) continue;
         auto stream = it->second;
-        streams_.erase(it);
+        if (stream) {
+            stream->peer_already_closed_ = true;
+            if (!stream->pending_erase_) {
+                stream->pending_erase_ = true;
+                pending_erase_streams_.push_back(sid);
+            }
+        }
         if (stream && stream->sink) {
-            stream->sink->OnError(
-                ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+            // Detach before OnError — see UPSTREAM_PROXY.md "Sink ptr
+            // stale across RST_STREAM → OnStreamClose race".
+            auto* sink = stream->sink;
+            stream->sink = nullptr;
+            sink->OnError(
+                ProxyTransaction::RESULT_GOAWAY_UNPROCESSED,
                 "h2 stream above GOAWAY last_stream_id — peer did not process");
         }
+    }
+
+    // GOAWAY-idle replacement: trigger when no surviving stream has
+    // id ≤ last_stream_id. Count post-fan-out so sink-reentrant
+    // ResetStream / SubmitRequest mutations to streams_ are observed.
+    size_t survivors_below = 0;
+    for (auto& kv : streams_) {
+        if (kv.first <= last_stream_id && kv.second &&
+            !kv.second->pending_erase_) {
+            ++survivors_below;
+        }
+    }
+    if (survivors_below == 0 && partition_ && transport_) {
+        // h2_table_ keys on service_name(), not transport upstream_host
+        // (logging literal).
+        partition_->MoveConnToPendingDestroy(this);
+        // Reentrancy invariant: this runs INSIDE the mem_recv2 callback
+        // frame. StartH2ReplacementConnect synchronously enters
+        // OpenNewH2Connection which installs connect/handshake/close
+        // callbacks on the new transport. Those callbacks MUST NOT
+        // fire synchronously inside this call stack — they capture
+        // `this` (the partition) and a sync close-cb would walk
+        // wait_queue_ while HandleBytes may still be iterating. Today
+        // they're dispatcher-scheduled (one loop turn away) so the
+        // invariant holds. Future maintainers wiring synchronous
+        // close-cb paths in OpenNewH2Connection MUST defer via
+        // EnQueue to preserve this.
+        partition_->StartH2ReplacementConnect(
+            partition_->service_name(), transport_->upstream_port());
     }
 }
 
@@ -566,11 +710,18 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                                          uint32_t error_code) {
     auto it = streams_.find(stream_id);
     if (it != streams_.end()) {
-        // Erase BEFORE firing the sink so any re-entrant SubmitRequest /
-        // ResetStream calls see a clean stream table. Keep the shared_ptr
-        // alive on the stack so the stream object survives the callback.
         auto stream = it->second;
-        streams_.erase(it);
+        // pending_erase_ is the "terminal dispatch already done" signal:
+        // another path (OnGoawayReceived above-last fan-out, SubmitRequest
+        // rollback, etc.) already fired the sink terminal; nghttp2's later
+        // stream-close notification is informational and must not
+        // double-dispatch.
+        if (stream && stream->pending_erase_) return;
+        if (stream) {
+            stream->peer_already_closed_ = true;
+            stream->pending_erase_ = true;
+            pending_erase_streams_.push_back(stream_id);
+        }
         if (stream && stream->sink) {
             using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
             if (error_code == NGHTTP2_NO_ERROR) {
@@ -629,14 +780,45 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                 // int) falls through ProxyTransaction::MakeErrorResponse's
                 // RESULT_* allowlist to InternalError() — surfacing a 500
                 // for what is fundamentally an upstream/transport failure.
-                // RESULT_UPSTREAM_DISCONNECT maps to 502 BadGateway and is
-                // retryable: covers REFUSED_STREAM (peer didn't process,
-                // safe to retry), CANCEL (peer aborted), PROTOCOL_ERROR /
-                // INTERNAL_ERROR (upstream-side malformed response —
-                // distinct from a local PARSE_ERROR which is also 502).
+                //
+                // GOAWAY-drained classification: if the peer has sent
+                // GOAWAY and this stream's id is ≤ last_stream_id (i.e.,
+                // the stream survived OnGoawayReceived's above-last
+                // fan-out and was draining naturally), classify the
+                // late-error as RESULT_GOAWAY_MAYBE_PROCESSED — RFC 9113
+                // §6.8 says the peer MAY have processed it. The retry
+                // path is identical to UPSTREAM_DISCONNECT shape-wise,
+                // but breaker-neutral so ordinary peer drain doesn't
+                // count as upstream health failure (a peer rolling
+                // sessions for deploy / idle-timeout / scaling is not
+                // an upstream-health signal). REFUSED_STREAM specifically
+                // is "peer didn't process" — promote to UNPROCESSED for
+                // zero-delay retry classification.
+                int classified = ProxyTransaction::RESULT_UPSTREAM_DISCONNECT;
+                const char* reason_label = "h2 stream closed with error";
+                const char* classification_label = "UPSTREAM_DISCONNECT";
+                if (error_code == NGHTTP2_REFUSED_STREAM) {
+                    classified = ProxyTransaction::RESULT_GOAWAY_UNPROCESSED;
+                    reason_label = "h2 stream refused — peer did not process";
+                    classification_label = "GOAWAY_UNPROCESSED";
+                } else if (goaway_seen_ &&
+                           stream_id <= goaway_last_stream_id_) {
+                    classified =
+                        ProxyTransaction::RESULT_GOAWAY_MAYBE_PROCESSED;
+                    reason_label = "h2 stream closed mid-drain after "
+                                   "GOAWAY — peer may have processed";
+                    classification_label = "GOAWAY_MAYBE_PROCESSED";
+                }
+                // Per-branch trace so operators can correlate retry
+                // classification with stream lifecycle from logs alone.
+                logging::Get()->info(
+                    "H2 stream close classified={} stream={} code={} "
+                    "goaway_seen={} goaway_last={}",
+                    classification_label, stream_id, error_code,
+                    goaway_seen_, goaway_last_stream_id_);
                 stream->sink->OnError(
-                    ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
-                    "h2 stream closed with error code=" +
+                    classified,
+                    std::string(reason_label) + " code=" +
                         std::to_string(error_code));
             }
         }
@@ -692,8 +874,8 @@ void UpstreamH2Connection::OnHeadersComplete(int32_t stream_id,
     }
 
     const bool bodyless_status =
-        (stream->response_head.status_code == 204 ||
-         stream->response_head.status_code == 304 ||
+        (stream->response_head.status_code == HttpStatus::NO_CONTENT ||
+         stream->response_head.status_code == HttpStatus::NOT_MODIFIED ||
          stream->request_method == "HEAD");
 
     if (bodyless_status) {
@@ -758,28 +940,55 @@ UpstreamH2Stream* UpstreamH2Connection::GetStream(int32_t stream_id) {
 bool UpstreamH2Connection::IsUsable() const {
     if (dead_ || !session_ || goaway_seen_ || !cfg_) return false;
     if (cfg_->max_concurrent_streams_pref == 0) return false;
-    return streams_.size() < cfg_->max_concurrent_streams_pref;
+    uint32_t cap = cfg_->max_concurrent_streams_pref;
+    if (session_) {
+        uint32_t peer = nghttp2_session_get_remote_settings(
+            session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
+        if (peer > 0 && peer < cap) cap = peer;
+    }
+    return static_cast<uint32_t>(active_streams_) < cap;
 }
 
 void UpstreamH2Connection::MarkDead() {
     dead_ = true;
 }
 
+void UpstreamH2Connection::SetPartition(PoolPartition* partition) {
+    partition_ = partition;
+    partition_alive_ = partition ? partition->alive_token() : nullptr;
+}
+
 void UpstreamH2Connection::AdoptLease(UpstreamLease lease) {
+    // Convert a per-request lease bump into long-lived H2 donation so
+    // the drain predicate (which consults inflight_leases_ only) does
+    // not stall observability flush on idle H2 sessions. Skip the swap
+    // for empty leases (no bump to convert) and when partition_ has
+    // not been wired yet (unit tests that construct sessions without
+    // installing them into a partition).
+    if (!lease.empty() && partition_ != nullptr && !lease.IsDonatedToH2()) {
+        partition_->ConvertLeaseBumpToDonatedH2();
+        lease.MarkDonatedToH2();
+    }
     lease_ = std::move(lease);
 }
 
 void UpstreamH2Connection::FailAllStreams(int error_code,
                                           const std::string& reason) {
-    if (streams_.empty()) return;
+    if (streams_.empty()) {
+        active_streams_ = 0;
+        return;
+    }
     auto streams = std::move(streams_);
     streams_.clear();
+    active_streams_ = 0;
     // Drain queue entries for these streams are now stale — sinks are
     // about to be invoked via OnError and must not fire request-side
     // virtuals afterwards. Clear the whole queue: no other streams are
     // left to attribute drained bytes to.
     drain_queue_.clear();
     bytes_in_drain_queue_ = 0;
+    // Stream ids in the deferred-erase queue are now stale.
+    pending_erase_streams_.clear();
     for (auto& kv : streams) {
         if (kv.second && kv.second->sink) {
             kv.second->sink->OnError(error_code, reason);
@@ -801,7 +1010,7 @@ void UpstreamH2Connection::ResetStream(int32_t stream_id) {
     // already moved on (e.g. a retry in progress). The drain-queue
     // sweep removes any not-yet-fired progress/submitted entries for
     // this stream so they don't later dispatch to the nulled sink.
-    if (it->second) it->second->sink = nullptr;
+    DetachSink(stream_id);
     DropDrainEntriesForStream(stream_id);
     int rv = nghttp2_submit_rst_stream(session_, NGHTTP2_FLAG_NONE, stream_id, NGHTTP2_CANCEL);
 
@@ -811,6 +1020,46 @@ void UpstreamH2Connection::ResetStream(int32_t stream_id) {
             stream_id, rv);
     }
     if (!in_receive_data_) FlushSend();
+}
+
+void UpstreamH2Connection::DetachSink(int32_t stream_id) {
+    auto it = streams_.find(stream_id);
+    if (it == streams_.end() || !it->second) return;
+    it->second->sink = nullptr;
+    if (it->second->peer_already_closed_ && !it->second->pending_erase_) {
+        it->second->pending_erase_ = true;
+        pending_erase_streams_.push_back(stream_id);
+    }
+}
+
+void UpstreamH2Connection::RunDeferredEraseWalk() {
+    bool slot_freed = false;
+    while (!pending_erase_streams_.empty()) {
+        int32_t sid = pending_erase_streams_.front();
+        pending_erase_streams_.pop_front();
+        auto it = streams_.find(sid);
+        if (it == streams_.end()) continue;
+        if (!it->second || !it->second->pending_erase_) continue;
+        streams_.erase(it);
+        if (active_streams_ <= 0) {
+            logging::Get()->warn(
+                "UpstreamH2Connection: active_streams_ underflow on "
+                "sid={} — invariant violated", sid);
+        } else {
+            --active_streams_;
+            slot_freed = true;
+        }
+    }
+    // Wake H2_STREAM_SLOT waiters when a slot frees. TODO: no enqueuer
+    // in production yet (waits on ProxyTransaction → UpstreamLease
+    // h2_lease_ migration).
+    if (slot_freed && partition_ && transport_ && !dead_ && !goaway_seen_) {
+        partition_->DrainH2StreamWaitersForHost(
+            partition_->service_name(), transport_->upstream_port());
+        // ANY-kind waiters (TotalCount-cap dedup) can multiplex onto the
+        // freshly-vacated slot via the empty-lease fast path.
+        partition_->DrainAnyWaitersForFastH2();
+    }
 }
 
 void UpstreamH2Connection::EnqueueFrameForDrain(int32_t stream_id,
@@ -1077,6 +1326,7 @@ int32_t UpstreamH2Connection::SubmitRequest(
 
     stream->stream_id = stream_id;
     streams_[stream_id] = std::move(stream);
+    ++active_streams_;
     last_activity_at_ = std::chrono::steady_clock::now();
 
     if (!in_receive_data_) {
@@ -1089,9 +1339,13 @@ int32_t UpstreamH2Connection::SubmitRequest(
             // dead so FindUsable evicts it instead of handing it to
             // another caller for SubmitRequest, which would also fail.
             auto it = streams_.find(stream_id);
-            if (it != streams_.end()) {
-                if (it->second) it->second->sink = nullptr;
-                streams_.erase(it);
+            if (it != streams_.end() && it->second) {
+                it->second->sink = nullptr;
+                it->second->peer_already_closed_ = true;
+                if (!it->second->pending_erase_) {
+                    it->second->pending_erase_ = true;
+                    pending_erase_streams_.push_back(stream_id);
+                }
             }
             MarkDead();
             return -1;
