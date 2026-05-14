@@ -320,7 +320,8 @@ void RunAllTest(){
     // Upstream pool gauge / histogram emits — connections.idle/active
     // UpDownCounters across every transition site, checkout.wait.duration
     // outcomes (immediate / created / queued_satisfied / rejected /
-    // cancelled), and shutdown / eviction drain-to-zero invariants.
+    // cancelled / queue_timeout), and shutdown / eviction drain-to-zero
+    // invariants.
     ObservabilityPoolGaugesTests::RunAllTests();
 
     // Middleware-layer emit (DNS resolver + rate-limit manager) —
@@ -428,7 +429,8 @@ void PrintUsage(const char* program_name) {
     std::cout << "                          latches at H1 first parse / H2 preface / WS handoff" << std::endl;
     std::cout << "  obs_pool_gauges    Upstream pool gauges — connections.idle/active UpDownCounters" << std::endl;
     std::cout << "                     across every transition site, checkout.wait.duration outcomes" << std::endl;
-    std::cout << "                     (immediate / created / queued_satisfied / rejected / cancelled)" << std::endl;
+    std::cout << "                     (immediate / created / queued_satisfied / rejected /" << std::endl;
+    std::cout << "                      cancelled / queue_timeout)" << std::endl;
     std::cout << "  obs_middleware_metrics  DNS resolves{outcome} closed-set enum, rate-limit" << std::endl;
     std::cout << "                          decisions{zone, decision} (admit/reject/dry_run_reject)," << std::endl;
     std::cout << "                          tokens histogram, null-manager safety guards" << std::endl;

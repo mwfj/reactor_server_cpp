@@ -9,7 +9,8 @@
 //       label {reactor.upstream.service}
 //   * reactor.upstream.pool.checkout.wait.duration — Histogram,
 //       labels {reactor.upstream.service, outcome}
-//       outcome ∈ {immediate, created, queued_satisfied, rejected, cancelled}
+//       outcome ∈ {immediate, created, queued_satisfied, rejected,
+//                  cancelled, queue_timeout}
 //
 // Tests boot a real gateway HttpServer in front of a real backend
 // HttpServer (the proxy path exercises every transition site —

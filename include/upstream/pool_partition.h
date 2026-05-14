@@ -414,7 +414,9 @@ private:
     void EmitIdleGaugeDelta(double delta);
     void EmitActiveGaugeDelta(double delta);
     // duration_sec ≈ 0 for immediate / rejected; positive for created /
-    // queued_satisfied / cancelled. outcome label allowlist enforced by
-    // the catalog cap (cap=6, see metrics_catalog.cc).
+    // queued_satisfied / cancelled / queue_timeout. outcome label
+    // allowlist enforced by the catalog cap (cap=8, see
+    // metrics_catalog.cc — 6 documented outcomes + two slots of
+    // headroom).
     void EmitCheckoutWaitDuration(double duration_sec, const char* outcome);
 };
