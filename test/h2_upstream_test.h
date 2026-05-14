@@ -629,12 +629,10 @@ void TestTickAllKeepsLiveConnections() {
     }
 }
 
-// A8 — UpstreamManager::CommitHttp2Snapshots ignores staged entries whose
-// names do not match any live partition (live-only narrow). The match-case
-// (live + staged-match) and the missing-from-staged case are covered by A9
-// and A9b respectively; this single test covers the remaining live-only
-// narrow semantic by driving through the production CommitHttp2Snapshots
-// path and observing partition state.
+// A8 — Live-only narrow: a staged entry whose name has no matching live
+// partition is silently ignored. Drives through CommitHttp2Snapshots and
+// observes that the staged "other" entry doesn't create a partition nor
+// mutate the live "backend" partition's snapshot.
 void TestCommitH2SnapshotsIgnoresStaleStagedEntry() {
     std::cout << "\n[TEST] H2Upstream A8: CommitHttp2Snapshots ignores staged entry with no live partition..." << std::endl;
     try {

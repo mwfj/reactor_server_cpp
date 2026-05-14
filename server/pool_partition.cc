@@ -643,14 +643,9 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
 }
 
 void PoolPartition::MoveConnToPendingDestroy(UpstreamH2Connection* conn) {
-    // Precondition: a PoolPartition serves exactly ONE upstream
-    // service (set by the ctor's service_name arg and asserted by
-    // h2_table_ keying — every Insert/Acquire/Drain site uses
-    // service_name_). The replacement target capture below uses
-    // service_name_ as the H2ConnectionTable key; if this invariant
-    // ever broadens (shared-pool routing, multi-name partition), this
-    // shortcut silently mis-keys the replacement and must be passed
-    // the key explicitly. See `service_name_` field docstring.
+    // Precondition: one service per partition (see `service_name_`).
+    // The replacement target below keys on service_name_; broadening
+    // to multi-name routing requires passing the key explicitly.
     if (!conn) return;
     auto owned = h2_table_.Extract(conn);
     if (!owned) {
@@ -1905,8 +1900,34 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
     // not apply, so the move triggers a heap allocation that can throw
     // bad_alloc. The try covers every such call (plus
     // RegisterOutboundCallbacks below) so a throw anywhere routes
-    // through the single catch-handler rollback rather than stranding
-    // partial wiring on the transport with `outstanding_conns_` bumped.
+    // through the rollback rather than stranding partial wiring on the
+    // transport with `outstanding_conns_` bumped.
+    //
+    // Shared rollback used by both catch blocks. The pitfall rule
+    // "bump + push + wire must be one transaction" needs BOTH std and
+    // non-std catches so rollback fires regardless of throw type. Drop
+    // `h2` BEFORE DestroyConnection so its safety-net dtor nulls H2
+    // transport callbacks first; ForceClose's close-cb chain then
+    // no-ops. outstanding_conns_ is decremented inline by
+    // DestroyConnection. No H2_STREAM_SLOT waiters can exist yet (this
+    // runs before any enqueue could land).
+    auto rollback = [&]() {
+        h2.reset();
+        if (auto owned = ExtractFromConnecting(raw_uc)) {
+            DestroyConnection(std::move(owned));
+            return;
+        }
+        // Transport vanished from connecting_conns_ between setup and
+        // rollback — almost certainly a synchronous close-cb chain
+        // already extracted it. outstanding_conns_ was bumped at
+        // CreateNewConnection but never decremented if DestroyConnection
+        // didn't run; surface the leak.
+        logging::Get()->error(
+            "OpenNewH2Connection rollback: ExtractFromConnecting "
+            "returned null for {}:{} — outstanding_conns_ may have "
+            "leaked unless the close-callback chain decremented it",
+            upstream_name, port);
+    };
     try {
         auto timed_out = std::make_shared<bool>(false);
         conn_handler->SetDeadlineTimeoutCb([timed_out]() {
@@ -1967,46 +1988,17 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
         conn_handler->SetErrorCb(std::move(classify_and_dispatch));
 
         conn_handler->RegisterOutboundCallbacks();
-    } catch (...) {
-        // Widen to catch (...) so non-std::exception throws (raw ints,
-        // library escapes, throw "...") still hit the rollback path —
-        // otherwise outstanding_conns_ is bumped, the transport is
-        // pushed to connecting_conns_, and the bump leaks. The pitfall
-        // rule "bump + push + wire must be one transaction" assumes the
-        // catch covers the full transaction regardless of throw type.
-        const char* what_text = "unknown exception";
-        try {
-            std::rethrow_exception(std::current_exception());
-        } catch (const std::exception& e) {
-            what_text = e.what();
-        } catch (...) {
-            // Leave default; non-std type, no portable message.
-        }
+    } catch (const std::exception& e) {
         logging::Get()->error(
             "OpenNewH2Connection: setup failed for {}:{}: {}",
-            upstream_name, port, what_text);
-        // Drop `h2` BEFORE DestroyConnection so its safety-net dtor
-        // nulls H2 transport callbacks first; ForceClose's close-cb
-        // chain then no-ops. outstanding_conns_ is decremented inline
-        // by DestroyConnection. No H2_STREAM_SLOT waiters can exist
-        // yet (this runs before any enqueue could land).
-        h2.reset();
-        if (auto owned = ExtractFromConnecting(raw_uc)) {
-            DestroyConnection(std::move(owned));
-        } else {
-            // Transport vanished from connecting_conns_ between this
-            // function's setup and the rollback path — almost certainly
-            // a synchronous close-cb chain that already extracted it.
-            // outstanding_conns_ was bumped at CreateNewConnection but
-            // never decremented if DestroyConnection didn't run; surface
-            // the leak so future refactors that widen this race don't
-            // hide it.
-            logging::Get()->error(
-                "OpenNewH2Connection rollback: ExtractFromConnecting "
-                "returned null for {}:{} — outstanding_conns_ may have "
-                "leaked unless the close-callback chain decremented it",
-                upstream_name, port);
-        }
+            upstream_name, port, e.what());
+        rollback();
+        return false;
+    } catch (...) {
+        logging::Get()->error(
+            "OpenNewH2Connection: setup failed for {}:{} (non-std exception)",
+            upstream_name, port);
+        rollback();
         return false;
     }
 
@@ -2166,33 +2158,32 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     // complete_callback synchronously on a writable transport.
     // try/catch covers std::function moves that can heap-allocate;
     // see UPSTREAM_H2.md "Set*Cb between fetch_add and try-block".
+    // Shared cleanup for both catch blocks below. ClearTransportCallbacks
+    // alone is not sufficient: SetOnMessageCb is wired first, so a
+    // mid-wire throw can leave an OnMessage closure live on the
+    // transport that captured `shell.get()`. fail() routes through
+    // `shell->DestroyOnDispatcher()` which flips conn_alive_->false
+    // BEFORE freeing the shell; any surviving callback's alive-token
+    // guard short-circuits before dereferencing the destroyed shell.
+    auto wire_cleanup = [&]() {
+        if (uc_raw) ClearTransportCallbacks(uc_raw);
+        fail(CHECKOUT_CONNECT_FAILED, "h2 wire-callbacks threw");
+    };
     try {
         WireH2SessionTransportCallbacks(uc_raw, shell.get());
-    } catch (...) {
-        // catch (...) so non-std::exception throws still route through
-        // the cleanup path — same widening rationale as
-        // OpenNewH2Connection's outer rollback.
-        const char* what_text = "unknown exception";
-        try {
-            std::rethrow_exception(std::current_exception());
-        } catch (const std::exception& e) {
-            what_text = e.what();
-        } catch (...) {
-            // Non-std type, no portable message.
-        }
+    } catch (const std::exception& e) {
         logging::Get()->error(
             "OnH2ConnectHandshakeComplete: WireH2SessionTransportCallbacks "
             "threw for {}:{}: {}",
-            upstream_name, port, what_text);
-        if (uc_raw) ClearTransportCallbacks(uc_raw);
-        // ClearTransportCallbacks alone is not sufficient: SetOnMessageCb
-        // is wired first, so a mid-wire throw can leave an OnMessage
-        // closure live on the transport that captured `shell.get()`.
-        // fail() routes through `shell->DestroyOnDispatcher()` which
-        // flips conn_alive_->false BEFORE freeing the shell; any
-        // surviving callback's alive-token guard short-circuits before
-        // dereferencing the destroyed shell.
-        fail(CHECKOUT_CONNECT_FAILED, "h2 wire-callbacks threw");
+            upstream_name, port, e.what());
+        wire_cleanup();
+        return;
+    } catch (...) {
+        logging::Get()->error(
+            "OnH2ConnectHandshakeComplete: WireH2SessionTransportCallbacks "
+            "threw non-std exception for {}:{}",
+            upstream_name, port);
+        wire_cleanup();
         return;
     }
 
