@@ -188,22 +188,11 @@ public:
     // True after MarkDead() has been called.
     bool IsDead() const { return dead_; }
 
-    // Dispatcher-thread polite teardown. Six-step ordering:
-    //   1. Flip conn_alive_ → false so in-flight dual-token captures
-    //      observe destruction on next acquire-load.
-    //   2. Null every transport callback so a queued epoll/kqueue
-    //      event cannot dispatch into the dying session.
-    //   3. Remove any deadline-timer registration for this fd.
-    //   4. Mark the transport CLOSING so ReturnConnection routes
-    //      through DestroyConnection (transport teardown + outstanding
-    //      conn accounting) instead of returning to idle.
-    //   5. Reset the donated lease — its destructor fires
-    //      ReturnConnection, which observes the CLOSING flag and
-    //      destroys the transport.
-    //   6. Set destroyed_on_dispatcher_ so the destructor's safety net
-    //      no-ops on the eventual unique_ptr drop.
-    // Idempotent on second call; short-circuits when `transferred_`
-    // (H1 adoption path) has consumed the transport.
+    // Dispatcher-thread polite teardown. Idempotent; short-circuits on
+    // `transferred_` (H1 adoption consumed the transport). The six-step
+    // ordering (alive-flip → callback-null → timer-remove → CLOSING →
+    // lease-reset → destroyed_on_dispatcher_) is implemented in the .cc
+    // and locked by the step-by-step comments at the call site.
     void DestroyOnDispatcher();
 
     // True after a TakeShellForH1Adoption hand-off has consumed the
@@ -219,14 +208,6 @@ public:
     // reaches shells that never called Init() (no nghttp2_session_*
     // to release).
     void MarkTransferred() { transferred_ = true; }
-    // Roll back the transferred_ flag — used by exception-safety
-    // envelopes around adoption call sites. If MarkTransferred fires
-    // before AdoptAsH1Connection / ReclassifyH2WaitersToAny throw, the
-    // safety-net dtor would skip ClearH2TransportCallbacks (transferred_
-    // short-circuit) while the transport's ownership state is
-    // ambiguous. Resetting the flag restores the dtor's full teardown
-    // path.
-    void ClearTransferredForRollback() { transferred_ = false; }
 
     // Null the raw `transport_` pointer. Used by ALPN-h1 adoption
     // catch handlers when AdoptAsH1Connection throws BEFORE committing

@@ -216,15 +216,13 @@ public:
     static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
 
 private:
-    // True iff the H2 conn pointer is set and BOTH alive tokens still
-    // observe the session as live. Pair-invariant: h2_conn_,
-    // h2_conn_alive_, and h2_partition_alive_ are set together and
-    // reset together. Today partition teardown destroys every H2 conn
-    // first (flipping conn_alive_), so the partition check is
-    // defense-in-depth — but it matches UpstreamLease's two-token
-    // semantic byte-for-byte so the future migration to
-    // UpstreamLease h2_lease_ is a behavioral no-op at this site.
+    // True iff h2_conn_ is set and BOTH alive tokens still observe the
+    // session as live. Pair-invariant (the three fields are mutated
+    // together at 3 sites) makes the pointer check redundant today;
+    // kept as defense-in-depth so the impl matches the contract docs
+    // and mirrors UpstreamLease's two-token semantic byte-for-byte.
     bool H2ConnAlive() const noexcept {
+        if (h2_conn_ == nullptr) return false;
         if (!h2_conn_alive_ ||
             !h2_conn_alive_->load(std::memory_order_acquire)) {
             return false;

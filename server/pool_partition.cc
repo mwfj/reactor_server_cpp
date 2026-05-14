@@ -152,39 +152,20 @@ PoolPartition::~PoolPartition() {
     // Atomic write — stops new purge chains from being scheduled.
     alive_->store(false, std::memory_order_release);
 
-    // The destructor cannot safely walk containers off-thread (close
-    // callbacks fired by dispatcher channel events can mutate them
-    // concurrently). Instead, enqueue a task that runs on the dispatcher
-    // thread and does ALL the work: walk containers, collect transports,
-    // clear callbacks. Then wait for the task to complete via inflight_tasks_.
-    //
-    // The inflight counter uses an RAII guard so the decrement fires even
-    // if EnQueue drops the task (dispatcher stopped mid-shutdown). Without
-    // this, a lossy EnQueue would leak the counter and the destructor
-    // would hang forever.
+    // All destruction-sensitive work runs on the dispatcher (close
+    // callbacks fired by channel events can mutate the same containers
+    // off-thread). RAII inflight-guard fires the decrement even if
+    // EnQueue is dropped by a stopped dispatcher.
 
     auto on_dispatcher = [this]() {
-        // On dispatcher thread — single-threaded, no concurrent mutation.
-        // Safe to walk containers and touch connection transports.
-        // Drop H2 sessions FIRST so their nghttp2_session destructors
-        // run before the underlying transports get their callbacks
-        // nulled (the H2 connection's lease destructor returns the
-        // transport to the pool and the pool walk below frees them).
-        // ~UpstreamH2Connection nulls its transport callbacks BEFORE
-        // running terminate_session + FlushSend, so a stray incoming-
-        // bytes event during the destruction window cannot reenter
-        // HandleBytes on a session about to be torn down. This is
-        // independent of SendRaw's was_stopped() drop — closes the
-        // door on a future SendRaw refactor that removes that check.
+        // H2 sessions destruct FIRST so their nghttp2 + transport-
+        // callback teardown lands here, before the underlying transports
+        // (in connecting_conns_ / active_conns_) get their callbacks
+        // nulled below. h2_connecting_conns_, pending_destroy_h2_conns_,
+        // and pending_h2_replacement_targets_ are cleared on the
+        // dispatcher for the same reason. See UPSTREAM_H2.md /
+        // UPSTREAM_PROXY.md for the full ordering invariant.
         h2_table_.Clear();
-        // Drop H2 cold-start probe shells and pending-destroy stash on
-        // the dispatcher thread so each shell's ~UpstreamH2Connection
-        // safety-net path (transport callback unwire + MarkClosing +
-        // FlushSend of any terminate_session GOAWAY) runs here rather
-        // than spilling to whatever thread happens to call ~PoolPartition.
-        // The underlying transports live in connecting_conns_ /
-        // active_conns_ (cleared right below) so transport_->MarkClosing
-        // inside the H2 dtors does not UAF.
         h2_connecting_conns_.clear();
         pending_destroy_h2_conns_.clear();
         pending_h2_replacement_targets_.clear();
@@ -223,20 +204,10 @@ PoolPartition::~PoolPartition() {
         on_dispatcher();
     }
 
-    // Wait for all in-flight dispatcher tasks to complete. Every lambda
-    // that touches `this` increments inflight_tasks_ before enqueue and
-    // decrements via RAII guard, so this counter is accurate even under
-    // lossy EnQueue (dispatcher stopped mid-shutdown).
-    //
-    // No timeout — we MUST wait. A stale task firing after the destructor
-    // returns would dereference freed members. inflight_tasks_ is a
-    // shared_ptr<atomic>, so it outlives the partition safely.
-    //
-    // If this destructor is running ON the dispatcher thread (standalone
-    // teardown from a pool callback), the queued tasks cannot drain by
-    // themselves — the loop thread is us, blocked here. Drain them
-    // inline via ProcessPendingTasks. Without this, the destructor
-    // deadlocks under load whenever a purge/shutdown task is still queued.
+    // Unbounded wait: a stale task firing post-destructor would UAF
+    // freed members. inflight_tasks_ is shared_ptr<atomic>, outlives
+    // the partition. ProcessPendingTasks inline-drains when this dtor
+    // runs on the dispatcher itself (self-teardown from a pool cb).
     int iteration = 0;
     while (inflight_tasks_->load(std::memory_order_acquire) > 0) {
         if (dispatcher_ && dispatcher_->is_on_loop_thread()) {
@@ -538,21 +509,10 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
         }
     }
 
-    // Capacity-aware fan-out. Each fired waiter synchronously dispatches
-    // through TryDispatchExistingH2Session → SubmitRequest which bumps
-    // active_streams_. Over-firing under a tight max_concurrent_streams
-    // cap would fail siblings inside SubmitRequest's IsUsable() gate
-    // (returns -1), even though they won the dequeue race. Refuse to
-    // admit unless FindUsable still reports a slot is available.
-    //
-    // continue vs break on FindUsable=null: FindUsable is deterministic
-    // across iterations of THIS drain — ready_callback creates no new
-    // sessions and the live h2_table_ entry only sheds capacity, never
-    // gains it. So once FindUsable returns null it stays null; continue
-    // and break are observationally equivalent on the !h2 branch.
-    // continue is chosen for symmetry with the shutdown-flip branch
-    // which DOES need to drain remaining entries into the requeue
-    // deque.
+    // Capacity-aware fan-out — re-check FindUsable each iteration so we
+    // never over-fire past max_concurrent_streams (siblings would lose
+    // SubmitRequest's IsUsable gate). continue (not break) preserves
+    // the shutdown-flip branch's requeue contract.
     std::deque<WaitEntry> requeue;
     for (size_t i = 0; i < matched.size(); ++i) {
         WaitEntry& e = matched[i];
@@ -632,20 +592,10 @@ void PoolPartition::ReapPendingDestroyH2Conns() {
         pending_h2_replacement_targets_.empty()) {
         return;
     }
-    // Snapshot BOTH containers together BEFORE running destroy. A
-    // destroy step's callback chain (sink OnError →
-    // ProxyTransaction::Cleanup → ResetStream → late GOAWAY handling)
-    // could re-enter MoveConnToPendingDestroy, which appends to BOTH
-    // pending_destroy_h2_conns_ and pending_h2_replacement_targets_.
-    // If we snapshot targets AFTER destroy, the newly-appended target
-    // is picked up here while its newly-appended victim sits unmoved
-    // in pending_destroy_h2_conns_ — StartH2ReplacementConnect runs
-    // BEFORE that victim's slot is freed, and under
-    // pool.max_connections=1 the cap-gate rejects the probe and the
-    // target is silently lost.
-    // Both snapshots taken together. Reentrant additions stay in the
-    // members for the NEXT reap, where they get paired correctly
-    // (victim destroyed → slot freed → target drained).
+    // Snapshot BOTH containers together — MoveConnToPendingDestroy
+    // appends to both; a destroy-chain reentrant call must leave them
+    // paired for the NEXT reap (else cap-gate rejects the probe and
+    // the target is silently lost under tight caps). See UPSTREAM_PROXY.md.
     auto victims = std::move(pending_destroy_h2_conns_);
     pending_destroy_h2_conns_.clear();
     auto targets = std::move(pending_h2_replacement_targets_);
@@ -777,22 +727,11 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn,
         return;
     }
 
-    // Endpoint generation check on return. A reload that atomic-stored a
-    // new resolved_endpoint_ between this connection's checkout and its
-    // return leaves the connection bound to the OLD IP. The downstream
-    // CheckoutAsync / ServiceWaitQueue idle-pop sites already reject
-    // mismatched endpoints, but two paths in this function bypass that
-    // gate by reusing `owned` synchronously without going through
-    // idle_conns_:
-    //   (1) the over-idle-cap direct waiter handoff below pops a waiter
-    //       and hands it `owned` after only ValidateConnection — never
-    //       consulting ConnectionEndpointMatches.
-    //   (2) the trailing ServiceWaitQueue() fires while `owned` is still
-    //       at the front of idle_conns_ (just pushed); the queued waiter
-    //       could grab a stale-IP keepalive that was returned post-swap.
-    // Failing closed at the entry guarantees a returning post-swap
-    // connection is destroyed + a fresh-endpoint replacement is created
-    // for any queued waiter via CreateForWaiters.
+    // Endpoint generation check on return. Two synchronous reuse paths
+    // below (over-idle-cap direct handoff + trailing ServiceWaitQueue
+    // grabbing this conn off the front of idle_conns_) bypass the
+    // CheckoutAsync endpoint gate, so a post-reload-swap conn could
+    // serve a queued waiter on a stale IP. Fail closed at entry.
     if (!ConnectionEndpointMatches(*owned)) {
         DestroyConnection(std::move(owned));
         CreateForWaiters();
@@ -946,20 +885,10 @@ std::shared_ptr<void> PoolPartition::MakeInflightGuard() {
 UpstreamH2Connection* PoolPartition::FindUsableH2Connection(
     const std::string& upstream_name)
 {
-    // After a hostname re-resolution, an existing session pinned to the
-    // old IP must NOT serve fresh requests; mark it dead so future
-    // FindUsable() skips it. In-flight streams on that connection are
-    // deliberately NOT failed here — mirrors the H1 keepalive reuse
-    // contract that lets requests already on the wire complete
-    // naturally. Three paths reap the dead connection afterwards:
-    // (a) normal stream completion drains active_stream_count to 0 and
-    //     TickAll's `IsDead() && empty` branch erases the entry;
-    // (b) transport close/error fires SetCloseCb / SetErrorCb (wired
-    //     in AcquireH2Connection's construct branch) which run
-    //     FailAllStreams + the table walker erases on the next Tick;
-    // (c) endpoint loss times out via ping_timeout_sec /
-    //     goaway_drain_timeout_sec, Tick returns false, FailAllStreams
-    //     fires, table walker erases.
+    // Post-reload IP swap: mark stale-endpoint session dead so
+    // FindUsable() skips it; in-flight streams complete naturally
+    // (H1-keepalive parity). Reaped by stream-completion, transport
+    // close/error, or ping/GOAWAY-drain timeout.
     if (auto* existing = h2_table_.FindUsable(upstream_name)) {
         UpstreamConnection* t = existing->transport();
         if (t && ConnectionEndpointMatches(*t)) {
@@ -1233,21 +1162,11 @@ void PoolPartition::InitiateShutdown() {
         if (!alive->load(std::memory_order_acquire)) return;
     }
 
-    // Retire H2 sessions explicitly. Each session holds a donated
-    // UpstreamLease whose destructor decrements outstanding_conns_ via
-    // ReturnConnection → DestroyConnection (shutting_down_ branch).
-    // Without this, an idle H2 session would keep its lease alive
-    // until ~PoolPartition's dispatcher lambda calls h2_table_.Clear()
-    // — but that runs AFTER WaitForDrain blocks on outstanding_conns_,
-    // so the manager destructor deadlocks until WAIT_FOR_DRAIN_TIMEOUT.
-    //
-    // Mid-loop bailout safety: if `alive` flips between iterations,
-    // `h2_to_destroy` is a local vector whose unique_ptr dtors run on
-    // this thread at scope exit. Each safety-net dtor performs
-    // memory-only ops (MarkDead, FailAllStreams, terminate_session,
-    // FlushSend, MarkClosing); the only sink-emitter (FlushSend) routes
-    // SendRaw through ConnectionHandler which handles cross-thread via
-    // EnQueue. Safe to bail out — the dtors complete the teardown.
+    // Retire H2 sessions explicitly so each donated lease releases its
+    // outstanding_conns_ slot BEFORE WaitForDrain blocks. Otherwise
+    // idle H2 sessions wedge the manager destructor until drain
+    // timeout (see UPSTREAM_PROXY.md). Mid-loop `alive` flip is safe:
+    // local unique_ptr dtors complete the teardown at scope exit.
     auto h2_to_destroy = h2_table_.ExtractAll();
     for (auto& conn : h2_to_destroy) {
         if (conn) conn->DestroyOnDispatcher();
@@ -1928,16 +1847,11 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
         logging::Get()->error(
             "OpenNewH2Connection: setup failed for {}:{}: {}",
             upstream_name, port, e.what());
-        // The shell `h2` has not been inserted into h2_connecting_conns_
-        // yet — drop it before the rollback so its dtor's safety-net
-        // (which nulls SetCloseCb / SetErrorCb on the transport) runs
-        // BEFORE DestroyConnection's ForceClose. After h2.reset() the
-        // transport has no H2 close-cb installed, so the ForceClose
-        // close-callback chain is a no-op for H2 purposes; the
-        // outstanding_conns_ decrement is handled inline by
-        // DestroyConnection. No queued H2_STREAM_SLOT waiters exist
-        // for this key at this point (OpenNewH2Connection runs before
-        // any waiter could enqueue), so no fan-out is needed.
+        // Drop `h2` BEFORE DestroyConnection so its safety-net dtor
+        // nulls H2 transport callbacks first; ForceClose's close-cb
+        // chain then no-ops. outstanding_conns_ is decremented inline
+        // by DestroyConnection. No H2_STREAM_SLOT waiters can exist
+        // yet (this runs before any enqueue could land).
         h2.reset();
         if (auto owned = ExtractFromConnecting(raw_uc)) {
             DestroyConnection(std::move(owned));
@@ -2044,17 +1958,11 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
                                     "transport vanished pre-h1-adoption");
             return;
         }
-        // Exception-safe adoption sequence:
-        //  1. AdoptAsH1Connection takes `owned_uc` by REFERENCE and
-        //     commits via push_back at the end. If it throws (e.g.
-        //     push_back bad_alloc, callback wiring fails), owned_uc
-        //     still owns the transport — the caller must destroy it
-        //     AND null shell->transport_ to prevent the shell's
-        //     safety-net dtor from dereferencing a freed transport.
-        //  2. MarkTransferred fires ONLY after the commit succeeds.
-        //     A late ReclassifyH2WaitersToAny throw after MarkTransferred
-        //     is harmless: the H2 shell's dtor short-circuits via
-        //     transferred_, the transport is alive in idle_conns_.
+        // Commit-at-end adoption: AdoptAsH1Connection is by-ref and
+        // commits via push_back. On throw, owned_uc still owns the
+        // transport; rollback nulls shell->transport_ + destroys.
+        // MarkTransferred fires post-commit so the shell's safety-net
+        // dtor stays armed until adoption is durable.
         try {
             AdoptAsH1Connection(owned_uc);  // by ref; commits at end
         } catch (...) {
@@ -2082,17 +1990,9 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     }
 
     if (!shell) {
-        // Distinguish the two shapes for shutdown-ordering forensics:
-        // - shell-only-missing (uc_raw still present): a concurrent
-        //   teardown reached the shell map first; uc_raw needs explicit
-        //   destruction here.
-        // - dual-null (uc_raw also vanished): a concurrent shutdown
-        //   reaped both the shell AND the transport from connecting_conns_
-        //   before this disposition path ran; nothing left to free, and
-        //   FailH2StreamSlotWaiters is a no-op today (no production
-        //   enqueuer) — so this branch returns silently otherwise. Log
-        //   at debug so a future shutdown-ordering regression has a
-        //   diagnostic trail.
+        // Shell-only-missing: extract + destroy uc_raw inline.
+        // Dual-null (concurrent shutdown reaped both): debug-log only —
+        // nothing to free, FailH2StreamSlotWaiters is a no-op today.
         if (!uc_raw) {
             logging::Get()->debug(
                 "OnH2ConnectHandshakeComplete: shell AND transport both "
@@ -2111,18 +2011,10 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         return;
     }
 
-    // Wire the multiplexed-H2-session transport callbacks BEFORE Init().
-    // Init()'s preface flush can fire complete_callback synchronously on
-    // a writable transport (DoSendRaw direct-write path) — the same
-    // contract AcquireH2Connection's in-place promotion path observes.
-    // Without this, the freshly-promoted session would have no path for
-    // response bytes (no OnMessage → no HandleBytes) and the probe-phase
-    // SetCloseCb / SetErrorCb would still point at the failure-disposition
-    // closures (semantically wrong after h2_table_ insertion). Wrapped
-    // in try/catch because each Set*Cb assignment moves a std::function
-    // whose closure can trigger heap allocation that throws bad_alloc;
-    // a mid-wire throw would otherwise orphan uc_raw in connecting_conns_
-    // with outstanding_conns_ leaked.
+    // Wire callbacks BEFORE Init() — its preface flush can fire
+    // complete_callback synchronously on a writable transport.
+    // try/catch covers std::function moves that can heap-allocate;
+    // see UPSTREAM_H2.md "Set*Cb between fetch_add and try-block".
     try {
         WireH2SessionTransportCallbacks(uc_raw, shell.get());
     } catch (const std::exception& e) {
@@ -2231,17 +2123,11 @@ void PoolPartition::StartH2ReplacementConnect(
         return;
     }
     if (TotalCount() >= partition_max_connections_) {
-        // Cap-saturated probe rejection is the failure mode that
-        // motivated the pending_h2_replacement_targets_ deque. The
-        // OnGoawayReceived call site queues a target via
-        // MoveConnToPendingDestroy BEFORE this inline call — under
-        // pool.max_connections=1 the dying session still occupies the
-        // slot, so this branch is the EXPECTED no-op; the post-recv
-        // ReapPendingDestroyH2Conns retries successfully. Suppress to
-        // debug when the target is already pending (design-target
-        // case). Steady-state cap pressure with no pending target is
-        // worth a warn because queued waiters will time out at
-        // MAX_QUEUE_AGE otherwise.
+        // Cap-saturated. Under pool.max_connections=1 the OnGoawayReceived
+        // call site is the EXPECTED no-op (dying session still occupies
+        // the slot; post-recv reap retries successfully) — debug-log
+        // when the target is already queued. Otherwise warn because
+        // queued waiters will time out at MAX_QUEUE_AGE.
         const bool already_pending = std::find(
             pending_h2_replacement_targets_.begin(),
             pending_h2_replacement_targets_.end(),
@@ -2268,13 +2154,12 @@ void PoolPartition::StartH2ReplacementConnect(
 void PoolPartition::AdoptAsH1Connection(
     std::unique_ptr<UpstreamConnection>& conn) {
     if (!conn) return;
-    // Pre-commit work first. Any throw here leaves `conn` unchanged
-    // (caller still owns it) so the H2 shell's transport_ raw pointer
-    // does not dangle while the caller's catch routes the transport
-    // through DestroyConnection. WirePoolCallbacks's std::function
-    // assignments and SetDeadline are the realistic throw sites
-    // (std::bad_alloc on SBO→heap promotion is unlikely but
-    // possible).
+    // Pre-commit work. A mid-wire throw leaves `conn` STILL OWNING
+    // the transport (the unique_ptr is untouched until push_back) —
+    // the transport's callbacks may be partially mutated, but the
+    // caller's catch routes through DestroyConnection which calls
+    // ClearTransportCallbacks to null all 5 cleanly. Realistic throw
+    // sites: WirePoolCallbacks's std::function moves and SetDeadline.
     WirePoolCallbacks(conn.get());
 
     static constexpr auto FAR_FUTURE_ADOPT = std::chrono::hours(24 * 365);
