@@ -93,7 +93,14 @@ std::unique_ptr<UpstreamH2Connection> H2ConnectionTable::Extract(
 
 std::vector<std::unique_ptr<UpstreamH2Connection>>
 H2ConnectionTable::ExtractAll() {
+    // Count first + reserve so push_back below is noexcept — without
+    // this, a mid-loop bad_alloc would leave by_upstream_ in
+    // moved-but-not-cleared state (null entries in the vectors,
+    // skipped clear()) on rethrow.
+    size_t total = 0;
+    for (auto& [_, conns] : by_upstream_) total += conns.size();
     std::vector<std::unique_ptr<UpstreamH2Connection>> out;
+    out.reserve(total);
     for (auto& [_, conns] : by_upstream_) {
         for (auto& c : conns) {
             if (c) out.push_back(std::move(c));

@@ -1203,7 +1203,12 @@ void PoolPartition::InitiateShutdown() {
     // outstanding_conns_ slot BEFORE WaitForDrain blocks. Otherwise
     // idle H2 sessions wedge the manager destructor until drain
     // timeout (see UPSTREAM_PROXY.md). Mid-loop `alive` flip is safe:
-    // local unique_ptr dtors complete the teardown at scope exit.
+    // local unique_ptr dtors complete the teardown at scope exit via
+    // the safety-net path. The safety-net omits step-3 timer-removal
+    // (RemoveTimerConnectionIfMatch is a dispatcher-only op), so any
+    // deadline-timer registration on the transport survives — that's
+    // harmless under shutdown because the dispatcher is being torn
+    // down and timer ticks no longer fan out.
     auto h2_to_destroy = h2_table_.ExtractAll();
     for (auto& conn : h2_to_destroy) {
         if (conn) conn->DestroyOnDispatcher();
@@ -1817,7 +1822,17 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
     // routes ReturnConnection through the active-conn path.
     outstanding_conns_.fetch_add(1, std::memory_order_relaxed);
     UpstreamConnection* raw_uc = upstream_conn.get();
-    connecting_conns_.push_back(std::move(upstream_conn));
+    // push_back is the move's commit point. unique_ptr's noexcept
+    // move-constructor pairs with vector's strong-exception guarantee
+    // for reallocation, but the catch below still rolls back
+    // outstanding_conns_ in case bad_alloc somehow escapes (cheap
+    // defense; the main throw path is the Set*Cb block below).
+    try {
+        connecting_conns_.push_back(std::move(upstream_conn));
+    } catch (...) {
+        outstanding_conns_.fetch_sub(1, std::memory_order_release);
+        throw;
+    }
 
     // Each Set*Cb below moves a std::function whose closure captures
     // alive / timed_out / raw_uc — at sizes large enough that SBO does

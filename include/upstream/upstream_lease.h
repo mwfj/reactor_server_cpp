@@ -98,7 +98,19 @@ public:
     }
     UpstreamConnection* operator->() const { return Get(); }
     explicit operator bool() const {
-        if (kind_ == Kind::H1) return conn_ != nullptr;
+        if (kind_ == Kind::H1) {
+            if (conn_ == nullptr) return false;
+            // partition_alive guard mirrors Release()'s gate: if the
+            // token is present AND observed dead, the lease outlived
+            // its partition → false. Token-absent (detached lease in
+            // test fixtures, where partition_=nullptr too) accepts
+            // conn_ alone — matches Release()'s null-partition skip.
+            if (partition_alive_ &&
+                !partition_alive_->load(std::memory_order_acquire)) {
+                return false;
+            }
+            return true;
+        }
         if (kind_ == Kind::H2) {
             if (h2_conn_ == nullptr) return false;
             if (!partition_alive_ ||

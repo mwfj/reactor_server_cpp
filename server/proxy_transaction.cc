@@ -946,8 +946,12 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
     if (!upstream_conn) {
         // Empty lease from DrainAnyWaitersForFastH2 — a multiplexed
         // session became usable while we were queued. Re-try the H2
-        // fast path; on miss (session gone, prefer disagrees, etc.)
-        // fall through to the existing error/retry surface.
+        // fast path; on miss (session evicted in the race window
+        // between drain decision and dispatch) route through
+        // MaybeRetry(CONNECT_FAILURE) for parity with the
+        // error_callback path (OnCheckoutError). The race is exactly
+        // the case where retry is appropriate — upstream is healthy,
+        // we just lost a slot to a sibling.
         if (TryDispatchExistingH2Session()) {
             return;
         }
@@ -955,8 +959,12 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
         if (DeliverPendingRetryable5xxResponse("checkout_empty_lease")) {
             return;
         }
-        OnError(RESULT_CHECKOUT_FAILED,
-                "Checkout returned empty lease");
+        logging::Get()->warn(
+            "ProxyTransaction empty-lease H2 dispatch miss client_fd={} "
+            "service={} attempt={} — routing through MaybeRetry",
+            client_fd_, service_name_, attempt_);
+        ReportBreakerOutcome(RESULT_CHECKOUT_FAILED);
+        MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
     }
 
