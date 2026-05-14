@@ -633,6 +633,14 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
 }
 
 void PoolPartition::MoveConnToPendingDestroy(UpstreamH2Connection* conn) {
+    // Precondition: a PoolPartition serves exactly ONE upstream
+    // service (set by the ctor's service_name arg and asserted by
+    // h2_table_ keying — every Insert/Acquire/Drain site uses
+    // service_name_). The replacement target capture below uses
+    // service_name_ as the H2ConnectionTable key; if this invariant
+    // ever broadens (shared-pool routing, multi-name partition), this
+    // shortcut silently mis-keys the replacement and must be passed
+    // the key explicitly. See `service_name_` field docstring.
     if (!conn) return;
     auto owned = h2_table_.Extract(conn);
     if (!owned) {
@@ -1949,10 +1957,24 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
         conn_handler->SetErrorCb(std::move(classify_and_dispatch));
 
         conn_handler->RegisterOutboundCallbacks();
-    } catch (const std::exception& e) {
+    } catch (...) {
+        // Widen to catch (...) so non-std::exception throws (raw ints,
+        // library escapes, throw "...") still hit the rollback path —
+        // otherwise outstanding_conns_ is bumped, the transport is
+        // pushed to connecting_conns_, and the bump leaks. The pitfall
+        // rule "bump + push + wire must be one transaction" assumes the
+        // catch covers the full transaction regardless of throw type.
+        const char* what_text = "unknown exception";
+        try {
+            std::rethrow_exception(std::current_exception());
+        } catch (const std::exception& e) {
+            what_text = e.what();
+        } catch (...) {
+            // Leave default; non-std type, no portable message.
+        }
         logging::Get()->error(
             "OpenNewH2Connection: setup failed for {}:{}: {}",
-            upstream_name, port, e.what());
+            upstream_name, port, what_text);
         // Drop `h2` BEFORE DestroyConnection so its safety-net dtor
         // nulls H2 transport callbacks first; ForceClose's close-cb
         // chain then no-ops. outstanding_conns_ is decremented inline
@@ -2136,11 +2158,22 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     // see UPSTREAM_H2.md "Set*Cb between fetch_add and try-block".
     try {
         WireH2SessionTransportCallbacks(uc_raw, shell.get());
-    } catch (const std::exception& e) {
+    } catch (...) {
+        // catch (...) so non-std::exception throws still route through
+        // the cleanup path — same widening rationale as
+        // OpenNewH2Connection's outer rollback.
+        const char* what_text = "unknown exception";
+        try {
+            std::rethrow_exception(std::current_exception());
+        } catch (const std::exception& e) {
+            what_text = e.what();
+        } catch (...) {
+            // Non-std type, no portable message.
+        }
         logging::Get()->error(
             "OnH2ConnectHandshakeComplete: WireH2SessionTransportCallbacks "
             "threw for {}:{}: {}",
-            upstream_name, port, e.what());
+            upstream_name, port, what_text);
         if (uc_raw) ClearTransportCallbacks(uc_raw);
         // ClearTransportCallbacks alone is not sufficient: SetOnMessageCb
         // is wired first, so a mid-wire throw can leave an OnMessage
