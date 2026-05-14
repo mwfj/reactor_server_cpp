@@ -223,12 +223,16 @@ private:
     // and mirrors UpstreamLease's two-token semantic byte-for-byte.
     bool H2ConnAlive() const noexcept {
         if (h2_conn_ == nullptr) return false;
-        if (!h2_conn_alive_ ||
-            !h2_conn_alive_->load(std::memory_order_acquire)) {
-            return false;
-        }
+        // Canonical order: partition_alive THEN conn_alive — matches
+        // UpstreamLease::operator bool() H2 branch + GetH2Connection()
+        // for byte-for-byte parity. Future readers verifying the
+        // invariant get the same load sequence at every site.
         if (!h2_partition_alive_ ||
             !h2_partition_alive_->load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (!h2_conn_alive_ ||
+            !h2_conn_alive_->load(std::memory_order_acquire)) {
             return false;
         }
         return true;

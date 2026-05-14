@@ -666,6 +666,17 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
         // h2_table_ keys on service_name(), not transport upstream_host
         // (logging literal).
         partition_->MoveConnToPendingDestroy(this);
+        // Reentrancy invariant: this runs INSIDE the mem_recv2 callback
+        // frame. StartH2ReplacementConnect synchronously enters
+        // OpenNewH2Connection which installs connect/handshake/close
+        // callbacks on the new transport. Those callbacks MUST NOT
+        // fire synchronously inside this call stack — they capture
+        // `this` (the partition) and a sync close-cb would walk
+        // wait_queue_ while HandleBytes may still be iterating. Today
+        // they're dispatcher-scheduled (one loop turn away) so the
+        // invariant holds. Future maintainers wiring synchronous
+        // close-cb paths in OpenNewH2Connection MUST defer via
+        // EnQueue to preserve this.
         partition_->StartH2ReplacementConnect(
             partition_->service_name(), transport_->upstream_port());
     }

@@ -11,6 +11,16 @@
 #include <cassert>
 #include <future>
 
+// ── Shutdown-strand invariant ─────────────────────────────────────────
+// ~PoolPartition's on_dispatcher lambda clears wait_queue_ WITHOUT
+// firing error_callback on remaining entries. Any code path that
+// observes shutting_down_ mid-loop must fan out CHECKOUT_SHUTTING_DOWN
+// to its snapshotted entries INLINE rather than requeue-and-bail —
+// otherwise the owning ProxyTransaction strands until its response
+// timeout. The Drain* helpers below repeat this guard at 3 points
+// (entry, mid-loop, post-requeue) to cover every observation window;
+// see UPSTREAM_PROXY.md for the original failure mode.
+
 // ── UpstreamLease out-of-line definitions ──────────────────────────────
 // These live here because the destructor/Release need the complete
 // PoolPartition type (forward-declared in upstream_lease.h).
@@ -33,25 +43,37 @@ void UpstreamLease::Release() {
     const bool partition_live = partition_ && partition_alive_ &&
         partition_alive_->load(std::memory_order_acquire);
 
-#ifndef NDEBUG
     // Dispatcher-thread-only invariant. Release calls into
     // partition_->ReturnConnection / ReturnH2Stream which mutate
     // idle_conns_ / active_conns_ / h2_table_ — all dispatcher-locked-
-    // by-convention with no internal mutex. A cross-thread Release would
-    // race those containers. Assert in debug builds only because the
-    // invariant is enforced socially today; if a future async drop site
-    // violates it, this fires loudly.
+    // by-convention with no internal mutex. A cross-thread Release
+    // would race those containers AND corrupt inflight_leases_ /
+    // donated_h2_leases_ accounting. Hard-reject in BOTH debug and
+    // release builds: debug-assert + warn-log + skip the partition
+    // mutations (counter corruption avoided, lease still resets local
+    // fields so the destructor stays well-defined). The H2 lease shape
+    // in this PR adds more lease holders → social discipline alone is
+    // weaker insurance than before.
+    bool off_dispatcher = false;
     if (partition_live && partition_->dispatcher() &&
         !partition_->dispatcher()->is_on_loop_thread()) {
+        off_dispatcher = true;
         logging::Get()->error(
             "UpstreamLease::Release: called off the partition dispatcher "
-            "thread — container mutation race");
+            "thread (kind={}) — skipping partition return to avoid "
+            "container/counter race",
+            kind_ == Kind::H1 ? "H1"
+                              : kind_ == Kind::H2 ? "H2" : "EMPTY");
+#ifndef NDEBUG
         assert(false &&
                "UpstreamLease::Release must run on partition dispatcher");
-    }
 #endif
+    }
 
-    if (kind_ == Kind::H1 && partition_live && conn_) {
+    if (off_dispatcher) {
+        // Skip partition mutation entirely. Counter corruption is the
+        // worse failure mode; a lost return is bounded (single lease).
+    } else if (kind_ == Kind::H1 && partition_live && conn_) {
         partition_->ReturnConnection(conn_, donated_to_h2_);
     } else if (kind_ == Kind::H2 && partition_live && h2_conn_ &&
                conn_alive_ &&
@@ -851,18 +873,22 @@ void PoolPartition::ReturnH2Stream(
     UpstreamH2Connection* h2_conn, int32_t stream_id,
     std::shared_ptr<std::atomic<bool>> /*partition_alive*/,
     std::shared_ptr<std::atomic<bool>> /*conn_alive*/) {
-    // Reaching this entry means an UpstreamLease::Kind::H2 destructor
-    // ran without a wired H2-lease vending path. Stream teardown today
-    // is driven by OnStreamClose / ResetStream / RunDeferredEraseWalk
-    // — silent no-op here would mask a future caller that DOES vend
-    // H2 leases via this API but forgot to drain the waiter queue.
+    // Reachable today through tests that construct H2-kind UpstreamLease
+    // objects with a live partition (see TestUpstreamLeaseKindH2AliveGates
+    // pattern) and let them destruct. Stream teardown in production
+    // still flows through OnStreamClose / ResetStream / RunDeferredEraseWalk
+    // — this entry is forward-work for the H2 lease-vending migration on
+    // ProxyTransaction. Warn level (not error) because the call path
+    // exists for tests; the warning still surfaces if a future
+    // production caller forgets the wait-queue drain.
     // FIXME: implement DrainH2StreamWaitersForHost dispatch once the
     // h2_lease_ migration on ProxyTransaction lands.
-    logging::Get()->error(
-        "BUG: PoolPartition::ReturnH2Stream called without a wired "
-        "H2-lease vending path (h2_conn={}, stream_id={}) — H2 stream "
-        "slot release dropped; queued H2_STREAM_SLOT waiters will not "
-        "be admitted.",
+    logging::Get()->warn(
+        "PoolPartition::ReturnH2Stream invoked (h2_conn={}, stream_id={}) "
+        "— H2 lease-vending path is forward-work; queued H2_STREAM_SLOT "
+        "waiters will NOT be admitted via this release path. Expected in "
+        "test fixtures; production callers must wait for the h2_lease_ "
+        "migration.",
         static_cast<const void*>(h2_conn), stream_id);
 }
 
