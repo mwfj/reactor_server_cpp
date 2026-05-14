@@ -6,9 +6,11 @@
 #include "upstream/upstream_lease.h"
 #include "upstream/upstream_callbacks.h"
 #include "upstream/h2_connection_table.h"
+#include "upstream/host_port_key.h"
 #include "config/server_config.h"
 #include "net/dns_resolver.h"    // ResolvedEndpoint — held via atomic shared_ptr
 #include <condition_variable>
+#include <unordered_set>
 // <memory>, <functional>, <deque>, <vector>, <chrono>, <atomic>, <mutex> provided by common.h
 
 // Forward declaration
@@ -22,6 +24,10 @@ public:
     using ErrorCallback = UPSTREAM_CALLBACKS_NAMESPACE::ErrorCallback;
 
     // Checkout error codes
+    // Success sentinel — emitted on the wait-queue admission path so
+    // callers using the same int channel for outcome and error code
+    // can disambiguate "admitted" from "rejected with code N".
+    static constexpr int CHECKOUT_OK              =  0;
     static constexpr int CHECKOUT_POOL_EXHAUSTED  = -1;
     static constexpr int CHECKOUT_CONNECT_FAILED  = -2;
     static constexpr int CHECKOUT_CONNECT_TIMEOUT = -3;
@@ -32,8 +38,13 @@ public:
     // this to RESULT_CIRCUIT_OPEN so the queued client gets the same
     // circuit-open response a fresh requester would get.
     static constexpr int CHECKOUT_CIRCUIT_OPEN    = -6;
+    // Wait queue rejected the enqueue at the MAX_WAIT_QUEUE_SIZE cap.
+    // Used by EnqueueH2StreamSlotWaiter when the bounded queue is full
+    // even after PurgeCancelledWaitEntries.
+    static constexpr int CHECKOUT_QUEUE_FULL      = -7;
 
     PoolPartition(std::shared_ptr<Dispatcher> dispatcher,
+                  const std::string& service_name,
                   const std::string& upstream_host, int upstream_port,
                   const std::string& sni_hostname,
                   std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> resolved_endpoint,
@@ -41,6 +52,9 @@ public:
                   std::shared_ptr<TlsClientContext> tls_ctx,
                   std::atomic<int64_t>& outstanding_conns,
                   std::atomic<int64_t>& inflight_leases,
+                  std::atomic<int64_t>& donated_h2_leases,
+                  std::shared_ptr<std::atomic<int64_t>>
+                      off_dispatcher_release_drops,
                   std::atomic<bool>& manager_shutting_down,
                   std::mutex& drain_mtx,
                   std::condition_variable& drain_cv);
@@ -51,24 +65,100 @@ public:
     PoolPartition& operator=(const PoolPartition&) = delete;
 
     // Async checkout (dispatcher-thread-only, no locking).
-    // NOTE: ready_cb or error_cb may be invoked synchronously before this
-    // function returns (e.g., when a valid idle connection is available or
-    // the pool is immediately exhausted). Callers must not hold any lock
-    // that the callback itself might attempt to acquire.
-    //
-    // Optional `cancel_token`: a shared atomic flag the caller may set
-    // to abort a queued checkout. The pool checks it on every pop and
-    // also proactively sweeps the queue for cancelled entries when the
-    // queue would otherwise reject a new CheckoutAsync for fullness.
-    // Cancelled entries are dropped without firing any callback. This
-    // prevents a burst of disconnected clients from filling the bounded
-    // wait queue with dead waiters that would otherwise block live
-    // requests with queue-full / queue-timeout errors.
+    // ready_cb / error_cb may fire SYNCHRONOUSLY before return (idle
+    // hit or immediate exhaustion); callers must hold no lock the cb
+    // might re-acquire. Optional `cancel_token` aborts queued entries
+    // without firing callbacks — prevents dead waiters from stalling
+    // live requests when clients disconnect.
     void CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb,
                        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr);
 
     // Return a connection to the pool. Called by UpstreamLease destructor.
-    void ReturnConnection(UpstreamConnection* conn);
+    // `was_donated_to_h2` flips the decrement target: donated leases
+    // owned by an H2 session drop the manager's donated_h2_leases_
+    // counter instead of inflight_leases_, so the shutdown drain
+    // predicate (which consults inflight_leases_ only) does not block
+    // on long-lived multiplexed sessions.
+    void ReturnConnection(UpstreamConnection* conn,
+                          bool was_donated_to_h2 = false);
+
+    // Return an H2 stream slot to the partition. Alive tokens were
+    // validated by the lease before this call.
+    // TODO: dispatch DrainH2StreamWaitersForHost from the body so
+    // queued H2_STREAM_SLOT waiters get admitted on slot release.
+    void ReturnH2Stream(UpstreamH2Connection* h2_conn, int32_t stream_id,
+                        std::shared_ptr<std::atomic<bool>> partition_alive,
+                        std::shared_ptr<std::atomic<bool>> conn_alive);
+
+    // Push an H2_STREAM_SLOT entry onto the wait queue. Called from
+    // CheckoutAsync's H2-cold-start path and from H2 capacity-defer
+    // sites. `upstream_name` is the partition's service identifier
+    // (matches `service_name()`), NOT the operator host string —
+    // wait-queue admission and `h2_table_` lookups key on the same
+    // name future transactions use.
+    void EnqueueH2StreamSlotWaiter(
+        const std::string& upstream_name, int port,
+        ReadyCallback ready_cb, ErrorCallback error_cb,
+        std::shared_ptr<std::atomic<bool>> cancel_token);
+
+    // Walk wait_queue_, admit every H2_STREAM_SLOT entry targeting
+    // (upstream_name, port) onto a usable H2 connection. Called by
+    // UpstreamH2Connection::RunDeferredEraseWalk when a slot frees, and
+    // by ALPN-h2-success paths once a fresh session is in h2_table_.
+    void DrainH2StreamWaitersForHost(const std::string& upstream_name,
+                                     int port);
+
+    // Walk wait_queue_, fire empty-lease ready_cb for every ANY-kind
+    // entry. Each waiter's ProxyTransaction::OnCheckoutReady redirects
+    // empty-lease to TryDispatchExistingH2Session, multiplexing onto the
+    // session that just promoted. Called from ALPN-h2-success paths
+    // (cold-start dedup with `pool.max_connections` near 1) and from
+    // slot-release walks once a usable session exists.
+    void DrainAnyWaitersForFastH2();
+
+    // Walk wait_queue_, fire `error_cb(connect_outcome)` for every
+    // H2_STREAM_SLOT entry targeting (upstream_name, port). Called on
+    // replacement-connect failure / ALPN-not-h2-under-prefer-always /
+    // shutdown teardown of in-flight probes.
+    void FailH2StreamSlotWaiters(const std::string& upstream_name, int port,
+                                 int connect_outcome,
+                                 const std::string& reason);
+
+    // Extract `conn`'s owning unique_ptr from `h2_table_` and push onto
+    // `pending_destroy_h2_conns_` for post-recv-tick destruction.
+    // Called from OnGoawayReceived's GOAWAY-idle branch (no surviving
+    // streams).
+    void MoveConnToPendingDestroy(UpstreamH2Connection* conn);
+
+    // Snapshot pending_destroy_h2_conns_ into a local vector, then
+    // invoke `DestroyOnDispatcher` on each before letting the local
+    // vector lapse. Called at the tail of the H2 recv chain
+    // (HandleBytes post-flush) and from shutdown paths.
+    void ReapPendingDestroyH2Conns();
+
+    // Idempotent replacement-connect: skip if (upstream_name, port)
+    // already has an in-flight probe in h2_connecting_conns_, an active
+    // session in h2_table_, or the pool is at cap. Called from
+    // OnGoawayReceived's GOAWAY-idle branch to start a fresh session
+    // before existing waiters time out. `upstream_name` MUST match the
+    // partition's `service_name()` so the promoted session lives under
+    // the same h2_table_ key future transactions look up via
+    // `AcquireH2Connection(service_name_, ...)`.
+    void StartH2ReplacementConnect(const std::string& upstream_name, int port);
+
+    // ALPN-h1 adoption: claim an H2 probe's transport for the H1 idle
+    // pool (prefer="auto" path from OnH2ConnectHandshakeComplete).
+    // By-ref + commit-at-end (push_back is the commit point): on throw,
+    // `conn` is unchanged so the caller can route it through
+    // DestroyConnection. outstanding_conns_ is NOT touched (already
+    // accounted by the probe; ownership transfers). See
+    // UPSTREAM_H2.md ALPN-h1 rollback pitfall.
+    void AdoptAsH1Connection(std::unique_ptr<UpstreamConnection>& conn);
+
+    // Flip every H2_STREAM_SLOT waiter targeting (upstream_name, port)
+    // to kind=ANY so the next ServiceWaitQueue idle-pop admits them
+    // from the adopted H1 idle pool. Called after AdoptAsH1Connection.
+    void ReclassifyH2WaitersToAny(const std::string& upstream_name, int port);
 
     // Evict expired idle connections. Called by timer handler.
     void EvictExpired();
@@ -94,26 +184,12 @@ public:
     // completion. Same pattern as ScheduleInitiateShutdown.
     void ScheduleForceCloseActive();
 
-    // Drain the wait queue on a CLOSED → OPEN breaker trip.
-    //
-    // Every live waiter receives CHECKOUT_CIRCUIT_OPEN (mapped by
-    // ProxyTransaction::OnCheckoutError to RESULT_CIRCUIT_OPEN, emitting
-    // the §12.1 circuit-open response). Cancelled waiters are dropped
-    // silently — the transaction already tore its side down via the
-    // framework abort hook. Does NOT set shutting_down_ (this is a
-    // transient drain, not a shutdown); the partition keeps its
-    // connections for HALF_OPEN probing when the open window elapses.
-    //
-    // Dispatcher-thread-only. The breaker's transition callback fires
-    // on the slice's owning dispatcher thread — the SAME dispatcher
-    // that owns this partition (one slice ↔ one partition by
-    // dispatcher_index). No enqueue needed.
-    //
-    // Rationale: without this drain, a queued waiter admitted by
-    // ConsultBreaker just before the trip would wait out the full
-    // `open_duration_ms` (up to 60s by default) before the pool's
-    // queue timeout rejects it. That's a visible latency spike for
-    // clients who are about to be served 503 anyway.
+    // Drain the wait queue on a CLOSED → OPEN breaker trip — every
+    // live waiter gets CHECKOUT_CIRCUIT_OPEN immediately rather than
+    // waiting out `open_duration_ms` for a queue-timeout reject.
+    // Dispatcher-thread-only (slice + partition share the same
+    // dispatcher by dispatcher_index). Does NOT set shutting_down_;
+    // partition keeps its conns for HALF_OPEN probing.
     void DrainWaitQueueOnTrip();
 
     bool IsShuttingDown() const {
@@ -178,31 +254,57 @@ public:
     //
     // Dispatcher-thread-only — runs on the same dispatcher as
     // ProxyTransaction since `dispatcher_index_` lines up.
-    std::shared_ptr<UpstreamH2Connection> AcquireH2Connection(
+    UpstreamH2Connection* AcquireH2Connection(
         const std::string& upstream_name, UpstreamLease& lease);
 
-    // Pre-checkout fast path: returns a usable H2 session for
-    // `upstream_name` if one already exists in the partition's H2 table
-    // AND its transport matches the partition's currently-published
-    // resolved_endpoint_. Returns null otherwise. Used by
-    // ProxyTransaction::AttemptCheckout to bypass CheckoutAsync when a
-    // multiplexed session is reusable — without this, with
-    // pool.max_connections set near 1 the donated H2 transport
-    // permanently occupies the only pool slot and subsequent requests
-    // would queue forever instead of multiplexing onto the existing
-    // session. Idempotent with AcquireH2Connection's reuse branch.
-    // Dispatcher-thread-only.
-    std::shared_ptr<UpstreamH2Connection> FindUsableH2Connection(
+    // Pre-checkout fast path: returns a usable H2 session matching the
+    // partition's published resolved_endpoint_, null otherwise. Bypasses
+    // CheckoutAsync so a donated H2 transport doesn't permanently
+    // occupy the only pool slot under pool.max_connections=1.
+    // Idempotent with AcquireH2Connection's reuse branch. Lifetime
+    // owned by h2_table_; capture `conn->alive_token()` for
+    // destroy-safe access. Dispatcher-thread-only.
+    UpstreamH2Connection* FindUsableH2Connection(
         const std::string& upstream_name);
 
     // Stats (dispatcher-thread-only reads)
     size_t IdleCount() const { return idle_conns_.size(); }
     size_t ActiveCount() const { return active_conns_.size(); }
     size_t ConnectingCount() const { return connecting_conns_.size(); }
+    size_t H2TableCount() const { return h2_table_.TotalConnections(); }
+
+    // Partition liveness token. Captured by callers that outlive a
+    // partition-destroy (delayed dispatcher tasks, donated H2 leases,
+    // ProxyTransaction H2 path). The shared_ptr keeps the atomic alive
+    // even after the partition destructs; observers consult it via
+    // memory_order_acquire load before dereferencing the partition.
+    std::shared_ptr<std::atomic<bool>> alive_token() const { return alive_; }
+    size_t H2ConnectingCount() const { return h2_connecting_conns_.size(); }
     size_t TotalCount() const {
-        return idle_conns_.size() + active_conns_.size() + connecting_conns_.size();
+        // H2 sessions hold their donated transport in active_conns_; H2
+        // probe shells hold theirs in connecting_conns_. Adding the
+        // h2_table_ / h2_connecting_conns_ sizes here would double-count
+        // every H2 transport against the partition's max_connections cap
+        // — with max_connections=1, a single multiplexed session would
+        // wedge replacement attempts forever.
+        return idle_conns_.size() + active_conns_.size() +
+               connecting_conns_.size();
     }
     size_t WaitQueueSize() const { return wait_queue_.size(); }
+
+    // Non-owning observer of the owning dispatcher. Used by H2 conns
+    // (via the partition back-pointer) to drive timer cleanup during
+    // DestroyOnDispatcher's step 3.
+    Dispatcher* dispatcher() const { return dispatcher_.get(); }
+
+    // shared_ptr accessor for lease vending. UpstreamLease captures
+    // this so the off-dispatcher Release check (`is_on_loop_thread`)
+    // can fire without dereferencing the partition pointer — the
+    // partition can race destruction between the alive observation
+    // and the dispatcher access, so partition_->dispatcher() is
+    // unsafe on that path. The shared_ptr keeps the Dispatcher alive
+    // independently of the partition's lifetime.
+    std::shared_ptr<Dispatcher> dispatcher_ptr() const { return dispatcher_; }
 
     // Test-only: the effective SNI string the partition forwards to
     // `TlsConnection` when it originates TLS to the upstream. Empty
@@ -215,8 +317,71 @@ public:
         return sni_hostname_;
     }
 
+    // The caller-facing service identifier this partition was constructed
+    // for. Used by `UpstreamH2Connection`'s replacement-connect path to
+    // key future probes / h2_table_ inserts under the same name future
+    // transactions look up. Safe to call from any thread —
+    // `service_name_` is ctor-initialised and never mutated.
+    const std::string& service_name() const { return service_name_; }
+
+    // Called by UpstreamH2Connection::AdoptLease to convert a per-request
+    // lease bump into long-lived H2 donation. Caller already +1'd
+    // inflight_leases_. Bump donated FIRST then decrement inflight so
+    // a concurrent reader of `inflight + donated` never sees a dip
+    // below the true total (monotonic-overcount instead of undercount).
+    void ConvertLeaseBumpToDonatedH2() {
+        donated_h2_leases_.fetch_add(1, std::memory_order_acq_rel);
+        inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    // Accessor used by UpstreamLease construction sites — the heap-owned
+    // counter is captured by every lease so off-dispatcher Release()
+    // can bump it without dereferencing the partition (which may be
+    // mid-destruction). Returns the partition-stored shared_ptr (same
+    // heap object as UpstreamManager's owning pointer).
+    std::shared_ptr<std::atomic<int64_t>> OffDispatcherReleaseDropsPtr()
+        const noexcept {
+        return off_dispatcher_release_drops_;
+    }
+
+#ifdef REACTOR_BUILDING_TESTS
+    // Test-only: insert a fully-Init'd `UpstreamH2Connection` (typically
+    // built with a null transport in unit-test fixtures) into the
+    // partition's h2_table_. Production paths funnel through
+    // `AcquireH2Connection` (in-place promotion) and
+    // `OnH2ConnectHandshakeComplete` (cold-start probe success) which
+    // carry the full transport + lease + callback wiring. Tests that
+    // exercise the partition's wait-queue / drain helpers without a
+    // real socket use this entry point to skip the connect probe.
+    // Dispatcher-thread-only — mutates h2_table_ without a barrier.
+    void InsertH2ConnectionForTesting(
+        const std::string& upstream_name,
+        std::unique_ptr<UpstreamH2Connection> conn);
+
+    // Test-only: directly seed pending_h2_replacement_targets_. The
+    // production path goes through MoveConnToPendingDestroy(conn), but
+    // that requires a transport-bearing conn (the null-transport
+    // branch correctly skips target capture). Tests that exercise the
+    // paired-snapshot ordering of ReapPendingDestroyH2Conns use this
+    // entry to populate the deque without spinning up a real socket.
+    // Dispatcher-thread-only.
+    void SeedPendingReplacementTargetForTesting(int port);
+
+    // Test-only: observe the current size of
+    // pending_h2_replacement_targets_. Used by regression tests that
+    // need to verify the deque was drained after ReapPendingDestroyH2Conns.
+    // Dispatcher-thread-only.
+    size_t PendingReplacementTargetCountForTesting() const {
+        return pending_h2_replacement_targets_.size();
+    }
+#endif  // REACTOR_BUILDING_TESTS
+
 private:
     std::shared_ptr<Dispatcher> dispatcher_;
+    // h2_table_ / wait-queue key. NOT upstream_host_ (operator literal,
+    // logging only) — promoted sessions must live under the same name
+    // future transactions look up via AcquireH2Connection(service_name).
+    std::string service_name_;
     std::string upstream_host_;     // Original operator host (hostname OR literal). LOGGING ONLY — connect reads resolved_endpoint_.
     int upstream_port_;              // Original operator port. Logs / fallback SNI port.
     std::string sni_hostname_;       // Empty = use upstream_host_ for SNI
@@ -241,6 +406,13 @@ private:
     // ready_cb is invoked with a fresh lease; decremented in
     // ReturnConnection when the lease's destructor releases.
     std::atomic<int64_t>& inflight_leases_;
+    std::atomic<int64_t>& donated_h2_leases_;
+    // Heap-owned counter shared with UpstreamManager and every
+    // UpstreamLease vended by this partition. shared_ptr (not
+    // reference) so the lease can capture it independently of the
+    // partition's lifetime — Release() bumps via the captured pointer
+    // even if the partition is concurrently destructing.
+    std::shared_ptr<std::atomic<int64_t>> off_dispatcher_release_drops_;
     std::atomic<bool>& manager_shutting_down_;  // Set immediately by manager
     std::mutex& drain_mtx_;
     std::condition_variable& drain_cv_;
@@ -259,6 +431,15 @@ private:
     // Cleaned up when leases release them via ReturnConnection.
     std::vector<std::unique_ptr<UpstreamConnection>> zombie_conns_;
 
+    // Wait-queue discriminator.
+    //   ANY: caller accepts the next available H1 idle connection OR a
+    //        fresh H2 session — the CheckoutAsync default.
+    //   H2_STREAM_SLOT: caller specifically wants an H2 stream slot on
+    //        a session for host:port. ServiceWaitQueue's idle-pop branch
+    //        must skip these entries; admission flows through
+    //        DrainH2StreamWaitersForHost.
+    enum class WaiterKind { ANY, H2_STREAM_SLOT };
+
     // Bounded wait queue
     struct WaitEntry {
         ReadyCallback ready_callback;
@@ -269,6 +450,15 @@ private:
         // true, the pool drops the entry on pop and skips firing its
         // callbacks. Nullable — regular checkouts leave this empty.
         std::shared_ptr<std::atomic<bool>> cancel_token;
+        WaiterKind kind = WaiterKind::ANY;
+        // Populated when kind == H2_STREAM_SLOT for replacement-connect
+        // targeting and DrainH2StreamWaitersForHost lookups. Stores the
+        // partition's service identifier (`service_name()`), NOT the
+        // operator host string — h2_table_ keys on the same name future
+        // transactions use via `AcquireH2Connection(service_name_, ...)`.
+        // Ignored when kind == ANY.
+        std::string upstream_name;
+        int port = 0;
     };
     std::deque<WaitEntry> wait_queue_;
     static constexpr size_t MAX_WAIT_QUEUE_SIZE = 256;
@@ -315,6 +505,35 @@ private:
     // (until GOAWAY drains the streams or PING timeout closes it).
     H2ConnectionTable h2_table_;
 
+    // Owned stash for H2 connection shells in TCP_CONNECTING /
+    // TLS_HANDSHAKE state — not yet visible to FindUsable on
+    // h2_table_. The keyset doubles as the in-flight-probe reservation
+    // set: concurrent CheckoutAsync calls for the same (host, port)
+    // dedup onto the existing probe by checking `.count(key) > 0`.
+    // Promoted into h2_table_ on ALPN-h2 success; destroyed via
+    // DestroyOnDispatcher on connect-fail / ALPN-h1-fallback / shutdown.
+    std::unordered_map<HostPortKey,
+        std::unique_ptr<UpstreamH2Connection>> h2_connecting_conns_;
+
+    // H2 connections whose sessions are fully retired (GOAWAY drained
+    // with no remaining active streams) and waiting for the post-recv
+    // tick to invoke DestroyOnDispatcher on each. Holding them here —
+    // rather than destroying inline — keeps nghttp2's stream-close
+    // callbacks from re-entering a partially-destroyed conn from
+    // inside the recv chain.
+    std::vector<std::unique_ptr<UpstreamH2Connection>> pending_destroy_h2_conns_;
+
+    // Replacement-connect targets deferred from OnGoawayReceived. Under
+    // max_connections=1 (and any tight cap where the GOAWAY'd session
+    // currently occupies the slot), OnGoawayReceived's immediate
+    // StartH2ReplacementConnect call short-circuits on the TotalCount
+    // cap because the dying transport still lives in active_conns_.
+    // ReapPendingDestroyH2Conns frees the slot, then drains this list
+    // by re-invoking StartH2ReplacementConnect. Captured at
+    // MoveConnToPendingDestroy time so the (service_name, port) tuple
+    // survives the H2 shell's destruction.
+    std::deque<HostPortKey> pending_h2_replacement_targets_;
+
     // True when a self-rescheduling wait-queue purge chain is already
     // scheduled. Prevents spawning duplicate chains per queued waiter.
     // Cleared when the chain terminates (queue empty or shutdown).
@@ -332,6 +551,23 @@ private:
     bool ValidateConnection(UpstreamConnection* conn);
     void ServiceWaitQueue();
     void PurgeExpiredWaitEntries();
+
+    // Cold-start H2 connect probe. Caller pre-conditions: cap +
+    // shutdown gates checked, no duplicate probe in h2_connecting_conns_,
+    // `upstream_name == service_name()` (keys h2_table_ insert). TLS
+    // required (no h2c cold-start); returns false if tls_ctx_ null.
+    bool OpenNewH2Connection(const std::string& upstream_name, int port);
+
+    // ALPN-resolve state machine. Called from the H2 shell's transport
+    // handshake-complete / close / error callbacks. `outcome` is one of
+    // the CHECKOUT_* sentinels (OK on TLS-handshake-success; FAILED /
+    // TIMEOUT / SHUTTING_DOWN on the failure paths). `alpn` is the
+    // negotiated ALPN string on the success path, empty on failure.
+    void OnH2ConnectHandshakeComplete(const std::string& upstream_name,
+                                      int port, int outcome,
+                                      const std::string& alpn);
+
+
     // Dispatcher-thread-only: close idle connections that captured old_ep.
     // Called from EnqueueIdleCleanupOnEndpointChange's enqueued task.
     void CloseIdleMatchingEndpointOnDispatcher(
@@ -347,6 +583,15 @@ private:
     // Called when returning a connection to idle — borrowers may have
     // overwritten the callbacks during their request.
     void WirePoolCallbacks(UpstreamConnection* conn);
+
+    // Install the multiplexed-H2-session transport callbacks (OnMessage,
+    // Close, Error, WriteProgress, Completion). Both the in-place promotion
+    // path (AcquireH2Connection) and the cold-start probe-success path
+    // (OnH2ConnectHandshakeComplete ALPN-h2 branch) must wire these
+    // BEFORE Init() — Init's preface flush can fire the completion
+    // callback synchronously on a writable transport.
+    void WireH2SessionTransportCallbacks(UpstreamConnection* up,
+                                         UpstreamH2Connection* raw);
 
     // Increment inflight_tasks_ and return an RAII guard that decrements it
     // on destruction. Capture the returned shared_ptr into any lambda

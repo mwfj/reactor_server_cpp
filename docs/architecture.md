@@ -211,6 +211,14 @@ The `/stats` response body is JSON. The top-level object contains legacy fields 
 | `last_reresolve_succeeded` | bool | Whether the most recent SIGHUP re-resolve attempt succeeded; absent if no reload has occurred |
 | `last_reresolve_error` | string | Error message from the last failed re-resolve; absent on success or no attempt |
 
+**`lease_health`** — upstream lease accounting (present only when at least one upstream is configured):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `active_leases` | int | Per-request `UpstreamLease` checkouts currently held by in-flight transactions. Drops to zero on quiescence. The shutdown-drain predicate consults this field — see `shutdown_drain_timeout_sec`. |
+| `donated_h2_leases` | int | Long-lived leases donated to multiplexed HTTP/2 sessions (one per live `UpstreamH2Connection`). Stays positive while the H2 session lives; excluded from the shutdown-drain predicate so idle multiplexed sessions don't wedge `Stop()`. |
+| `off_dispatcher_release_drops` | int | Safety counter — each increment is one `UpstreamLease::Release()` call invoked off the partition's dispatcher thread. Skipped the partition mutation to avoid container races; the per-request bump leaked. Should stay zero in healthy production. Non-zero values mean `Stop()` may wedge until `shutdown_drain_timeout_sec`. |
+
 **`dns`** — resolver and reload counters:
 
 | Field | Type | Description |

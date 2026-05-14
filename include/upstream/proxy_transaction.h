@@ -77,6 +77,24 @@ public:
     // serving CONNECT here would emit a malformed request. Terminal —
     // deterministic policy reject (502 BadGateway + X-H2-Limitation header).
     static constexpr int RESULT_H2_METHOD_NOT_SUPPORTED = -11;
+    // Peer sent GOAWAY with last_stream_id < our stream_id. Per RFC 9113
+    // §6.8 the peer provably did not process this request — connect-style
+    // retryable, breaker-neutral. Maps to 502 BadGateway in
+    // MakeErrorResponse.
+    static constexpr int RESULT_GOAWAY_UNPROCESSED  = -12;
+    // Peer sent GOAWAY with last_stream_id >= our stream_id, then
+    // dropped the stream before delivering a complete response.
+    // Per RFC 9113 §6.8 we don't know whether the peer processed it —
+    // retryable for idempotent methods, response-level backoff,
+    // breaker-neutral. Maps to 502 BadGateway in MakeErrorResponse.
+    static constexpr int RESULT_GOAWAY_MAYBE_PROCESSED = -13;
+    // `prefer = "always"` configured but peer did not negotiate h2 via
+    // ALPN. Deterministic policy reject — no upstream contact, no
+    // retry. Terminal — breaker-neutral (same shape as
+    // RESULT_H2_METHOD_NOT_SUPPORTED). Maps to 502 BadGateway with
+    // `X-H2-Limitation: alpn-not-h2` in MakeErrorResponse so operators
+    // see a distinct signal from generic checkout-failure.
+    static constexpr int RESULT_H2_ALPN_NOT_NEGOTIATED = -14;
 
     // Constructor copies all needed fields from client_request (method, path,
     // query, headers, body, params, dispatcher_index, client_ip, client_tls,
@@ -198,6 +216,41 @@ public:
     static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
 
 private:
+    // True iff h2_conn_ is set and BOTH alive tokens still observe the
+    // session as live. Pair-invariant (the three fields are mutated
+    // together at 3 sites) makes the pointer check redundant today;
+    // kept as defense-in-depth so the impl matches the contract docs
+    // and mirrors UpstreamLease's two-token semantic byte-for-byte.
+    bool H2ConnAlive() const noexcept {
+        if (h2_conn_ == nullptr) return false;
+        // Canonical order: partition_alive THEN conn_alive — matches
+        // UpstreamLease::operator bool() H2 branch + GetH2Connection()
+        // for byte-for-byte parity. Future readers verifying the
+        // invariant get the same load sequence at every site.
+        if (!h2_partition_alive_ ||
+            !h2_partition_alive_->load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (!h2_conn_alive_ ||
+            !h2_conn_alive_->load(std::memory_order_acquire)) {
+            return false;
+        }
+        return true;
+    }
+
+    // Allowlist for H2-path retries from OnError. H1 retries from
+    // OnUpstreamData; H2 retries flow through OnError because the H2
+    // codec surfaces every transport-level failure via sink->OnError
+    // rather than the parser-driven H1 path.
+    static bool IsH2RetryableCode(int result_code) noexcept;
+    // Map an H2-retryable result code to the RetryPolicy condition.
+    // Connect-style codes (peer never processed the stream) map to
+    // CONNECT_FAILURE so the first retry runs at zero delay; the rest
+    // route through UPSTREAM_DISCONNECT for the response-level backoff
+    // policy.
+    static RetryPolicy::RetryCondition MapH2CodeToRetryCondition(
+        int result_code) noexcept;
+
     // Bump h2_send_stall_generation_ and queue a fresh send-stall
     // closure for the full budget. Called from DispatchH2 at attempt
     // start. OnRequestBodyProgress does NOT call this directly —
@@ -371,9 +424,18 @@ private:
 
     // H2 dispatch state. `h2_path_` flips true once DispatchH2 has
     // successfully submitted a stream; cleanup paths gate H1-specific
-    // teardown on `!h2_path_`. The weak_ptr lets a mid-flight Cleanup
-    // / Cancel issue RST_STREAM if the H2 session is still alive.
-    std::weak_ptr<UpstreamH2Connection> h2_conn_weak_;
+    // teardown on `!h2_path_`. The dual-token shape (raw pointer +
+    // shared alive-flag) lets a mid-flight Cleanup / Cancel issue
+    // RST_STREAM if the H2 session is still alive, while
+    // short-circuiting safely if the session was destroyed in between.
+    UpstreamH2Connection* h2_conn_ = nullptr;
+    std::shared_ptr<std::atomic<bool>> h2_conn_alive_;
+    // Partition liveness token captured alongside the conn alive token.
+    // Defense-in-depth: today partition teardown destroys every H2 conn
+    // first (flipping conn_alive_), but checking both makes H2ConnAlive()
+    // symmetric with UpstreamLease::GetH2Connection() — no divergence
+    // when the planned migration to UpstreamLease h2_lease_ lands.
+    std::shared_ptr<std::atomic<bool>> h2_partition_alive_;
     int32_t h2_stream_id_ = -1;
     bool h2_path_ = false;
 

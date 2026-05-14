@@ -3,7 +3,7 @@
 
 namespace {
 
-bool IsExpired(const std::shared_ptr<UpstreamH2Connection>& c) {
+bool IsExpired(const std::unique_ptr<UpstreamH2Connection>& c) {
     if (!c) return true;
     // A connection is reapable only when it cannot serve traffic AND
     // has no in-flight streams to drain. Dead+empty and goaway+empty
@@ -49,7 +49,7 @@ size_t H2ConnectionTable::ReapDrained() {
     return removed;
 }
 
-std::shared_ptr<UpstreamH2Connection> H2ConnectionTable::FindUsable(
+UpstreamH2Connection* H2ConnectionTable::FindUsable(
     const std::string& upstream_name)
 {
     auto it = by_upstream_.find(upstream_name);
@@ -62,17 +62,52 @@ std::shared_ptr<UpstreamH2Connection> H2ConnectionTable::FindUsable(
     conns.erase(end, conns.end());
 
     for (auto& c : conns) {
-        if (c && c->IsUsable()) return c;
+        if (c && c->IsUsable()) return c.get();
     }
     return nullptr;
 }
 
 void H2ConnectionTable::Insert(
     const std::string& upstream_name,
-    std::shared_ptr<UpstreamH2Connection> conn)
+    std::unique_ptr<UpstreamH2Connection> conn)
 {
     if (!conn) return;
     by_upstream_[upstream_name].push_back(std::move(conn));
+}
+
+std::unique_ptr<UpstreamH2Connection> H2ConnectionTable::Extract(
+    UpstreamH2Connection* conn)
+{
+    if (!conn) return nullptr;
+    for (auto& [_, conns] : by_upstream_) {
+        for (auto it = conns.begin(); it != conns.end(); ++it) {
+            if (it->get() == conn) {
+                auto out = std::move(*it);
+                conns.erase(it);
+                return out;
+            }
+        }
+    }
+    return nullptr;
+}
+
+std::vector<std::unique_ptr<UpstreamH2Connection>>
+H2ConnectionTable::ExtractAll() {
+    // Count first + reserve so push_back below is noexcept — without
+    // this, a mid-loop bad_alloc would leave by_upstream_ in
+    // moved-but-not-cleared state (null entries in the vectors,
+    // skipped clear()) on rethrow.
+    size_t total = 0;
+    for (auto& [_, conns] : by_upstream_) total += conns.size();
+    std::vector<std::unique_ptr<UpstreamH2Connection>> out;
+    out.reserve(total);
+    for (auto& [_, conns] : by_upstream_) {
+        for (auto& c : conns) {
+            if (c) out.push_back(std::move(c));
+        }
+    }
+    by_upstream_.clear();
+    return out;
 }
 
 void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
@@ -103,19 +138,21 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
             int timeout = cfg->ping_timeout_sec;
             int goaway_drain = cfg->goaway_drain_timeout_sec;
             if (!c->Tick(now, idle, timeout, goaway_drain)) {
-                // MarkDead BEFORE FailAllStreams: between the failure
-                // fan-out and the table erase below, FindUsable could be
-                // called from another path and would return this conn
-                // with dead_=false / streams_.empty() / IsUsable()=true.
-                // The next SubmitRequest then fails on a poisoned session
-                // and burns retry budget. Pitfall doc: UPSTREAM_PROXY.md
-                // "After any FailAllStreams call site, the connection
-                // MUST be marked dead".
-                c->MarkDead();
-                c->FailAllStreams(-1,
-                                  c->goaway_seen() ? "h2 GOAWAY drain timeout"
-                                                   : "h2 PING timeout");
+                // Move + erase BEFORE FailAllStreams: a sink's OnError
+                // could synchronously re-enter FindUsable on this same
+                // bucket. Removing the dying entry from `conns` first
+                // means reentrants see an empty slot for this key,
+                // preserving iterator validity. MarkDead still runs on
+                // `victim` so any weak_ptr observer sees IsDead()=true.
+                // Pitfall doc: UPSTREAM_PROXY.md "After any
+                // FailAllStreams call site, the connection MUST be
+                // marked dead".
+                auto victim = std::move(*it);
                 it = conns.erase(it);
+                victim->MarkDead();
+                victim->FailAllStreams(
+                    -1, victim->goaway_seen() ? "h2 GOAWAY drain timeout"
+                                              : "h2 PING timeout");
             } else if (c->goaway_seen() && c->active_stream_count() == 0) {
                 // Mark dead before erasing so any weak_ptr observer
                 // racing the destructor sees `IsDead() == true` instead

@@ -192,7 +192,8 @@ UpstreamManager::UpstreamManager(
             effective_sni,
             resolved_endpoint,
             upstream.pool, dispatchers, tls_ctx,
-            outstanding_conns_, inflight_leases_,
+            outstanding_conns_, inflight_leases_, donated_h2_leases_,
+            off_dispatcher_release_drops_ptr_,
             shutting_down_, drain_mtx_, drain_cv_);
     }
 
@@ -403,22 +404,6 @@ void UpstreamManager::UpdateResolvedEndpoints(
         if (!new_ep) continue;
         it->second->UpdateResolvedEndpoint(new_ep);
     }
-}
-
-std::optional<Http2UpstreamConfig>
-UpstreamManager::LookupStagedH2ForLivePartitionForTesting(
-    const std::string& upstream_name,
-    const std::vector<UpstreamConfig>& staged_upstreams) const
-{
-    if (pools_.find(upstream_name) == pools_.end()) {
-        return std::nullopt;
-    }
-    for (const auto& staged : staged_upstreams) {
-        if (staged.name == upstream_name) {
-            return staged.http2;
-        }
-    }
-    return std::nullopt;
 }
 
 std::vector<UpstreamManager::LivePartitionRef>

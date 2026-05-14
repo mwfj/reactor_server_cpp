@@ -110,13 +110,17 @@ A successful H2 request flow shows: `submit` → `OnHeaders` → `OnBodyChunk` (
 
 ### Monitoring
 
-The following metrics aren't currently exposed via `/stats` but show up in logs at debug/info level:
+`/stats` exposes upstream lease accounting under the `lease_health` sub-object:
+
+- **`active_leases`** — in-flight per-request lease checkouts. Watched by the shutdown drain predicate.
+- **`donated_h2_leases`** — long-lived leases held by multiplexed H2 sessions (one per live `UpstreamH2Connection`). Stays positive across the H2 session's lifetime; explicitly excluded from the shutdown-drain predicate so idle sessions don't wedge `Stop()`.
+- **`off_dispatcher_release_drops`** — safety counter; non-zero means lease releases ran off the partition's dispatcher thread and skipped the partition mutation. Should stay zero in healthy production. If you see it rising, expect `Stop()` to wedge until `shutdown_drain_timeout_sec`.
+
+The following per-session metrics show up only in logs at debug/info level today (planned for `/stats` exposure in a future release):
 
 - H2 connection count per upstream (one log line per `Init` and per retire).
 - Active stream count at retire time (visible in the GOAWAY-drain logs).
 - PING send / ACK latency (correlate `submit_ping` debug log with `OnPingAck`).
-
-`/stats` exposure for these counters is planned for a future release.
 
 ---
 

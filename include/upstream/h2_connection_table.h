@@ -45,14 +45,15 @@ public:
 
     // Find the first usable H2 connection for `upstream_name`. Reaps
     // drained entries inline as a side benefit. Returns null when no
-    // tracked connection can host a new stream right now.
-    std::shared_ptr<UpstreamH2Connection> FindUsable(
-        const std::string& upstream_name);
+    // tracked connection can host a new stream right now. Lifetime is
+    // owned by the table; callers that need destroy-safety capture
+    // `conn->alive_token()` alongside the raw pointer.
+    UpstreamH2Connection* FindUsable(const std::string& upstream_name);
 
     // Append a freshly Init()'d connection. Caller has already donated
     // the lease via UpstreamH2Connection::AdoptLease.
     void Insert(const std::string& upstream_name,
-                std::shared_ptr<UpstreamH2Connection> conn);
+                std::unique_ptr<UpstreamH2Connection> conn);
 
     // Run the per-connection liveness Tick on every tracked connection.
     // Connections whose Tick returns false (PING timeout, session-fatal
@@ -60,7 +61,23 @@ public:
     // already be on the partition's owning dispatcher thread.
     void TickAll(std::chrono::steady_clock::time_point now);
 
+    // Extract the owning unique_ptr for `conn` out of the table.
+    // Returns null if `conn` is not tracked. Used by
+    // PoolPartition::MoveConnToPendingDestroy to hand ownership to the
+    // post-recv-tick destroy stash without invoking the conn's dtor
+    // inline (which would re-enter callbacks from within a recv
+    // callback).
+    std::unique_ptr<UpstreamH2Connection> Extract(UpstreamH2Connection* conn);
+
+    // Move every tracked connection out of the table. Returned vector
+    // owns the conns; the table is left empty. Used by
+    // PoolPartition::InitiateShutdown to retire H2 sessions via
+    // DestroyOnDispatcher on the partition's dispatcher thread so the
+    // donated leases drop and the partition's outstanding_conns_
+    // counter reaches zero before WaitForDrain times out.
+    std::vector<std::unique_ptr<UpstreamH2Connection>> ExtractAll();
+
 private:
     std::unordered_map<std::string,
-        std::vector<std::shared_ptr<UpstreamH2Connection>>> by_upstream_;
+        std::vector<std::unique_ptr<UpstreamH2Connection>>> by_upstream_;
 };

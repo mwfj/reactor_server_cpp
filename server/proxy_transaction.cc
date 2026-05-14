@@ -944,12 +944,27 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
 
     auto* upstream_conn = lease_.Get();
     if (!upstream_conn) {
+        // Empty lease from DrainAnyWaitersForFastH2 — a multiplexed
+        // session became usable while we were queued. Re-try the H2
+        // fast path; on miss (session evicted in the race window
+        // between drain decision and dispatch) route through
+        // MaybeRetry(CONNECT_FAILURE) for parity with the
+        // error_callback path (OnCheckoutError). The race is exactly
+        // the case where retry is appropriate — upstream is healthy,
+        // we just lost a slot to a sibling.
+        if (TryDispatchExistingH2Session()) {
+            return;
+        }
         ReleaseBreakerAdmissionNeutral();
         if (DeliverPendingRetryable5xxResponse("checkout_empty_lease")) {
             return;
         }
-        OnError(RESULT_CHECKOUT_FAILED,
-                "Checkout returned empty lease");
+        logging::Get()->warn(
+            "ProxyTransaction empty-lease H2 dispatch miss client_fd={} "
+            "service={} attempt={} — routing through MaybeRetry",
+            client_fd_, service_name_, attempt_);
+        ReportBreakerOutcome(RESULT_CHECKOUT_FAILED);
+        MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
     }
 
@@ -984,16 +999,18 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
 
     bool want_h2 = false;
     bool defer_for_handshake = false;
+    const bool prefer_always = (cfg && cfg->enabled && cfg->prefer == "always");
     if (cfg && cfg->enabled) {
         const std::string& prefer = cfg->prefer;
-        if (prefer == "always") {
-            want_h2 = true;
-        } else if (prefer == "auto") {
+        if (prefer == "always" || prefer == "auto") {
             if (transport->IsTlsReady()) {
                 want_h2 = (transport->GetAlpnProtocol() == "h2");
             } else if (transport->HasTls()) {
                 defer_for_handshake = true;
             }
+            // Bare TCP under prefer=always cannot satisfy strict h2 —
+            // there is no ALPN signal. want_h2 stays false; the strict-fail
+            // gate below converts that into an explicit CHECKOUT_FAILED.
         }
     }
 
@@ -1015,14 +1032,36 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
                               "upstream disconnected during TLS handshake");
             });
         transport->SetHandshakeCompleteCallback(
-            [wk_self, wk_t]() {
+            [wk_self, wk_t, prefer_always]() {
                 auto self = wk_self.lock();
                 if (!self || self->cancelled_) return;
                 auto t = wk_t.lock();
                 bool h2 = t && (t->GetAlpnProtocol() == "h2");
-                if (h2) self->DispatchH2();
-                else    self->DispatchH1();
+                if (h2) {
+                    self->DispatchH2();
+                } else if (prefer_always) {
+                    // prefer=always + ALPN!=h2: dedicated terminal so
+                    // routing through OnCheckoutError can't burn the
+                    // retry budget on a deterministic reject.
+                    self->ReleaseBreakerAdmissionNeutral();
+                    self->OnError(
+                        RESULT_H2_ALPN_NOT_NEGOTIATED,
+                        "prefer=always but peer ALPN!=h2");
+                } else {
+                    self->DispatchH1();
+                }
             });
+        return;
+    }
+
+    // Strict-h2 gate on the immediate (already-ready or bare-TCP) path.
+    // Deferred-handshake branch above has its own gate.
+    if (prefer_always && !want_h2) {
+        ReleaseBreakerAdmissionNeutral();
+        OnError(RESULT_H2_ALPN_NOT_NEGOTIATED,
+                transport->IsTlsReady()
+                    ? "prefer=always but peer ALPN!=h2"
+                    : "prefer=always requires TLS+ALPN");
         return;
     }
 
@@ -1194,6 +1233,18 @@ void ProxyTransaction::DispatchH2() {
     if (host_it != rewritten_headers_.end() && !host_it->second.empty()) {
         authority = host_it->second;
     } else {
+        // Rewriter contract drift: HeaderRewriter::RewriteRequest is
+        // expected to emit a Host derived from upstream_host_ / SNI / IPv6
+        // brackets / default-port elision. An empty Host here would
+        // produce an :authority that nghttp2 rejects (and a wire-invalid
+        // H1 request on the parallel codec path). Warn so operators can
+        // chase the rewriter regression instead of debugging from the
+        // 502 alone, then synthesize a defensive :authority.
+        logging::Get()->error(
+            "ProxyTransaction H2 :authority fallback fired (rewritten Host "
+            "empty) client_fd={} service={} — using upstream_host derivation. "
+            "This indicates a HeaderRewriter contract regression.",
+            client_fd_, service_name_);
         const std::string& host_src =
             (upstream_tls_ && !sni_hostname_.empty())
                 ? sni_hostname_
@@ -1225,7 +1276,9 @@ void ProxyTransaction::DispatchH2() {
     // == 0 opts out of the response-wait timer; stall protection stays
     // on via SEND_STALL_FALLBACK_MS.
     h2_path_ = true;
-    h2_conn_weak_ = h2;
+    h2_conn_ = h2;
+    h2_conn_alive_ = h2->alive_token();
+    h2_partition_alive_ = h2->partition_alive_token();
     state_ = State::SENDING_REQUEST;
     h2_response_timeout_armed_ = false;
     h2_request_fully_sent_ = false;
@@ -1255,15 +1308,30 @@ void ProxyTransaction::DispatchH2() {
         h2_path_ = false;
         h2_response_timeout_armed_ = false;
         h2_request_fully_sent_ = false;
-        h2_conn_weak_.reset();
+        h2_conn_ = nullptr;
+        h2_conn_alive_.reset();
+        h2_partition_alive_.reset();
         logging::Get()->warn(
             "ProxyTransaction H2 submit failed client_fd={} service={} "
             "attempt={}", client_fd_, service_name_, attempt_);
+        // Drain queued ANY waiters: the session stays in h2_table_ so a
+        // sibling waiter may still multiplex. Capacity-aware drain
+        // requeues if IsUsable() reports the session is full.
+        partition->DrainAnyWaitersForFastH2();
         MaybeRetry(RetryPolicy::RetryCondition::CONNECT_FAILURE);
         return;
     }
 
     h2_stream_id_ = stream_id;
+
+    // Wake any ANY-kind waiters that queued during the connect window.
+    // Done HERE (not inside AcquireH2Connection's construct branch) so
+    // the just-consumed stream slot is visible to FindUsable's
+    // IsUsable() check inside DrainAnyWaitersForFastH2 — otherwise a
+    // queued waiter would synchronously dispatch + SubmitRequest, win
+    // the only stream slot under max_concurrent_streams=1, and force
+    // this transaction's own SubmitRequest above to fail.
+    partition->DrainAnyWaitersForFastH2();
 }
 
 void ProxyTransaction::OnCheckoutError(int error_code) {
@@ -1862,32 +1930,29 @@ void ProxyTransaction::OnError(int result_code,
     // Centralized neutral breaker release for deterministic policy
     // rejects. Idempotent — ReleaseBreakerAdmissionNeutral is a no-op
     // when no admission is held. Runs BEFORE the H2 retryable-
-    // disconnect routing below so RESULT_H2_METHOD_NOT_SUPPORTED
-    // doesn't leak into MaybeRetry.
-    if (result_code == RESULT_H2_METHOD_NOT_SUPPORTED) {
+    // disconnect routing below so these terminal codes don't leak
+    // into MaybeRetry.
+    if (result_code == RESULT_H2_METHOD_NOT_SUPPORTED ||
+        result_code == RESULT_H2_ALPN_NOT_NEGOTIATED) {
         ReleaseBreakerAdmissionNeutral();
     }
 
     // H2 transport-level failures arrive here through sink->OnError —
     // unlike H1, which detects transport failure inside OnUpstreamData
     // and calls MaybeRetry(UPSTREAM_DISCONNECT) directly before the sink
-    // ever sees an error. Bring H2 to feature parity: when the result is
-    // a retryable disconnect AND no response has been committed AND the
-    // transaction is not already terminal, route through MaybeRetry so
-    // the retry policy fires (idempotent method, attempt budget, retry
-    // budget all honored). The state guard guards against a late
-    // OnError fired from a stream-close callback that the partition
-    // didn't manage to suppress, after a previous attempt's terminal
-    // delivery (Cleanup → ResetStream → sink=nullptr is the primary
-    // defense; the local guard makes the invariant explicit). Cleanup()
-    // inside MaybeRetry's success branch tears down the H2 stream
-    // state; its retry-not-allowed branch falls through to
-    // DeliverTerminalError.
+    // ever sees an error. Bring H2 to feature parity: route every
+    // H2-retryable code through MaybeRetry. The state guard rejects a
+    // late OnError fired from a stream-close callback after a previous
+    // attempt's terminal delivery (Cleanup → ResetStream → sink=nullptr
+    // is the primary defense; the local guard makes the invariant
+    // explicit). Cleanup() inside MaybeRetry's success branch tears
+    // down the H2 stream state; its retry-not-allowed branch falls
+    // through to DeliverTerminalError.
     if (h2_path_ && !response_committed_ &&
         state_ != State::FAILED && state_ != State::COMPLETE &&
-        result_code == RESULT_UPSTREAM_DISCONNECT) {
+        IsH2RetryableCode(result_code)) {
         ReportBreakerOutcome(result_code);
-        MaybeRetry(RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT);
+        MaybeRetry(MapH2CodeToRetryCondition(result_code));
         return;
     }
 
@@ -2088,6 +2153,11 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             // the full upstream 5xx body — same trade-off the H2 OnHeaders
             // synchronous-decision path already accepts.
             if (h2_path_) {
+                // H2 retry path never holds the prior 5xx body — there is
+                // no equivalent of H1's lease+PauseParsing+IncReadDisable
+                // backpressure for multiplexed streams (sibling streams
+                // must keep flowing), so force-complete the pending
+                // body so MaybeRetry's Cleanup-driven path runs cleanly.
                 pending_retryable_5xx_body_complete_ = true;
             }
             holding_retryable_5xx_response_ =
@@ -2538,13 +2608,13 @@ void ProxyTransaction::Cleanup() {
     // callbacks or release a lease (the lease was donated to the H2
     // connection at dispatch time).
     if (h2_path_) {
-        if (h2_stream_id_ >= 0) {
-            if (auto h2 = h2_conn_weak_.lock()) {
-                h2->ResetStream(h2_stream_id_);
-            }
+        if (h2_stream_id_ >= 0 && H2ConnAlive()) {
+            h2_conn_->ResetStream(h2_stream_id_);
         }
         h2_stream_id_ = -1;
-        h2_conn_weak_.reset();
+        h2_conn_ = nullptr;
+        h2_conn_alive_.reset();
+        h2_partition_alive_.reset();
         // Bump send-stall generation BEFORE the h2_path_ flip so any
         // in-flight send-stall closure no-ops on its eventual fire.
         // Same pattern as h2_response_timeout_generation_ below.
@@ -3317,11 +3387,21 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         resp.Header("X-H2-Limitation", "connect-not-supported");
         return resp;
     }
+    if (result_code == RESULT_H2_ALPN_NOT_NEGOTIATED) {
+        // Operator configured `http2.prefer = "always"` but peer did
+        // not negotiate h2 via ALPN. Deterministic policy reject —
+        // self-identifying header analogous to connect-not-supported.
+        HttpResponse resp = HttpResponse::BadGateway();
+        resp.Header("X-H2-Limitation", "alpn-not-h2");
+        return resp;
+    }
     if (result_code == RESULT_CHECKOUT_FAILED ||
         result_code == RESULT_SEND_FAILED ||
         result_code == RESULT_PARSE_ERROR ||
         result_code == RESULT_UPSTREAM_DISCONNECT ||
-        result_code == RESULT_TRUNCATED_RESPONSE) {
+        result_code == RESULT_TRUNCATED_RESPONSE ||
+        result_code == RESULT_GOAWAY_UNPROCESSED ||
+        result_code == RESULT_GOAWAY_MAYBE_PROCESSED) {
         return HttpResponse::BadGateway();
     }
     return HttpResponse::InternalError();
@@ -3485,6 +3565,64 @@ void ProxyTransaction::ReleaseBreakerAdmissionNeutral() {
     slice_->ReportNeutral(probe, gen);
 }
 
+bool ProxyTransaction::IsH2RetryableCode(int result_code) noexcept {
+    // RESULT_TRUNCATED_RESPONSE: terminal per the constant's public
+    // contract — retrying would double-deliver streamed bytes.
+    //
+    // RESULT_RESPONSE_TIMEOUT: intentionally NOT in this allowlist.
+    // Today's two H2 timeout paths bypass IsH2RetryableCode entirely:
+    //   (a) The response-wait closure routes retry-eligible states
+    //       (SENDING_REQUEST / AWAITING_RESPONSE / RECEIVING_BODY)
+    //       through MaybeRetry(RESPONSE_TIMEOUT) directly without
+    //       going through OnError → IsH2RetryableCode.
+    //   (b) Per-stream idle/budget timeouts only fire post-commit, so
+    //       response_committed_ already gates retry off before any
+    //       OnError dispatch.
+    // INVARIANT: no caller routes RESULT_RESPONSE_TIMEOUT through
+    // OnError on the H2 path with `!response_committed_`. Before
+    // landing such a call site, ALSO add the code here AND to
+    // MapH2CodeToRetryCondition — otherwise retry silently drops
+    // even when retry_on_timeout=true.
+    switch (result_code) {
+        case RESULT_UPSTREAM_DISCONNECT:
+        case RESULT_GOAWAY_UNPROCESSED:
+        case RESULT_GOAWAY_MAYBE_PROCESSED:
+            return true;
+        default:
+            return false;
+    }
+}
+
+RetryPolicy::RetryCondition ProxyTransaction::MapH2CodeToRetryCondition(
+    int result_code) noexcept {
+    // Caller is expected to gate on IsH2RetryableCode first, so this
+    // function only ever sees codes from that allowlist. Switch on the
+    // allowlist explicitly with no fallthrough — a future addition to
+    // IsH2RetryableCode that misses this function triggers the error
+    // log instead of silently classifying as UPSTREAM_DISCONNECT.
+    switch (result_code) {
+        case RESULT_GOAWAY_UNPROCESSED:
+            // Connect-style: peer demonstrably never processed the
+            // request. First retry runs at zero delay; breaker neutral.
+            return RetryPolicy::RetryCondition::CONNECT_FAILURE;
+        case RESULT_UPSTREAM_DISCONNECT:
+        case RESULT_GOAWAY_MAYBE_PROCESSED:
+            // Response-level: peer may have processed. Backoff applies
+            // via the policy's idempotency gate.
+            return RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT;
+        default:
+            // Unreachable if IsH2RetryableCode and this switch stay in
+            // sync. Log loud and conservative-default to
+            // UPSTREAM_DISCONNECT so a future regression surfaces in
+            // logs before causing odd retry-cadence behavior.
+            logging::Get()->error(
+                "MapH2CodeToRetryCondition: unexpected result_code={} "
+                "(missing from H2 retry allowlist switch) — defaulting "
+                "to UPSTREAM_DISCONNECT", result_code);
+            return RetryPolicy::RetryCondition::UPSTREAM_DISCONNECT;
+    }
+}
+
 void ProxyTransaction::ReportBreakerOutcome(int result_code) {
     // No slice, or already reported: bail. admission_generation_==0 is
     // the sentinel — slice domain generations start at 1, so a 0 gen
@@ -3536,11 +3674,25 @@ void ProxyTransaction::ReportBreakerOutcome(int result_code) {
             return;
 
         case RESULT_H2_METHOD_NOT_SUPPORTED:
-            // Deterministic policy reject (CONNECT on H2 upstream) —
+        case RESULT_H2_ALPN_NOT_NEGOTIATED:
+            // Deterministic policy rejects (CONNECT on H2 upstream, or
+            // operator-configured prefer=always with peer ALPN!=h2) —
             // no upstream contact, so no health signal. The OnError
             // pre-routing hook already calls
             // ReleaseBreakerAdmissionNeutral; this case is the
             // defensive fallback if a code path slips past the hook.
+            slice_->ReportNeutral(probe, gen);
+            return;
+
+        case RESULT_GOAWAY_UNPROCESSED:
+        case RESULT_GOAWAY_MAYBE_PROCESSED:
+            // RFC 9113 §6.8: GOAWAY signals connection-lifecycle, not
+            // upstream health. Counting it as a failure would trip
+            // breakers when the peer is rolling sessions for ordinary
+            // reasons (graceful drain, deploy, idle timeout). The
+            // MAYBE_PROCESSED variant is identical for breaker
+            // purposes — the per-attempt retry budget enforces the
+            // idempotency gate, not the breaker.
             slice_->ReportNeutral(probe, gen);
             return;
 

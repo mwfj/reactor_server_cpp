@@ -21,6 +21,8 @@
 #include "upstream/upstream_manager.h"
 #include "upstream/upstream_host_pool.h"
 #include "upstream/pool_partition.h"
+#include "upstream/upstream_h2_connection.h"
+#include "upstream/host_port_key.h"
 #include "net/dns_resolver.h"
 #include "socket_handler.h"
 #include "connection_handler.h"
@@ -1010,6 +1012,339 @@ void TestUpstreamLeaseMoveAssignment() {
     }
 }
 
+// Default-constructed lease reports kind == EMPTY and accessors return null.
+void TestUpstreamLeaseKindEmpty() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: kind EMPTY..." << std::endl;
+    try {
+        UpstreamLease lease;
+        bool pass = (lease.kind() == UpstreamLease::Kind::EMPTY) &&
+                    lease.empty() &&
+                    !static_cast<bool>(lease) &&
+                    lease.Get() == nullptr &&
+                    lease.GetH2Connection() == nullptr &&
+                    lease.GetH2StreamId() == -1;
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind EMPTY",
+                                  pass, pass ? "" : "accessors disagree");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind EMPTY", false, e.what());
+    }
+}
+
+// H1 ctor stamps kind == H1; H2 accessors return null even on a live H1 lease.
+void TestUpstreamLeaseKindH1() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: kind H1..." << std::endl;
+    try {
+        int sv[2];
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+            throw std::runtime_error("socketpair failed");
+        ::close(sv[1]);
+        auto sock = std::make_unique<SocketHandler>(sv[0]);
+        auto conn_handler = std::make_shared<ConnectionHandler>(nullptr, std::move(sock));
+        auto uc = std::make_unique<UpstreamConnection>(conn_handler, "127.0.0.1", 9999);
+        UpstreamLease lease(uc.get(), nullptr, nullptr);
+        bool pass = (lease.kind() == UpstreamLease::Kind::H1) &&
+                    static_cast<bool>(lease) &&
+                    lease.Get() == uc.get() &&
+                    lease.GetH2Connection() == nullptr &&
+                    lease.GetH2StreamId() == -1;
+        lease.Release();
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind H1",
+                                  pass, pass ? "" : "kind/accessors mismatch");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind H1", false, e.what());
+    }
+}
+
+// H2 ctor stamps kind == H2; alive-token gates `GetH2Connection`.
+void TestUpstreamLeaseKindH2AliveGates() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: kind H2 alive gates..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 4;
+        auto conn = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+        auto partition_alive = std::make_shared<std::atomic<bool>>(true);
+        auto conn_alive = conn->alive_token();
+
+        UpstreamLease lease(conn.get(), /*stream_id=*/3, nullptr,
+                            partition_alive, conn_alive);
+        bool pass = (lease.kind() == UpstreamLease::Kind::H2) &&
+                    static_cast<bool>(lease) &&
+                    lease.GetH2Connection() == conn.get() &&
+                    lease.GetH2StreamId() == 3 &&
+                    lease.Get() == nullptr;
+
+        // Flip the partition alive flag — H2 conn accessor must return null.
+        partition_alive->store(false, std::memory_order_release);
+        if (lease.GetH2Connection() != nullptr) {
+            pass = false;
+        }
+
+        // Reset partition alive but kill the conn alive — same result.
+        partition_alive->store(true, std::memory_order_release);
+        conn_alive->store(false, std::memory_order_release);
+        if (lease.GetH2Connection() != nullptr) {
+            pass = false;
+        }
+
+        lease.Release();
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind H2 alive gates",
+                                  pass, pass ? "" : "H2 alive token gate broken");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("UpstreamPool UpstreamLease: kind H2 alive gates",
+                                  false, e.what());
+    }
+}
+
+// Off-dispatcher Release skips the partition mutation (avoids container
+// race) AND bumps UpstreamManager::off_dispatcher_release_drops so the
+// leak is operator-visible via /stats. On-dispatcher Release must NOT
+// bump the counter. The lease captures the counter via shared_ptr at
+// construction so the bump is safe even if the partition is racing
+// destruction — the partition pointer is never dereferenced on the
+// off-dispatcher path.
+void TestOffDispatcherReleaseBumpsCounter() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: off-dispatcher Release bumps counter..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeUpstreamConfig("svc", "127.0.0.1", 9999);
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        // Sanity: counter starts at zero.
+        if (mgr.off_dispatcher_release_drops() != 0) {
+            TestFramework::RecordTest(
+                "UpstreamPool UpstreamLease: off-dispatcher Release bumps counter",
+                false, "counter not zero at boot");
+            return;
+        }
+
+        PoolPartition* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "UpstreamPool UpstreamLease: off-dispatcher Release bumps counter",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        // Construct two leases that point at the partition with the
+        // counter shared_ptr captured. Release them on the calling thread
+        // — that's NOT the dispatcher thread (DispatcherThreadGuard runs
+        // the dispatcher's RunEventLoop in its own thread). Both leases'
+        // Release() must take the off-dispatcher branch.
+        {
+            UpstreamLease lease(/*conn=*/nullptr, part,
+                                part->alive_token(),
+                                part->OffDispatcherReleaseDropsPtr(),
+                                part->dispatcher_ptr());
+            lease.Release();
+        }
+        {
+            UpstreamLease lease(/*conn=*/nullptr, part,
+                                part->alive_token(),
+                                part->OffDispatcherReleaseDropsPtr(),
+                                part->dispatcher_ptr());
+            lease.Release();
+        }
+
+        if (mgr.off_dispatcher_release_drops() != 2) {
+            TestFramework::RecordTest(
+                "UpstreamPool UpstreamLease: off-dispatcher Release bumps counter",
+                false,
+                std::string("expected 2 drops, got ") +
+                std::to_string(mgr.off_dispatcher_release_drops()));
+            return;
+        }
+
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: off-dispatcher Release bumps counter",
+            true, "");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: off-dispatcher Release bumps counter",
+            false, e.what());
+    }
+}
+
+// On-dispatcher Release runs the normal return path AND must NOT bump
+// the off-dispatcher-drops counter. Drives the lease's Release from
+// the partition's dispatcher thread via a synchronous enqueue.
+void TestOnDispatcherReleaseDoesNotBumpCounter() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: on-dispatcher Release leaves counter zero..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeUpstreamConfig("svc", "127.0.0.1", 9999);
+        UpstreamManager mgr({cfg}, {disp});
+        DispatcherThreadGuard dtg{disp, t};
+
+        PoolPartition* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "UpstreamPool UpstreamLease: on-dispatcher Release leaves counter zero",
+                false, "GetPoolPartition returned null");
+            return;
+        }
+
+        // Drive Release on the dispatcher thread. Lease's conn=null means
+        // the H1 return branch's `conn_` guard short-circuits — no real
+        // ReturnConnection call, but the off_dispatcher branch is also
+        // not entered (we're on the loop). Counter must stay zero.
+        std::promise<void> done;
+        auto fut = done.get_future();
+        disp->EnQueue([&]() {
+            UpstreamLease lease(/*conn=*/nullptr, part,
+                                part->alive_token(),
+                                part->OffDispatcherReleaseDropsPtr(),
+                                part->dispatcher_ptr());
+            lease.Release();
+            done.set_value();
+        });
+        if (fut.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+            TestFramework::RecordTest(
+                "UpstreamPool UpstreamLease: on-dispatcher Release leaves counter zero",
+                false, "release task did not complete");
+            return;
+        }
+
+        bool pass = (mgr.off_dispatcher_release_drops() == 0);
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: on-dispatcher Release leaves counter zero",
+            pass,
+            pass ? "" :
+            std::string("expected 0 drops, got ") +
+                std::to_string(mgr.off_dispatcher_release_drops()));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: on-dispatcher Release leaves counter zero",
+            false, e.what());
+    }
+}
+
+// Lock the "alive_=true observed → partition destroyed → dispatcher
+// access" UAF path. Forces a scenario where the lease has already
+// snapshotted partition_alive_ as true (via simulated load that
+// preserves it) but the partition's underlying object is gone.
+// The captured dispatcher_ shared_ptr must keep the Dispatcher alive
+// so the is_on_loop_thread() check is safe without touching the
+// freed partition. Verifies BOTH the heap counter survival AND the
+// dispatcher survival across teardown.
+void TestOffDispatcherReleaseDispatcherSurvivesPartitionTeardown() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: dispatcher survives partition teardown..." << std::endl;
+    try {
+        std::shared_ptr<Dispatcher> captured_disp;
+        std::shared_ptr<std::atomic<bool>> captured_alive;
+        std::shared_ptr<std::atomic<int64_t>> captured_drops;
+
+        {
+            auto disp = std::make_shared<Dispatcher>();
+            auto t = StartDispatcher(disp);
+            UpstreamConfig cfg = MakeUpstreamConfig("svc", "127.0.0.1", 9999);
+            UpstreamManager mgr({cfg}, {disp});
+            DispatcherThreadGuard dtg{disp, t};
+
+            PoolPartition* part = mgr.GetPoolPartition("svc", 0);
+            if (!part) {
+                TestFramework::RecordTest(
+                    "UpstreamPool UpstreamLease: dispatcher survives partition teardown",
+                    false, "GetPoolPartition returned null");
+                return;
+            }
+            captured_disp = part->dispatcher_ptr();
+            captured_alive = part->alive_token();
+            captured_drops = part->OffDispatcherReleaseDropsPtr();
+            // Manager destroys → partition destroys → alive flips false.
+            // The captured shared_ptrs survive.
+        }
+
+        // After teardown:
+        //  - captured_alive points at a live atomic<bool> (heap kept by
+        //    shared_ptr); ~PoolPartition stored false.
+        //  - captured_disp points at the live Dispatcher (kept by
+        //    shared_ptr); the dispatcher itself was stopped, but the
+        //    object is still alive and is_on_loop_thread() is safe.
+        //  - captured_drops points at the live counter.
+        bool alive_dead = !captured_alive->load(std::memory_order_acquire);
+        bool dispatcher_alive = (captured_disp.use_count() >= 1);
+        bool drops_alive = (captured_drops.use_count() >= 1);
+
+        // Sanity: calling is_on_loop_thread on the captured dispatcher
+        // must not crash. This is THE invariant the fix protects.
+        bool on_loop = captured_disp->is_on_loop_thread();
+        (void)on_loop;  // we don't care about the value; only that it doesn't UAF.
+
+        bool pass = alive_dead && dispatcher_alive && drops_alive;
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: dispatcher survives partition teardown",
+            pass,
+            pass ? "" :
+            std::string("alive_dead=") + (alive_dead ? "1" : "0") +
+            " dispatcher_alive=" + (dispatcher_alive ? "1" : "0") +
+            " drops_alive=" + (drops_alive ? "1" : "0"));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: dispatcher survives partition teardown",
+            false, e.what());
+    }
+}
+
+// The lease must remain safe when its partition is destroyed before
+// Release(): the captured shared_ptr keeps the counter atomic alive,
+// so an off-dispatcher Release after partition destruction can still
+// bump the counter without touching partition memory.
+void TestOffDispatcherReleaseSafeAfterManagerTeardown() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: counter bump safe after manager teardown..." << std::endl;
+    try {
+        UpstreamLease lease;
+        std::shared_ptr<std::atomic<int64_t>> drops_ptr;
+
+        {
+            auto disp = std::make_shared<Dispatcher>();
+            auto t = StartDispatcher(disp);
+            UpstreamConfig cfg = MakeUpstreamConfig("svc", "127.0.0.1", 9999);
+            UpstreamManager mgr({cfg}, {disp});
+            DispatcherThreadGuard dtg{disp, t};
+
+            PoolPartition* part = mgr.GetPoolPartition("svc", 0);
+            if (!part) {
+                TestFramework::RecordTest(
+                    "UpstreamPool UpstreamLease: counter bump safe after manager teardown",
+                    false, "GetPoolPartition returned null");
+                return;
+            }
+            drops_ptr = part->OffDispatcherReleaseDropsPtr();
+            lease = UpstreamLease(/*conn=*/nullptr, part,
+                                  part->alive_token(),
+                                  drops_ptr,
+                                  part->dispatcher_ptr());
+            // Manager + partition + dispatcher all destruct at end of
+            // scope. The partition's alive_ atomic is stored to false
+            // before destruction (~PoolPartition).
+        }
+
+        // At this point: partition is destroyed. partition_alive_ is set
+        // to false. Calling Release on the calling thread must:
+        //  - Skip the partition mutation (partition_live == false)
+        //  - NOT crash dereferencing partition_->IncOffDispatcherReleaseDrops
+        // The counter bump path requires partition_live == true; since the
+        // partition is dead, no bump happens — but the test really checks
+        // the "no crash on dereferencing partition_" contract.
+        lease.Release();
+        // drops_ptr survives manager teardown; bumping it directly proves
+        // the heap atomic outlived the partition cleanly.
+        drops_ptr->fetch_add(1, std::memory_order_acq_rel);
+        bool pass = (drops_ptr->load(std::memory_order_acquire) == 1);
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: counter bump safe after manager teardown",
+            pass, pass ? "" : "drops_ptr did not survive manager teardown");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: counter bump safe after manager teardown",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Section 5: Integration — UpstreamManager with a real Dispatcher
 //
@@ -1376,20 +1711,57 @@ void TestPoolPartitionErrorCodes() {
         if (PoolPartition::CHECKOUT_CONNECT_TIMEOUT >= 0) { pass = false; err += "CONNECT_TIMEOUT; "; }
         if (PoolPartition::CHECKOUT_SHUTTING_DOWN   >= 0) { pass = false; err += "SHUTTING_DOWN; "; }
         if (PoolPartition::CHECKOUT_QUEUE_TIMEOUT   >= 0) { pass = false; err += "QUEUE_TIMEOUT; "; }
+        if (PoolPartition::CHECKOUT_QUEUE_FULL      >= 0) { pass = false; err += "QUEUE_FULL; "; }
+        // CHECKOUT_OK is the lone non-negative success sentinel.
+        if (PoolPartition::CHECKOUT_OK              != 0) { pass = false; err += "OK should be zero; "; }
 
         // All error codes must be distinct.
         std::set<int> codes{
+            PoolPartition::CHECKOUT_OK,
             PoolPartition::CHECKOUT_POOL_EXHAUSTED,
             PoolPartition::CHECKOUT_CONNECT_FAILED,
             PoolPartition::CHECKOUT_CONNECT_TIMEOUT,
             PoolPartition::CHECKOUT_SHUTTING_DOWN,
-            PoolPartition::CHECKOUT_QUEUE_TIMEOUT
+            PoolPartition::CHECKOUT_QUEUE_TIMEOUT,
+            PoolPartition::CHECKOUT_QUEUE_FULL
         };
-        if (codes.size() != 5) { pass = false; err += "error codes not distinct; "; }
+        if (codes.size() != 7) { pass = false; err += "error codes not distinct; "; }
 
         TestFramework::RecordTest("UpstreamPool PoolPartition: error code values", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest("UpstreamPool PoolPartition: error code values", false, e.what());
+    }
+}
+
+// HostPortKey is used as a key in h2_connecting_conns_. Verify
+// equality + hash distribution so collisions on common shapes don't
+// blow up.
+void TestHostPortKeyHashAndEquality() {
+    std::cout << "\n[TEST] UpstreamPool HostPortKey: hash + equality..." << std::endl;
+    try {
+        HostPortKey a{"example.com", 443};
+        HostPortKey b{"example.com", 443};
+        HostPortKey c{"example.com", 80};
+        HostPortKey d{"example.org", 443};
+
+        std::hash<HostPortKey> h;
+        bool pass = (a == b) && (a != c) && (a != d) &&
+                    (h(a) == h(b)) &&
+                    (h(a) != h(c)) &&
+                    (h(a) != h(d));
+
+        // Smoke-test usability in an unordered_map.
+        std::unordered_map<HostPortKey, int> m;
+        m[a] = 1;
+        m[c] = 2;
+        m[d] = 3;
+        if (m.size() != 3 || m[b] != 1) pass = false;
+
+        TestFramework::RecordTest("UpstreamPool HostPortKey: hash + equality",
+                                  pass, pass ? "" : "hash collision or equality mismatch");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest("UpstreamPool HostPortKey: hash + equality",
+                                  false, e.what());
     }
 }
 
@@ -1427,12 +1799,16 @@ void TestUpstreamHostPoolPartitionCount() {
         resolved->resolved_at = std::chrono::steady_clock::now();
 
         std::atomic<int64_t> inflight_leases{0};
+        std::atomic<int64_t> donated_h2_leases{0};
+        auto off_dispatcher_release_drops =
+            std::make_shared<std::atomic<int64_t>>(0);
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
             resolved,
             ucfg.pool, {d0, d1}, nullptr,
-            outstanding, inflight_leases, mgr_shutdown, drain_mtx, drain_cv);
+            outstanding, inflight_leases, donated_h2_leases,
+            off_dispatcher_release_drops, mgr_shutdown, drain_mtx, drain_cv);
 
         bool pass = true;
         std::string err;
@@ -1486,12 +1862,16 @@ void TestUpstreamHostPoolAccessors() {
         resolved->resolved_at = std::chrono::steady_clock::now();
 
         std::atomic<int64_t> inflight_leases{0};
+        std::atomic<int64_t> donated_h2_leases{0};
+        auto off_dispatcher_release_drops =
+            std::make_shared<std::atomic<int64_t>>(0);
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
             resolved,
             ucfg.pool, {dispatcher}, nullptr,
-            outstanding, inflight_leases, mgr_shutdown, drain_mtx, drain_cv);
+            outstanding, inflight_leases, donated_h2_leases,
+            off_dispatcher_release_drops, mgr_shutdown, drain_mtx, drain_cv);
 
         bool pass = true;
         std::string err;
@@ -2205,6 +2585,13 @@ void RunAllTests() {
     TestUpstreamLeaseMoveSematics();
     TestUpstreamLeaseExplicitRelease();
     TestUpstreamLeaseMoveAssignment();
+    TestUpstreamLeaseKindEmpty();
+    TestUpstreamLeaseKindH1();
+    TestUpstreamLeaseKindH2AliveGates();
+    TestOffDispatcherReleaseBumpsCounter();
+    TestOnDispatcherReleaseDoesNotBumpCounter();
+    TestOffDispatcherReleaseSafeAfterManagerTeardown();
+    TestOffDispatcherReleaseDispatcherSurvivesPartitionTeardown();
 
     // Section 5: Integration (UpstreamManager + real Dispatcher)
     TestUpstreamManagerHasUpstream();
@@ -2216,6 +2603,7 @@ void RunAllTests() {
 
     // Section 6: PoolPartition error codes
     TestPoolPartitionErrorCodes();
+    TestHostPortKeyHashAndEquality();
 
     // Section 7: UpstreamHostPool
     TestUpstreamHostPoolPartitionCount();

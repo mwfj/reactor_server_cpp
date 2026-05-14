@@ -10,6 +10,15 @@
 
 class UpstreamConnection;
 class UpstreamH2Codec;
+class ConnectionHandler;
+class PoolPartition;
+
+// Null every callback an H2 session installed on its transport so a
+// late epoll/kqueue event cannot dispatch into a destroyed session.
+// Called from DestroyOnDispatcher AND the dtor safety net. Safe from
+// any thread because each setter is a plain field write under
+// ConnectionHandler's normal ABI.
+void ClearH2TransportCallbacks(ConnectionHandler* transport);
 
 // Multiplexed H2 client session bound to one upstream transport. Owns
 // the nghttp2_session* and the per-stream table for its lifetime. The
@@ -73,9 +82,27 @@ public:
     // Last stream id from the most recent GOAWAY, or -1 if none.
     int32_t goaway_last_stream_id() const { return goaway_last_stream_id_; }
 
-    // Active stream count (used by GOAWAY drain accounting and by the
-    // reap walker to decide when this connection can be retired).
-    size_t active_stream_count() const { return streams_.size(); }
+    // Active stream count. Incremented in SubmitRequest; decremented in
+    // RunDeferredEraseWalk (the sole per-stream decrement site).
+    // FailAllStreams resets to 0 as part of the bulk fan-out.
+    size_t active_stream_count() const {
+        return static_cast<size_t>(active_streams_);
+    }
+
+    // Liveness token. Flipped to false by destroy paths before any other
+    // state mutation; transport-callback captures consult this via
+    // memory_order_acquire load before dereferencing the raw connection
+    // pointer.
+    std::shared_ptr<std::atomic<bool>> alive_token() const {
+        return conn_alive_;
+    }
+
+    // Partition liveness token. Captured at SetPartition() time so the
+    // shared_ptr stays alive even after the partition destructs. Returns
+    // a null shared_ptr if SetPartition was never called.
+    std::shared_ptr<std::atomic<bool>> partition_alive_token() const {
+        return partition_alive_;
+    }
 
     // Per-upstream H2 sub-config snapshot captured at construction.
     // Reference is valid for the lifetime of *this — `cfg_` is never
@@ -107,10 +134,30 @@ public:
     // so the post-receive flush in the caller picks it up safely.
     void ResetStream(int32_t stream_id);
 
+    // Null the stream's sink and, if peer has already closed, enqueue
+    // the entry for the deferred-erase walker. Callers that submit RST
+    // (ResetStream) also call this; callers that observe peer-close
+    // (OnStreamClose) do so directly inline.
+    void DetachSink(int32_t stream_id);
+
+    // Erase entries flagged pending_erase_. Must run on dispatcher and
+    // outside any nghttp2 callback frame — HandleBytes calls this after
+    // FlushSend.
+    void RunDeferredEraseWalk();
+
     // Take ownership of the lease that funded this connection's
     // transport. Released in ~UpstreamH2Connection so the transport
     // returns to the pool only after every stream has exited.
     void AdoptLease(UpstreamLease lease);
+
+    // Bind this session to its owning partition. Set by every code path
+    // that installs an H2 session: AcquireH2Connection (in-place
+    // promotion), OnH2ConnectHandshakeComplete (cold-start probe
+    // success), and InsertH2ConnectionForTesting. Never reassigned
+    // after install. Needed by HandleBytes to drive the post-recv
+    // pending_destroy reap and by DestroyOnDispatcher to clean up
+    // timer registrations.
+    void SetPartition(PoolPartition* partition);
 
     // Fan out an error to every active stream (transport closed, PING
     // timeout, session-fatal nghttp2 error). Each stream's sink receives
@@ -140,6 +187,37 @@ public:
 
     // True after MarkDead() has been called.
     bool IsDead() const { return dead_; }
+
+    // Dispatcher-thread polite teardown. Idempotent; short-circuits on
+    // `transferred_` (H1 adoption consumed the transport). The six-step
+    // ordering (alive-flip → callback-null → timer-remove → CLOSING →
+    // lease-reset → destroyed_on_dispatcher_) is implemented in the .cc
+    // and locked by the step-by-step comments at the call site.
+    void DestroyOnDispatcher();
+
+    // True after a TakeShellForH1Adoption hand-off has consumed the
+    // transport. The dtor MUST suppress its callback-null / lease
+    // teardown when set — the adopted H1 connection now owns the
+    // transport and the pool accounting it carries.
+    bool transferred() const { return transferred_; }
+
+    // Mark this shell as having donated its transport to the H1
+    // adoption path. Set BEFORE DestroyOnDispatcher / dtor so both
+    // skip every step — the new H1 owner keeps the transport and its
+    // outstanding_conns_ contribution. Safe because adoption only
+    // reaches shells that never called Init() (no nghttp2_session_*
+    // to release).
+    void MarkTransferred() { transferred_ = true; }
+
+    // Null the raw `transport_` pointer. Used by ALPN-h1 adoption
+    // catch handlers when AdoptAsH1Connection throws BEFORE committing
+    // the move into idle_conns_: the caller is about to DestroyConnection
+    // the still-owned `owned_uc`, which would leave shell->transport_
+    // dangling. Nulling it here makes the safety-net dtor's
+    // ClearH2TransportCallbacks(transport_->GetTransport())
+    // evaluate to nullptr (no-op) so the dtor finishes cleanly.
+    // Dispatcher-thread-only.
+    void ClearTransportForRollback() { transport_ = nullptr; }
 
     // True while a HandleBytes call is active. Submit / ResetStream check
     // this to defer the inline FlushSend so we never re-enter
@@ -187,9 +265,38 @@ private:
     // Per-stream table keyed by nghttp2 stream_id.
     std::unordered_map<int32_t, std::shared_ptr<UpstreamH2Stream>> streams_;
 
+    // Submitted-stream count. Diverges from streams_.size() once
+    // pending_erase_ entries accumulate before the walker reaps them.
+    int active_streams_ = 0;
+
+    // Heap-allocated liveness flag. Initialized to true at construction.
+    // Destroy paths must store false BEFORE any other state mutation so
+    // callback captures observing the acquire-load no-op cleanly.
+    std::shared_ptr<std::atomic<bool>> conn_alive_;
+
     // Permanently dead flag: set by MarkDead() (e.g. transport closed)
     // so IsUsable() returns false and the next table walk evicts this entry.
     bool dead_ = false;
+
+    // Set by DestroyOnDispatcher; consulted by the dtor's safety-net
+    // path to skip the teardown that already ran. Atomic so the dtor
+    // can observe the set from a different thread if the dtor races.
+    std::atomic<bool> destroyed_on_dispatcher_{false};
+
+    // Set by MarkTransferred when the transport has been adopted out
+    // to the H1 idle pool on ALPN-h1 fallback. Both DestroyOnDispatcher
+    // and the dtor MUST suppress transport teardown when set, so the
+    // new H1 borrower owns the pool accounting.
+    bool transferred_ = false;
+
+    // Non-owning back-pointer to the owning partition. Null in unit
+    // tests that construct an H2 conn without a real pool. Set by
+    // AcquireH2Connection via SetPartition.
+    PoolPartition* partition_ = nullptr;
+    // Partition liveness token captured at SetPartition() time. shared_ptr
+    // keeps the atomic alive even after the partition destructs so
+    // borrowers (ProxyTransaction H2 path) can safely consult it.
+    std::shared_ptr<std::atomic<bool>> partition_alive_;
 
     bool goaway_seen_ = false;
     int32_t goaway_last_stream_id_ = -1;
@@ -235,6 +342,10 @@ private:
         bool is_control;       // PING/SETTINGS/WINDOW_UPDATE/RST/etc — no sink
     };
     std::deque<PendingFrameDrain> drain_queue_;
+
+    // Stream ids awaiting deferred erase from streams_. Pushed by
+    // OnStreamClose / DetachSink; drained by RunDeferredEraseWalk.
+    std::deque<int32_t> pending_erase_streams_;
     // Total bytes queued on the transport on our behalf — sum of every
     // bytes field in drain_queue_. Maintained alongside the queue so we
     // can compute drained-since-last-fire as
@@ -250,4 +361,5 @@ private:
     // been failed / reset. The sink is about to be detached so its
     // virtuals must not fire post-detach.
     void DropDrainEntriesForStream(int32_t stream_id);
+
 };
