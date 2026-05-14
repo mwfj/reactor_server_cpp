@@ -17,6 +17,7 @@
 #include "observability/resource.h"
 #include "observability/span_processor.h"
 #include "observability/trace_id.h"
+#include "upstream/upstream_manager.h"
 #include "nlohmann/json.hpp"
 
 // <cstdio> provided by common.h (via http_server.h)
@@ -461,6 +462,18 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
             root["bind"]     = BuildBindObject(server);
             root["upstream"] = BuildUpstreamObject(server);
             root["dns"]      = BuildDnsObject(server);
+            // Lease-health counters. off_dispatcher_release_drops is the
+            // operator signal that shutdown drain may wedge until
+            // timeout — every increment is a leaked lease bump that the
+            // drain predicate will never observe.
+            if (auto* upm = server->GetUpstreamManager()) {
+                nlohmann::json lh;
+                lh["active_leases"] = upm->active_leases();
+                lh["donated_h2_leases"] = upm->donated_h2_leases();
+                lh["off_dispatcher_release_drops"] =
+                    upm->off_dispatcher_release_drops();
+                root["lease_health"] = std::move(lh);
+            }
             // Render the JSON, then re-open the trailing '}' so
             // AppendAuthSnapshot can splice in the auth fields without
             // re-serializing the whole tree.

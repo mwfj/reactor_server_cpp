@@ -13,6 +13,7 @@ UpstreamHostPool::UpstreamHostPool(
     std::atomic<int64_t>& outstanding_conns,
     std::atomic<int64_t>& inflight_leases,
     std::atomic<int64_t>& donated_h2_leases,
+    std::atomic<int64_t>& off_dispatcher_release_drops,
     std::atomic<bool>& manager_shutting_down,
     std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
@@ -89,6 +90,7 @@ UpstreamHostPool::UpstreamHostPool(
             dispatchers[i], service_name, host, port, sni_hostname,
             resolved_endpoint, partition_config, tls_ctx,
             outstanding_conns, inflight_leases, donated_h2_leases,
+            off_dispatcher_release_drops,
             manager_shutting_down, drain_mtx, drain_cv));
     }
 

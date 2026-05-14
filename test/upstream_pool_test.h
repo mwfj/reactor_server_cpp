@@ -1551,12 +1551,14 @@ void TestUpstreamHostPoolPartitionCount() {
 
         std::atomic<int64_t> inflight_leases{0};
         std::atomic<int64_t> donated_h2_leases{0};
+        std::atomic<int64_t> off_dispatcher_release_drops{0};
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
             resolved,
             ucfg.pool, {d0, d1}, nullptr,
-            outstanding, inflight_leases, donated_h2_leases, mgr_shutdown, drain_mtx, drain_cv);
+            outstanding, inflight_leases, donated_h2_leases,
+            off_dispatcher_release_drops, mgr_shutdown, drain_mtx, drain_cv);
 
         bool pass = true;
         std::string err;
@@ -1611,12 +1613,14 @@ void TestUpstreamHostPoolAccessors() {
 
         std::atomic<int64_t> inflight_leases{0};
         std::atomic<int64_t> donated_h2_leases{0};
+        std::atomic<int64_t> off_dispatcher_release_drops{0};
         UpstreamHostPool pool(
             ucfg.name, ucfg.host, ucfg.port,
             ucfg.tls.sni_hostname,
             resolved,
             ucfg.pool, {dispatcher}, nullptr,
-            outstanding, inflight_leases, donated_h2_leases, mgr_shutdown, drain_mtx, drain_cv);
+            outstanding, inflight_leases, donated_h2_leases,
+            off_dispatcher_release_drops, mgr_shutdown, drain_mtx, drain_cv);
 
         bool pass = true;
         std::string err;

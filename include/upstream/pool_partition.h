@@ -53,6 +53,7 @@ public:
                   std::atomic<int64_t>& outstanding_conns,
                   std::atomic<int64_t>& inflight_leases,
                   std::atomic<int64_t>& donated_h2_leases,
+                  std::atomic<int64_t>& off_dispatcher_release_drops,
                   std::atomic<bool>& manager_shutting_down,
                   std::mutex& drain_mtx,
                   std::condition_variable& drain_cv);
@@ -323,6 +324,16 @@ public:
         inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
     }
 
+    // Bumped by UpstreamLease::Release() when invoked off the partition
+    // dispatcher thread (the partition mutation is skipped to avoid a
+    // container race). Operator signal that a leased counter bump went
+    // unreturned. Surfaced via UpstreamManager::off_dispatcher_release_drops().
+    void IncOffDispatcherReleaseDrops() noexcept {
+        off_dispatcher_release_drops_.fetch_add(
+            1, std::memory_order_acq_rel);
+    }
+
+#ifdef REACTOR_BUILDING_TESTS
     // Test-only: insert a fully-Init'd `UpstreamH2Connection` (typically
     // built with a null transport in unit-test fixtures) into the
     // partition's h2_table_. Production paths funnel through
@@ -352,6 +363,7 @@ public:
     size_t PendingReplacementTargetCountForTesting() const {
         return pending_h2_replacement_targets_.size();
     }
+#endif  // REACTOR_BUILDING_TESTS
 
 private:
     std::shared_ptr<Dispatcher> dispatcher_;
@@ -384,6 +396,7 @@ private:
     // ReturnConnection when the lease's destructor releases.
     std::atomic<int64_t>& inflight_leases_;
     std::atomic<int64_t>& donated_h2_leases_;
+    std::atomic<int64_t>& off_dispatcher_release_drops_;
     std::atomic<bool>& manager_shutting_down_;  // Set immediately by manager
     std::mutex& drain_mtx_;
     std::condition_variable& drain_cv_;

@@ -20,6 +20,7 @@ public:
                      std::atomic<int64_t>& outstanding_conns,
                      std::atomic<int64_t>& inflight_leases,
                      std::atomic<int64_t>& donated_h2_leases,
+                     std::atomic<int64_t>& off_dispatcher_release_drops,
                      std::atomic<bool>& manager_shutting_down,
                      std::mutex& drain_mtx,
                      std::condition_variable& drain_cv);

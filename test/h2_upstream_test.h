@@ -11,7 +11,7 @@
 //     A5.  H2ConnectionTable::ReapDrained correctness
 //     A6.  H2ConnectionTable::Clear correctness
 //     A7.  H2ConnectionTable::TickAll PING-timeout removal
-//     A8.  UpstreamManager::LookupStagedH2ForLivePartitionForTesting
+//     A8.  UpstreamManager::CommitHttp2Snapshots live-only narrow (stale staged entry ignored)
 //     A9.  UpstreamManager::CommitHttp2Snapshots bootstrap
 //     A10. UpstreamManager::ComputeMinUpstreamCadenceSec
 //     A11. PoolPartition::ApplyHttp2ConfigCommit / LoadHttp2ConfigSnapshot
@@ -629,70 +629,60 @@ void TestTickAllKeepsLiveConnections() {
     }
 }
 
-// A8 — UpstreamManager::LookupStagedH2ForLivePartitionForTesting
-void TestLookupStagedH2Found() {
-    std::cout << "\n[TEST] H2Upstream A8a: LookupStagedH2 returns config when upstream exists..." << std::endl;
+// A8 — UpstreamManager::CommitHttp2Snapshots ignores staged entries whose
+// names do not match any live partition (live-only narrow). The match-case
+// (live + staged-match) and the missing-from-staged case are covered by A9
+// and A9b respectively; this single test covers the remaining live-only
+// narrow semantic by driving through the production CommitHttp2Snapshots
+// path and observing partition state.
+void TestCommitH2SnapshotsIgnoresStaleStagedEntry() {
+    std::cout << "\n[TEST] H2Upstream A8: CommitHttp2Snapshots ignores staged entry with no live partition..." << std::endl;
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
         UpstreamConfig live_cfg = MakeH2UpstreamConfig("backend", "127.0.0.1", 9999);
+        live_cfg.http2.ping_idle_sec = 33;
         UpstreamManager mgr({live_cfg}, {disp});
         DispatcherThreadGuard dtg{disp, t};
 
-        // Staged set contains "backend" with H2 enabled
-        UpstreamConfig staged = live_cfg;
-        staged.http2.ping_idle_sec = 45;
+        // Seed an initial snapshot so we can detect any unintended mutation.
+        mgr.CommitHttp2Snapshots({live_cfg});
 
-        auto result = mgr.LookupStagedH2ForLivePartitionForTesting("backend", {staged});
-        bool pass = result.has_value() && result->ping_idle_sec == 45;
-        TestFramework::RecordTest("H2Upstream A8a: LookupStagedH2 returns config when upstream exists",
-                                   pass,
-                                   pass ? "" : "expected value with ping_idle_sec=45");
+        // Commit a staged set whose only entry names a non-live upstream.
+        // "backend" remains live but is missing from the staged set; "other"
+        // is staged but has no live partition. CommitHttp2Snapshots must
+        // leave the live partition's snapshot unchanged.
+        UpstreamConfig stale_staged = MakeH2UpstreamConfig("other", "127.0.0.1", 9998);
+        stale_staged.http2.ping_idle_sec = 99;
+        mgr.CommitHttp2Snapshots({stale_staged});
+
+        auto parts = mgr.LivePartitions();
+        bool pass = true;
+        std::string err;
+        bool found_backend = false;
+        for (auto& ref : parts) {
+            if (ref.upstream_name == "other") {
+                pass = false;
+                err += "stale staged entry created a live partition; ";
+            }
+            if (ref.upstream_name != "backend") continue;
+            found_backend = true;
+            auto snap = ref.partition->LoadHttp2ConfigSnapshot();
+            if (!snap) {
+                pass = false; err += "backend snapshot cleared; ";
+            } else if (snap->ping_idle_sec != 33) {
+                pass = false;
+                err += "backend snapshot mutated (ping_idle_sec=" +
+                       std::to_string(snap->ping_idle_sec) + "); ";
+            }
+        }
+        if (!found_backend) {
+            pass = false; err += "backend partition missing; ";
+        }
+        TestFramework::RecordTest("H2Upstream A8: CommitHttp2Snapshots ignores staged entry with no live partition",
+                                   pass, err);
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("H2Upstream A8a: LookupStagedH2 returns config when upstream exists",
-                                   false, e.what());
-    }
-}
-
-void TestLookupStagedH2MissingFromStaged() {
-    std::cout << "\n[TEST] H2Upstream A8b: LookupStagedH2 returns nullopt when missing from staged..." << std::endl;
-    try {
-        auto disp = std::make_shared<Dispatcher>();
-        auto t = StartDispatcher(disp);
-        UpstreamConfig live_cfg = MakeH2UpstreamConfig("backend", "127.0.0.1", 9999);
-        UpstreamManager mgr({live_cfg}, {disp});
-        DispatcherThreadGuard dtg{disp, t};
-
-        // Staged set does NOT contain "backend"
-        auto result = mgr.LookupStagedH2ForLivePartitionForTesting("backend", {});
-        bool pass = !result.has_value();
-        TestFramework::RecordTest("H2Upstream A8b: LookupStagedH2 returns nullopt when missing from staged",
-                                   pass,
-                                   pass ? "" : "expected nullopt");
-    } catch (const std::exception& e) {
-        TestFramework::RecordTest("H2Upstream A8b: LookupStagedH2 returns nullopt when missing from staged",
-                                   false, e.what());
-    }
-}
-
-void TestLookupStagedH2UnknownLivePartition() {
-    std::cout << "\n[TEST] H2Upstream A8c: LookupStagedH2 returns nullopt for unknown live upstream..." << std::endl;
-    try {
-        auto disp = std::make_shared<Dispatcher>();
-        auto t = StartDispatcher(disp);
-        UpstreamConfig live_cfg = MakeH2UpstreamConfig("backend", "127.0.0.1", 9999);
-        UpstreamManager mgr({live_cfg}, {disp});
-        DispatcherThreadGuard dtg{disp, t};
-
-        // Query a name that is not in the live pools
-        UpstreamConfig staged = MakeH2UpstreamConfig("other", "127.0.0.1", 9998);
-        auto result = mgr.LookupStagedH2ForLivePartitionForTesting("other", {staged});
-        bool pass = !result.has_value();
-        TestFramework::RecordTest("H2Upstream A8c: LookupStagedH2 returns nullopt for unknown live upstream",
-                                   pass,
-                                   pass ? "" : "expected nullopt for unknown live partition");
-    } catch (const std::exception& e) {
-        TestFramework::RecordTest("H2Upstream A8c: LookupStagedH2 returns nullopt for unknown live upstream",
+        TestFramework::RecordTest("H2Upstream A8: CommitHttp2Snapshots ignores staged entry with no live partition",
                                    false, e.what());
     }
 }
@@ -7371,9 +7361,7 @@ void RunAllH2UpstreamTests() {
     TestBuildSettingsArray();
     TestBuildSettingsArrayDefaults();
 
-    TestLookupStagedH2Found();
-    TestLookupStagedH2MissingFromStaged();
-    TestLookupStagedH2UnknownLivePartition();
+    TestCommitH2SnapshotsIgnoresStaleStagedEntry();
 
     TestCommitH2SnapshotsBootstrap();
     TestCommitH2SnapshotsMissingPartitionRetainsPrevious();

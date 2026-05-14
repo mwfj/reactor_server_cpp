@@ -73,6 +73,9 @@ void UpstreamLease::Release() {
     if (off_dispatcher) {
         // Skip partition mutation entirely. Counter corruption is the
         // worse failure mode; a lost return is bounded (single lease).
+        // Bump the manager-level counter so /stats surfaces the leak
+        // and operators can correlate shutdown-drain delays.
+        partition_->IncOffDispatcherReleaseDrops();
     } else if (kind_ == Kind::H1 && partition_live && conn_) {
         partition_->ReturnConnection(conn_, donated_to_h2_);
     } else if (kind_ == Kind::H2 && partition_live && h2_conn_ &&
@@ -113,6 +116,7 @@ PoolPartition::PoolPartition(
     std::atomic<int64_t>& outstanding_conns,
     std::atomic<int64_t>& inflight_leases,
     std::atomic<int64_t>& donated_h2_leases,
+    std::atomic<int64_t>& off_dispatcher_release_drops,
     std::atomic<bool>& manager_shutting_down,
     std::mutex& drain_mtx,
     std::condition_variable& drain_cv)
@@ -127,6 +131,7 @@ PoolPartition::PoolPartition(
     , outstanding_conns_(outstanding_conns)
     , inflight_leases_(inflight_leases)
     , donated_h2_leases_(donated_h2_leases)
+    , off_dispatcher_release_drops_(off_dispatcher_release_drops)
     , manager_shutting_down_(manager_shutting_down)
     , drain_mtx_(drain_mtx)
     , drain_cv_(drain_cv)
@@ -678,6 +683,7 @@ void PoolPartition::ReapPendingDestroyH2Conns() {
     }
 }
 
+#ifdef REACTOR_BUILDING_TESTS
 void PoolPartition::InsertH2ConnectionForTesting(
     const std::string& upstream_name,
     std::unique_ptr<UpstreamH2Connection> conn) {
@@ -690,6 +696,7 @@ void PoolPartition::SeedPendingReplacementTargetForTesting(int port) {
     pending_h2_replacement_targets_.push_back(
         HostPortKey{service_name_, port});
 }
+#endif  // REACTOR_BUILDING_TESTS
 
 void PoolPartition::FailH2StreamSlotWaiters(
     const std::string& upstream_name, int port, int connect_outcome,
@@ -873,22 +880,23 @@ void PoolPartition::ReturnH2Stream(
     UpstreamH2Connection* h2_conn, int32_t stream_id,
     std::shared_ptr<std::atomic<bool>> /*partition_alive*/,
     std::shared_ptr<std::atomic<bool>> /*conn_alive*/) {
-    // Reachable today through tests that construct H2-kind UpstreamLease
-    // objects with a live partition (see TestUpstreamLeaseKindH2AliveGates
-    // pattern) and let them destruct. Stream teardown in production
-    // still flows through OnStreamClose / ResetStream / RunDeferredEraseWalk
-    // — this entry is forward-work for the H2 lease-vending migration on
-    // ProxyTransaction. Warn level (not error) because the call path
-    // exists for tests; the warning still surfaces if a future
-    // production caller forgets the wait-queue drain.
+    // Reaching this entry means an UpstreamLease::Kind::H2 destructor
+    // ran with partition_live=true AND conn_alive observed live — but
+    // no production caller of the H2 lease-vending path exists yet
+    // (stream teardown flows through OnStreamClose / ResetStream /
+    // RunDeferredEraseWalk). Existing tests construct H2-kind leases
+    // with partition=nullptr (partition_live=false), short-circuiting
+    // Release BEFORE reaching here. So error-level is correct today:
+    // any invocation indicates a production caller wired the H2
+    // lease-vending path without the matching DrainH2StreamWaitersForHost
+    // dispatch — exactly the bug the pitfall-doc rule guards against.
     // FIXME: implement DrainH2StreamWaitersForHost dispatch once the
     // h2_lease_ migration on ProxyTransaction lands.
-    logging::Get()->warn(
-        "PoolPartition::ReturnH2Stream invoked (h2_conn={}, stream_id={}) "
-        "— H2 lease-vending path is forward-work; queued H2_STREAM_SLOT "
-        "waiters will NOT be admitted via this release path. Expected in "
-        "test fixtures; production callers must wait for the h2_lease_ "
-        "migration.",
+    logging::Get()->error(
+        "BUG: PoolPartition::ReturnH2Stream called without a wired "
+        "H2-lease vending path (h2_conn={}, stream_id={}) — H2 stream "
+        "slot release dropped; queued H2_STREAM_SLOT waiters will not "
+        "be admitted.",
         static_cast<const void*>(h2_conn), stream_id);
 }
 

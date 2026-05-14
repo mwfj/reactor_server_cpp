@@ -98,18 +98,28 @@ public:
     int64_t donated_h2_leases() const noexcept {
         return donated_h2_leases_.load(std::memory_order_acquire);
     }
+    // Count of `UpstreamLease::Release()` calls that observed an
+    // off-dispatcher invocation and skipped the partition mutation.
+    // Each increment represents a leaked inflight/donated counter
+    // bump that the drain predicate will never observe — operator
+    // signal that shutdown drain risks wedging until timeout. Should
+    // remain zero in healthy production; bumps surface via /stats.
+    int64_t off_dispatcher_release_drops() const noexcept {
+        return off_dispatcher_release_drops_.load(
+            std::memory_order_acquire);
+    }
+    void IncOffDispatcherReleaseDrops() noexcept {
+        off_dispatcher_release_drops_.fetch_add(
+            1, std::memory_order_acq_rel);
+    }
 
+#ifdef REACTOR_BUILDING_TESTS
     // Test-only: adjust the lease counters by signed deltas. Tests that
     // exercise the swap helper in isolation use this to restore a clean
     // baseline before the manager destructor checks invariants.
-    //
-    // WARNING: production use silently corrupts the drain predicate.
-    // The HttpServer::WaitForAllAsyncDrain barrier gates on
-    // `inflight_leases_ == 0`; a non-zero delta from production code
-    // would either prematurely satisfy the predicate (leaks) or wedge
-    // shutdown forever (deadlock). The `_DO_NOT_USE_IN_PRODUCTION`
-    // suffix makes grep-audits trivial — a CI/lint hook can reject any
-    // non-test file that references this symbol.
+    // Compile-only-in-test-builds (Makefile -DREACTOR_BUILDING_TESTS on
+    // the test_runner target); production code cannot reference this
+    // symbol because it isn't declared in the production build.
     void RebalanceCountersForTesting_DO_NOT_USE_IN_PRODUCTION(
         int64_t inflight_delta, int64_t donated_delta) noexcept {
         inflight_leases_.fetch_add(inflight_delta,
@@ -117,6 +127,7 @@ public:
         donated_h2_leases_.fetch_add(donated_delta,
                                      std::memory_order_acq_rel);
     }
+#endif
     int64_t inflight_transactions() const noexcept {
         return inflight_transactions_.load(std::memory_order_acquire);
     }
@@ -166,16 +177,6 @@ public:
     // Called by HttpServer::Reload while holding reload_mtx_.
     void UpdateResolvedEndpoints(
         const NET_DNS_NAMESPACE::ResolvedMap& merged);
-
-    // Single-key staged-lookup helper. Production reload uses
-    // CommitHttp2Snapshots() which builds an O(N) name→config map once
-    // and applies in O(K+P); this single-key variant is retained for
-    // unit-test coverage of the lookup semantics (live-only narrow,
-    // missing-from-staged returns nullopt). Pure lookup — does not
-    // mutate partition state. Safe from any thread.
-    std::optional<Http2UpstreamConfig> LookupStagedH2ForLivePartitionForTesting(
-        const std::string& upstream_name,
-        const std::vector<UpstreamConfig>& staged_upstreams) const;
 
     // Reload-time enumerator: pairs every live PoolPartition with its
     // upstream service name. Pointers stay valid until UpstreamManager
@@ -290,6 +291,13 @@ private:
     // its full budget waiting for the lease that only releases when
     // InitiateShutdown explicitly retires the session.
     std::atomic<int64_t> donated_h2_leases_{0};
+
+    // Off-dispatcher Release safety counter. Each increment indicates a
+    // single leaked inflight/donated bump (Release skipped the partition
+    // mutation to avoid container races). Operators monitor via /stats;
+    // a non-zero value means shutdown drain may wedge until timeout
+    // OR /stats active_leases reports stale.
+    std::atomic<int64_t> off_dispatcher_release_drops_{0};
 
     // Bumped from ProxyTransaction::Start, decremented at terminal
     // completion. Read by HttpServer::WaitForAllAsyncDrain alongside

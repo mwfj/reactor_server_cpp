@@ -209,9 +209,11 @@ $(THIRD_PARTY_DIR)/llhttp/%.o: $(THIRD_PARTY_DIR)/llhttp/%.c
 $(THIRD_PARTY_DIR)/nghttp2/%.o: $(THIRD_PARTY_DIR)/nghttp2/%.c
 	$(CC) $(NGHTTP2_CFLAGS) -c $< -o $@
 
-# Build the test executable
+# Build the test executable. -DREACTOR_BUILDING_TESTS exposes the
+# *_ForTesting / *_DO_NOT_USE_IN_PRODUCTION helpers (intentionally
+# absent from the production server build).
 $(TARGET): $(TEST_SRCS) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
-	$(CXX) $(CXXFLAGS) $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(LDFLAGS) -o $(TARGET)
+	$(CXX) $(CXXFLAGS) -DREACTOR_BUILDING_TESTS $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(LDFLAGS) -o $(TARGET)
 
 # Build the production server binary
 $(SERVER_TARGET): $(LIB_SRCS) $(MAIN_SRC) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
@@ -497,7 +499,7 @@ TSAN_TARGET   = test_runner_tsan
 
 $(TSAN_TARGET): $(TEST_SRCS) $(HEADERS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ)
 	@echo "Building TSAN test runner ($(TSAN_TARGET))..."
-	$(CXX) $(TSAN_CXXFLAGS) $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(TSAN_LDFLAGS) -o $(TSAN_TARGET)
+	$(CXX) $(TSAN_CXXFLAGS) -DREACTOR_BUILDING_TESTS $(TEST_SRCS) $(LLHTTP_OBJ) $(NGHTTP2_OBJ) $(TSAN_LDFLAGS) -o $(TSAN_TARGET)
 
 test_dual_stack_tsan: $(TSAN_TARGET)
 	@echo "Running dual-stack TSAN tests (stop/reload/destruction) under ThreadSanitizer..."
