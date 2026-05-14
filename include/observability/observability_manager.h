@@ -322,7 +322,6 @@ private:
     // from the new `traces.propagators` list.
     std::shared_ptr<const Propagator>         propagator_;
 
-    std::unique_ptr<TracerProvider>           tracer_provider_;
     std::unique_ptr<MeterProvider>            meter_provider_;
     // Built at Init() time, registered into meter_provider_'s
     // "reactor.http.server" Meter. Not owned by this manager — Meter
@@ -335,9 +334,10 @@ private:
     // Catalogued instrument handles (pointers owned by MeterProvider).
     // Built by `MetricsCatalog::Build` at the end of `Init()`.
     // MUST be declared AFTER meter_provider_ AND BEFORE metric_reader_ /
-    // span_processor_. Workers in PMR and BSP dereference manager_->catalog()
-    // during self-metric emission; reverse-destruction must join both workers
-    // BEFORE catalog (and the meter_provider that owns its instruments) dies.
+    // span_processor_ / tracer_provider_. Workers in PMR and BSP
+    // dereference manager_->catalog() during self-metric emission;
+    // reverse-destruction must join both workers BEFORE catalog (and
+    // the meter_provider that owns its instruments) dies.
     MetricsCatalog                            catalog_;
 
     // MUST be declared AFTER catalog_ AND meter_provider_. Members
@@ -348,16 +348,37 @@ private:
     // return before the final cycle completes; ~PeriodicMetricReader's
     // unconditional fallback join is the safety net, and it only works
     // if catalog_ and MeterProvider are still alive when it runs.
+    // PMR has a SINGLE ref-holder (this manager), so dropping
+    // metric_reader_ here actually runs ~PeriodicMetricReader.
     std::shared_ptr<PeriodicMetricReader>     metric_reader_;
 
-    // MUST be declared LAST among observer/worker members for the same
-    // reason as metric_reader_. The BSP worker reads manager_->catalog()
-    // for self-metrics (queue depth, drop counters) and dereferences
-    // meter_provider_-owned instruments. Reverse-destruction joins this
-    // worker first, before catalog_ / meter_provider_ / metric_reader_
-    // are destroyed. ~BatchSpanProcessor's unconditional fallback join
-    // depends on those members still being alive when it runs.
+    // MUST be declared AFTER catalog_ AND meter_provider_, and BEFORE
+    // tracer_provider_. The BSP worker reads manager_->catalog() for
+    // self-metrics (queue depth, drop counters) and dereferences
+    // meter_provider_-owned instruments. Unlike PMR, SpanProcessor has
+    // MULTIPLE ref-holders: this manager, TracerProvider::processor_,
+    // and every cached Tracer's processor_ (and any in-flight Span's
+    // processor_). Dropping the manager's ref here is NOT sufficient to
+    // run ~BatchSpanProcessor — those other refs must drop first.
+    // tracer_provider_ is declared AFTER this member so reverse-
+    // destruction destroys it FIRST (releasing TP's + every Tracer's
+    // ref to BSP), THEN this manager's ref drops, THEN ~BSP runs and
+    // joins the worker — all while catalog_ + meter_provider_ are
+    // still alive.
     std::shared_ptr<SpanProcessor>            span_processor_;
+
+    // MUST be declared LAST among observer/worker members. Reverse-
+    // destruction destroys tracer_provider_ FIRST, which destroys its
+    // tracers_ map; each ~Tracer drops its `processor_` ref to the BSP,
+    // and TracerProvider's own `processor_` ref drops here. Only after
+    // all those refs are released does the manager's `span_processor_`
+    // shared_ptr (declared above) hold the last ref — when it destructs
+    // next, ~BatchSpanProcessor finally runs and joins the worker,
+    // BEFORE catalog_ / meter_provider_ / metric_reader_ destruct.
+    // See the OBSERVABILITY pitfall: "Worker-owning shared_ptr with
+    // multiple ref-holders — reorder alone is insufficient" for why
+    // member-reorder of span_processor_ alone does not fix the UAF.
+    std::unique_ptr<TracerProvider>           tracer_provider_;
 
     // Live-flag snapshots (atomic; updated on Reload).
     std::atomic<bool> traces_enabled_{true};

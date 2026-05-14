@@ -1128,6 +1128,92 @@ inline void TestSelfMetricsClosureInvariant() {
         TestFramework::RecordTest(
             "SelfMetrics: closure invariant AlwaysOff (created == dropped_unsampled)",
             pass_off, msg_off, TestFramework::TestCategory::OTHER);
+
+        // --- Pass 3: AlwaysOn + kFailedNotRetryable — every export attempt
+        // emits exported{outcome=non_retryable_fail}. Closure still holds:
+        // created == exported{non_retryable_fail}. The failure path is the
+        // most likely regression site, so this pass guards against a
+        // double-count where a retry inflates `exported` without bumping
+        // `created`. ---
+        ObservabilityConfig fail_cfg;
+        fail_cfg.enabled = true;
+        fail_cfg.traces.enabled = true;
+        fail_cfg.metrics.enabled = true;
+        fail_cfg.traces.sampler.type = SamplerType::AlwaysOn;
+        fail_cfg.resource.service_name = "obs-self-metrics-closure-fail";
+        auto fail_mgr = ObservabilityManager::Create(
+            std::move(fail_cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCA7FA17EULL));
+        auto fail_exporter = std::make_shared<FixedResultSpanExporter>(
+            ExportResult::kFailedNotRetryable);
+        BatchSpanProcessorOptions fail_opts;
+        fail_opts.max_export_batch_size = 64;
+        fail_opts.schedule_delay = std::chrono::milliseconds{30};
+        auto fail_bsp = std::make_shared<BatchSpanProcessor>(
+            fail_exporter, fail_opts, fail_mgr.get());
+        fail_mgr->SwapToBatchSpanProcessor(fail_bsp);
+        auto* fail_tracer = fail_mgr->GetTracer("test.closure.fail", "1.0");
+
+        auto fail_before = fail_mgr->meter_provider()->Snapshot();
+        const double fail_created_before =
+            SumCounter(fail_before, "reactor.otel.spans.created");
+        const double fail_exported_before =
+            SumCounter(fail_before, "reactor.otel.spans.exported");
+        const double fail_drop_unsampled_before = SumCounter(
+            fail_before, "reactor.otel.spans.dropped_unsampled");
+        const double fail_drop_unended_before = SumCounter(
+            fail_before, "reactor.otel.spans.dropped_unended");
+        const double fail_drop_queue_before = SumCounter(
+            fail_before, "reactor.otel.spans.dropped_queue_full");
+
+        constexpr int kFailSpans = 12;
+        for (int i = 0; i < kFailSpans; ++i) {
+            auto span = fail_tracer->StartSpan("op.fail");
+            span->End();
+        }
+        fail_bsp->ForceFlush(std::chrono::milliseconds{2000});
+        for (int i = 0; i < 100 && fail_exporter->total_received() < kFailSpans; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+
+        auto fail_after = fail_mgr->meter_provider()->Snapshot();
+        const double fail_created_d =
+            SumCounter(fail_after, "reactor.otel.spans.created")
+            - fail_created_before;
+        const double fail_exported_d =
+            SumCounter(fail_after, "reactor.otel.spans.exported")
+            - fail_exported_before;
+        const double fail_drop_unsampled_d = SumCounter(
+            fail_after, "reactor.otel.spans.dropped_unsampled")
+            - fail_drop_unsampled_before;
+        const double fail_drop_unended_d = SumCounter(
+            fail_after, "reactor.otel.spans.dropped_unended")
+            - fail_drop_unended_before;
+        const double fail_drop_queue_d = SumCounter(
+            fail_after, "reactor.otel.spans.dropped_queue_full")
+            - fail_drop_queue_before;
+
+        fail_bsp->SignalShutdown();
+        fail_bsp->JoinWorkers(std::chrono::milliseconds{500});
+
+        const double rhs_fail = fail_exported_d + fail_drop_unsampled_d +
+                                fail_drop_unended_d + fail_drop_queue_d;
+        const bool pass_fail = fail_created_d == rhs_fail &&
+                               fail_created_d == static_cast<double>(kFailSpans);
+        std::string msg_fail;
+        if (!pass_fail) {
+            msg_fail = "FailExport created=" + std::to_string(fail_created_d) +
+                       " exported=" + std::to_string(fail_exported_d) +
+                       " drop_unsampled=" + std::to_string(fail_drop_unsampled_d) +
+                       " drop_unended=" + std::to_string(fail_drop_unended_d) +
+                       " drop_queue_full=" + std::to_string(fail_drop_queue_d) +
+                       " rhs=" + std::to_string(rhs_fail);
+        }
+        TestFramework::RecordTest(
+            "SelfMetrics: closure invariant kFailedNotRetryable (created == exported{non_retryable_fail})",
+            pass_fail, msg_fail, TestFramework::TestCategory::OTHER);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "SelfMetrics: closure invariant (created == exported + dropped_*)",

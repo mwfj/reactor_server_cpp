@@ -4286,23 +4286,34 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetUpgradeCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                HttpRequest& request) {
-            // Connection is no longer HTTP/1 — it's now WebSocket.
-            // Decrement here so /stats doesn't count WS as HTTP/1.
-            // RemoveConnection checks IsUpgraded() to skip the double-decrement.
-            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
-            // Release the http/1.1 slot on
-            // reactor.http.connections.active. The WS connection emits
-            // its own +1 on `protocol=websocket` once the obs snapshot
-            // is wired in WebSocketConnection::SetObservabilitySnapshot.
+            // Idempotent no-op when called twice: AttemptWebSocketUpgrade
+            // and ContinueWsUpgradeAfterAuth already call HandOffToWebSocket
+            // BEFORE invoking this callback (so a /metrics scrape racing
+            // the handoff sees a transient under-count of
+            // sum(http.connections.active{protocol=*}) rather than an
+            // over-count). HandOffToWebSocket nulls http_protocol_label_;
+            // this second call short-circuits.
             if (auto c = self->GetConnection()) {
                 c->HandOffToWebSocket();
             }
-            // total_requests_ already counted by request_count_callback
+            // total_requests_ already counted by request_count_callback.
+            // Invoke ws_handler BEFORE decrementing active_http1_connections_
+            // so a throwing user handler doesn't leave the legacy /stats
+            // counter double-decremented: the caller's catch block resets
+            // upgraded_=false, and RemoveConnection then fetch_subs the
+            // counter once. The fix is "delay the H1 -1 until the upgrade
+            // is fully successful" — if ws_handler throws, this fetch_sub
+            // never runs and RemoveConnection compensates exactly once.
             auto ws_handler = router_.GetWebSocketHandler(request);
             if (ws_handler && self->GetWebSocket()) {
                 self->GetWebSocket()->SetParams(request.params);
                 ws_handler(*self->GetWebSocket());
             }
+            // Connection is no longer HTTP/1 — it's now WebSocket.
+            // Decrement here so /stats doesn't count WS as HTTP/1.
+            // RemoveConnection checks IsUpgraded() to skip the double-decrement
+            // on the success path; on the throw path this never runs.
+            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
     );
 }
