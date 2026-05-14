@@ -88,6 +88,24 @@ ObservabilityManager::~ObservabilityManager() {
     // SERVER spans silently leak (never End()-ed).
     KillOutstandingSnapshots(std::chrono::milliseconds{0});
     BeginShutdown(kDtorShutdownBudget);
+    // Disarm self-metric pointers held by BSP and PMR. The new
+    // declaration order in observability_manager.h normally ensures
+    // both workers are joined while catalog_ + meter_provider_ are
+    // still alive (tracer_provider_ destructs first → all Tracer refs
+    // to BSP drop → span_processor_ destructs → ~BSP joins worker;
+    // metric_reader_ destructs → ~PMR joins worker). However, BSP's
+    // shared_ptr has multiple ref-holders (TracerProvider, Tracers, and
+    // potentially user-held Spans bypassing snapshot machinery). A user-
+    // held Span destruct after this dtor returns would call BSP::OnEnd
+    // and dereference manager_->catalog() — dead by then. Nulling the
+    // manager pointer on BSP (and symmetrically on PMR) makes those
+    // late paths no-op instead of UAF.
+    if (auto* bsp = dynamic_cast<BatchSpanProcessor*>(span_processor_.get())) {
+        bsp->DisarmManager();
+    }
+    if (metric_reader_) {
+        metric_reader_->DisarmManager();
+    }
 }
 
 void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {

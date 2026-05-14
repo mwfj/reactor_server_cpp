@@ -517,6 +517,74 @@ inline void TestNetAcceptedIsMonotonic() {
 }
 
 // ---------------------------------------------------------------------
+// Test 7 — sync-path WS upgrade with a throwing ws_handler MUST balance
+// the legacy /stats `active_http1_connections` counter back to 0. The
+// upgrade_callback decrements the counter BEFORE invoking ws_handler
+// and marks `LegacyH1StatsDecremented`; the post-101 catch keeps
+// `upgraded_=true` and sends WS 1011 close, then RemoveConnection's
+// guard (!IsUpgraded() && !LegacyH1StatsDecremented()) skips the
+// removal-time decrement. Without that flag the previous ordering
+// leaked +1 on sync-throw OR double-decremented on async-throw.
+// ---------------------------------------------------------------------
+inline void TestWsUpgradeThrowBalancesH1StatsCounter() {
+    const char* TAG = "ObsConnMetrics: throwing WS handler leaves active_http1_connections == 0";
+    try {
+        HttpServer server("127.0.0.1", 0);
+        server.WebSocket("/ws/throws",
+            [](WebSocketConnection&) {
+                throw std::runtime_error("synthetic ws handler failure");
+            });
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        int fd = ConnectTcp(port);
+        if (fd < 0) {
+            TestFramework::RecordTest(TAG, false, "connect failed",
+                                       TestFramework::TestCategory::OTHER);
+            return;
+        }
+        const std::string upgrade =
+            "GET /ws/throws HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n";
+        if (!SendAll(fd, upgrade)) {
+            ::close(fd);
+            TestFramework::RecordTest(TAG, false, "send failed",
+                                       TestFramework::TestCategory::OTHER);
+            return;
+        }
+        // Server: 101 → ws_handler throws → catch sends WS 1011 close.
+        // Drain everything until the peer closes / quiet period elapses.
+        (void)DrainSocket(fd, 600);
+        ::close(fd);
+
+        // Allow the dispatcher to process the close + RemoveConnection.
+        for (int i = 0; i < 50; ++i) {
+            if (server.GetStats().active_http1_connections == 0 &&
+                server.GetStats().active_connections == 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        auto stats = server.GetStats();
+        bool pass = stats.active_http1_connections == 0;
+        std::string err;
+        if (!pass) {
+            err = "active_http1_connections=" +
+                  std::to_string(stats.active_http1_connections) +
+                  " (expected 0)";
+        }
+        TestFramework::RecordTest(TAG, pass, err,
+                                   TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(TAG, false, e.what(),
+                                   TestFramework::TestCategory::OTHER);
+    }
+}
+
+// ---------------------------------------------------------------------
 // Suite entry point.
 // ---------------------------------------------------------------------
 inline void RunAllTests() {
@@ -530,6 +598,7 @@ inline void RunAllTests() {
     TestH2PrefaceSetsProtocolGauge();
     TestWsUpgradeTransitionsProtocolGauge();
     TestNetAcceptedIsMonotonic();
+    TestWsUpgradeThrowBalancesH1StatsCounter();
 }
 
 }  // namespace ObservabilityConnectionMetricsTests

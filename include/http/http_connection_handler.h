@@ -102,6 +102,17 @@ public:
     // Check if upgraded to WebSocket
     bool IsUpgraded() const { return upgraded_; }
 
+    // True iff HttpServer's upgrade_callback has already decremented the
+    // legacy /stats counter `active_http1_connections_` for this connection.
+    // Set inside the callback after fetch_sub; checked by RemoveConnection
+    // alongside !IsUpgraded() so the counter is decremented EXACTLY ONCE
+    // across the success path AND both throw paths. Without this flag the
+    // sync-path catch (which preserves upgraded_=true because 101 is already
+    // on the wire) would leak +1, and the async-resume catch (which resets
+    // upgraded_=false because 101 hasn't been flushed) would double-decrement.
+    bool LegacyH1StatsDecremented() const { return legacy_h1_decremented_; }
+    void MarkLegacyH1StatsDecremented() { legacy_h1_decremented_ = true; }
+
     // Access WebSocket connection (nullptr if not upgraded)
     WebSocketConnection* GetWebSocket() { return ws_conn_.get(); }
 
@@ -307,6 +318,9 @@ private:
     HttpParser parser_;
     HTTP_CALLBACKS_NAMESPACE::HttpConnCallbacks callbacks_;
     bool upgraded_ = false;
+    // Dispatcher-thread-only flag (no atomic needed). See
+    // LegacyH1StatsDecremented() docstring above for the contract.
+    bool legacy_h1_decremented_ = false;
     std::unique_ptr<WebSocketConnection> ws_conn_;
 
     // Deferred-response state — dispatcher-thread only, no atomics needed.

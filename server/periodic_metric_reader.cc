@@ -76,9 +76,11 @@ void PeriodicMetricReader::WorkerLoop() {
                     "PeriodicMetricReader::Export threw unknown exception");
             }
             // Self-metric: per-shard atomic write; emits even on
-            // exception so duration always covers the attempt.
-            if (manager_ != nullptr) {
-                const auto& cat = manager_->catalog();
+            // exception so duration always covers the attempt. Atomic
+            // load picks up DisarmManager's null-store if the manager
+            // has already started teardown.
+            if (auto* mgr = manager_.load(std::memory_order_acquire)) {
+                const auto& cat = mgr->catalog();
                 if (cat.reactor_otel_export_duration != nullptr) {
                     const double elapsed_s =
                         std::chrono::duration<double>(
@@ -90,8 +92,8 @@ void PeriodicMetricReader::WorkerLoop() {
         } else {
             // Self-metric: bump skip counter so operators see SIGHUP-
             // driven metrics.enabled=false dampening the push side.
-            if (manager_ != nullptr) {
-                const auto& cat = manager_->catalog();
+            if (auto* mgr = manager_.load(std::memory_order_acquire)) {
+                const auto& cat = mgr->catalog();
                 if (cat.reactor_otel_metrics_export_skipped != nullptr) {
                     cat.reactor_otel_metrics_export_skipped->Add(1.0, {});
                 }

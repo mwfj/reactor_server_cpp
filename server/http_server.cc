@@ -1036,10 +1036,16 @@ void HttpServer::MarkServerReady() {
             // invocation sees a valid UpstreamManager.
             UpstreamManager* um = upstream_manager_.get();
             // Manager pointer for the metric-emit branch of the composed
-            // transition callback. Same lifetime guarantee as `um` — the
-            // observability manager outlives circuit_breaker_manager_ per
-            // HttpServer's declaration order; slice callbacks only fire on
-            // dispatcher threads which stop before either manager dies.
+            // transition callback. Lifetime: in HttpServer's declaration
+            // order observability_manager_ is declared LAST and destructs
+            // FIRST in reverse order — circuit_breaker_manager_ outlives it.
+            // Safe to capture as raw pointer because slice transition
+            // callbacks fire on dispatcher threads only, and dispatchers
+            // are joined in HttpServer::Stop() BEFORE ~HttpServer runs
+            // (Stop runs KillAndShutdownObservability + net_server_.Stop()
+            // joining every dispatcher; ~HttpServer's member destruction
+            // happens after Stop returns). No callback can fire between
+            // dispatcher join and ~ObservabilityManager.
             auto* obs_mgr = observability_manager_.get();
             for (const auto& u : upstream_configs_) {
                 auto* host = circuit_breaker_manager_->GetHost(u.name);
@@ -1512,9 +1518,15 @@ void HttpServer::RemoveConnection(std::shared_ptr<ConnectionHandler> conn) {
         return;
     }
     if (http_conn) {
-        // Only decrement if not upgraded — the upgrade callback already
-        // decremented active_http1_connections_ at upgrade time.
-        if (!http_conn->IsUpgraded()) {
+        // Decrement only if the upgrade_callback did not already do so.
+        // The upgrade_callback fires on every WS upgrade attempt and
+        // unconditionally decrements + sets LegacyH1StatsDecremented.
+        // Three success/failure scenarios are all handled by this guard:
+        //   - WS upgrade succeeded → upgraded_=true, flag=true     → skip
+        //   - sync post-101 throw  → upgraded_=true, flag=true     → skip
+        //   - async pre-101 throw  → upgraded_=false (rolled back), flag=true → skip
+        //   - no WS upgrade ever   → upgraded_=false, flag=false   → decrement
+        if (!http_conn->IsUpgraded() && !http_conn->LegacyH1StatsDecremented()) {
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
         // If the downstream client dropped while an async request was
@@ -3596,6 +3608,18 @@ void HttpServer::KillAndShutdownObservability(
         });
     }
     observability_manager_->BeginShutdown(remaining());
+    // Disarm subsystems that hold a raw ObservabilityManager* but whose
+    // workers cannot be joined before ~ObservabilityManager. Detached
+    // pthreads inside blocking getaddrinfo (DnsResolver) are the canonical
+    // case — they can return arbitrarily later and dereference the manager
+    // via `state_->obs_manager` from their completion path. Nulling the
+    // atomic now (manager still alive) makes those completions see null
+    // and skip emit (`EmitResolveOutcomeWithManager` null-guards). Workers
+    // that complete during this small window still observe the live manager
+    // and emit normally — race-free either way.
+    if (dns_resolver_) {
+        dns_resolver_->SetObservabilityManager(nullptr);
+    }
 }
 
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {
@@ -4296,24 +4320,26 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             if (auto c = self->GetConnection()) {
                 c->HandOffToWebSocket();
             }
+            // Decrement the legacy /stats counter BEFORE invoking
+            // ws_handler. Mark the connection so RemoveConnection's
+            // guard (!IsUpgraded() && !LegacyH1StatsDecremented()) skips
+            // its own fetch_sub regardless of which catch path runs:
+            //   - sync post-101 throw  → upgraded_ stays true → skip
+            //   - async pre-101 throw  → upgraded_=false BUT flag=true → skip
+            //   - happy path           → upgraded_ stays true → skip
+            // Without the flag the async-resume catch (which resets
+            // upgraded_=false) double-decrements; deferring the fetch_sub
+            // until after ws_handler leaves the sync-throw path leaking
+            // +1 (catch keeps upgraded_=true so the removal-time
+            // fetch_sub is skipped). Pair them.
+            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
+            self->MarkLegacyH1StatsDecremented();
             // total_requests_ already counted by request_count_callback.
-            // Invoke ws_handler BEFORE decrementing active_http1_connections_
-            // so a throwing user handler doesn't leave the legacy /stats
-            // counter double-decremented: the caller's catch block resets
-            // upgraded_=false, and RemoveConnection then fetch_subs the
-            // counter once. The fix is "delay the H1 -1 until the upgrade
-            // is fully successful" — if ws_handler throws, this fetch_sub
-            // never runs and RemoveConnection compensates exactly once.
             auto ws_handler = router_.GetWebSocketHandler(request);
             if (ws_handler && self->GetWebSocket()) {
                 self->GetWebSocket()->SetParams(request.params);
                 ws_handler(*self->GetWebSocket());
             }
-            // Connection is no longer HTTP/1 — it's now WebSocket.
-            // Decrement here so /stats doesn't count WS as HTTP/1.
-            // RemoveConnection checks IsUpgraded() to skip the double-decrement
-            // on the success path; on the throw path this never runs.
-            active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
     );
 }

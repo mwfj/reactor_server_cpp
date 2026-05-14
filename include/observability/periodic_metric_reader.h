@@ -85,27 +85,35 @@ public:
     // installed at construction time, or null when constructed without
     // one (test fixtures). See batch_span_processor.h::manager() docstring
     // for the SHUTDOWN CAVEAT on sub-member usage.
-    ObservabilityManager* manager() const noexcept { return manager_; }
+    ObservabilityManager* manager() const noexcept {
+        return manager_.load(std::memory_order_acquire);
+    }
+
+    // Atomically null the manager pointer so the worker's self-metric
+    // emit path sees nullptr and skips. Called by ~ObservabilityManager
+    // BEFORE member destruction begins. Idempotent. Mirrors
+    // BatchSpanProcessor::DisarmManager — see that docstring for the
+    // multi-holder safety rationale.
+    void DisarmManager() noexcept {
+        manager_.store(nullptr, std::memory_order_release);
+    }
 
 private:
     void WorkerLoop();
 
     MeterProvider*                  provider_;
     std::shared_ptr<MetricExporter> exporter_;
-    // Raw pointer; manager storage outlives PMR (PMR is owned by manager
-    // and destructs as part of ~ObservabilityManager's body).
-    //
-    // SHUTDOWN CAVEAT (PMR-specific): `catalog_` is declared AFTER
-    // metric_reader_ in observability_manager.h and destructs FIRST in
-    // reverse-declaration order — by the time ~PeriodicMetricReader's
-    // drain runs, manager_->catalog() may be null/stale. By contrast,
-    // `meter_provider_` and `tracer_provider_` are declared BEFORE
-    // metric_reader_ and are GUARANTEED live for the entire drain (the
-    // declaration order at observability_manager.h:303-313 exists
-    // precisely so the worker can keep calling meter_provider_->Snapshot()
-    // during teardown). See batch_span_processor.h::manager() for the
-    // broader BSP-specific caveat.
-    ObservabilityManager*           manager_;
+    // Atomic so DisarmManager()'s release-store is visible to the worker
+    // and any synchronous emit path. After the tracer_provider_ reorder
+    // in observability_manager.h, metric_reader_ is declared AFTER
+    // catalog_ and meter_provider_ — reverse-destruction joins this
+    // reader BEFORE either dies, so manager_->catalog() and
+    // manager_->meter_provider() are GUARANTEED LIVE for the entire
+    // worker drain on the production path. DisarmManager() is the
+    // safety net for a future code path where a PMR ref outlives the
+    // manager (today PMR has a single ref-holder, but mirroring BSP's
+    // disarm semantics keeps the contract symmetric).
+    std::atomic<ObservabilityManager*> manager_;
 
     std::atomic<int64_t>            interval_ns_;
     std::atomic<int64_t>            timeout_ns_;

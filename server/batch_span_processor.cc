@@ -87,8 +87,10 @@ void BatchSpanProcessor::OnEnd(SpanData data) {
         // Post-shutdown drop — counted as overflow for diagnostics.
         dropped_on_overflow_.fetch_add(1, std::memory_order_relaxed);
         // Self-metric: per-shard atomic write, no recursion into OnEnd.
-        if (manager_ != nullptr) {
-            const auto& cat = manager_->catalog();
+        // Load manager_ atomically so DisarmManager()'s null-store fence
+        // is visible if ~ObservabilityManager has already run.
+        if (auto* mgr = manager_.load(std::memory_order_acquire)) {
+            const auto& cat = mgr->catalog();
             if (cat.reactor_otel_spans_dropped_queue_full != nullptr) {
                 cat.reactor_otel_spans_dropped_queue_full->Add(1.0, {});
             }
@@ -107,11 +109,13 @@ void BatchSpanProcessor::OnEnd(SpanData data) {
         }
         queue_.emplace_back(std::move(data));
     }
-    if (overflow_dropped && manager_ != nullptr) {
-        // Self-metric emitted outside the queue mutex.
-        const auto& cat = manager_->catalog();
-        if (cat.reactor_otel_spans_dropped_queue_full != nullptr) {
-            cat.reactor_otel_spans_dropped_queue_full->Add(1.0, {});
+    if (overflow_dropped) {
+        if (auto* mgr = manager_.load(std::memory_order_acquire)) {
+            // Self-metric emitted outside the queue mutex.
+            const auto& cat = mgr->catalog();
+            if (cat.reactor_otel_spans_dropped_queue_full != nullptr) {
+                cat.reactor_otel_spans_dropped_queue_full->Add(1.0, {});
+            }
         }
     }
     cv_.notify_one();
@@ -225,8 +229,8 @@ void BatchSpanProcessor::WorkerLoop() {
                 }
                 // Self-metric: per-shard atomic write, no recursion into
                 // OnEnd. Exception paths attribute to non_retryable_fail.
-                if (manager_ != nullptr) {
-                    const auto& cat = manager_->catalog();
+                if (auto* mgr = manager_.load(std::memory_order_acquire)) {
+                    const auto& cat = mgr->catalog();
                     if (cat.reactor_otel_export_duration != nullptr) {
                         const double elapsed_s =
                             std::chrono::duration<double>(

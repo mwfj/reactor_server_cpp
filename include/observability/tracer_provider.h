@@ -91,12 +91,13 @@ private:
     std::shared_ptr<RandomSource>  random_;
     ProcessorOptions               processor_options_;
 
-    // Raw pointer; manager storage outlives every Tracer (TracerProvider
-    // destructs as part of ~ObservabilityManager's body). See
-    // batch_span_processor.h::manager() docstring for the SHUTDOWN CAVEAT
-    // that applies to any code path consuming manager_-> sub-members
-    // (catalog, meter_provider, metric_reader) — those may already be
-    // destroyed by the time ~TracerProvider's drain runs.
+    // Raw pointer; manager storage outlives every Tracer. After the
+    // declaration reorder in observability_manager.h, tracer_provider_
+    // is declared LAST among observer members and destructs FIRST in
+    // reverse order — so catalog_, meter_provider_, metric_reader_,
+    // AND span_processor_ are ALL still alive during ~TracerProvider's
+    // drain. Tracer/Span code paths that read manager_->catalog() or
+    // manager_->meter_provider() at destruction time are safe.
     ObservabilityManager*          manager_ = nullptr;
 
     // (name, version) → Tracer cache. Tracer instances are owned by
