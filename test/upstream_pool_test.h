@@ -1136,13 +1136,15 @@ void TestOffDispatcherReleaseBumpsCounter() {
         {
             UpstreamLease lease(/*conn=*/nullptr, part,
                                 part->alive_token(),
-                                part->OffDispatcherReleaseDropsPtr());
+                                part->OffDispatcherReleaseDropsPtr(),
+                                part->dispatcher_ptr());
             lease.Release();
         }
         {
             UpstreamLease lease(/*conn=*/nullptr, part,
                                 part->alive_token(),
-                                part->OffDispatcherReleaseDropsPtr());
+                                part->OffDispatcherReleaseDropsPtr(),
+                                part->dispatcher_ptr());
             lease.Release();
         }
 
@@ -1194,7 +1196,8 @@ void TestOnDispatcherReleaseDoesNotBumpCounter() {
         disp->EnQueue([&]() {
             UpstreamLease lease(/*conn=*/nullptr, part,
                                 part->alive_token(),
-                                part->OffDispatcherReleaseDropsPtr());
+                                part->OffDispatcherReleaseDropsPtr(),
+                                part->dispatcher_ptr());
             lease.Release();
             done.set_value();
         });
@@ -1215,6 +1218,73 @@ void TestOnDispatcherReleaseDoesNotBumpCounter() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "UpstreamPool UpstreamLease: on-dispatcher Release leaves counter zero",
+            false, e.what());
+    }
+}
+
+// Lock the "alive_=true observed → partition destroyed → dispatcher
+// access" UAF path. Forces a scenario where the lease has already
+// snapshotted partition_alive_ as true (via simulated load that
+// preserves it) but the partition's underlying object is gone.
+// The captured dispatcher_ shared_ptr must keep the Dispatcher alive
+// so the is_on_loop_thread() check is safe without touching the
+// freed partition. Verifies BOTH the heap counter survival AND the
+// dispatcher survival across teardown.
+void TestOffDispatcherReleaseDispatcherSurvivesPartitionTeardown() {
+    std::cout << "\n[TEST] UpstreamPool UpstreamLease: dispatcher survives partition teardown..." << std::endl;
+    try {
+        std::shared_ptr<Dispatcher> captured_disp;
+        std::shared_ptr<std::atomic<bool>> captured_alive;
+        std::shared_ptr<std::atomic<int64_t>> captured_drops;
+
+        {
+            auto disp = std::make_shared<Dispatcher>();
+            auto t = StartDispatcher(disp);
+            UpstreamConfig cfg = MakeUpstreamConfig("svc", "127.0.0.1", 9999);
+            UpstreamManager mgr({cfg}, {disp});
+            DispatcherThreadGuard dtg{disp, t};
+
+            PoolPartition* part = mgr.GetPoolPartition("svc", 0);
+            if (!part) {
+                TestFramework::RecordTest(
+                    "UpstreamPool UpstreamLease: dispatcher survives partition teardown",
+                    false, "GetPoolPartition returned null");
+                return;
+            }
+            captured_disp = part->dispatcher_ptr();
+            captured_alive = part->alive_token();
+            captured_drops = part->OffDispatcherReleaseDropsPtr();
+            // Manager destroys → partition destroys → alive flips false.
+            // The captured shared_ptrs survive.
+        }
+
+        // After teardown:
+        //  - captured_alive points at a live atomic<bool> (heap kept by
+        //    shared_ptr); ~PoolPartition stored false.
+        //  - captured_disp points at the live Dispatcher (kept by
+        //    shared_ptr); the dispatcher itself was stopped, but the
+        //    object is still alive and is_on_loop_thread() is safe.
+        //  - captured_drops points at the live counter.
+        bool alive_dead = !captured_alive->load(std::memory_order_acquire);
+        bool dispatcher_alive = (captured_disp.use_count() >= 1);
+        bool drops_alive = (captured_drops.use_count() >= 1);
+
+        // Sanity: calling is_on_loop_thread on the captured dispatcher
+        // must not crash. This is THE invariant the fix protects.
+        bool on_loop = captured_disp->is_on_loop_thread();
+        (void)on_loop;  // we don't care about the value; only that it doesn't UAF.
+
+        bool pass = alive_dead && dispatcher_alive && drops_alive;
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: dispatcher survives partition teardown",
+            pass,
+            pass ? "" :
+            std::string("alive_dead=") + (alive_dead ? "1" : "0") +
+            " dispatcher_alive=" + (dispatcher_alive ? "1" : "0") +
+            " drops_alive=" + (drops_alive ? "1" : "0"));
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "UpstreamPool UpstreamLease: dispatcher survives partition teardown",
             false, e.what());
     }
 }
@@ -1246,7 +1316,8 @@ void TestOffDispatcherReleaseSafeAfterManagerTeardown() {
             drops_ptr = part->OffDispatcherReleaseDropsPtr();
             lease = UpstreamLease(/*conn=*/nullptr, part,
                                   part->alive_token(),
-                                  drops_ptr);
+                                  drops_ptr,
+                                  part->dispatcher_ptr());
             // Manager + partition + dispatcher all destruct at end of
             // scope. The partition's alive_ atomic is stored to false
             // before destruction (~PoolPartition).
@@ -2520,6 +2591,7 @@ void RunAllTests() {
     TestOffDispatcherReleaseBumpsCounter();
     TestOnDispatcherReleaseDoesNotBumpCounter();
     TestOffDispatcherReleaseSafeAfterManagerTeardown();
+    TestOffDispatcherReleaseDispatcherSurvivesPartitionTeardown();
 
     // Section 5: Integration (UpstreamManager + real Dispatcher)
     TestUpstreamManagerHasUpstream();

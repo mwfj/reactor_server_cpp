@@ -54,9 +54,18 @@ void UpstreamLease::Release() {
     // fields so the destructor stays well-defined). The H2 lease shape
     // in this PR adds more lease holders → social discipline alone is
     // weaker insurance than before.
+    // Use the lease's captured dispatcher_ shared_ptr, NOT
+    // partition_->dispatcher(). The partition may be racing destruction:
+    // ~PoolPartition stores `alive=false` first but then waits for
+    // inflight_tasks_==0 — UpstreamLease::Release does NOT bump that
+    // counter, so an off-dispatcher Release that already observed
+    // `alive=true` can race the destructor's return. After the
+    // destructor returns, partition_ storage is freed.
+    // The captured dispatcher_ shared_ptr keeps the Dispatcher alive
+    // independently of the partition.
     bool off_dispatcher = false;
-    if (partition_live && partition_->dispatcher() &&
-        !partition_->dispatcher()->is_on_loop_thread()) {
+    if (partition_live && dispatcher_ &&
+        !dispatcher_->is_on_loop_thread()) {
         off_dispatcher = true;
         logging::Get()->error(
             "UpstreamLease::Release: called off the partition dispatcher "
@@ -114,6 +123,7 @@ void UpstreamLease::Release() {
     partition_alive_.reset();
     conn_alive_.reset();
     off_dispatcher_release_drops_.reset();
+    dispatcher_.reset();
     donated_to_h2_ = false;
 }
 
@@ -339,7 +349,7 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         // Bump inflight_leases_ BEFORE handing the lease to the caller.
         // ReturnConnection (called from ~UpstreamLease) decrements.
         inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
-        ready_cb(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_));
+        ready_cb(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_, dispatcher_));
         return;
     }
 
@@ -873,7 +883,7 @@ void PoolPartition::ReturnConnection(UpstreamConnection* conn,
             // the observability shutdown drain never observes
             // active_leases() == 0.
             inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
-            entry.ready_callback(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_));
+            entry.ready_callback(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_, dispatcher_));
             // No member access follows (function returns), but keep the
             // check for defense-in-depth against future refactors.
             if (!alive->load(std::memory_order_acquire)) return;
@@ -1739,7 +1749,7 @@ void PoolPartition::OnConnectComplete(UpstreamConnection* conn,
 
     // See the matching site above — bump before handing the lease out.
     inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
-    ready_cb(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_));
+    ready_cb(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_, dispatcher_));
 }
 
 void PoolPartition::OnConnectionClosed(UpstreamConnection* conn) {
@@ -2243,7 +2253,8 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
     // was_donated_to_h2=true.
     inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
     shell->AdoptLease(UpstreamLease(uc_raw, this, alive_,
-                                    off_dispatcher_release_drops_));
+                                    off_dispatcher_release_drops_,
+                                    dispatcher_));
 
     h2_table_.Insert(upstream_name, std::move(shell));
     DrainAnyWaitersForFastH2();
@@ -2433,7 +2444,7 @@ void PoolPartition::ServiceWaitQueue() {
         // the eventual lease release drives active_leases() negative
         // and stalls graceful shutdown's drain wait.
         inflight_leases_.fetch_add(1, std::memory_order_acq_rel);
-        entry.ready_callback(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_));
+        entry.ready_callback(UpstreamLease(raw, this, alive_, off_dispatcher_release_drops_, dispatcher_));
         if (!alive->load(std::memory_order_acquire)) return;
         // ready_callback can synchronously start server shutdown
         // (e.g. a first-request callback that calls HttpServer::Stop

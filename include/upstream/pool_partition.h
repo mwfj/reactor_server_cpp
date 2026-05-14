@@ -297,6 +297,15 @@ public:
     // DestroyOnDispatcher's step 3.
     Dispatcher* dispatcher() const { return dispatcher_.get(); }
 
+    // shared_ptr accessor for lease vending. UpstreamLease captures
+    // this so the off-dispatcher Release check (`is_on_loop_thread`)
+    // can fire without dereferencing the partition pointer — the
+    // partition can race destruction between the alive observation
+    // and the dispatcher access, so partition_->dispatcher() is
+    // unsafe on that path. The shared_ptr keeps the Dispatcher alive
+    // independently of the partition's lifetime.
+    std::shared_ptr<Dispatcher> dispatcher_ptr() const { return dispatcher_; }
+
     // Test-only: the effective SNI string the partition forwards to
     // `TlsConnection` when it originates TLS to the upstream. Empty
     // means "no SNI sent" (TlsConnection skips

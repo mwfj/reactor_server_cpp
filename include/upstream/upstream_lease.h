@@ -8,6 +8,7 @@ class UpstreamConnection;
 class UpstreamH2Connection;
 class UpstreamH2Stream;
 class PoolPartition;
+class Dispatcher;
 
 // Move-only RAII handle for a checked-out upstream resource. Two flavors:
 //
@@ -31,25 +32,32 @@ public:
     // `off_dispatcher_release_drops` is the heap-owned counter captured
     // at construction so that off-dispatcher Release() can bump it
     // without dereferencing `partition` (which may be racing
-    // destruction). Null is accepted for test fixtures and for any
-    // lease constructed outside the production partition vending path.
+    // destruction). `dispatcher` is captured for the same race-safety
+    // reason — the off-dispatcher `is_on_loop_thread()` check must NOT
+    // dereference the partition. Both are null for test fixtures and
+    // for any lease constructed outside the production partition
+    // vending path; the Release code path then short-circuits via
+    // `partition_live=false` since those fixtures pass `partition=null`.
     UpstreamLease(UpstreamConnection* conn, PoolPartition* partition,
                   std::shared_ptr<std::atomic<bool>> partition_alive,
                   std::shared_ptr<std::atomic<int64_t>>
-                      off_dispatcher_release_drops = nullptr)
+                      off_dispatcher_release_drops = nullptr,
+                  std::shared_ptr<Dispatcher> dispatcher = nullptr)
         : kind_(Kind::H1),
           conn_(conn),
           partition_(partition),
           partition_alive_(std::move(partition_alive)),
           off_dispatcher_release_drops_(
-              std::move(off_dispatcher_release_drops)) {}
+              std::move(off_dispatcher_release_drops)),
+          dispatcher_(std::move(dispatcher)) {}
 
     UpstreamLease(UpstreamH2Connection* h2_conn, int32_t stream_id,
                   PoolPartition* partition,
                   std::shared_ptr<std::atomic<bool>> partition_alive,
                   std::shared_ptr<std::atomic<bool>> conn_alive,
                   std::shared_ptr<std::atomic<int64_t>>
-                      off_dispatcher_release_drops = nullptr)
+                      off_dispatcher_release_drops = nullptr,
+                  std::shared_ptr<Dispatcher> dispatcher = nullptr)
         : kind_(Kind::H2),
           h2_conn_(h2_conn),
           h2_stream_id_(stream_id),
@@ -57,7 +65,8 @@ public:
           partition_alive_(std::move(partition_alive)),
           conn_alive_(std::move(conn_alive)),
           off_dispatcher_release_drops_(
-              std::move(off_dispatcher_release_drops)) {}
+              std::move(off_dispatcher_release_drops)),
+          dispatcher_(std::move(dispatcher)) {}
 
     ~UpstreamLease();
 
@@ -71,6 +80,7 @@ public:
           conn_alive_(std::move(other.conn_alive_)),
           off_dispatcher_release_drops_(
               std::move(other.off_dispatcher_release_drops_)),
+          dispatcher_(std::move(other.dispatcher_)),
           donated_to_h2_(other.donated_to_h2_) {
         other.kind_ = Kind::EMPTY;
         other.conn_ = nullptr;
@@ -92,6 +102,7 @@ public:
             conn_alive_ = std::move(other.conn_alive_);
             off_dispatcher_release_drops_ =
                 std::move(other.off_dispatcher_release_drops_);
+            dispatcher_ = std::move(other.dispatcher_);
             donated_to_h2_ = other.donated_to_h2_;
             other.kind_ = Kind::EMPTY;
             other.conn_ = nullptr;
@@ -190,5 +201,11 @@ private:
     // partition so off-dispatcher Release() can bump it without
     // dereferencing partition_ (which would race destruction).
     std::shared_ptr<std::atomic<int64_t>> off_dispatcher_release_drops_;
+    // Dispatcher captured at construction. Outlives the partition
+    // so the off-dispatcher `is_on_loop_thread()` check can fire
+    // without dereferencing partition_ (which would race the
+    // partition's destructor between alive-flag observation and
+    // dispatcher access).
+    std::shared_ptr<Dispatcher> dispatcher_;
     bool donated_to_h2_ = false;
 };
