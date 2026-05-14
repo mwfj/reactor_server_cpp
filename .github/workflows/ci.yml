@@ -303,6 +303,13 @@ jobs:
         # async-resume path through the auth middleware. Platform-sensitive
         # because of socket + thread scheduling on the IdP mock.
         run: ./test_runner obs_auth_trace
+      - name: Test - obs_kill_marshal (CASE B cross-thread marshal of kill closures)
+        # Exercises EnQueueDelayed-based marshal of kill closures across
+        # dispatcher threads under bump-before-enqueue + RAII decrement.
+        # Dispatcher scheduling timing differs between kqueue (macOS) and
+        # epoll (Linux), so the CASE B counter transitions surface
+        # platform-specific drift.
+        run: ./test_runner obs_kill_marshal
       - name: Test - obs_ws_messages (per-message WS observability)
         # Boots a real HttpServer, completes WS upgrades over TCP, exchanges
         # masked client + server frames. Exercises the websocket_messages

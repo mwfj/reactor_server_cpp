@@ -404,12 +404,14 @@ void WebSocketConnection::SetObservabilitySnapshot(
     }
     // Bump reactor.http.connections.active{protocol=websocket}; the
     // matching -1 runs in the dtor under `ws_protocol_active_counted_`.
-    // WS upgrade transition: SetObservabilitySnapshot (ws +1) runs
-    // BEFORE the upgrade_callback (h1 -1 via HandOffToWebSocket). The
-    // transient window shows sum(http.connections.active{protocol=*})
-    // at +1 above baseline. Both emits run on the same dispatcher
-    // thread, so /metrics scrapes see either pre- or post-transition
-    // state — never the transient.
+    // WS upgrade ordering: HttpConnectionHandler calls
+    // `conn_->HandOffToWebSocket()` (h1 -1) BEFORE invoking
+    // SetObservabilitySnapshot (ws +1). Prometheus /metrics scrapes
+    // execute on whichever socket dispatcher accepted the scrape
+    // connection — not necessarily this dispatcher — so a scrape racing
+    // the handoff can observe a transient under-count of
+    // sum(http.connections.active{protocol=*}) but never an over-count.
+    // Under-count is the safer artifact for capacity-planning alerts.
     if (http_connections_active_counter_ != nullptr) {
         http_connections_active_counter_->Add(1.0,
             {{"protocol", "websocket"}});

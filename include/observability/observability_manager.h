@@ -315,7 +315,6 @@ private:
     ObservabilityConfig                       config_;
     std::shared_ptr<const Resource>           resource_;
     std::shared_ptr<RandomSource>             random_;
-    std::shared_ptr<SpanProcessor>            span_processor_;
 
     // Live propagator snapshot. atomic_load / atomic_store on the
     // shared_ptr (C++17 free-function form) gives lock-free reads on
@@ -325,15 +324,6 @@ private:
 
     std::unique_ptr<TracerProvider>           tracer_provider_;
     std::unique_ptr<MeterProvider>            meter_provider_;
-    // MUST be declared AFTER meter_provider_. Members destruct in
-    // reverse declaration order; the PMR worker thread holds a raw
-    // MeterProvider* and calls Snapshot() in its final drain cycle, so
-    // the reader must be destroyed (joining the worker) BEFORE the
-    // provider it points at. BeginShutdown's bounded JoinWorkers can
-    // return before the final cycle completes; ~PeriodicMetricReader's
-    // unconditional fallback join is the safety net, and it only works
-    // if MeterProvider is still alive when it runs.
-    std::shared_ptr<PeriodicMetricReader>     metric_reader_;
     // Built at Init() time, registered into meter_provider_'s
     // "reactor.http.server" Meter. Not owned by this manager — Meter
     // owns the Histogram. Recorded once per request from
@@ -344,7 +334,30 @@ private:
 
     // Catalogued instrument handles (pointers owned by MeterProvider).
     // Built by `MetricsCatalog::Build` at the end of `Init()`.
+    // MUST be declared AFTER meter_provider_ AND BEFORE metric_reader_ /
+    // span_processor_. Workers in PMR and BSP dereference manager_->catalog()
+    // during self-metric emission; reverse-destruction must join both workers
+    // BEFORE catalog (and the meter_provider that owns its instruments) dies.
     MetricsCatalog                            catalog_;
+
+    // MUST be declared AFTER catalog_ AND meter_provider_. Members
+    // destruct in reverse declaration order; the PMR worker thread reads
+    // manager_->catalog() and holds a raw MeterProvider*, so the reader
+    // must be destroyed (joining the worker) BEFORE the catalog and the
+    // provider it points at. BeginShutdown's bounded JoinWorkers can
+    // return before the final cycle completes; ~PeriodicMetricReader's
+    // unconditional fallback join is the safety net, and it only works
+    // if catalog_ and MeterProvider are still alive when it runs.
+    std::shared_ptr<PeriodicMetricReader>     metric_reader_;
+
+    // MUST be declared LAST among observer/worker members for the same
+    // reason as metric_reader_. The BSP worker reads manager_->catalog()
+    // for self-metrics (queue depth, drop counters) and dereferences
+    // meter_provider_-owned instruments. Reverse-destruction joins this
+    // worker first, before catalog_ / meter_provider_ / metric_reader_
+    // are destroyed. ~BatchSpanProcessor's unconditional fallback join
+    // depends on those members still being alive when it runs.
+    std::shared_ptr<SpanProcessor>            span_processor_;
 
     // Live-flag snapshots (atomic; updated on Reload).
     std::atomic<bool> traces_enabled_{true};

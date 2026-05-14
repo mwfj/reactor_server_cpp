@@ -132,7 +132,7 @@ PoolPartition::~PoolPartition() {
         // after ~ObservabilityManager may have already run. Zeroing the
         // pointer here ensures every emit helper's null-guard on obs_manager_
         // fires and no calls reach a destroyed ObservabilityManager.
-        obs_manager_ = nullptr;
+        obs_manager_.store(nullptr, std::memory_order_release);
         //
         // Drop H2 sessions FIRST so their nghttp2_session destructors
         // run before the underlying transports get their callbacks
@@ -1699,16 +1699,18 @@ void PoolPartition::DestroyConnection(
 }
 
 void PoolPartition::EmitIdleGaugeDelta(double delta) {
-    if (!obs_manager_ || service_name_.empty() || delta == 0.0) return;
-    const auto& cat = obs_manager_->catalog();
+    auto* obs = obs_manager_.load(std::memory_order_acquire);
+    if (!obs || service_name_.empty() || delta == 0.0) return;
+    const auto& cat = obs->catalog();
     if (cat.reactor_upstream_pool_connections_idle == nullptr) return;
     cat.reactor_upstream_pool_connections_idle->Add(
         delta, {{"reactor.upstream.service", service_name_}});
 }
 
 void PoolPartition::EmitActiveGaugeDelta(double delta) {
-    if (!obs_manager_ || service_name_.empty() || delta == 0.0) return;
-    const auto& cat = obs_manager_->catalog();
+    auto* obs = obs_manager_.load(std::memory_order_acquire);
+    if (!obs || service_name_.empty() || delta == 0.0) return;
+    const auto& cat = obs->catalog();
     if (cat.reactor_upstream_pool_connections_active == nullptr) return;
     cat.reactor_upstream_pool_connections_active->Add(
         delta, {{"reactor.upstream.service", service_name_}});
@@ -1716,8 +1718,9 @@ void PoolPartition::EmitActiveGaugeDelta(double delta) {
 
 void PoolPartition::EmitCheckoutWaitDuration(double duration_sec,
                                               const char* outcome) {
-    if (!obs_manager_ || service_name_.empty() || outcome == nullptr) return;
-    const auto& cat = obs_manager_->catalog();
+    auto* obs = obs_manager_.load(std::memory_order_acquire);
+    if (!obs || service_name_.empty() || outcome == nullptr) return;
+    const auto& cat = obs->catalog();
     if (cat.reactor_upstream_pool_checkout_wait_duration == nullptr) return;
     if (duration_sec < 0.0) duration_sec = 0.0;
     cat.reactor_upstream_pool_checkout_wait_duration->Record(

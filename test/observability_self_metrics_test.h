@@ -954,6 +954,187 @@ inline void TestPmrExportSelfMetrics() {
     }
 }
 
+// ---------------------------------------------------------------------
+// Closure invariant — every created span ends in exactly one terminal
+// state. The four-way partition documented in OBSERVABILITY.md is:
+//   created == sum(exported{outcome=*})
+//            + dropped_unsampled
+//            + dropped_unended
+//            + dropped_queue_full
+//
+// Catches double-counts in one path paired with under-counts in another
+// (which individual-counter tests miss). Two passes per manager — one
+// AlwaysOn (exercising exported + dropped_unended), one AlwaysOff
+// (exercising dropped_unsampled). Each pass asserts closure on its own
+// per-manager counters.
+// ---------------------------------------------------------------------
+inline void TestSelfMetricsClosureInvariant() {
+    std::cout << "\n[TEST] SelfMetrics: created == exported + dropped_* closure"
+              << std::endl;
+    try {
+        // --- Pass 1: AlwaysOn — N end + K drop_without_end. ---
+        // Bootstrap a manager wired with a NoopSpanProcessor so the
+        // BSP swap below takes effect (SwapToBatchSpanProcessor only
+        // swaps when the existing processor is Noop).
+        ObservabilityConfig on_cfg;
+        on_cfg.enabled = true;
+        on_cfg.traces.enabled = true;
+        on_cfg.metrics.enabled = true;
+        on_cfg.traces.sampler.type = SamplerType::AlwaysOn;
+        on_cfg.resource.service_name = "obs-self-metrics-closure-on";
+        auto on_mgr = ObservabilityManager::Create(
+            std::move(on_cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<OBSERVABILITY_NAMESPACE::NoopSpanProcessor>(),
+            std::make_shared<RandomSource>(0xCA7C105EULL));
+        auto exporter = std::make_shared<FixedResultSpanExporter>(
+            ExportResult::kSuccess);
+        BatchSpanProcessorOptions opts;
+        opts.max_export_batch_size = 64;
+        opts.schedule_delay = std::chrono::milliseconds{30};
+        auto bsp = std::make_shared<BatchSpanProcessor>(
+            exporter, opts, on_mgr.get());
+        on_mgr->SwapToBatchSpanProcessor(bsp);
+
+        auto* tracer = on_mgr->GetTracer("test.closure.on", "1.0");
+
+        auto snap_before = on_mgr->meter_provider()->Snapshot();
+        const double created_before =
+            SumCounter(snap_before, "reactor.otel.spans.created");
+        const double exported_before =
+            SumCounter(snap_before, "reactor.otel.spans.exported");
+        const double drop_unsampled_before = SumCounter(
+            snap_before, "reactor.otel.spans.dropped_unsampled");
+        const double drop_unended_before = SumCounter(
+            snap_before, "reactor.otel.spans.dropped_unended");
+        const double drop_queue_before = SumCounter(
+            snap_before, "reactor.otel.spans.dropped_queue_full");
+
+        constexpr int kEndSpans = 20;
+        constexpr int kDropSpans = 8;
+        for (int i = 0; i < kEndSpans; ++i) {
+            auto span = tracer->StartSpan("op.end");
+            span->End();
+        }
+        for (int i = 0; i < kDropSpans; ++i) {
+            auto span = tracer->StartSpan("op.drop");
+            span->DropWithoutEnd();
+        }
+        bsp->ForceFlush(std::chrono::milliseconds{2000});
+        for (int i = 0; i < 100 && exporter->total_received() < kEndSpans; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        }
+
+        auto snap_after = on_mgr->meter_provider()->Snapshot();
+        const double created_d =
+            SumCounter(snap_after, "reactor.otel.spans.created")
+            - created_before;
+        const double exported_d =
+            SumCounter(snap_after, "reactor.otel.spans.exported")
+            - exported_before;
+        const double drop_unsampled_d = SumCounter(
+            snap_after, "reactor.otel.spans.dropped_unsampled")
+            - drop_unsampled_before;
+        const double drop_unended_d = SumCounter(
+            snap_after, "reactor.otel.spans.dropped_unended")
+            - drop_unended_before;
+        const double drop_queue_d = SumCounter(
+            snap_after, "reactor.otel.spans.dropped_queue_full")
+            - drop_queue_before;
+
+        bsp->SignalShutdown();
+        bsp->JoinWorkers(std::chrono::milliseconds{500});
+
+        const double rhs_on = exported_d + drop_unsampled_d + drop_unended_d +
+                              drop_queue_d;
+        const bool pass_on = created_d == rhs_on &&
+                             created_d == static_cast<double>(
+                                kEndSpans + kDropSpans);
+        std::string msg_on;
+        if (!pass_on) {
+            msg_on = "AlwaysOn created=" + std::to_string(created_d) +
+                     " exported=" + std::to_string(exported_d) +
+                     " drop_unsampled=" + std::to_string(drop_unsampled_d) +
+                     " drop_unended=" + std::to_string(drop_unended_d) +
+                     " drop_queue_full=" + std::to_string(drop_queue_d) +
+                     " rhs=" + std::to_string(rhs_on);
+        }
+        TestFramework::RecordTest(
+            "SelfMetrics: closure invariant AlwaysOn (created == exported + dropped_*)",
+            pass_on, msg_on, TestFramework::TestCategory::OTHER);
+
+        // --- Pass 2: AlwaysOff — every StartSpan drops at sampler. ---
+        ObservabilityConfig cfg;
+        cfg.enabled = true;
+        cfg.traces.enabled = true;
+        cfg.metrics.enabled = true;
+        cfg.traces.sampler.type = SamplerType::AlwaysOff;
+        cfg.resource.service_name = "obs-self-metrics-closure-off";
+        auto off_mgr = ObservabilityManager::Create(
+            std::move(cfg),
+            std::make_shared<Resource>(),
+            std::make_shared<InMemorySpanProcessor>(),
+            std::make_shared<RandomSource>(0xC105E27EULL));
+        auto* off_tracer = off_mgr->GetTracer("test.closure.off", "1.0");
+
+        auto off_before = off_mgr->meter_provider()->Snapshot();
+        const double off_created_before =
+            SumCounter(off_before, "reactor.otel.spans.created");
+        const double off_exported_before =
+            SumCounter(off_before, "reactor.otel.spans.exported");
+        const double off_drop_unsampled_before = SumCounter(
+            off_before, "reactor.otel.spans.dropped_unsampled");
+        const double off_drop_unended_before = SumCounter(
+            off_before, "reactor.otel.spans.dropped_unended");
+        const double off_drop_queue_before = SumCounter(
+            off_before, "reactor.otel.spans.dropped_queue_full");
+
+        constexpr int kOffSpans = 15;
+        for (int i = 0; i < kOffSpans; ++i) {
+            auto span = off_tracer->StartSpan("op.off");
+            span->End();  // End on a non-recording span — no exported emit.
+        }
+
+        auto off_after = off_mgr->meter_provider()->Snapshot();
+        const double off_created_d =
+            SumCounter(off_after, "reactor.otel.spans.created")
+            - off_created_before;
+        const double off_exported_d =
+            SumCounter(off_after, "reactor.otel.spans.exported")
+            - off_exported_before;
+        const double off_drop_unsampled_d = SumCounter(
+            off_after, "reactor.otel.spans.dropped_unsampled")
+            - off_drop_unsampled_before;
+        const double off_drop_unended_d = SumCounter(
+            off_after, "reactor.otel.spans.dropped_unended")
+            - off_drop_unended_before;
+        const double off_drop_queue_d = SumCounter(
+            off_after, "reactor.otel.spans.dropped_queue_full")
+            - off_drop_queue_before;
+
+        const double rhs_off = off_exported_d + off_drop_unsampled_d +
+                               off_drop_unended_d + off_drop_queue_d;
+        const bool pass_off = off_created_d == rhs_off &&
+                              off_created_d == static_cast<double>(kOffSpans);
+        std::string msg_off;
+        if (!pass_off) {
+            msg_off = "AlwaysOff created=" + std::to_string(off_created_d) +
+                      " exported=" + std::to_string(off_exported_d) +
+                      " drop_unsampled=" + std::to_string(off_drop_unsampled_d) +
+                      " drop_unended=" + std::to_string(off_drop_unended_d) +
+                      " drop_queue_full=" + std::to_string(off_drop_queue_d) +
+                      " rhs=" + std::to_string(rhs_off);
+        }
+        TestFramework::RecordTest(
+            "SelfMetrics: closure invariant AlwaysOff (created == dropped_unsampled)",
+            pass_off, msg_off, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "SelfMetrics: closure invariant (created == exported + dropped_*)",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 inline void RunAllTests() {
     std::cout << "\n" << std::string(60, '=') << std::endl;
     std::cout << "OBSERVABILITY SELF-METRICS TESTS" << std::endl;
@@ -972,6 +1153,7 @@ inline void RunAllTests() {
     TestBspNonRetryableFailureSelfMetric();
     TestBspDropOnOverflowSelfMetric();
     TestPmrExportSelfMetrics();
+    TestSelfMetricsClosureInvariant();
 }
 
 }  // namespace ObservabilitySelfMetricsTests

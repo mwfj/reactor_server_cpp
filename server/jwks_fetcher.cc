@@ -256,13 +256,21 @@ void JwksFetcher::StartFetch(const std::string& jwks_uri,
         // the cache and generation atomic alive until the lambda ends
         // — avoids UAF that would otherwise arise from raw-pointer
         // captures surviving into a teardown window.
-        // `obs` is captured by raw pointer. ObservabilityManager destructs
-        // FIRST (declared LAST on HttpServer per auth_manager.h), so the
-        // pointer can dangle if the lambda fires after manager teardown.
-        // Safety: HttpServer::Stop runs KillAndShutdownObservability and
-        // flips each JwksFetcher's `token` BEFORE manager destruction;
-        // the cancellation short-circuit below fires before reaching any
-        // `obs` deref.
+        // `obs` is captured by raw pointer. ObservabilityManager is owned
+        // by HttpServer via shared_ptr and declared LAST on HttpServer,
+        // so it destructs FIRST inside ~HttpServer. Safety relies on the
+        // teardown sequence in HttpServer::Stop running BEFORE ~HttpServer:
+        //   1. net_server_.Stop() joins every dispatcher thread, so no
+        //      new dispatcher-thread work can fire after Stop returns.
+        //   2. auth_manager_->Stop() then flips every JwksFetcher's
+        //      cancellation token; any lambda already submitted but not
+        //      yet run will short-circuit on the cancelled-check below.
+        //   3. Only after Stop() returns does ~HttpServer destruct
+        //      observability_manager_.
+        // Net result: the lambda can fire only while dispatchers are still
+        // running, which is strictly before ~ObservabilityManager. If a
+        // future refactor reorders this sequence, capture `obs` as
+        // `weak_ptr<ObservabilityManager>` instead.
         [cache, issuer_name, generation, owner_generation, cb, token, obs](
                 UpstreamHttpClient::Response resp) {
             // Terminal callback — guaranteed at most once. Always release

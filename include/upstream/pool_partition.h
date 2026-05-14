@@ -52,11 +52,14 @@ public:
     ~PoolPartition();
 
     // Late install — UpstreamManager forwards this when MarkServerReady
-    // wires the observability manager. Idempotent; null clears.
-    // Dispatcher-thread-only on the partition's owning dispatcher.
+    // wires the observability manager. Idempotent; null clears. Called
+    // from MarkServerReady (conn-dispatcher thread) but read from the
+    // partition's owning dispatcher on every emit path. Release-store
+    // pairs with acquire-load in GetObservabilityManager for safe
+    // cross-thread publication.
     void SetObservabilityManager(
         OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept {
-        obs_manager_ = obs_manager;
+        obs_manager_.store(obs_manager, std::memory_order_release);
     }
 
     // Non-copyable, non-movable
@@ -253,7 +256,13 @@ private:
     // test fixture dropped without Stop()), the safety-net ~UpstreamManager
     // path MUST null-guard: PoolPartition::~PoolPartition nulls this field
     // before any emit, so the helpers' null-guards on obs_manager_ fire.
-    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
+    //
+    // Atomic because SetObservabilityManager runs on MarkServerReady's
+    // thread (conn dispatcher) while emit helpers read from the owning
+    // partition's dispatcher. Release/acquire pairs with the setter.
+    // Mirrors RateLimiter::obs_manager_'s atomic-pointer pattern.
+    std::atomic<OBSERVABILITY_NAMESPACE::ObservabilityManager*>
+        obs_manager_{nullptr};
 
     // C++17 note: `std::atomic_load_explicit(shared_ptr*)` is the
     // standard-compliant form. C++20 deprecates the free-function

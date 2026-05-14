@@ -50,9 +50,14 @@ void ConnectionHandler::MarkApplicationProtocolConfirmed(
         const char* protocol_label) {
     if (protocol_label == nullptr) return;
     if (http_protocol_label_ != nullptr) {
-        logging::Get()->error(
-            "MarkApplicationProtocolConfirmed called twice — old={}, new={}, fd={}",
-            http_protocol_label_, protocol_label, fd());
+        // Same-label re-confirm is normal: H1 keep-alive calls this on every
+        // headers_complete. Different label is a real bug (protocol change
+        // on a live connection without going through HandOffToWebSocket).
+        if (strcmp(http_protocol_label_, protocol_label) != 0) {
+            logging::Get()->error(
+                "MarkApplicationProtocolConfirmed label change — old={}, new={}, fd={}",
+                http_protocol_label_, protocol_label, fd());
+        }
         return;
     }
     http_protocol_label_ = protocol_label;
