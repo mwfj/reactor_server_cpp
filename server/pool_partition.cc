@@ -454,11 +454,20 @@ void PoolPartition::DrainH2StreamWaitersForHost(
         }
         if (shutting_down_.load(std::memory_order_acquire) ||
             manager_shutting_down_.load(std::memory_order_acquire)) {
-            // Push back what we've already moved out so shutdown drain
-            // sees them and fires CHECKOUT_SHUTTING_DOWN uniformly.
-            requeue.push_back(std::move(e));
-            stopped_early = true;
-            continue;
+            // Fire CHECKOUT_SHUTTING_DOWN inline rather than requeueing.
+            // ~PoolPartition's on_dispatcher lambda clears wait_queue_
+            // WITHOUT fan-out, so any requeued entry would strand the
+            // owning ProxyTransaction. Drain all remaining matched
+            // entries with the same fate so we don't half-strand them.
+            if (e.error_callback) e.error_callback(CHECKOUT_SHUTTING_DOWN);
+            for (size_t j = i + 1; j < matched.size(); ++j) {
+                if (matched[j].error_callback) {
+                    matched[j].error_callback(CHECKOUT_SHUTTING_DOWN);
+                }
+            }
+            // Don't restore the requeue deque — every entry has been
+            // notified inline. Return early.
+            return;
         }
         UpstreamH2Connection* h2 = h2_table_.FindUsable(upstream_name);
         if (!h2 || !h2->IsUsable()) {
@@ -477,6 +486,17 @@ void PoolPartition::DrainH2StreamWaitersForHost(
         // waiters is covered by DrainAnyWaitersForFastH2.
         requeue.push_back(std::move(e));
         stopped_early = true;
+    }
+    // Shutdown observation between requeue-push and the FIFO restore
+    // below: any requeued entry would strand because ~PoolPartition's
+    // lambda clears wait_queue_ without firing error_callback.
+    // Fan-out CHECKOUT_SHUTTING_DOWN inline instead of restoring.
+    if (shutting_down_.load(std::memory_order_acquire) ||
+        manager_shutting_down_.load(std::memory_order_acquire)) {
+        for (auto& e : requeue) {
+            if (e.error_callback) e.error_callback(CHECKOUT_SHUTTING_DOWN);
+        }
+        return;
     }
     // Restore FIFO order at front of queue.
     for (auto it = requeue.rbegin(); it != requeue.rend(); ++it) {
@@ -532,7 +552,13 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
         }
         if (shutting_down_.load(std::memory_order_acquire) ||
             manager_shutting_down_.load(std::memory_order_acquire)) {
-            requeue.push_back(std::move(e));
+            // Fire CHECKOUT_SHUTTING_DOWN inline rather than requeueing:
+            // ~PoolPartition's on_dispatcher lambda clears wait_queue_
+            // WITHOUT firing error_callback, so a requeued entry would
+            // strand the owning ProxyTransaction until response timeout.
+            // InitiateShutdown's single-pass rejection may already have
+            // completed by the time we observed the flag.
+            if (e.error_callback) e.error_callback(CHECKOUT_SHUTTING_DOWN);
             continue;
         }
         UpstreamH2Connection* h2 = h2_table_.FindUsable(service_name_);
@@ -547,6 +573,17 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
         if (e.ready_callback) e.ready_callback(UpstreamLease());
     }
 
+    // Shutdown observation between requeue-push and FIFO restore: a
+    // requeued entry would strand because ~PoolPartition's lambda
+    // clears wait_queue_ without firing error_callback. Fan-out
+    // CHECKOUT_SHUTTING_DOWN inline.
+    if (shutting_down_.load(std::memory_order_acquire) ||
+        manager_shutting_down_.load(std::memory_order_acquire)) {
+        for (auto& e : requeue) {
+            if (e.error_callback) e.error_callback(CHECKOUT_SHUTTING_DOWN);
+        }
+        return;
+    }
     // Restore FIFO: push_front in reverse so first requeued ends up
     // at wait_queue_.front().
     for (auto it = requeue.rbegin(); it != requeue.rend(); ++it) {
@@ -1175,15 +1212,21 @@ void PoolPartition::InitiateShutdown() {
         // short-circuit fires; lease was released by step 5 above.
     }
 
-    // Connecting H2 probes: same shape. The probe shell's transport is
-    // in connecting_conns_ above (already drained by the connecting
-    // loop). What remains is the H2 session wrapper — destroy it on
-    // dispatcher to flip its alive token before the dtor runs.
+    // Connecting H2 probes: extract first, then destroy. Mirrors the
+    // h2_table_.ExtractAll() pattern above — DestroyOnDispatcher can
+    // reentrantly mutate h2_connecting_conns_ via lease-return
+    // chains, so iterating-by-reference on the live map would invalidate
+    // iterators.
+    std::vector<std::unique_ptr<UpstreamH2Connection>> probes_to_destroy;
+    probes_to_destroy.reserve(h2_connecting_conns_.size());
     for (auto& kv : h2_connecting_conns_) {
-        if (kv.second) kv.second->DestroyOnDispatcher();
-        if (!alive->load(std::memory_order_acquire)) return;
+        if (kv.second) probes_to_destroy.push_back(std::move(kv.second));
     }
     h2_connecting_conns_.clear();
+    for (auto& probe : probes_to_destroy) {
+        if (probe) probe->DestroyOnDispatcher();
+        if (!alive->load(std::memory_order_acquire)) return;
+    }
 
     // Drain any GOAWAY victims sitting in the pending-destroy stash so
     // their leases also release before the drain wait below. Also
@@ -1952,10 +1995,23 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         // can match them against the freshly-adopted idle conn.
         auto owned_uc = uc_raw ? ExtractFromConnecting(uc_raw) : nullptr;
         if (!owned_uc) {
+            // Transport vanished from connecting_conns_ between
+            // OnH2ConnectHandshakeComplete entry and the extract here
+            // (concurrent close-cb chain). Symmetric to the ALPN-h2
+            // success branch's vanish path: fail H2_STREAM_SLOT
+            // waiters AND re-dispatch ANY-kind cold-start waiters via
+            // ServiceWaitQueue so they pick up fresh capacity rather
+            // than stranding until MAX_QUEUE_AGE.
+            logging::Get()->warn(
+                "OnH2ConnectHandshakeComplete: ALPN-h1 transport "
+                "vanished from connecting_conns_ for {}:{} — failing "
+                "H2 slot waiters and triggering wait-queue service",
+                upstream_name, port);
             if (shell) shell->DestroyOnDispatcher();
             FailH2StreamSlotWaiters(upstream_name, port,
                                     CHECKOUT_CONNECT_FAILED,
                                     "transport vanished pre-h1-adoption");
+            ServiceWaitQueue();
             return;
         }
         // Commit-at-end adoption: AdoptAsH1Connection is by-ref and
@@ -2408,6 +2464,11 @@ void PoolPartition::PurgeExpiredWaitEntries() {
             now - entry.queued_at);
         if (waited.count() >= config_.connect_timeout_ms) {
             auto error_cb = std::move(entry.error_callback);
+            logging::Get()->warn(
+                "PoolPartition wait queue: aged-out waiter for {} "
+                "(waited_ms={}, queue_size={}, timeout_ms={})",
+                service_name_, waited.count(),
+                wait_queue_.size(), config_.connect_timeout_ms);
             wait_queue_.pop_front();
             error_cb(CHECKOUT_QUEUE_TIMEOUT);
             if (!alive->load(std::memory_order_acquire)) return;

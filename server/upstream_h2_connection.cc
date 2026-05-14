@@ -218,17 +218,20 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     using Framing = UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead::Framing;
     // Detach sink before OnError so a synchronous teardown chain
     // (sink OnError → Cleanup → ResetStream) does not re-dispatch on
-    // an already-failed path.
-    auto reject_truncation = [&](const char* msg) {
+    // an already-failed path. RESULT_PARSE_ERROR (not _TRUNCATED) —
+    // these branches catch OVER-read (body on NO_BODY, body exceeds
+    // CL); RESULT_TRUNCATED_RESPONSE is reserved for under-read at
+    // OnStreamClose's CL short-read backstop.
+    auto reject_overrun = [&](const char* msg) {
         auto* sink = stream->sink;
         stream->sink = nullptr;
         if (sink) {
-            sink->OnError(ProxyTransaction::RESULT_TRUNCATED_RESPONSE, msg);
+            sink->OnError(ProxyTransaction::RESULT_PARSE_ERROR, msg);
         }
         self->ResetStream(stream_id);
     };
     if (stream->response_head.framing == Framing::NO_BODY && len > 0) {
-        reject_truncation("body bytes on NO_BODY response");
+        reject_overrun("body bytes on NO_BODY response");
         return 0;
     }
     if (stream->response_head.framing == Framing::CONTENT_LENGTH &&
@@ -236,7 +239,7 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
         static_cast<int64_t>(len) >
             stream->response_head.expected_length -
             stream->body_bytes_received) {
-        reject_truncation("body exceeds Content-Length");
+        reject_overrun("body exceeds Content-Length");
         return 0;
     }
 

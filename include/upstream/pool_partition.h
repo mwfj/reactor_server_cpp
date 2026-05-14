@@ -314,14 +314,13 @@ public:
     const std::string& service_name() const { return service_name_; }
 
     // Called by UpstreamH2Connection::AdoptLease to convert a per-request
-    // lease bump into long-lived H2 donation. The caller already +1'd
-    // inflight_leases_ (either at CheckoutAsync time, for caller-passed
-    // leases, or at the OnH2ConnectHandshakeComplete manual bump). This
-    // swap is dispatcher-thread-safe because the atomics carry their own
-    // memory ordering.
+    // lease bump into long-lived H2 donation. Caller already +1'd
+    // inflight_leases_. Bump donated FIRST then decrement inflight so
+    // a concurrent reader of `inflight + donated` never sees a dip
+    // below the true total (monotonic-overcount instead of undercount).
     void ConvertLeaseBumpToDonatedH2() {
-        inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
         donated_h2_leases_.fetch_add(1, std::memory_order_acq_rel);
+        inflight_leases_.fetch_sub(1, std::memory_order_acq_rel);
     }
 
     // Test-only: insert a fully-Init'd `UpstreamH2Connection` (typically
