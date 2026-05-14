@@ -427,12 +427,12 @@ Pool saturation gauges with the closed `outcome` vocabulary for checkout-wait hi
 |---|---|---|---|
 | `reactor.upstream.pool.connections.idle` | UpDownCounter | `reactor.upstream.service` | Idle conns in the pool, ready for checkout. Sustained 0 = pool under-provisioned. |
 | `reactor.upstream.pool.connections.active` | UpDownCounter | `reactor.upstream.service` | In-use conns. Sustained `active == max_connections` = pool saturated; checkout will queue or reject. |
-| `reactor.upstream.pool.checkout.wait_duration` | Histogram (seconds) | `reactor.upstream.service`, `outcome` ∈ `{immediate, queued_satisfied, cancelled, rejected, created}` | Per-checkout latency by exit path. `immediate` = idle reuse hit; `created` = had to spawn a new conn (includes connect latency); `queued_satisfied` = waited for an existing conn to return; `cancelled` / `rejected` = checkout failed without serving traffic. |
+| `reactor.upstream.pool.checkout.wait.duration` | Histogram (seconds) | `reactor.upstream.service`, `outcome` ∈ `{immediate, queued_satisfied, cancelled, rejected, created}` | Per-checkout latency by exit path. `immediate` = idle reuse hit; `created` = had to spawn a new conn (includes connect latency); `queued_satisfied` = waited for an existing conn to return; `cancelled` / `rejected` = checkout failed without serving traffic. |
 | `http.client.active_requests` | UpDownCounter | `reactor.upstream.service` | In-flight per-attempt requests against the upstream. Includes RETRIES — N attempts on a single transaction produce N concurrent `+1`s. Returns to zero on natural finalize, kill loop, or dtor backstop via CAS-safe drain. |
 
 **Operator interpretation tips:**
 
-- `checkout.wait_duration{outcome=queued_satisfied}` p99 rising indicates pool exhaustion — bump `pool.max_connections` or shorten upstream response latency.
+- `checkout.wait.duration{outcome=queued_satisfied}` p99 rising indicates pool exhaustion — bump `pool.max_connections` or shorten upstream response latency.
 - High `outcome=created` rate with stable `outcome=immediate` = the pool isn't sized for the request rate; conn spawn cost dominates.
 - Persistent `outcome=rejected` = `pool.checkout_queue_max_size` is hit; either raise the queue limit or back-pressure the inbound side.
 - `http.client.active_requests` significantly higher than the inbound `http.server.active_requests` on the same upstream's traffic indicates a retry-heavy workload (or a stuck attempt being held by the response timer).

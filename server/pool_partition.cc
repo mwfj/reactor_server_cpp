@@ -264,11 +264,21 @@ void PoolPartition::CheckoutAsync(ReadyCallback ready_cb, ErrorCallback error_cb
         // get destroyed here.
         (void)current_ep_for_pop;  // helper does its own atomic_load
         if (!ConnectionEndpointMatches(*conn)) {
+            // This conn previously emitted +1 on the idle gauge in
+            // ReturnConnection. Emit the matching -1 BEFORE Destroy so a
+            // hostname/DNS endpoint reload doesn't leave
+            // reactor.upstream.pool.connections.idle permanently high.
+            EmitIdleGaugeDelta(-1.0);
             DestroyConnection(std::move(conn));
             continue;
         }
 
         if (!ValidateConnection(conn.get())) {
+            // Same idle-gauge balance as the endpoint-mismatch branch
+            // above — the popped conn previously bumped +1 in
+            // ReturnConnection; destroying it without a matching -1
+            // leaks the gauge.
+            EmitIdleGaugeDelta(-1.0);
             DestroyConnection(std::move(conn));
             continue;
         }
@@ -936,6 +946,10 @@ void PoolPartition::CloseIdleMatchingEndpointOnDispatcher(
         if ((*it)->captured_endpoint() == old_ep) {
             auto owned = std::move(*it);
             it = idle_conns_.erase(it);
+            // Balance the +1 idle gauge emitted in ReturnConnection. Without
+            // this, every reload that adopts a new endpoint leaks one tick
+            // on reactor.upstream.pool.connections.idle per evicted conn.
+            EmitIdleGaugeDelta(-1.0);
             DestroyConnection(std::move(owned));
         } else {
             ++it;

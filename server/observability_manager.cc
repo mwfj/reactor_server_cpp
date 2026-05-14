@@ -88,29 +88,48 @@ ObservabilityManager::~ObservabilityManager() {
     // SERVER spans silently leak (never End()-ed).
     KillOutstandingSnapshots(std::chrono::milliseconds{0});
     BeginShutdown(kDtorShutdownBudget);
-    // Disarm self-metric pointers held by BSP and PMR. The new
-    // declaration order in observability_manager.h normally ensures
-    // both workers are joined while catalog_ + meter_provider_ are
-    // still alive (tracer_provider_ destructs first → all Tracer refs
-    // to BSP drop → span_processor_ destructs → ~BSP joins worker;
-    // metric_reader_ destructs → ~PMR joins worker). However, BSP's
-    // shared_ptr has multiple ref-holders (TracerProvider, Tracers, and
-    // potentially user-held Spans bypassing snapshot machinery). A user-
-    // held Span destruct after this dtor returns would call BSP::OnEnd
-    // and dereference manager_->catalog() — dead by then. Nulling the
-    // manager pointer on BSP (and symmetrically on PMR) makes those
-    // late paths no-op instead of UAF.
+    // After BeginShutdown's bounded JoinWorkers, the worker may still be
+    // running if its export was stalled past kDtorShutdownBudget. The
+    // atomic disarm below cannot stop a worker that has ALREADY loaded
+    // a non-null raw pointer and is preempted between load and
+    // dereference — only an actual thread-join guarantees the worker is
+    // not executing. Do an unbounded SignalShutdown + JoinWorkers(-1)
+    // pair on BSP and PMR so the workers are demonstrably gone BEFORE
+    // member destruction (catalog_, meter_provider_) begins.
+    //
+    // External-holder safety: BSP's shared_ptr has multiple ref-holders
+    // (TracerProvider, cached Tracers, user-held Spans); PMR is a
+    // shared_ptr that tests register via RegisterMetricReader. Dropping
+    // the manager's ref does NOT necessarily run their destructors. The
+    // explicit SignalShutdown + unconditional join makes worker
+    // termination independent of refcount.
+    //
+    // Hang risk: JoinWorkers(-1) does worker_.join() unconditionally,
+    // blocking until the worker exits. The worker's last iteration is
+    // bounded by the exporter's per-export timeout (production: 5s
+    // default; tests use synchronous FixedResult exporters). A
+    // misbehaving exporter that ignores its timeout could wedge here —
+    // documented as operator misconfiguration.
+    if (span_processor_) {
+        span_processor_->SignalShutdown();
+        span_processor_->JoinWorkers(std::chrono::milliseconds{-1});
+    }
+    if (metric_reader_) {
+        metric_reader_->SignalShutdown();
+        metric_reader_->JoinWorkers(std::chrono::milliseconds{-1});
+    }
+    // Disarm self-metric pointers held by BSP and PMR for any USER-thread
+    // path that fires after this dtor returns (e.g. a user-held Span's
+    // dtor calls BSP::OnEnd from the user thread, not the worker — the
+    // worker is now joined, so user-thread paths are the only remaining
+    // concern). With manager_/provider_ atomically nulled, those paths
+    // see nullptr and skip emit instead of dereferencing dead catalog_
+    // / meter_provider_. Idempotent.
     if (auto* bsp = dynamic_cast<BatchSpanProcessor*>(span_processor_.get())) {
         bsp->DisarmManager();
     }
     if (metric_reader_) {
         metric_reader_->DisarmManager();
-        // Also disarm the raw MeterProvider* the worker dereferences in
-        // Snapshot(). RegisterMetricReader takes shared_ptr, so an
-        // external holder can keep PMR alive past member destruction;
-        // without this, the worker would touch dead meter_provider_
-        // memory before the destructor's bounded join completes (or
-        // immediately, if the join times out).
         metric_reader_->DisarmProvider();
     }
 }
