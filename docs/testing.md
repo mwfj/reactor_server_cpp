@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all suites (1379 tests across 41+ suites at HEAD)
+make test               # Build and run all suites (1491 tests across 41+ suites at HEAD)
 ./test_runner                   # Run all tests directly (after building)
 ./test_runner help              # Print every supported flag
 
