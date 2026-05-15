@@ -260,7 +260,8 @@ CircuitBreakerSlice::Admission CircuitBreakerSlice::TryAcquire() {
     // Disabled fast path — zero overhead when config.enabled=false.
     // Use generation 0 (sentinel) since the slice won't consult it on report.
     if (!config_.enabled) {
-        return Admission{Decision::ADMITTED, /*generation=*/0};
+        return Admission{Decision::ADMITTED, /*generation=*/0,
+                         RejectReason::NONE};
     }
 
     State s = state_.load(std::memory_order_acquire);
@@ -282,8 +283,21 @@ CircuitBreakerSlice::Admission CircuitBreakerSlice::TryAcquire() {
             // Report* for a rejected admission, and 0 always compares stale
             // (domain gens start at 1), so an accidental Report would drop
             // safely rather than mutating state.
-            return Admission{RejectWithLog("open", /*half_open_full=*/false),
-                             /*generation=*/0};
+            //
+            // Reason vocabulary mirrors RejectWithLog's dry-run branching:
+            // dry-run flips Decision to REJECTED_OPEN_DRYRUN (caller proceeds
+            // through to the upstream) and RejectReason to OPEN_DRYRUN so the
+            // metric label distinguishes shadow-mode would-rejects from real
+            // enforced rejects. The "half_open_full" arg to RejectWithLog is
+            // unrelated to dry-run — it only drives the dedicated
+            // rejected_half_open_full_ counter and stays false here.
+            const auto rr = config_.dry_run
+                ? RejectReason::OPEN_DRYRUN
+                : RejectReason::OPEN;
+            return Admission{
+                RejectWithLog("open", /*half_open_full=*/false),
+                /*generation=*/0,
+                rr};
         }
     }
 
@@ -298,7 +312,8 @@ CircuitBreakerSlice::Admission CircuitBreakerSlice::TryAcquire() {
         if (half_open_saw_failure_) {
             return Admission{RejectWithLog("half_open_recovery_failing",
                                            /*half_open_full=*/false),
-                             /*generation=*/0};
+                             /*generation=*/0,
+                             RejectReason::HALF_OPEN_RECOVERY_FAILING};
         }
         // Case B: probe budget exhausted for this cycle. "No capacity" — bump
         // the dedicated counter so dashboards can tell this apart from
@@ -320,16 +335,18 @@ CircuitBreakerSlice::Admission CircuitBreakerSlice::TryAcquire() {
         if (half_open_admitted_ >= half_open_permitted_snapshot_) {
             return Admission{RejectWithLog("half_open_full",
                                            /*half_open_full=*/true),
-                             /*generation=*/0};
+                             /*generation=*/0,
+                             RejectReason::HALF_OPEN_FULL};
         }
         half_open_admitted_++;
         half_open_inflight_++;
         // Probe admission — stamp with halfopen_gen_.
-        return Admission{Decision::ADMITTED_PROBE, halfopen_gen_};
+        return Admission{Decision::ADMITTED_PROBE, halfopen_gen_,
+                         RejectReason::NONE};
     }
 
     // CLOSED: fast path — stamp with closed_gen_.
-    return Admission{Decision::ADMITTED, closed_gen_};
+    return Admission{Decision::ADMITTED, closed_gen_, RejectReason::NONE};
 }
 
 Decision CircuitBreakerSlice::RejectWithLog(const char* state_label,
@@ -588,8 +605,8 @@ void CircuitBreakerSlice::Reload(const CircuitBreakerConfig& new_config) {
         //     a subsequent enable would interpret as live probes.
         //   - Disabling mid-CLOSED-cycle and re-enabling would trip on the
         //     very next failure because consecutive_failures_ persisted.
-        // Matches design doc §10.1 (enabled→disabled / disabled→enabled
-        // transitions both get a clean CLOSED start).
+        // Enabled→disabled and disabled→enabled transitions both get a
+        // clean CLOSED start.
         //
         // Silent reset — no transition callback. The change is operator-
         // initiated configuration, not a runtime state signal; firing the

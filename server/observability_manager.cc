@@ -8,6 +8,7 @@
 #include "observability/span_status.h"
 
 #include "common.h"
+#include "dispatcher.h"
 #include "log/logger.h"
 
 namespace OBSERVABILITY_NAMESPACE {
@@ -49,6 +50,32 @@ ObservabilityManager::ObservabilityManager(
 // unwinding test doesn't hang.
 static constexpr auto kDtorShutdownBudget = std::chrono::milliseconds{1000};
 
+// Drains residual http.client.active_requests +1s for one snapshot.
+// CAS-decrements `snap.attempt_active_inflight_` to zero and emits a
+// single `Add(-won)` against the per-service labeled series; the
+// natural-finalize path and this drain both CAS the same counter, so
+// only the winner produces the matching -1. Used from both
+// ~ObservabilitySnapshot branches and KillOutstandingSnapshots.
+void ObservabilityManager::DrainResidualClientActive(
+        ObservabilitySnapshot& snap) noexcept {
+    if (catalog_.http_client_active_requests == nullptr) return;
+    int won = 0;
+    while (TryDecrementIfPositive(snap.attempt_active_inflight_)) ++won;
+    if (won == 0) return;
+    std::string service;
+    {
+        std::lock_guard<std::mutex> g(snap.link_mtx);
+        service = snap.upstream_service_for_metrics;
+    }
+    if (!service.empty()) {
+        catalog_.http_client_active_requests->Add(
+            -static_cast<double>(won),
+            {{"reactor.upstream.service", service}});
+    }
+    client_active_decremented_via_kill_or_dtor_.fetch_add(
+        static_cast<uint64_t>(won), std::memory_order_relaxed);
+}
+
 ObservabilityManager::~ObservabilityManager() {
     // Idempotent safety net for tests / abnormal teardown paths.
     // Production goes through HttpServer::Stop's coordinated kill +
@@ -61,6 +88,50 @@ ObservabilityManager::~ObservabilityManager() {
     // SERVER spans silently leak (never End()-ed).
     KillOutstandingSnapshots(std::chrono::milliseconds{0});
     BeginShutdown(kDtorShutdownBudget);
+    // After BeginShutdown's bounded JoinWorkers, the worker may still be
+    // running if its export was stalled past kDtorShutdownBudget. The
+    // atomic disarm below cannot stop a worker that has ALREADY loaded
+    // a non-null raw pointer and is preempted between load and
+    // dereference — only an actual thread-join guarantees the worker is
+    // not executing. Do an unbounded SignalShutdown + JoinWorkers(-1)
+    // pair on BSP and PMR so the workers are demonstrably gone BEFORE
+    // member destruction (catalog_, meter_provider_) begins.
+    //
+    // External-holder safety: BSP's shared_ptr has multiple ref-holders
+    // (TracerProvider, cached Tracers, user-held Spans); PMR is a
+    // shared_ptr that tests register via RegisterMetricReader. Dropping
+    // the manager's ref does NOT necessarily run their destructors. The
+    // explicit SignalShutdown + unconditional join makes worker
+    // termination independent of refcount.
+    //
+    // Hang risk: JoinWorkers(-1) does worker_.join() unconditionally,
+    // blocking until the worker exits. The worker's last iteration is
+    // bounded by the exporter's per-export timeout (production: 5s
+    // default; tests use synchronous FixedResult exporters). A
+    // misbehaving exporter that ignores its timeout could wedge here —
+    // documented as operator misconfiguration.
+    if (span_processor_) {
+        span_processor_->SignalShutdown();
+        span_processor_->JoinWorkers(std::chrono::milliseconds{-1});
+    }
+    if (metric_reader_) {
+        metric_reader_->SignalShutdown();
+        metric_reader_->JoinWorkers(std::chrono::milliseconds{-1});
+    }
+    // Disarm self-metric pointers held by BSP and PMR for any USER-thread
+    // path that fires after this dtor returns (e.g. a user-held Span's
+    // dtor calls BSP::OnEnd from the user thread, not the worker — the
+    // worker is now joined, so user-thread paths are the only remaining
+    // concern). With manager_/provider_ atomically nulled, those paths
+    // see nullptr and skip emit instead of dereferencing dead catalog_
+    // / meter_provider_. Idempotent.
+    if (auto* bsp = dynamic_cast<BatchSpanProcessor*>(span_processor_.get())) {
+        bsp->DisarmManager();
+    }
+    if (metric_reader_) {
+        metric_reader_->DisarmManager();
+        metric_reader_->DisarmProvider();
+    }
 }
 
 void ObservabilityManager::PublishLiveFlags(const ObservabilityConfig& c) {
@@ -120,9 +191,10 @@ void ObservabilityManager::Init() {
     route_overrides_snapshot_ = BuildRouteOverridesFromConfig();
 
     tracer_provider_ = std::make_unique<TracerProvider>(
-        resource_, span_processor_, std::move(sampler), random_);
+        resource_, span_processor_, std::move(sampler), random_,
+        /*manager=*/this);
     meter_provider_ = std::make_unique<MeterProvider>(
-        resource_, kDefaultMetricShards);
+        resource_, kDefaultMetricShards, /*manager=*/this);
 
     std::atomic_store_explicit(&propagator_,
         CompositePropagator::Build(config_.traces.propagators),
@@ -279,8 +351,15 @@ ObservabilityManager::EffectiveSamplerForPath(
 // finalizer that wins the race; manager.lock() failure means the
 // kill path already finalized us through the registry.
 ObservabilitySnapshot::~ObservabilitySnapshot() {
-    if (finalized.load(std::memory_order_acquire)) return;
     auto mgr = manager.lock();
+    if (finalized.load(std::memory_order_acquire)) {
+        // SERVER-span backstop already done by the finalize winner.
+        // Still drain residual http.client.active_requests counters
+        // (a finalize winner that ran before any proxy attempt
+        // produced a +1 leaves the counter at 0; nothing to do here).
+        if (mgr) mgr->DrainResidualClientActive(*this);
+        return;
+    }
     if (!mgr) return;  // manager torn down — kill loop ran or test path.
 
     // Exception-safe: FinalizeFromSnapshot wraps OnFinalizeWinner in
@@ -296,6 +375,12 @@ ObservabilitySnapshot::~ObservabilitySnapshot() {
 
     mgr->FinalizeFromSnapshot(*this, /*status=*/0, /*wire_body=*/0,
                                 /*error_type=*/"unfinalized_drop");
+
+    // Drain residual http.client.active_requests counters that
+    // escaped both FinalizeAttemptSpan AND KillOutstandingSnapshots.
+    // Same CAS-decrement path as the kill loop so a late natural
+    // finalize racing the dtor cannot produce a duplicate -1.
+    mgr->DrainResidualClientActive(*this);
 }
 
 void ObservabilityManager::RegisterLiveSnapshot(
@@ -662,64 +747,148 @@ void ObservabilityManager::KillOutstandingSnapshots(
     for (auto& snap_sp : to_kill) {
         ObservabilitySnapshot& snap = *snap_sp;
 
-        // The link/kill protocol must be atomic against
-        // ProxyTransaction::Start. Without holding link_mtx across
-        // the finalized CAS:
-        //   1. Kill takes link_mtx, sees tx_weak empty, releases.
-        //   2. Start (under link_mtx) sees finalized=false, publishes
-        //      tx_weak, releases.
-        //   3. Kill CAS-flips finalized=true.
-        //   4. Nobody ever calls MarkKilledForShutdown — the proxy
-        //      runs against a snapshot already removed from
-        //      drain counters.
-        // Holding link_mtx across the CAS makes Start's locked check
-        // either observe finalized=true (and self-mark) OR run
-        // entirely before/after kill's whole locked region.
-        std::shared_ptr<UpstreamTransactionLink> tx;
-        bool finalize_won = false;
+        // Inline-vs-marshal decision. The stopper thread (HttpServer::Stop)
+        // is typically NOT a dispatcher thread, so the cross-thread branch
+        // is the common path. Inline covers (a) snapshots with no owning
+        // dispatcher (auth-only / non-routed) and (b) the rare case where
+        // Stop() runs from a dispatcher whose own snapshot is the survivor.
+        Dispatcher* owning = snap.owning_dispatcher;
+        const bool inline_kill = (owning == nullptr) ||
+                                  owning->is_on_loop_thread();
+
+        if (inline_kill) {
+            KillSnapshotInline(snap);
+            continue;
+        }
+
+        // Cross-thread marshal. Bump under finalizers_done_mtx_ so the
+        // drain predicate observes the increment before the marshal
+        // becomes visible. Lock-around-notify on the decrement side
+        // closes the lost-wakeup window on finalizers_done_cv_.
         {
-            std::lock_guard<std::mutex> g(snap.link_mtx);
-            tx = snap.tx_weak.lock();
-            bool expected = false;
-            finalize_won = snap.finalized.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel);
-        }
-        if (!finalize_won) {
-            continue;  // a finalizer already won; let it run.
-        }
-        // Only mark survivors as killed for shutdown — transactions
-        // that finalized normally (CAS lost above) are already past
-        // their terminal callback and don't need a redundant
-        // EnQueue + Cancel.
-        if (tx) tx->MarkKilledForShutdown();
-
-        // DropWithoutEnd only flips the dropped_ atomic; it never
-        // touches the Span's non-atomic state. Safe to invoke from
-        // the stopper thread even if the owning dispatcher is mid-
-        // SetAttribute. The processor was already drained by
-        // BeginShutdown above, and the destructor will reclaim
-        // memory naturally on the last shared_ptr release.
-        if (snap.inbound_span) {
-            snap.inbound_span->DropWithoutEnd();
+            std::lock_guard<std::mutex> lk(finalizers_done_mtx_);
+            kill_marshals_in_flight_.fetch_add(1, std::memory_order_release);
         }
 
-        // Symmetric -1 for the +1 emitted by ObservabilityMiddleware on
-        // request entry. The kill loop bypasses OnFinalizeWinner, so
-        // without this site the gauge leaks by N on every shutdown
-        // that times out N survivors (OBSERVABILITY.md "exactly one
-        // +1 and -1 per finalize" invariant).
-        if (catalog_.http_server_active_requests != nullptr) {
-            catalog_.http_server_active_requests->Add(
-                -1.0,
-                MakeActiveRequestsLabels(snap.method, snap.route_pattern));
-        }
+        auto weak_self = weak_from_this();
+        std::weak_ptr<ObservabilitySnapshot> snap_weak = snap_sp;
 
-        DeregisterAndDecrement(snap);
-        snapshots_killed_on_timeout_.fetch_add(1, std::memory_order_relaxed);
-        // Self-metric — surface kill-loop activity at /metrics.
-        if (catalog_.reactor_otel_snapshots_killed_on_timeout != nullptr) {
-            catalog_.reactor_otel_snapshots_killed_on_timeout->Add(1.0, {});
+        // EnQueueDelayed returns bool — bare EnQueue silently drops
+        // post-stop, which would leak the bump. delay=0ms places the
+        // task immediately at the deadline-min-heap front; the
+        // dispatcher's first WaitForEvent wakeup drains it.
+        const bool enqueued = owning->EnQueueDelayed(
+            [weak_self, snap_weak]() {
+                // RAII decrement on every exit path — weak.lock()
+                // failure or any exception thrown by KillSnapshotInline
+                // still drains the bump.
+                struct DecrementGuard {
+                    std::weak_ptr<ObservabilityManager> w;
+                    ~DecrementGuard() {
+                        if (auto m = w.lock()) {
+                            {
+                                std::lock_guard<std::mutex> lk(
+                                    m->finalizers_done_mtx_);
+                                m->kill_marshals_in_flight_.fetch_sub(
+                                    1, std::memory_order_release);
+                            }
+                            m->finalizers_done_cv_.notify_all();
+                        }
+                        // Manager already gone: drain barrier joined
+                        // via the dtor's join semantics; no work to do.
+                    }
+                } guard{weak_self};
+
+                auto self = weak_self.lock();
+                if (!self) return;
+                auto snap = snap_weak.lock();
+                if (!snap) return;
+                self->KillSnapshotInline(*snap);
+            },
+            std::chrono::milliseconds{0});
+
+        if (!enqueued) {
+            // Dispatcher already stopped — roll back the bump (closure
+            // will never run) and fall back to inline kill on the
+            // current thread. Effect-equivalent to the inline branch.
+            {
+                std::lock_guard<std::mutex> lk(finalizers_done_mtx_);
+                kill_marshals_in_flight_.fetch_sub(
+                    1, std::memory_order_release);
+            }
+            finalizers_done_cv_.notify_all();
+            KillSnapshotInline(snap);
         }
+    }
+}
+
+void ObservabilityManager::KillSnapshotInline(
+    ObservabilitySnapshot& snap) noexcept {
+    // The link/kill protocol must be atomic against
+    // ProxyTransaction::Start. Without holding link_mtx across
+    // the finalized CAS:
+    //   1. Kill takes link_mtx, sees tx_weak empty, releases.
+    //   2. Start (under link_mtx) sees finalized=false, publishes
+    //      tx_weak, releases.
+    //   3. Kill CAS-flips finalized=true.
+    //   4. Nobody ever calls MarkKilledForShutdown — the proxy
+    //      runs against a snapshot already removed from
+    //      drain counters.
+    // Holding link_mtx across the CAS makes Start's locked check
+    // either observe finalized=true (and self-mark) OR run
+    // entirely before/after kill's whole locked region.
+    std::shared_ptr<UpstreamTransactionLink> tx;
+    bool finalize_won = false;
+    {
+        std::lock_guard<std::mutex> g(snap.link_mtx);
+        tx = snap.tx_weak.lock();
+        bool expected = false;
+        finalize_won = snap.finalized.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel);
+    }
+    if (!finalize_won) {
+        return;  // a finalizer already won; let it run.
+    }
+    // Only mark survivors as killed for shutdown — transactions
+    // that finalized normally (CAS lost above) are already past
+    // their terminal callback and don't need a redundant
+    // EnQueue + Cancel.
+    if (tx) tx->MarkKilledForShutdown();
+
+    // DropWithoutEnd only flips the dropped_ atomic; it never
+    // touches the Span's non-atomic state. Safe to invoke from
+    // the stopper thread even if the owning dispatcher is mid-
+    // SetAttribute. The processor was already drained by
+    // BeginShutdown above, and the destructor will reclaim
+    // memory naturally on the last shared_ptr release.
+    if (snap.inbound_span) {
+        snap.inbound_span->DropWithoutEnd();
+    }
+
+    // Symmetric -1 for the +1 emitted by ObservabilityMiddleware on
+    // request entry. The kill loop bypasses OnFinalizeWinner, so
+    // without this site the gauge leaks by N on every shutdown
+    // that times out N survivors (OBSERVABILITY.md "exactly one
+    // +1 and -1 per finalize" invariant).
+    if (catalog_.http_server_active_requests != nullptr) {
+        catalog_.http_server_active_requests->Add(
+            -1.0,
+            MakeActiveRequestsLabels(snap.method, snap.route_pattern));
+    }
+
+    // Drain residual http.client.active_requests +1s for this
+    // snapshot. The natural finalize path (FinalizeAttemptSpan)
+    // and this kill-loop both CAS-decrement the same counter —
+    // only the winner emits the matching -1. Killed-snapshot
+    // drain catches every +1 that the natural path did not
+    // finalize first.
+    DrainResidualClientActive(snap);
+
+    DeregisterAndDecrement(snap);
+    snapshots_killed_on_timeout_.fetch_add(1, std::memory_order_relaxed);
+    // Self-metric — surface kill-loop activity at /metrics.
+    if (catalog_.reactor_otel_snapshots_killed_on_timeout != nullptr) {
+        catalog_.reactor_otel_snapshots_killed_on_timeout->Add(1.0, {});
     }
 }
 

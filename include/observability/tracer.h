@@ -38,6 +38,7 @@
 namespace OBSERVABILITY_NAMESPACE {
 
 class InstrumentationScope;
+class ObservabilityManager;
 class Resource;
 class SpanProcessor;
 
@@ -63,10 +64,16 @@ public:
            std::shared_ptr<const Resource>             resource,
            std::shared_ptr<SpanProcessor>              processor,
            std::shared_ptr<const Sampler>              sampler,
-           std::shared_ptr<RandomSource>               random);
+           std::shared_ptr<RandomSource>               random,
+           ObservabilityManager*                       manager);
 
     Tracer(const Tracer&) = delete;
     Tracer& operator=(const Tracer&) = delete;
+
+    // Self-metric escape hatch — returns the ObservabilityManager pointer
+    // installed at construction time, or null when constructed without
+    // one (test fixtures).
+    ObservabilityManager* manager() const noexcept { return manager_; }
 
     // StartSpan — the only span constructor. Returns a non-null
     // shared_ptr<Span> on every call: even DROP-sampled spans get a
@@ -93,6 +100,10 @@ private:
     std::shared_ptr<SpanProcessor>              processor_;
     std::shared_ptr<const Sampler>              sampler_;
     std::shared_ptr<RandomSource>               random_;
+
+    // Raw pointer; manager storage outlives every Tracer (TracerProvider
+    // destructs as part of ~ObservabilityManager's body).
+    ObservabilityManager*                       manager_ = nullptr;
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

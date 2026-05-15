@@ -40,8 +40,15 @@ public:
     // consecutive_failures_, or a pre-CLOSED'-cycle success wiping a
     // legitimate post-CLOSED' counter).
     struct Admission {
-        Decision decision;
-        uint64_t generation;
+        Decision     decision;
+        uint64_t     generation;
+        // Annotates which reject path produced `decision` so callers can
+        // emit reactor.circuit_breaker.rejected{reason} without re-deriving
+        // the path from logs. NONE on every admit outcome. Defaulted (not
+        // positional) so existing test sites that brace-init with two
+        // fields keep compiling — the legacy code that doesn't care about
+        // the reason gets NONE for free.
+        RejectReason reject_reason = RejectReason::NONE;
     };
 
     // Hot-path decision. Consults state + (if applicable) advances OPEN→HALF_OPEN

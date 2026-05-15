@@ -16,6 +16,10 @@
 // Forward declaration
 class TlsClientContext;
 
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+}
+
 class PoolPartition {
 public:
     // Checkout callback aliases — defined in upstream_callbacks.h,
@@ -59,6 +63,17 @@ public:
                   std::mutex& drain_mtx,
                   std::condition_variable& drain_cv);
     ~PoolPartition();
+
+    // Late install — UpstreamManager forwards this when MarkServerReady
+    // wires the observability manager. Idempotent; null clears. Called
+    // from MarkServerReady (conn-dispatcher thread) but read from the
+    // partition's owning dispatcher on every emit path. Release-store
+    // pairs with acquire-load in GetObservabilityManager for safe
+    // cross-thread publication.
+    void SetObservabilityManager(
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept {
+        obs_manager_.store(obs_manager, std::memory_order_release);
+    }
 
     // Non-copyable, non-movable
     PoolPartition(const PoolPartition&) = delete;
@@ -388,6 +403,13 @@ private:
     UpstreamPoolConfig config_;
     std::shared_ptr<TlsClientContext> tls_ctx_;
 
+    // Non-owning. Installed by UpstreamManager::SetObservabilityManager
+    // (during MarkServerReady) AFTER ObservabilityManager construction.
+    // Lifetime: in HttpServer's declaration order, observability_manager_
+    // is declared AFTER upstream_manager_ , so reverse-destruction destroys
+    // observability_manager_ FIRST.
+    std::atomic<OBSERVABILITY_NAMESPACE::ObservabilityManager*> obs_manager_{nullptr};
+
     // C++17 note: `std::atomic_load_explicit(shared_ptr*)` is the
     // standard-compliant form. C++20 deprecates the free-function
     // overloads in favor of `std::atomic<std::shared_ptr<T>>`.
@@ -609,4 +631,16 @@ private:
 
     // Signal drain completion if shutting down and all connections closed
     void MaybeSignalDrain();
+
+    // Pool gauge / histogram emit helpers. No-op when `service_name_` is
+    // empty or `obs_manager_` is null. UpDownCounter::Add takes per-shard
+    // internal locks; the call MUST NOT be issued under a PoolPartition-
+    // owned lock — PoolPartition is dispatcher-thread-only, so no caller
+    // holds one today. Direction: +1 for "enters" gauge, -1 for "leaves".
+    void EmitIdleGaugeDelta(double delta);
+    void EmitActiveGaugeDelta(double delta);
+    // duration_sec ≈ 0 for immediate / rejected; positive for created /
+    // queued_satisfied / cancelled / queue_timeout. outcome label
+    // allowlist enforced by the catalog cap (cap=8).
+    void EmitCheckoutWaitDuration(double duration_sec, const char* outcome);
 };

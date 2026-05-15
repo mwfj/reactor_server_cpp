@@ -17,11 +17,14 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
+class ObservabilityManager;
+
 class PeriodicMetricReader {
 public:
     PeriodicMetricReader(MeterProvider*                 provider,
                           std::shared_ptr<MetricExporter> exporter,
-                          MeterReaderOptions             options = {});
+                          MeterReaderOptions             options = {},
+                          ObservabilityManager*          manager = nullptr);
 
     PeriodicMetricReader(const PeriodicMetricReader&) = delete;
     PeriodicMetricReader& operator=(const PeriodicMetricReader&) = delete;
@@ -78,11 +81,48 @@ public:
         return exporter_;
     }
 
+    // Self-metric escape hatch — returns the ObservabilityManager pointer
+    // installed at construction time, or null when constructed without
+    // one (test fixtures). See batch_span_processor.h::manager() docstring
+    // for the SHUTDOWN CAVEAT on sub-member usage.
+    ObservabilityManager* manager() const noexcept {
+        return manager_.load(std::memory_order_acquire);
+    }
+
+    // Atomically null the manager pointer so the worker's self-metric
+    // emit path sees nullptr and skips. Called by ~ObservabilityManager
+    // BEFORE member destruction begins. Idempotent.
+    void DisarmManager() noexcept {
+        manager_.store(nullptr, std::memory_order_release);
+    }
+
+    void DisarmProvider() noexcept {
+        provider_.store(nullptr, std::memory_order_release);
+    }
+
 private:
     void WorkerLoop();
 
-    MeterProvider*                  provider_;
+    // Atomic so DisarmProvider()'s release-store is visible to the worker
+    // on its next iteration. After the declaration reorder in
+    // observability_manager.h, meter_provider_ is declared BEFORE
+    // metric_reader_ — reverse-destruction joins this reader BEFORE
+    // meter_provider_ dies on the manager-owned path. DisarmProvider()
+    // is the safety net for the external-holder case where a PMR
+    // shared_ptr outlives the manager.
+    std::atomic<MeterProvider*>     provider_;
     std::shared_ptr<MetricExporter> exporter_;
+    // Atomic so DisarmManager()'s release-store is visible to the worker
+    // and any synchronous emit path. After the tracer_provider_ reorder
+    // in observability_manager.h, metric_reader_ is declared AFTER
+    // catalog_ and meter_provider_ — reverse-destruction joins this
+    // reader BEFORE either dies, so manager_->catalog() and
+    // manager_->meter_provider() are GUARANTEED LIVE for the entire
+    // worker drain on the production path. DisarmManager() is the
+    // safety net for a future code path where a PMR ref outlives the
+    // manager (today PMR has a single ref-holder, but mirroring BSP's
+    // disarm semantics keeps the contract symmetric).
+    std::atomic<ObservabilityManager*> manager_;
 
     std::atomic<int64_t>            interval_ns_;
     std::atomic<int64_t>            timeout_ns_;

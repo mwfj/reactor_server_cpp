@@ -956,6 +956,14 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     // Send server connection preface (SETTINGS)
     session_->SendServerPreface();
 
+    // Connection is confirmed HTTP/2 — bump
+    // `reactor.http.connections.active{protocol=h2}`. The matching -1
+    // fires from `~ConnectionHandler` (or `HandOffToWebSocket` if we
+    // later add an H2-to-WS upgrade path).
+    if (conn_) {
+        conn_->MarkApplicationProtocolConfirmed("h2");
+    }
+
     // Install HTTP/2 deadline timeout callback. Always installed (not gated
     // on request_timeout_sec_) because it also handles shutdown drain logic.
     // Per-stream RST only runs when request_timeout_sec_ > 0.

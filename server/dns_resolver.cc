@@ -1,5 +1,8 @@
 #include "net/dns_resolver.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 
 #include <netdb.h>
 #include <pthread.h>
@@ -51,6 +54,13 @@ struct DnsResolver::PoolState {
     std::atomic<int64_t> total_resolutions_failed{0};
     std::atomic<int64_t> total_resolutions_timeout{0};
     std::atomic<int64_t> eai_again{0};
+
+    // Non-owning pointer to the observability manager. Mirror of
+    // DnsResolver::obs_manager_, kept here so worker / reaper trampolines
+    // (which only see PoolState) can emit reactor.dns.resolves{outcome}.
+    // Read under relaxed-acquire ordering on the emit hot path; written
+    // by DnsResolver::SetObservabilityManager before any worker spawns.
+    std::atomic<OBSERVABILITY_NAMESPACE::ObservabilityManager*> obs_manager{nullptr};
 };
 
 // ---------------------------------------------------------------------------
@@ -83,6 +93,39 @@ namespace {
 // ---------------------------------------------------------------------------
 // Static helpers — local to this TU
 // ---------------------------------------------------------------------------
+
+// Map a getaddrinfo result code to the closed-set outcome vocabulary
+// recorded on reactor.dns.resolves. Centralised so submission-side
+// short-circuits (literal parse error, saturated queue) and worker /
+// reaper paths agree on classification.
+const char* OutcomeForGaiError(int rc) noexcept {
+    switch (rc) {
+        case 0:           return "success";
+        case EAI_NONAME:  return "nxdomain";
+        case EAI_AGAIN:   return "timeout";
+        case EAI_FAIL:    return "servfail";
+        default:          return "other_error";
+    }
+}
+
+// Emit a single reactor.dns.resolves{outcome} increment. Null-safe and
+// catalog-instrument-null-safe so DNS code paths that fire before
+// MarkServerReady wires the manager remain quiet.
+void EmitResolveOutcomeWithManager(
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* mgr,
+    const char* outcome) noexcept
+{
+    if (mgr == nullptr || outcome == nullptr) return;
+    const auto& cat = mgr->catalog();
+    auto* counter = cat.reactor_dns_resolves;
+    if (counter == nullptr) return;
+    try {
+        counter->Add(1.0, {{"outcome", std::string(outcome)}});
+    } catch (...) {
+        // Defensive: emit must never propagate exceptions to the resolver
+        // hot path. Observability is best-effort.
+    }
+}
 
 // Strict IPv4 dotted-quad pre-filter: exactly four dot-separated
 // segments, each 1-3 ASCII digits, each value <= 255, and NO leading
@@ -631,6 +674,12 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
                 item->done = true;
                 state->total_resolutions.fetch_add(1, std::memory_order_relaxed);
                 state->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
+                // Emit BEFORE publishing the future so a synchronously
+                // waiting caller is guaranteed to see the counter when
+                // the future becomes ready.
+                EmitResolveOutcomeWithManager(
+                    state->obs_manager.load(std::memory_order_acquire),
+                    "timeout");
                 try {
                     item->promise.set_value(MakeTimeoutResult(
                         item->req, "queue-time exceeded deadline"));
@@ -652,6 +701,13 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
         // this item) skips both — `in_flight_it` may have been
         // invalidated by the reaper's erase but is never dereferenced
         // here.
+        //
+        // Observability emit MUST happen BEFORE `promise.set_value` so
+        // the caller's wait_for+snapshot sequence is guaranteed to see
+        // the new counter value (the future's ready state is the
+        // happens-before edge a synchronous test relies on; emitting
+        // after set_value lets the wait return before the catalog Add
+        // completes, racing the snapshot to zero).
         {
             std::lock_guard<std::mutex> lk(state->mtx);
             if (!item->done) {
@@ -666,19 +722,33 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
                 const bool late =
                     std::chrono::steady_clock::now() > item->deadline;
                 state->total_resolutions.fetch_add(1, std::memory_order_relaxed);
+                const char* outcome_to_emit = nullptr;
                 if (late) {
                     state->total_resolutions_timeout.fetch_add(
                         1, std::memory_order_relaxed);
+                    outcome_to_emit = "timeout";
+                } else {
+                    if (result.error) {
+                        state->total_resolutions_failed.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    outcome_to_emit = OutcomeForGaiError(
+                        result.error ? result.error_code : 0);
+                }
+                // Emit BEFORE publishing the future. The
+                // MetricLabelRegistry lock taken inside Counter::Add is
+                // leaf-level and does not re-enter state->mtx, so
+                // nesting here is safe in practice.
+                EmitResolveOutcomeWithManager(
+                    state->obs_manager.load(std::memory_order_acquire),
+                    outcome_to_emit);
+                if (late) {
                     try {
                         item->promise.set_value(MakeTimeoutResult(
                             item->req,
                             "queue-time exceeded deadline"));
                     } catch (const std::future_error&) {}
                 } else {
-                    if (result.error) {
-                        state->total_resolutions_failed.fetch_add(
-                            1, std::memory_order_relaxed);
-                    }
                     try {
                         item->promise.set_value(std::move(result));
                     } catch (const std::future_error&) {}
@@ -687,7 +757,8 @@ void* DnsResolver::WorkerTrampoline(void* raw) {
             }
             // else: reaper beat us to it and already erased
             // `in_flight_it`. Do nothing — our blocking work is
-            // discarded; the caller got the timeout result.
+            // discarded; the caller got the timeout result. The reaper
+            // path will emit "timeout" for this item.
         }
     }
 }
@@ -763,6 +834,12 @@ void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
         // iteration pattern as the submission-side sweep in
         // ResolveAsync (unambiguous promise set_value semantics for
         // shared_ptr<WorkItem> elements).
+        //
+        // Emit BEFORE set_value so a synchronously waiting caller's
+        // wait_for→get→snapshot sequence is guaranteed to observe the
+        // counter. Counter::Add holds a leaf-level MetricLabelRegistry
+        // lock that never re-enters state->mtx, so nesting is safe.
+        auto* mgr = state->obs_manager.load(std::memory_order_acquire);
         const auto now = std::chrono::steady_clock::now();
         auto write = state->queue.begin();
         for (auto read = state->queue.begin(); read != state->queue.end(); ++read) {
@@ -772,6 +849,7 @@ void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
                     sp->done = true;
                     state->total_resolutions.fetch_add(1, std::memory_order_relaxed);
                     state->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
+                    EmitResolveOutcomeWithManager(mgr, "timeout");
                     try {
                         sp->promise.set_value(MakeTimeoutResult(
                             sp->req, "queue-time exceeded deadline"));
@@ -800,6 +878,7 @@ void* DnsResolver::TimeoutReaperTrampoline(void* raw) {
                     sp->done = true;
                     state->total_resolutions.fetch_add(1, std::memory_order_relaxed);
                     state->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
+                    EmitResolveOutcomeWithManager(mgr, "timeout");
                     try {
                         sp->promise.set_value(MakeTimeoutResult(
                             sp->req, "queue-time exceeded deadline"));
@@ -943,6 +1022,7 @@ DnsResolver::ResolveAsyncImpl(
             "' (must be a bare IP literal or RFC 1123 hostname; "
             "bracketed IPv6 / legacy numeric-dotted forms are not "
             "accepted at the resolver boundary)"));
+        EmitResolveOutcome("nxdomain");
         return fut;
     }
 
@@ -953,15 +1033,24 @@ DnsResolver::ResolveAsyncImpl(
             req, EAI_NONAME,
             "invalid port " + std::to_string(req.port) +
             " (must be in [0, 65535])"));
+        EmitResolveOutcome("nxdomain");
         return fut;
     }
 
     // Literal short-circuit (§5.2.9): ready-future path without
-    // spawning the pool. Keeps literal-only servers thread-free.
+    // spawning the pool. Keeps literal-only servers thread-free. This
+    // is the in-process fast path that bypasses the DNS pool entirely,
+    // so it surfaces as `cache_hit` on reactor.dns.resolves. A literal
+    // that fails inet_pton (operator-typed IP-shape input that the
+    // bracket-strip / family-policy combo rejects) is classified as
+    // nxdomain to match the OS-resolver "name does not exist" outcome.
     if (IsIpLiteral(req.host)) {
         std::promise<ResolvedEndpoint> p;
         auto fut = p.get_future();
-        p.set_value(MakeReadyLiteralResult(req));
+        ResolvedEndpoint result = MakeReadyLiteralResult(req);
+        const bool literal_ok = !result.error;
+        p.set_value(std::move(result));
+        EmitResolveOutcome(literal_ok ? "cache_hit" : "nxdomain");
         return fut;
     }
 
@@ -974,6 +1063,7 @@ DnsResolver::ResolveAsyncImpl(
         p.set_value(MakeReadyErrorResult(
             req, EAI_SYSTEM,
             std::string("resolver pool init failed: ") + e.what()));
+        EmitResolveOutcome("other_error");
         return fut;
     }
 
@@ -997,6 +1087,13 @@ DnsResolver::ResolveAsyncImpl(
         // accumulating toward kMaxQueuedItems) AND the per-request
         // deadline contract. Cost O(N) per submission; for realistic
         // queue sizes, microseconds.
+        //
+        // Emit timeout BEFORE set_value on every evicted item so the
+        // synchronously-waiting caller's wait→get→snapshot sequence is
+        // guaranteed to observe the counter. The catalog Counter::Add
+        // path takes its own leaf-level lock (MetricLabelRegistry)
+        // which never re-enters state_->mtx, so emitting under the pool
+        // mutex is safe.
         const auto sweep_now = std::chrono::steady_clock::now();
         auto write = state_->queue.begin();
         for (auto read = state_->queue.begin();
@@ -1007,6 +1104,7 @@ DnsResolver::ResolveAsyncImpl(
                     sp->done = true;
                     state_->total_resolutions.fetch_add(1, std::memory_order_relaxed);
                     state_->total_resolutions_timeout.fetch_add(1, std::memory_order_relaxed);
+                    EmitResolveOutcome("timeout");
                     try {
                         sp->promise.set_value(MakeTimeoutResult(
                             sp->req, "queue-time exceeded deadline"));
@@ -1031,11 +1129,12 @@ DnsResolver::ResolveAsyncImpl(
             // result, so /stats.dns must include it in completed totals.
             state_->total_resolutions.fetch_add(1, std::memory_order_relaxed);
             state_->eai_again.fetch_add(1, std::memory_order_relaxed);
+            EmitResolveOutcome("timeout");
             std::promise<ResolvedEndpoint> p;
-            auto saturated = p.get_future();
+            auto saturated_fut = p.get_future();
             p.set_value(MakeReadyErrorResult(
                 item->req, EAI_AGAIN, "resolver saturated"));
-            return saturated;
+            return saturated_fut;
         }
         state_->queue.push_back(std::move(item));
     }
@@ -1136,6 +1235,24 @@ void DnsResolver::SetMaxQueuedItemsForTesting(std::size_t cap) {
     // contention is zero in practice.
     std::lock_guard<std::mutex> lk(state_->mtx);
     max_queued_items_ = cap;
+}
+
+void DnsResolver::SetObservabilityManager(
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept
+{
+    obs_manager_ = obs_manager;
+    if (state_) {
+        // Publish to PoolState so worker / reaper trampolines (which only
+        // see PoolState) emit through the same manager. Release ordering
+        // pairs with the relaxed-acquire load in EmitResolveOutcome.
+        state_->obs_manager.store(obs_manager, std::memory_order_release);
+    }
+}
+
+void DnsResolver::EmitResolveOutcome(const char* outcome) const noexcept {
+    if (state_ == nullptr) return;
+    auto* mgr = state_->obs_manager.load(std::memory_order_acquire);
+    EmitResolveOutcomeWithManager(mgr, outcome);
 }
 
 ResolverSnapshot DnsResolver::Snapshot() const {

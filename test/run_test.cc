@@ -61,8 +61,12 @@
 #include "observability_proxy_client_test.h"
 #include "observability_auth_trace_test.h"
 #include "observability_catalog_test.h"
+#include "observability_middleware_metrics_test.h"
 #include "observability_kill_marshal_test.h"
 #include "observability_ws_messages_test.h"
+#include "observability_self_metrics_test.h"
+#include "observability_connection_metrics_test.h"
+#include "observability_pool_gauges_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -292,15 +296,39 @@ void RunAllTest(){
     // kill loop bumps the self-metric.
     ObservabilityCatalogTests::RunAllTests();
 
-    // Kill-loop invariant guards — RESERVED contract on
-    // kill_marshals_in_flight_, FinalizeFromSnapshot CAS resolves
-    // multi-thread races, snapshots_killed_on_timeout counter accuracy.
+    // Kill-loop invariant guards — kill_marshals_in_flight_ bump /
+    // decrement on cross-thread marshal, FinalizeFromSnapshot CAS
+    // resolves multi-thread races, snapshots_killed_on_timeout
+    // counter accuracy.
     ObservabilityKillMarshalTests::RunAllTests();
 
     // Per-message WS observability — `traces.websocket_messages` gate,
     // control-frame skip, fragmented-message single span, install-once
     // rebind reject.
     ObservabilityWsMessagesTests::RunAllTests();
+
+    // Self-metric emit — `reactor.otel.cardinality_overflow` slow + fast
+    // path counter bumps, null-manager safety, `reactor.otel.export.duration`
+    // {signal} label wiring.
+    ObservabilitySelfMetricsTests::RunAllTests();
+
+    // Connection-level transport / protocol metrics — net.connections.*,
+    // http.connections.active{protocol} latches at accept / H1-first-parse /
+    // H2-preface / WS-upgrade, dtor decrement symmetry.
+    ObservabilityConnectionMetricsTests::RunAllTests();
+
+    // Upstream pool gauge / histogram emits — connections.idle/active
+    // UpDownCounters across every transition site, checkout.wait.duration
+    // outcomes (immediate / created / queued_satisfied / rejected /
+    // cancelled / queue_timeout), and shutdown / eviction drain-to-zero
+    // invariants.
+    ObservabilityPoolGaugesTests::RunAllTests();
+
+    // Middleware-layer emit (DNS resolver + rate-limit manager) —
+    // reactor.dns.resolves{outcome} closed-set enum, rate-limit
+    // decisions {admit/reject/dry_run_reject}, tokens histogram,
+    // null-manager safety.
+    ObservabilityMiddlewareMetricsTests::RunAllTests();
 
     std::cout << "====================================\n" << std::endl;
 }
@@ -388,11 +416,24 @@ void PrintUsage(const char* program_name) {
     std::cout << "                     hop, auth.idp_check INTERNAL span (or pending_* events)" << std::endl;
     std::cout << "  obs_catalog        Catalogued metrics — instrument registration, HTTP" << std::endl;
     std::cout << "                     server body / active_requests emit, kill-loop self-metric" << std::endl;
-    std::cout << "  obs_kill_marshal   Kill-loop invariant guards — RESERVED contract on" << std::endl;
-    std::cout << "                     kill_marshals_in_flight, finalize CAS race, kill counter" << std::endl;
+    std::cout << "  obs_kill_marshal   Kill-loop invariant guards — inline vs cross-thread marshal" << std::endl;
+    std::cout << "                     on kill_marshals_in_flight, finalize CAS race, kill counter" << std::endl;
     std::cout << "  obs_ws_messages    WebSocket per-message tracing — websocket_messages opt-in" << std::endl;
     std::cout << "                     gate, control-frame span skip, fragmented-message single" << std::endl;
     std::cout << "                     span, install-once rebind reject" << std::endl;
+    std::cout << "  obs_self_metrics   OTel pipeline self-metrics — cardinality_overflow slow/" << std::endl;
+    std::cout << "                     fast path emit, null-manager safety, export.duration" << std::endl;
+    std::cout << "                     {signal} label wiring" << std::endl;
+    std::cout << "  obs_connection_metrics  Connection transport / protocol gauges — net.connections.*" << std::endl;
+    std::cout << "                          accept/close symmetry, http.connections.active{protocol}" << std::endl;
+    std::cout << "                          latches at H1 first parse / H2 preface / WS handoff" << std::endl;
+    std::cout << "  obs_pool_gauges    Upstream pool gauges — connections.idle/active UpDownCounters" << std::endl;
+    std::cout << "                     across every transition site, checkout.wait.duration outcomes" << std::endl;
+    std::cout << "                     (immediate / created / queued_satisfied / rejected /" << std::endl;
+    std::cout << "                      cancelled / queue_timeout)" << std::endl;
+    std::cout << "  obs_middleware_metrics  DNS resolves{outcome} closed-set enum, rate-limit" << std::endl;
+    std::cout << "                          decisions{zone, decision} (admit/reject/dry_run_reject)," << std::endl;
+    std::cout << "                          tokens histogram, null-manager safety guards" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -613,13 +654,26 @@ int main(int argc, char* argv[]) {
         // emit + kill-loop self-metric.
         }else if(mode == "obs_catalog"){
             ObservabilityCatalogTests::RunAllTests();
-        // Kill-loop invariant guards — RESERVED contract +
-        // FinalizeFromSnapshot CAS + snapshots_killed_on_timeout.
+        // Kill-loop invariant guards — kill_marshals_in_flight_
+        // bump / decrement + FinalizeFromSnapshot CAS +
+        // snapshots_killed_on_timeout.
         }else if(mode == "obs_kill_marshal"){
             ObservabilityKillMarshalTests::RunAllTests();
         // Per-message WS observability.
         }else if(mode == "obs_ws_messages"){
             ObservabilityWsMessagesTests::RunAllTests();
+        // Self-metric emit — cardinality_overflow + export.duration{signal}.
+        }else if(mode == "obs_self_metrics"){
+            ObservabilitySelfMetricsTests::RunAllTests();
+        // Connection-level transport + protocol gauges + accepted counter.
+        }else if(mode == "obs_connection_metrics"){
+            ObservabilityConnectionMetricsTests::RunAllTests();
+        // Upstream pool gauge + checkout-wait histogram emits.
+        }else if(mode == "obs_pool_gauges"){
+            ObservabilityPoolGaugesTests::RunAllTests();
+        // Middleware-layer emit: DNS resolves + rate-limit decisions/tokens.
+        }else if(mode == "obs_middleware_metrics"){
+            ObservabilityMiddlewareMetricsTests::RunAllTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

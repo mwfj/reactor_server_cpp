@@ -7,7 +7,8 @@ namespace CIRCUIT_BREAKER_NAMESPACE {
 CircuitBreakerManager::CircuitBreakerManager(
         const std::vector<UpstreamConfig>& upstreams,
         size_t partition_count,
-        std::vector<std::shared_ptr<Dispatcher>> dispatchers)
+        std::vector<std::shared_ptr<Dispatcher>> dispatchers,
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager)
     : dispatchers_(std::move(dispatchers)) {
     // Invariant (production path): slices are indexed by dispatcher,
     // so partition_count must match dispatcher count. Any divergence
@@ -30,7 +31,7 @@ CircuitBreakerManager::CircuitBreakerManager(
 
     // Build one Host per upstream regardless of .circuit_breaker.enabled.
     // Disabled hosts still need a live Slice so a later reload can flip
-    // them on without re-wiring transition callbacks (design §3.1).
+    // them on without re-wiring transition callbacks.
     hosts_.reserve(upstreams.size());
     for (const auto& u : upstreams) {
         if (u.name.empty()) {
@@ -44,7 +45,8 @@ CircuitBreakerManager::CircuitBreakerManager(
         auto [it, inserted] = hosts_.emplace(
             u.name,
             std::make_unique<CircuitBreakerHost>(
-                u.name, u.host, u.port, partition_count, u.circuit_breaker));
+                u.name, u.host, u.port, partition_count, u.circuit_breaker,
+                obs_manager));
         if (!inserted) {
             // Duplicate service name — shouldn't happen (Validate checks
             // uniqueness), but log so the collision is visible rather

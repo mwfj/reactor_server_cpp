@@ -2,9 +2,14 @@
 
 #include "common.h"
 #include "circuit_breaker/circuit_breaker_host.h"
+#include "observability/common.h"
 // <memory>, <mutex>, <string>, <unordered_map>, <vector> provided by common.h
 
 class Dispatcher;
+
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+}  // namespace OBSERVABILITY_NAMESPACE
 
 namespace CIRCUIT_BREAKER_NAMESPACE {
 
@@ -40,10 +45,15 @@ public:
     // `partition_count` must match the server's dispatcher partition
     // count (upstream pool / NetServer worker count). `dispatchers`
     // captures the dispatcher list so Reload can route per-slice work.
+    // `obs_manager` is the gateway-wide observability manager; null when
+    // observability is disabled or for unit tests that don't wire it. The
+    // manager forwards this pointer to each CircuitBreakerHost so per-slice
+    // baseline gauge emission can fire in the host ctor.
     CircuitBreakerManager(
         const std::vector<UpstreamConfig>& upstreams,
         size_t partition_count,
-        std::vector<std::shared_ptr<Dispatcher>> dispatchers);
+        std::vector<std::shared_ptr<Dispatcher>> dispatchers,
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager = nullptr);
 
     CircuitBreakerManager(const CircuitBreakerManager&) = delete;
     CircuitBreakerManager& operator=(const CircuitBreakerManager&) = delete;

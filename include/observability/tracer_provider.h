@@ -22,6 +22,8 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
+class ObservabilityManager;
+
 // Subset of BatchSpanProcessor knobs passed through Reload. Future
 // processor implementations may extend this struct; the provider just
 // shuttles it onward.
@@ -50,7 +52,8 @@ public:
     TracerProvider(std::shared_ptr<const Resource> resource,
                     std::shared_ptr<SpanProcessor>  processor,
                     std::shared_ptr<const Sampler>  sampler,
-                    std::shared_ptr<RandomSource>   random);
+                    std::shared_ptr<RandomSource>   random,
+                    ObservabilityManager*           manager);
 
     TracerProvider(const TracerProvider&) = delete;
     TracerProvider& operator=(const TracerProvider&) = delete;
@@ -87,6 +90,15 @@ private:
     std::shared_ptr<const Sampler> sampler_;
     std::shared_ptr<RandomSource>  random_;
     ProcessorOptions               processor_options_;
+
+    // Raw pointer; manager storage outlives every Tracer. After the
+    // declaration reorder in observability_manager.h, tracer_provider_
+    // is declared LAST among observer members and destructs FIRST in
+    // reverse order — so catalog_, meter_provider_, metric_reader_,
+    // AND span_processor_ are ALL still alive during ~TracerProvider's
+    // drain. Tracer/Span code paths that read manager_->catalog() or
+    // manager_->meter_provider() at destruction time are safe.
+    ObservabilityManager*          manager_ = nullptr;
 
     // (name, version) → Tracer cache. Tracer instances are owned by
     // the provider via unique_ptr stored in `tracer_storage_`; the map

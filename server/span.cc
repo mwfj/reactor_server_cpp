@@ -1,5 +1,8 @@
 #include "observability/span.h"
 
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 #include "observability/span_processor.h"
 
 namespace OBSERVABILITY_NAMESPACE {
@@ -161,7 +164,22 @@ void Span::DropWithoutEnd() {
     bool expected = false;
     if (!dropped_.compare_exchange_strong(expected, true,
                                             std::memory_order_acq_rel)) {
-        return;  // already dropped.
+        return;  // already dropped — second+ caller no-ops.
+    }
+    // Self-metric: surface unended drops via the dedicated catalog
+    // field. Reach the manager through the processor's manager()
+    // accessor — Span does NOT carry an ObservabilityManager pointer
+    // itself; the SpanProcessor base virtual is the only conduit.
+    // Null-safe at every hop: NoopSpanProcessor + InMemorySpanProcessor
+    // (no manager wired) return nullptr; the catalog pointer guard
+    // covers the cold window during Init() before MetricsCatalog::Build
+    // runs.
+    auto* mgr = processor_ ? processor_->manager() : nullptr;
+    if (mgr != nullptr) {
+        const auto& cat = mgr->catalog();
+        if (cat.reactor_otel_spans_dropped_unended != nullptr) {
+            cat.reactor_otel_spans_dropped_unended->Add(1.0, {});
+        }
     }
     // Mutating the vectors / shared_ptrs here would race with a
     // dispatcher thread mid-SetAttribute / AddEvent / End — IsRecording()

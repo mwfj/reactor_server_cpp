@@ -191,7 +191,7 @@ CIRCUIT_BREAKER_HEADERS = $(LIB_DIR)/circuit_breaker/circuit_breaker_state.h $(L
 JWT_CPP_DIR = $(THIRD_PARTY_DIR)/jwt-cpp/include/jwt-cpp
 AUTH_HEADERS = $(LIB_DIR)/auth/auth_context.h $(LIB_DIR)/auth/auth_config.h $(LIB_DIR)/auth/token_hasher.h $(LIB_DIR)/auth/auth_policy_matcher.h $(LIB_DIR)/auth/auth_claims.h $(LIB_DIR)/auth/auth_result.h $(LIB_DIR)/auth/auth_url_util.h $(LIB_DIR)/auth/jwks_cache.h $(LIB_DIR)/auth/upstream_http_client.h $(LIB_DIR)/auth/issuer.h $(LIB_DIR)/auth/jwks_fetcher.h $(LIB_DIR)/auth/oidc_discovery.h $(LIB_DIR)/auth/jwt_verifier.h $(LIB_DIR)/auth/auth_error_responses.h $(LIB_DIR)/auth/auth_manager.h $(LIB_DIR)/auth/auth_middleware.h $(LIB_DIR)/auth/introspection_cache.h $(LIB_DIR)/auth/introspection_client.h $(JWT_CPP_DIR)/jwt.h $(JWT_CPP_DIR)/base.h $(JWT_CPP_DIR)/traits/nlohmann-json/defaults.h $(JWT_CPP_DIR)/traits/nlohmann-json/traits.h
 CLI_HEADERS = $(LIB_DIR)/cli/cli_parser.h $(LIB_DIR)/cli/signal_handler.h $(LIB_DIR)/cli/pid_file.h $(LIB_DIR)/cli/version.h $(LIB_DIR)/cli/daemonizer.h
-TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h $(TEST_DIR)/auth_foundation_test.h $(TEST_DIR)/jwt_verifier_test.h $(TEST_DIR)/jwks_cache_test.h $(TEST_DIR)/oidc_discovery_test.h $(TEST_DIR)/header_rewriter_auth_test.h $(TEST_DIR)/auth_manager_test.h $(TEST_DIR)/auth_integration_test.h $(TEST_DIR)/auth_failure_mode_test.h $(TEST_DIR)/auth_reload_test.h $(TEST_DIR)/auth_multi_issuer_test.h $(TEST_DIR)/auth_websocket_upgrade_test.h $(TEST_DIR)/auth_race_test.h $(TEST_DIR)/dns_resolver_test.h $(TEST_DIR)/dual_stack_test.h $(TEST_DIR)/router_async_middleware_test.h $(TEST_DIR)/introspection_cache_test.h $(TEST_DIR)/introspection_client_test.h $(TEST_DIR)/mock_introspection_server.h $(TEST_DIR)/auth_introspection_integration_test.h $(TEST_DIR)/auth_observability_test.h $(TEST_DIR)/h2_upstream_test.h $(TEST_DIR)/observability_test_helpers.h $(TEST_DIR)/observability_foundation_test.h $(TEST_DIR)/observability_tracer_test.h $(TEST_DIR)/observability_metrics_test.h $(TEST_DIR)/observability_manager_test.h $(TEST_DIR)/observability_propagator_test.h $(TEST_DIR)/observability_export_pipeline_test.h $(TEST_DIR)/observability_prometheus_test.h $(TEST_DIR)/observability_config_test.h $(TEST_DIR)/observability_shutdown_test.h $(TEST_DIR)/observability_link_kill_test.h $(TEST_DIR)/observability_issue_inject_test.h $(TEST_DIR)/observability_stress_test.h $(TEST_DIR)/observability_e2e_test.h $(TEST_DIR)/observability_self_handler_test.h $(TEST_DIR)/observability_proxy_client_test.h $(TEST_DIR)/observability_auth_trace_test.h $(TEST_DIR)/observability_catalog_test.h $(TEST_DIR)/observability_kill_marshal_test.h
+TEST_HEADERS = $(TEST_DIR)/test_framework.h $(TEST_DIR)/http_test_client.h $(TEST_DIR)/basic_test.h $(TEST_DIR)/stress_test.h $(TEST_DIR)/race_condition_test.h $(TEST_DIR)/timeout_test.h $(TEST_DIR)/config_test.h $(TEST_DIR)/http_test.h $(TEST_DIR)/websocket_test.h $(TEST_DIR)/tls_test.h $(TEST_DIR)/cli_test.h $(TEST_DIR)/http2_test.h $(TEST_DIR)/route_test.h $(TEST_DIR)/upstream_pool_test.h $(TEST_DIR)/proxy_test.h $(TEST_DIR)/rate_limit_test.h $(TEST_DIR)/kqueue_test.h $(TEST_DIR)/circuit_breaker_test.h $(TEST_DIR)/circuit_breaker_components_test.h $(TEST_DIR)/circuit_breaker_integration_test.h $(TEST_DIR)/circuit_breaker_retry_budget_test.h $(TEST_DIR)/circuit_breaker_wait_queue_drain_test.h $(TEST_DIR)/circuit_breaker_observability_test.h $(TEST_DIR)/circuit_breaker_reload_test.h $(TEST_DIR)/auth_foundation_test.h $(TEST_DIR)/jwt_verifier_test.h $(TEST_DIR)/jwks_cache_test.h $(TEST_DIR)/oidc_discovery_test.h $(TEST_DIR)/header_rewriter_auth_test.h $(TEST_DIR)/auth_manager_test.h $(TEST_DIR)/auth_integration_test.h $(TEST_DIR)/auth_failure_mode_test.h $(TEST_DIR)/auth_reload_test.h $(TEST_DIR)/auth_multi_issuer_test.h $(TEST_DIR)/auth_websocket_upgrade_test.h $(TEST_DIR)/auth_race_test.h $(TEST_DIR)/dns_resolver_test.h $(TEST_DIR)/dual_stack_test.h $(TEST_DIR)/router_async_middleware_test.h $(TEST_DIR)/introspection_cache_test.h $(TEST_DIR)/introspection_client_test.h $(TEST_DIR)/mock_introspection_server.h $(TEST_DIR)/auth_introspection_integration_test.h $(TEST_DIR)/auth_observability_test.h $(TEST_DIR)/h2_upstream_test.h $(TEST_DIR)/observability_test_helpers.h $(TEST_DIR)/observability_foundation_test.h $(TEST_DIR)/observability_tracer_test.h $(TEST_DIR)/observability_metrics_test.h $(TEST_DIR)/observability_manager_test.h $(TEST_DIR)/observability_propagator_test.h $(TEST_DIR)/observability_export_pipeline_test.h $(TEST_DIR)/observability_prometheus_test.h $(TEST_DIR)/observability_config_test.h $(TEST_DIR)/observability_shutdown_test.h $(TEST_DIR)/observability_link_kill_test.h $(TEST_DIR)/observability_issue_inject_test.h $(TEST_DIR)/observability_stress_test.h $(TEST_DIR)/observability_e2e_test.h $(TEST_DIR)/observability_self_handler_test.h $(TEST_DIR)/observability_proxy_client_test.h $(TEST_DIR)/observability_auth_trace_test.h $(TEST_DIR)/observability_catalog_test.h $(TEST_DIR)/observability_kill_marshal_test.h $(TEST_DIR)/observability_pool_gauges_test.h $(TEST_DIR)/observability_middleware_metrics_test.h $(TEST_DIR)/observability_self_metrics_test.h $(TEST_DIR)/observability_connection_metrics_test.h $(TEST_DIR)/observability_jaeger_propagator_test.h $(TEST_DIR)/observability_ws_messages_test.h
 
 # All headers combined
 HEADERS = $(CORE_HEADERS) $(CALLBACK_HEADERS) $(REACTOR_HEADERS) $(NETWORK_HEADERS) $(DNS_HEADERS) $(SERVER_HEADERS) $(THREAD_POOL_HEADERS) $(UTIL_HEADERS) $(FOUNDATION_HEADERS) $(HTTP_HEADERS) $(HTTP2_HEADERS) $(WS_HEADERS) $(TLS_HEADERS) $(UPSTREAM_HEADERS) $(RATE_LIMIT_HEADERS) $(CIRCUIT_BREAKER_HEADERS) $(AUTH_HEADERS) $(CLI_HEADERS) $(OBSERVABILITY_HEADERS) $(TEST_HEADERS)
@@ -404,7 +404,9 @@ test_obs: test_obs_foundation test_obs_tracer test_obs_metrics \
           test_obs_export test_obs_prom test_obs_config test_obs_shutdown \
           test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e \
           test_obs_self_handler test_obs_proxy_client test_obs_auth_trace \
-          test_obs_catalog test_obs_kill_marshal test_obs_ws_messages
+          test_obs_catalog test_obs_kill_marshal test_obs_ws_messages \
+          test_obs_self_metrics test_obs_connection_metrics \
+          test_obs_pool_gauges test_obs_middleware_metrics
 	@echo "All observability suites passed."
 
 test_obs_foundation: $(TARGET)
@@ -479,9 +481,29 @@ test_obs_catalog: $(TARGET)
 	@echo "Running observability metrics-catalog tests..."
 	./$(TARGET) obs_catalog
 
+test_obs_kill_marshal: $(TARGET)
+	@echo "Running observability kill-marshal tests..."
+	./$(TARGET) obs_kill_marshal
+
 test_obs_ws_messages: $(TARGET)
 	@echo "Running WebSocket per-message observability tests..."
 	./$(TARGET) obs_ws_messages
+
+test_obs_self_metrics: $(TARGET)
+	@echo "Running observability self-metric tests..."
+	./$(TARGET) obs_self_metrics
+
+test_obs_connection_metrics: $(TARGET)
+	@echo "Running observability connection-metrics tests..."
+	./$(TARGET) obs_connection_metrics
+
+test_obs_pool_gauges: $(TARGET)
+	@echo "Running observability upstream-pool gauge tests..."
+	./$(TARGET) obs_pool_gauges
+
+test_obs_middleware_metrics: $(TARGET)
+	@echo "Running observability middleware metrics tests (DNS + rate-limit)..."
+	./$(TARGET) obs_middleware_metrics
 
 # Thread-Sanitizer build for dual-stack stop/reload/destruction race tests.
 # Builds a separate binary (test_runner_tsan) with -fsanitize=thread and
@@ -585,4 +607,4 @@ help:
 # Build only the production server binary
 server: $(SERVER_TARGET)
 
-.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_auth_foundation test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dns test_dual_stack test_dual_stack_tsan test_dns_resolver test_auth_observability test_h2_upstream test_obs test_obs_foundation test_obs_tracer test_obs_metrics test_obs_mgr test_obs_propagator test_obs_jaeger_propagator test_obs_export test_obs_prom test_obs_config test_obs_shutdown test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e help
+.PHONY: all clean test server test_basic test_stress test_race test_config test_http test_ws test_tls test_cli test_http2 test_upstream test_proxy test_rate_limit test_circuit_breaker test_auth test_auth_foundation test_jwt test_jwks test_oidc test_hrauth test_auth_mgr test_auth2 test_auth_fail test_auth_reload test_auth_multi test_auth_ws test_auth_race test_router_async test_introspection_cache test_intro_client test_auth_intro test_dns test_dual_stack test_dual_stack_tsan test_dns_resolver test_auth_observability test_h2_upstream test_obs test_obs_foundation test_obs_tracer test_obs_metrics test_obs_mgr test_obs_propagator test_obs_jaeger_propagator test_obs_export test_obs_prom test_obs_config test_obs_shutdown test_obs_linkkill test_obs_issue test_obs_stress test_obs_e2e test_obs_self_handler test_obs_proxy_client test_obs_auth_trace test_obs_catalog test_obs_kill_marshal test_obs_ws_messages test_obs_self_metrics test_obs_connection_metrics test_obs_pool_gauges test_obs_middleware_metrics help

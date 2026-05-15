@@ -120,6 +120,11 @@ private:
     OBSERVABILITY_NAMESPACE::Counter* frames_counter_ = nullptr;
     OBSERVABILITY_NAMESPACE::UpDownCounter*
         active_connections_counter_ = nullptr;
+    // Cached pointer to the labeled HTTP-protocol gauge so the WS
+    // connection can emit `protocol=websocket` independently of the
+    // ConnectionHandler-owned `http/1.1` / `h2` gauges. dtor issues
+    // the matching -1 under `ws_protocol_active_counted_`.
+    OBSERVABILITY_NAMESPACE::UpDownCounter* http_connections_active_counter_ = nullptr;
     // Manager kept alive for the connection's lifetime so the atomic
     // pointed to by ws_messages_enabled_flag_ stays valid even when
     // the snapshot's `manager` weak_ptr would otherwise allow the
@@ -132,6 +137,10 @@ private:
     // once. Cleared after the decrement so a later snapshot reset
     // can't double-decrement.
     bool active_counted_ = false;
+    // Latch — set by SetObservabilitySnapshot when the +1 on
+    // reactor.http.connections.active{protocol=websocket} fires; dtor
+    // checks this to issue the matching -1 exactly once.
+    bool ws_protocol_active_counted_ = false;
     // Install-once latch — set on the FIRST call to
     // SetObservabilitySnapshot regardless of whether the manager
     // lock succeeded or any cached pointer was populated. The lock-

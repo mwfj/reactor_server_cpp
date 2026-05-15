@@ -35,6 +35,20 @@ enum class Decision : uint8_t {
                            // and log already updated by TryAcquire.
 };
 
+// Reason annotation paired with every TryAcquire admission outcome.
+// Reject paths stamp the matching variant; ADMITTED / ADMITTED_PROBE
+// outcomes carry NONE. Callers use this to drive observability emit
+// (reactor.circuit_breaker.rejected{reason}) — the Decision enum
+// collapses every reject path to REJECTED_OPEN / REJECTED_OPEN_DRYRUN,
+// so the reason label cannot be recovered from Decision alone.
+enum class RejectReason : uint8_t {
+    NONE,
+    OPEN,
+    OPEN_DRYRUN,
+    HALF_OPEN_FULL,
+    HALF_OPEN_RECOVERY_FAILING,
+};
+
 // Failure classification. Only these kinds feed ReportFailure — 4xx and
 // local-capacity issues (POOL_EXHAUSTED, QUEUE_TIMEOUT, shutdown) are NOT
 // reported as failures.
@@ -53,7 +67,7 @@ enum class FailureKind : uint8_t {
 //
 // TODO(post-v1): once a snapshot / admin JSON endpoint lands, convert
 // `trigger` to an `enum class TransitionTrigger` so the valid set is
-// compile-time checked rather than string-compared. See design doc §15.8.
+// compile-time checked rather than string-compared.
 using StateTransitionCallback =
     std::function<void(State old_state, State new_state, const char* trigger)>;
 
@@ -65,6 +79,20 @@ inline const char* StateName(State s) {
         case State::HALF_OPEN: return "half_open";
     }
     return "unknown";
+}
+
+// Convert a reject reason to its closed-vocab label string for
+// `reactor.circuit_breaker.rejected{reason}`. Returns nullptr for NONE
+// (admit paths) — caller short-circuits on null.
+inline const char* RejectReasonLabel(RejectReason r) {
+    switch (r) {
+        case RejectReason::OPEN:                       return "open";
+        case RejectReason::OPEN_DRYRUN:                return "open_dry_run";
+        case RejectReason::HALF_OPEN_FULL:             return "half_open_full";
+        case RejectReason::HALF_OPEN_RECOVERY_FAILING: return "half_open_recovery_failing";
+        case RejectReason::NONE:                       return nullptr;
+    }
+    return nullptr;
 }
 
 }  // namespace CIRCUIT_BREAKER_NAMESPACE

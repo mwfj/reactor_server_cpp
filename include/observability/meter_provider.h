@@ -20,6 +20,8 @@
 
 namespace OBSERVABILITY_NAMESPACE {
 
+class ObservabilityManager;
+
 // Subset of PeriodicMetricReader knobs passed through Reload.
 // Reader-side knobs are export_interval + export_timeout only;
 // max_export_batch_size + schedule_delay are TRACE-only and live on
@@ -31,8 +33,13 @@ struct MeterReaderOptions {
 
 class MeterProvider {
 public:
+    // `manager` is forwarded into every Meter the provider constructs so
+    // the cardinality-overflow self-metric can find its catalog instrument.
+    // Default null retained for tests that build a raw provider outside
+    // an ObservabilityManager (overflow events are silent in that case).
     explicit MeterProvider(std::shared_ptr<const Resource> resource,
-                            size_t shard_count = kDefaultMetricShards);
+                            size_t shard_count = kDefaultMetricShards,
+                            ObservabilityManager* manager = nullptr);
 
     MeterProvider(const MeterProvider&) = delete;
     MeterProvider& operator=(const MeterProvider&) = delete;
@@ -59,6 +66,16 @@ private:
     mutable std::mutex                                    meter_mtx_;
     std::unordered_map<std::string, std::unique_ptr<Meter>> meters_;
     MeterReaderOptions                                     reader_options_;
+
+    // Raw pointer; manager storage outlives the provider (MeterProvider
+    // destructs as part of ~ObservabilityManager's body). See
+    // batch_span_processor.h::manager() docstring for the SHUTDOWN
+    // CAVEAT that applies to any code path consuming manager_->
+    // sub-members (catalog, meter_provider, metric_reader) — those may
+    // already be destroyed by the time worker drains run.
+    // (Today this dtor is default and emits nothing — caveat applies
+    // only if a future dtor adds emission paths.)
+    ObservabilityManager*                                  manager_ = nullptr;
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

@@ -5,8 +5,8 @@
 #include "buffer.h"
 #include "timestamp.h"
 #include "callbacks.h"
+#include "observability/common.h"
 
-#include <memory>
 
 // Forward declaration (no need to include full TLS headers)
 class TlsConnection;
@@ -105,6 +105,22 @@ private:
     // borrower). That prevents stale reads from crossing request boundaries.
     std::atomic<uint64_t> on_message_cb_epoch_{0};
     std::atomic<bool> has_on_message_callback_{false};
+
+    // Observability — transport + protocol gauges. Wired by the
+    // accept-time call to AttachTransportObservability; the
+    // protocol-confirmed gauge is wired by MarkApplicationProtocolConfirmed
+    // once the L7 handler determines whether the peer is speaking
+    // HTTP/1.1, HTTP/2, or has handed off to WebSocket.
+    bool net_active_incremented_ = false;
+    OBSERVABILITY_NAMESPACE::UpDownCounter* net_active_counter_   = nullptr;
+    OBSERVABILITY_NAMESPACE::Counter*       net_accepted_counter_ = nullptr;
+    // Null when no application protocol has been confirmed yet. Holds
+    // a pointer to a static label literal ("http/1.1", "h2", "websocket")
+    // so the dtor can issue a matching -1 against the SAME labeled
+    // series without per-connection string allocation.
+    const char* http_protocol_label_ = nullptr;
+    OBSERVABILITY_NAMESPACE::UpDownCounter* http_active_counter_  = nullptr;
+    OBSERVABILITY_NAMESPACE::Counter*       tls_handshakes_counter_ = nullptr;
 public:
     ConnectionHandler() = delete;
     ConnectionHandler(std::shared_ptr<Dispatcher>, std::unique_ptr<SocketHandler>);
@@ -235,4 +251,25 @@ public:
     bool CallDeadlineTimeoutCb();  // returns true if handled (keep alive)
 
     bool IsTimeOut(std::chrono::seconds) const;
+
+    // Transport-level observability wiring. Idempotent — second calls
+    // are silently ignored so accept paths that retry stay safe. Caches
+    // catalog instrument pointers under the assumption that the
+    // ObservabilityManager outlives this connection (every ConnectionHandler
+    // is destroyed before the ObservabilityManager via the documented
+    // four-phase shutdown). 
+    // Bumps `reactor.net.connections.active` +1 and `reactor.net.connections.accepted` +1 on first call; 
+    // the matching -1 against the active gauge fires from ~ConnectionHandler.
+    void AttachTransportObservability(OBSERVABILITY_NAMESPACE::ObservabilityManager* mgr);
+    // Called once when the L7 protocol becomes known (HTTP/1.1 after
+    // first parse, HTTP/2 after preface accept). 
+    // Bumps `reactor.http.connections.active{protocol=<label>}` +1; dtor
+    // and HandOffToWebSocket fire the matching -1. 
+    // Double-confirm is a logic error and is logged.
+    void MarkApplicationProtocolConfirmed(const char* protocol_label);
+    // WS upgrade handoff — decrements the labeled HTTP gauge against
+    // the previously-confirmed protocol and clears the label so the
+    // dtor's backstop -1 does not double-decrement. The WS connection
+    // emits its own `protocol=websocket` +1 once observability is wired.
+    void HandOffToWebSocket();
 };

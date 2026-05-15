@@ -2122,6 +2122,14 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
             ws_conn_->SetMaxMessageSize(max_ws_message_size_);
             conn_->SetMaxInputSize(max_ws_message_size_);
         }
+        // Release the http/1.1 slot BEFORE wiring the WS snapshot's +1 so
+        // a /metrics scrape racing the handoff (Prometheus scrapes run on
+        // whichever socket dispatcher accepted the scrape connection, not
+        // necessarily this dispatcher) sees a transient under-count rather
+        // than an over-count of sum(http.connections.active{protocol=*}).
+        // The upgrade_callback also calls HandOffToWebSocket; the second
+        // call is an idempotent no-op (http_protocol_label_ now null).
+        conn_->HandOffToWebSocket();
         ws_conn_->SetObservabilitySnapshot(req.obs_snapshot);
         // Install user-registered WebSocket handlers (OnMessage / OnClose
         // / etc.) BEFORE CompleteAsyncResponse fires the deferred-buf
@@ -2205,6 +2213,14 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
         ws_conn_->SetMaxMessageSize(max_ws_message_size_);
         conn_->SetMaxInputSize(max_ws_message_size_);
     }
+    // Release the http/1.1 slot BEFORE wiring the WS snapshot's +1 so a
+    // /metrics scrape racing the handoff (Prometheus scrapes run on
+    // whichever socket dispatcher accepted the scrape connection, not
+    // necessarily this dispatcher) sees a transient under-count rather
+    // than an over-count of sum(http.connections.active{protocol=*}).
+    // The upgrade_callback also calls HandOffToWebSocket; the second
+    // call is an idempotent no-op (http_protocol_label_ now null).
+    conn_->HandOffToWebSocket();
     ws_conn_->SetObservabilitySnapshot(req.obs_snapshot);
 
     if (callbacks_.upgrade_callback) {
@@ -2419,6 +2435,7 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
             (parser_.GetRequest().http_minor == 0 || parser_.GetRequest().http_minor == 1)) {
             current_http_minor_.store(parser_.GetRequest().http_minor,
                                        std::memory_order_release);
+            conn_->MarkApplicationProtocolConfirmed("http/1.1");
         }
 
         if (parser_.HasError()) {

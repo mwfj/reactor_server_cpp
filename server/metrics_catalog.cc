@@ -81,6 +81,30 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         "{connections}",
         MakeCatalog({"protocol"}));
 
+    // Transport-level connection metrics — emitted at accept-time so
+    // the gauges remain valid even when no application protocol is
+    // ever confirmed (idle TCP probe, TLS handshake that never sees
+    // an HTTP byte). No labels: this is the raw transport view.
+    out.reactor_net_connections_active = meter->GetUpDownCounter(
+        "reactor.net.connections.active",
+        "Active transport connections (TCP/TLS) regardless of protocol",
+        "{connections}",
+        MakeCatalog({}));
+
+    out.reactor_net_connections_accepted = meter->GetCounter(
+        "reactor.net.connections.accepted",
+        "Accepted transport connections",
+        "{connections}",
+        MakeCatalog({}));
+
+    // TLS handshake event counter — `outcome` is a closed vocabulary
+    // {success, failure}. Cap=2 documents the bound.
+    out.reactor_tls_handshakes = meter->GetCounter(
+        "reactor.tls.handshakes",
+        "TLS handshake outcomes",
+        "{handshakes}",
+        MakeCatalog({"outcome"}, {{"outcome", 2}}));
+
     // Client / upstream pool ----------------------------------------
     // Defense-in-depth: keys whose values come from operator config
     // (`server.address`, `reactor.upstream.service`) or include
@@ -130,13 +154,17 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         MakeCatalog({"reactor.upstream.service"},
                      {{"reactor.upstream.service", kDefaultGenericCap}}));
 
+    // outcome cardinality: immediate, created, queued_satisfied, rejected,
+    // cancelled, queue_timeout (waited past connect_timeout_ms) — bounded
+    // set with two slots of headroom (cap=8).
     out.reactor_upstream_pool_checkout_wait_duration = meter->GetHistogram(
         "reactor.upstream.pool.checkout.wait.duration",
         "Pool checkout wait time in seconds",
         "s",
         ToVec(kLatencyBuckets),
         MakeCatalog({"reactor.upstream.service", "outcome"},
-                     {{"reactor.upstream.service", kDefaultGenericCap}}));
+                     {{"reactor.upstream.service", kDefaultGenericCap},
+                      {"outcome", 8}}));
 
     // Middleware (auth + rate limit + circuit breaker + ws) ---------
     // `issuer` values are operator-config-bounded (issuer names from
@@ -231,24 +259,37 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         "{spans}",
         MakeCatalog({}));
 
+    out.reactor_otel_spans_dropped_unended = meter->GetCounter(
+        "reactor.otel.spans.dropped_unended",
+        "Spans dropped via DropWithoutEnd (no OnEnd dispatch)",
+        "{spans}",
+        MakeCatalog({}));
+
     out.reactor_otel_spans_dropped_queue_full = meter->GetCounter(
         "reactor.otel.spans.dropped_queue_full",
         "BatchSpanProcessor queue overflow drops",
         "{spans}",
         MakeCatalog({}));
 
+    // `outcome` vocabulary is closed at {success, retryable_fail,
+    // non_retryable_fail}; cap=4 leaves one slot of headroom while
+    // documenting the bound.
     out.reactor_otel_spans_exported = meter->GetCounter(
         "reactor.otel.spans.exported",
         "Span export outcomes",
         "{spans}",
-        MakeCatalog({"outcome"}));
+        MakeCatalog({"outcome"}, {{"outcome", 4}}));
 
+    // `signal` distinguishes traces vs metrics export attempts; the
+    // closed vocabulary is {"traces", "metrics"} so cap=2 documents the
+    // bound (one over the closed set still trips overflow before
+    // anything legitimate flows through).
     out.reactor_otel_export_duration = meter->GetHistogram(
         "reactor.otel.export.duration",
-        "Exporter end-to-end duration in seconds",
+        "OpenTelemetry export attempt duration per signal",
         "s",
         ToVec(kLatencyBuckets),
-        MakeCatalog({}));
+        MakeCatalog({"signal"}, {{"signal", 2}}));
 
     out.reactor_otel_propagation_invalid = meter->GetCounter(
         "reactor.otel.propagation.invalid",
@@ -268,11 +309,15 @@ void MetricsCatalog::Build(ObservabilityManager& manager, MetricsCatalog& out) {
         "{snapshots}",
         MakeCatalog({}));
 
+    // label_key vocabulary = union of allowed_keys across all catalogs
+    // (~23 entries today).  Explicit cap documents the closed-set
+    // contract — new catalogs must stay within this bound.
     out.reactor_otel_cardinality_overflow = meter->GetCounter(
         "reactor.otel.cardinality_overflow",
         "Label values rewritten to __overflow__",
         "{rewrites}",
-        MakeCatalog({"label_key"}));
+        MakeCatalog({"label_key"},
+                    {{"label_key", kDefaultGenericCap}}));
 }
 
 }  // namespace OBSERVABILITY_NAMESPACE

@@ -20,19 +20,11 @@
 // cap_full latches, the unique_lock is never taken again for that key.
 
 #include "observability/attr_value.h"
-
-#include <atomic>
-#include <cstddef>
-#include <memory>
-#include <shared_mutex>
-#include <string>
-#include <string_view>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
+
+class ObservabilityManager;
 
 // Sentinel value emitted when a label key's cardinality cap is reached.
 // Operators see this in /metrics + OTLP as a structured overflow signal.
@@ -54,7 +46,13 @@ public:
         std::unordered_map<std::string, size_t> value_cardinality_caps;
     };
 
-    explicit MetricLabelRegistry(Catalog catalog);
+    // `manager` is the self-metric escape hatch: when non-null the slow
+    // path emits `reactor.otel.cardinality_overflow{label_key=...}`
+    // alongside the existing `__overflow__` rewrite so operators see
+    // overflow events on /metrics + OTLP. Default null retained for
+    // tests that build a raw registry outside the manager.
+    explicit MetricLabelRegistry(Catalog catalog,
+                                  ObservabilityManager* manager = nullptr);
 
     // Build a LabelSet from an unsorted sequence of (key, value) pairs.
     // Drops keys not in the allowlist; rewrites values past the cap to
@@ -79,6 +77,16 @@ private:
 
     std::unordered_set<std::string>                          allowed_keys_;
     std::unordered_map<std::string, std::unique_ptr<PerKeyState>> per_key_;
+
+    // Raw pointer; manager storage outlives every MetricLabelRegistry
+    // (MeterProvider destructs as part of ~ObservabilityManager's body).
+    // See batch_span_processor.h::manager() docstring for the SHUTDOWN
+    // CAVEAT that applies to any code path consuming manager_->
+    // sub-members (catalog, meter_provider, metric_reader) — those may
+    // already be destroyed by the time worker drains run.
+    // (Today this dtor is default and emits nothing — caveat applies
+    // only if a future dtor adds emission paths.)
+    ObservabilityManager* manager_ = nullptr;
 };
 
 }  // namespace OBSERVABILITY_NAMESPACE

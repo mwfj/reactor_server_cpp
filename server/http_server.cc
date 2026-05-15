@@ -8,6 +8,8 @@
 #include "auth/auth_manager.h"
 #include "auth/upstream_http_client.h"
 #include "observability/batch_span_processor.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
 #include "observability/observability_manager.h"
 #include "observability/observability_middleware.h"
 #include "observability/observability_snapshot.h"
@@ -22,9 +24,6 @@
 #include "log/logger.h"
 #include "log/log_utils.h"
 #include <netdb.h>                        // getaddrinfo (bind-host resolve)
-#include <algorithm>
-#include <set>
-#include <unordered_set>
 
 // Definition of the per-thread sync push slot. See declaration in
 // include/http/http_server.h. Initial value is nullptr — the helper
@@ -977,6 +976,14 @@ void HttpServer::MarkServerReady() {
             // `upstream.host` for effective-SNI derivation.
             upstream_manager_ = std::make_unique<UpstreamManager>(
                 upstream_configs_, dispatchers, upstream_resolved_);
+            // Forward the observability manager into every PoolPartition
+            // BEFORE CommitHttp2Snapshots (which may trigger partition-side
+            // work) so pool gauge emits land on a wired manager. Pre-this-
+            // call partitions stay quiet (obs_manager_ stays null inside
+            // each partition); post-this-call every gauge / histogram emit
+            // routes through the catalog.
+            upstream_manager_->SetObservabilityManager(
+                observability_manager_.get());
             // Initial H2 snapshot bootstrap. Reload uses the same path
             // for live propagation. Disabled-H2 entries publish a
             // shared_ptr<const Http2UpstreamConfig> with enabled=false
@@ -987,6 +994,22 @@ void HttpServer::MarkServerReady() {
             net_server_.Stop();
             throw;
         }
+    }
+
+    // Forward observability into peer subsystems whose emit sites do not
+    // depend on upstream pool existence — DNS resolver (always present)
+    // and rate-limit manager (created above unconditionally). Done after
+    // the upstream block so the wire-up order is consistent regardless
+    // of whether upstreams are configured.
+    if (dns_resolver_) {
+        dns_resolver_->SetObservabilityManager(observability_manager_.get());
+    }
+    if (rate_limit_manager_) {
+        rate_limit_manager_->SetObservabilityManager(
+            observability_manager_.get());
+    }
+
+    if (!upstream_configs_.empty()) {
 
         // Circuit breaker — built alongside the pool. One host per
         // configured upstream (regardless of enabled), with one slice
@@ -1000,7 +1023,8 @@ void HttpServer::MarkServerReady() {
         try {
             circuit_breaker_manager_ =
                 std::make_unique<CIRCUIT_BREAKER_NAMESPACE::CircuitBreakerManager>(
-                    upstream_configs_, dispatchers.size(), dispatchers);
+                    upstream_configs_, dispatchers.size(), dispatchers,
+                    observability_manager_.get());
             upstream_manager_->AttachCircuitBreakerManager(
                 circuit_breaker_manager_.get());
 
@@ -1024,6 +1048,18 @@ void HttpServer::MarkServerReady() {
             // which are stopped before either manager is destroyed. So any live callback
             // invocation sees a valid UpstreamManager.
             UpstreamManager* um = upstream_manager_.get();
+            // Manager pointer for the metric-emit branch of the composed
+            // transition callback. Lifetime: in HttpServer's declaration
+            // order observability_manager_ is declared LAST and destructs
+            // FIRST in reverse order — circuit_breaker_manager_ outlives it.
+            // Safe to capture as raw pointer because slice transition
+            // callbacks fire on dispatcher threads only, and dispatchers
+            // are joined in HttpServer::Stop() BEFORE ~HttpServer runs
+            // (Stop runs KillAndShutdownObservability + net_server_.Stop()
+            // joining every dispatcher; ~HttpServer's member destruction
+            // happens after Stop returns). No callback can fire between
+            // dispatcher join and ~ObservabilityManager.
+            auto* obs_mgr = observability_manager_.get();
             for (const auto& u : upstream_configs_) {
                 auto* host = circuit_breaker_manager_->GetHost(u.name);
                 if (!host) continue;
@@ -1041,10 +1077,47 @@ void HttpServer::MarkServerReady() {
                     // outlives every possible callback invocation.
                     auto* slice_ptr = slice;
                     slice->SetTransitionCallback(
-                        [um, service, i, slice_ptr](
+                        [um, service, i, slice_ptr, obs_mgr](
                                 CIRCUIT_BREAKER_NAMESPACE::State old_s,
                                 CIRCUIT_BREAKER_NAMESPACE::State new_s,
                                 const char* trigger) {
+                            // Metric emit — runs FIRST so a future throw
+                            // in the drain path doesn't lose the
+                            // observation. Drops silently when obs is not
+                            // wired (manager null) or the catalog field
+                            // is unbound. The synthetic OPEN→OPEN edge
+                            // (trigger=dry_run_disabled) is treated as a
+                            // real transition for the transitions counter
+                            // but is a no-op for the gauge (old == new).
+                            if (obs_mgr != nullptr) {
+                                const auto& cat = obs_mgr->catalog();
+                                const char* old_label =
+                                    CIRCUIT_BREAKER_NAMESPACE::StateName(old_s);
+                                const char* new_label =
+                                    CIRCUIT_BREAKER_NAMESPACE::StateName(new_s);
+                                if (cat.reactor_circuit_breaker_state
+                                        != nullptr && old_s != new_s) {
+                                    cat.reactor_circuit_breaker_state->Add(
+                                        -1.0,
+                                        {{"service", service},
+                                         {"state", old_label}});
+                                    cat.reactor_circuit_breaker_state->Add(
+                                        +1.0,
+                                        {{"service", service},
+                                         {"state", new_label}});
+                                }
+                                if (cat.reactor_circuit_breaker_transitions
+                                        != nullptr) {
+                                    cat.reactor_circuit_breaker_transitions->Add(
+                                        1.0,
+                                        {{"service", service},
+                                         {"from", old_label},
+                                         {"to", new_label},
+                                         {"trigger",
+                                          trigger != nullptr ? trigger
+                                                             : "unknown"}});
+                                }
+                            }
                             // Three drain triggers, all entering OPEN:
                             //   CLOSED→OPEN  : fresh trip; queued non-
                             //     probe waiters need CHECKOUT_CIRCUIT_OPEN
@@ -1336,7 +1409,8 @@ void HttpServer::MarkServerReady() {
         bsp_opts.retries_max_backoff     = cfg.traces.batch.retries.max_backoff;
 
         auto bsp = std::make_shared<
-            OBSERVABILITY_NAMESPACE::BatchSpanProcessor>(otlp_exporter_, bsp_opts);
+            OBSERVABILITY_NAMESPACE::BatchSpanProcessor>(
+                otlp_exporter_, bsp_opts, observability_manager_.get());
         observability_manager_->SwapToBatchSpanProcessor(bsp);
 
         logging::Get()->info(
@@ -1371,7 +1445,7 @@ void HttpServer::MarkServerReady() {
 
         auto reader = std::make_shared<OBSERVABILITY_NAMESPACE::PeriodicMetricReader>(
             observability_manager_->meter_provider(),
-            metrics_exporter, reader_opts);
+            metrics_exporter, reader_opts, observability_manager_.get());
         observability_manager_->RegisterMetricReader(std::move(reader));
 
         logging::Get()->info(
@@ -1471,9 +1545,15 @@ void HttpServer::RemoveConnection(std::shared_ptr<ConnectionHandler> conn) {
         return;
     }
     if (http_conn) {
-        // Only decrement if not upgraded — the upgrade callback already
-        // decremented active_http1_connections_ at upgrade time.
-        if (!http_conn->IsUpgraded()) {
+        // Decrement only if the upgrade_callback did not already do so.
+        // The upgrade_callback fires on every WS upgrade attempt and
+        // unconditionally decrements + sets LegacyH1StatsDecremented.
+        // Three success/failure scenarios are all handled by this guard:
+        //   - WS upgrade succeeded → upgraded_=true, flag=true     → skip
+        //   - sync post-101 throw  → upgraded_=true, flag=true     → skip
+        //   - async pre-101 throw  → upgraded_=false (rolled back), flag=true → skip
+        //   - no WS upgrade ever   → upgraded_=false, flag=false   → decrement
+        if (!http_conn->IsUpgraded() && !http_conn->LegacyH1StatsDecremented()) {
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
         }
         // If the downstream client dropped while an async request was
@@ -3423,15 +3503,16 @@ bool HttpServer::WaitForAllAsyncDrain(
     //                                decremented, so the window where
     //                                inflight==0 but finalizer hasn't
     //                                returned must also be drained.
-    //   - kill_marshals_in_flight_ : RESERVED for a future per-
-    //                                dispatcher kill-marshal step
-    //                                (today the kill loop runs inline
-    //                                from the stopper thread; no
-    //                                incrementer/decrementer exists).
-    //                                The clause is permanently zero
-    //                                today and is kept here so the
-    //                                predicate is forward-compatible
-    //                                with that wiring.
+    //   - kill_marshals_in_flight_ : KillOutstandingSnapshots
+    //                                bumped this counter under
+    //                                finalizers_done_mtx_ for every
+    //                                snapshot that marshalled to its
+    //                                owning_dispatcher via
+    //                                EnQueueDelayed; the closure's RAII
+    //                                guard decrements under the same
+    //                                mutex when the kill body returns.
+    //                                The drain barrier waits for every
+    //                                marshaled closure to complete.
     auto* upm = upstream_manager_.get();
     auto* obs = observability_manager_.get();
     auto predicate = [upm, obs]() {
@@ -3546,14 +3627,35 @@ void HttpServer::KillAndShutdownObservability(
     // overflow. Today's NoopSpanProcessor masks the loss; the moment
     // BatchSpanProcessor wires in, this becomes user-visible data
     // loss.
+    //
+    // ALSO wait for kill_marshals_in_flight to drain. KillOutstandingSnapshots
+    // enqueues cross-dispatcher kill bodies via EnQueueDelayed(0ms) and
+    // returns immediately; the closures publish the matching -1s for
+    // http.server.active_requests / http.client.active_requests and bump
+    // reactor.otel.snapshots_killed_on_timeout from inside the queued task.
+    // Without this gate, BeginShutdown can run before those closures
+    // execute → the final PMR export ships stale or positive gauges.
     auto* obs = observability_manager_.get();
     {
         std::unique_lock<std::mutex> lck(obs->finalizers_done_mtx());
         obs->finalizers_done_cv().wait_until(lck, deadline, [obs]() {
-            return obs->finalizers_in_progress() == 0;
+            return obs->finalizers_in_progress() == 0 &&
+                   obs->kill_marshals_in_flight() == 0;
         });
     }
     observability_manager_->BeginShutdown(remaining());
+    // Disarm subsystems that hold a raw ObservabilityManager* but whose
+    // workers cannot be joined before ~ObservabilityManager. Detached
+    // pthreads inside blocking getaddrinfo (DnsResolver) are the canonical
+    // case — they can return arbitrarily later and dereference the manager
+    // via `state_->obs_manager` from their completion path. Nulling the
+    // atomic now (manager still alive) makes those completions see null
+    // and skip emit (`EmitResolveOutcomeWithManager` null-guards). Workers
+    // that complete during this small window still observe the live manager
+    // and emit normally — race-free either way.
+    if (dns_resolver_) {
+        dns_resolver_->SetObservabilityManager(nullptr);
+    }
 }
 
 void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn) {
@@ -4244,11 +4346,31 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetUpgradeCallback(
         [this](std::shared_ptr<HttpConnectionHandler> self,
                HttpRequest& request) {
-            // Connection is no longer HTTP/1 — it's now WebSocket.
-            // Decrement here so /stats doesn't count WS as HTTP/1.
-            // RemoveConnection checks IsUpgraded() to skip the double-decrement.
+            // Idempotent no-op when called twice: AttemptWebSocketUpgrade
+            // and ContinueWsUpgradeAfterAuth already call HandOffToWebSocket
+            // BEFORE invoking this callback (so a /metrics scrape racing
+            // the handoff sees a transient under-count of
+            // sum(http.connections.active{protocol=*}) rather than an
+            // over-count). HandOffToWebSocket nulls http_protocol_label_;
+            // this second call short-circuits.
+            if (auto c = self->GetConnection()) {
+                c->HandOffToWebSocket();
+            }
+            // Decrement the legacy /stats counter BEFORE invoking
+            // ws_handler. Mark the connection so RemoveConnection's
+            // guard (!IsUpgraded() && !LegacyH1StatsDecremented()) skips
+            // its own fetch_sub regardless of which catch path runs:
+            //   - sync post-101 throw  → upgraded_ stays true → skip
+            //   - async pre-101 throw  → upgraded_=false BUT flag=true → skip
+            //   - happy path           → upgraded_ stays true → skip
+            // Without the flag the async-resume catch (which resets
+            // upgraded_=false) double-decrements; deferring the fetch_sub
+            // until after ws_handler leaves the sync-throw path leaking
+            // +1 (catch keeps upgraded_=true so the removal-time
+            // fetch_sub is skipped). Pair them.
             active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
-            // total_requests_ already counted by request_count_callback
+            self->MarkLegacyH1StatsDecremented();
+            // total_requests_ already counted by request_count_callback.
             auto ws_handler = router_.GetWebSocketHandler(request);
             if (ws_handler && self->GetWebSocket()) {
                 self->GetWebSocket()->SetParams(request.params);
@@ -4278,6 +4400,11 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         logging::Get()->debug("New connection already closing fd={}, skipping", conn->fd());
         return;
     }
+
+    // Wire transport-level observability counters. Idempotent and a no-op
+    // when no manager is installed; the matching -1 against
+    // reactor.net.connections.active fires from ~ConnectionHandler.
+    conn->AttachTransportObservability(observability_manager_.get());
 
     // NOTE: total_accepted_ and active_connections_ are NOT incremented here.
     // They are incremented at map-insertion points (pending_detection_ in this
@@ -4360,9 +4487,12 @@ void HttpServer::HandleNewConnection(std::shared_ptr<ConnectionHandler> conn) {
         }
         if (stale_h1) {
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
-            // Only decrement HTTP/1 counter if NOT upgraded — the upgrade
-            // callback already decremented at upgrade time.
-            if (!stale_h1->IsUpgraded()) {
+            // Match RemoveConnection's combined guard so a stale-eviction
+            // racing async-resume rollback (upgraded_=false but
+            // legacy_h1_decremented_=true) doesn't double-decrement.
+            // The upgrade_callback's fetch_sub already balanced the counter.
+            if (!stale_h1->IsUpgraded() &&
+                !stale_h1->LegacyH1StatsDecremented()) {
                 active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
             }
         }
@@ -4491,6 +4621,14 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
         // notify the old WS handler and replace with a fresh one.
         if (http_conn->GetConnection() != conn) {
             bool was_upgraded = http_conn->IsUpgraded();
+            // Capture LegacyH1StatsDecremented before http_conn is reset
+            // so the combined guard below mirrors RemoveConnection's
+            // exactly. Without this, an async-resume rollback that left
+            // upgraded_=false but legacy_h1_decremented_=true (the
+            // upgrade_callback already did the fetch_sub) would
+            // re-decrement here → counter goes negative.
+            bool was_legacy_h1_decremented =
+                http_conn->LegacyH1StatsDecremented();
             SafeNotifyWsClose(http_conn);
             {
                 auto c = http_conn->GetConnection();
@@ -4509,7 +4647,7 @@ void HttpServer::HandleMessage(std::shared_ptr<ConnectionHandler> conn, std::str
             }
             if (evicted_stale_h1) {
                 active_connections_.fetch_sub(1, std::memory_order_relaxed);
-                if (!was_upgraded) {
+                if (!was_upgraded && !was_legacy_h1_decremented) {
                     active_http1_connections_.fetch_sub(1, std::memory_order_relaxed);
                 }
             }

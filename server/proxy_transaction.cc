@@ -442,9 +442,13 @@ void ProxyTransaction::FinalizeAttemptSpan(int status_code,
                 cat.http_client_request_duration->Record(elapsed, labels);
             }
             // Matching -1 for the +1 from SetupAttemptObservability.
-            // Same gate as the histogram above so the pair stays
-            // balanced; same labels (service name only) as the +1.
-            if (cat.http_client_active_requests != nullptr) {
+            // Gated on TryDecrementIfPositive winning the CAS so the
+            // kill-loop / dtor backstop and this natural finalize
+            // racer cannot both emit a -1 for the same attempt.
+            if (cat.http_client_active_requests != nullptr &&
+                obs_snapshot_ != nullptr &&
+                OBSERVABILITY_NAMESPACE::TryDecrementIfPositive(
+                    obs_snapshot_->attempt_active_inflight_)) {
                 cat.http_client_active_requests->Add(
                     -1.0,
                     {{"reactor.upstream.service", service_name_}});
@@ -808,10 +812,26 @@ void ProxyTransaction::SetupAttemptObservability() {
     if (mgr) {
         // Duration histogram fires per-attempt regardless of trace sampling.
         attempt_start_steady_ = std::chrono::steady_clock::now();
+        // One-time service-name capture under link_mtx; idempotent —
+        // only writes if empty so retries don't re-publish. The kill
+        // loop / dtor backstop reads this under the same mutex to
+        // emit residual -1s with the correct label.
+        if (obs_snapshot_) {
+            {
+                std::lock_guard<std::mutex> g(obs_snapshot_->link_mtx);
+                if (obs_snapshot_->upstream_service_for_metrics.empty()) {
+                    obs_snapshot_->upstream_service_for_metrics = service_name_;
+                }
+            }
+            // Per-attempt +1: the snapshot tracks its outstanding count so
+            // the kill / dtor backstop can drain whatever remains.
+            obs_snapshot_->attempt_active_inflight_.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        
         // Bump http.client.active_requests; matching -1 in
-        // FinalizeAttemptSpan, gated on attempt_start_steady_ non-sentinel.
-        // TODO: kill-loop survivors leak +1 until the snapshot carries
-        // the upstream label and the kill path can emit the matching -1.
+        // FinalizeAttemptSpan (CAS-gated on attempt_active_inflight_)
+        // OR in the kill-loop / dtor backstop for survivors.
         const auto& cat = mgr->catalog();
         if (cat.http_client_active_requests != nullptr) {
             cat.http_client_active_requests->Add(
@@ -3512,6 +3532,23 @@ bool ProxyTransaction::ConsultBreaker() {
     admission_generation_ = admission.generation;
     is_probe_ = (admission.decision ==
                  CIRCUIT_BREAKER_NAMESPACE::Decision::ADMITTED_PROBE);
+
+    // Emit reactor.circuit_breaker.rejected{service, reason} for every
+    // would-reject outcome — including OPEN_DRYRUN, which falls through
+    // as admitted but is observable as a shadow-mode trip-decision. The
+    // emit fires once per admission, BEFORE the decision-specific
+    // response delivery, so any later return branch carries the metric.
+    if (const char* rl = CIRCUIT_BREAKER_NAMESPACE::RejectReasonLabel(
+            admission.reject_reason)) {
+        if (auto* mgr = obs_manager()) {
+            const auto& cat = mgr->catalog();
+            if (cat.reactor_circuit_breaker_rejected != nullptr) {
+                cat.reactor_circuit_breaker_rejected->Add(
+                    1.0,
+                    {{"service", service_name_}, {"reason", rl}});
+            }
+        }
+    }
 
     if (admission.decision == CIRCUIT_BREAKER_NAMESPACE::Decision::REJECTED_OPEN) {
         // Hard reject — slice counted it, logged it, and we must not

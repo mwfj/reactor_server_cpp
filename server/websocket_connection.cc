@@ -21,6 +21,12 @@ WebSocketConnection::~WebSocketConnection() {
         active_connections_counter_->Add(-1.0, {});
         active_counted_ = false;
     }
+    if (ws_protocol_active_counted_ &&
+        http_connections_active_counter_ != nullptr) {
+        http_connections_active_counter_->Add(-1.0,
+            {{"protocol", "websocket"}});
+        ws_protocol_active_counted_ = false;
+    }
 }
 
 void WebSocketConnection::OnMessage(MessageCallback callback) { callbacks_.message_callback = std::move(callback); }
@@ -389,11 +395,27 @@ void WebSocketConnection::SetObservabilitySnapshot(
     const auto& cat = obs_manager_->catalog();
     frames_counter_             = cat.reactor_websocket_frames;
     active_connections_counter_ = cat.reactor_websocket_active_connections;
+    http_connections_active_counter_ = cat.reactor_http_connections_active;
     // Bump reactor.websocket.active_connections; the matching -1 runs
     // in the dtor under the `active_counted_` latch.
     if (active_connections_counter_ != nullptr) {
         active_connections_counter_->Add(1.0, {});
         active_counted_ = true;
+    }
+    // Bump reactor.http.connections.active{protocol=websocket}; the
+    // matching -1 runs in the dtor under `ws_protocol_active_counted_`.
+    // WS upgrade ordering: HttpConnectionHandler calls
+    // `conn_->HandOffToWebSocket()` (h1 -1) BEFORE invoking
+    // SetObservabilitySnapshot (ws +1). Prometheus /metrics scrapes
+    // execute on whichever socket dispatcher accepted the scrape
+    // connection — not necessarily this dispatcher — so a scrape racing
+    // the handoff can observe a transient under-count of
+    // sum(http.connections.active{protocol=*}) but never an over-count.
+    // Under-count is the safer artifact for capacity-planning alerts.
+    if (http_connections_active_counter_ != nullptr) {
+        http_connections_active_counter_->Add(1.0,
+            {{"protocol", "websocket"}});
+        ws_protocol_active_counted_ = true;
     }
 }
 

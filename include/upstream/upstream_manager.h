@@ -13,6 +13,10 @@ namespace CIRCUIT_BREAKER_NAMESPACE {
 class CircuitBreakerManager;
 }
 
+namespace OBSERVABILITY_NAMESPACE {
+class ObservabilityManager;
+}
+
 class UpstreamManager {
 public:
     // PRODUCTION ctor: resolved endpoints are provided by
@@ -221,6 +225,21 @@ public:
         return it == tls_contexts_.end() ? nullptr : it->second;
     }
 
+    // Install a non-owning pointer to the server's ObservabilityManager.
+    // Called once from HttpServer::MarkServerReady after both managers are
+    // constructed. Forwards into every existing PoolPartition so pool
+    // gauge / histogram emits can begin. Pre-call, partitions skip emits
+    // (obs_manager_ stays null). Lifetime: in HttpServer's declaration
+    // order, observability_manager_ is declared AFTER upstream_manager_, so
+    // reverse-destruction destroys observability_manager_ FIRST. The
+    // production path is safe because ~HttpServer calls Stop() first;
+    // Stop() drives InitiateShutdown while obs is still alive. In abnormal
+    // teardown paths (mid-startup exception, test fixtures that drop the
+    // server without Stop()), PoolPartition's safety-net dtor nulls
+    // obs_manager_ before any emit — see PoolPartition::~PoolPartition.
+    void SetObservabilityManager(
+        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept;
+
     // Install a non-owning pointer to the server's CircuitBreakerManager.
     // Called once from HttpServer::MarkServerReady after both managers are
     // constructed (§3.1). Lifetime guarantee: the CircuitBreakerManager
@@ -251,6 +270,13 @@ private:
     // Set immediately by InitiateShutdown — checked by CheckoutAsync to
     // reject new checkouts before per-partition shutdown tasks execute.
     std::atomic<bool> shutting_down_{false};
+
+    // Non-owning pointer to the observability manager, installed by
+    // HttpServer::MarkServerReady. Forwarded into every PoolPartition.
+    // No atomic — set once on dispatcher-aware initialization before any
+    // partition-side gauge emit runs. Default null — observability is
+    // an opt-in layer.
+    OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager_ = nullptr;
 
     // Non-owning pointer to the circuit-breaker manager, installed by
     // HttpServer::MarkServerReady after both managers exist. Atomic so

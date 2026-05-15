@@ -2,9 +2,11 @@
 
 #include "auth/auth_claims.h"
 #include "auth/auth_error_responses.h"
+#include "auth/auth_metrics.h"
 #include "auth/introspection_cache.h"
 #include "auth/introspection_client.h"
 #include "auth/issuer.h"
+#include "auth/jwks_fetcher.h"
 #include "auth/jwt_verifier.h"
 #include "auth/token_hasher.h"
 #include "auth/upstream_http_client.h"
@@ -14,6 +16,8 @@
 #include "http/trailer_policy.h"  // TrimOptionalWhitespace (RFC 7230 §3.2.3)
 #include "log/log_utils.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/metrics_catalog.h"
 #include "observability/observability_manager.h"
 #include "observability/observability_snapshot.h"
 #include "observability/span.h"
@@ -210,6 +214,14 @@ AuthManager::AuthManager(const AuthConfig& config,
         auto issuer = std::make_shared<Issuer>(
             normalized, upstream_manager_, dispatchers_,
             upstream_http_client_, hmac_key_, &stopping_);
+        // Plumb the observability manager into the issuer's JwksFetcher
+        // so reactor.auth.jwks_refreshes emits at every terminal fetch.
+        // Safe to call with nullptr — JwksFetcher::SetObservabilityManager
+        // stores the pointer unconditionally; the fetcher's emit helper
+        // null-guards on every fire.
+        if (auto* fetcher = issuer->jwks_fetcher()) {
+            fetcher->SetObservabilityManager(obs_manager_);
+        }
         issuers_.emplace(normalized.name, std::move(issuer));
     }
 
@@ -727,8 +739,16 @@ bool AuthManager::InvokeMiddleware(HttpRequest& req,
             logging::SanitizePath(req.path), policy.name);
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidRequest,
                                  "authorization required");
+        // log_label is "missing_authorization" (header absent) or
+        // "bad_scheme" (header present but not "Bearer "). The latter is
+        // closest to malformed_token in the closed vocabulary; the former
+        // is missing_token. Pass log_label so empty/bad-scheme collapse
+        // through CanonicalReasonLabel correctly.
+        const std::string_view reason_label =
+            log_label == "bad_scheme" ? "malformed_token" : "missing_token";
         RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
-                       policy.name, AuthCache::None, policy_incarnation);
+                       policy.name, AuthCache::None, policy_incarnation,
+                       reason_label);
         return false;
     }
     // 8 KiB DoS guard mirrors InvokeAsyncMiddleware. JWT-only requests and
@@ -741,8 +761,11 @@ bool AuthManager::InvokeMiddleware(HttpRequest& req,
             logging::SanitizePath(req.path), policy.name);
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidRequest,
                                  "token too large");
+        // Oversized token is a policy/limit issue. policy_denied is the
+        // closest fit in the closed vocab.
         RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
-                       policy.name, AuthCache::None, policy_incarnation);
+                       policy.name, AuthCache::None, policy_incarnation,
+                       "policy_denied");
         return false;
     }
 
@@ -769,7 +792,8 @@ bool AuthManager::InvokeMiddleware(HttpRequest& req,
             resp = MakeUnauthorized(realm, AuthErrorCode::InvalidToken,
                                      "issuer not accepted");
             RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
-                           policy.name, AuthCache::None, policy_incarnation);
+                           policy.name, AuthCache::None, policy_incarnation,
+                           "iss_mismatch");
             return false;
         }
     } else if (!policy.issuers.empty()) {
@@ -805,13 +829,15 @@ bool AuthManager::InvokeMiddleware(HttpRequest& req,
             ctx.policy_name = policy.name;
             req.auth.emplace(std::move(ctx));
             RecordVerdict(resp, VerifyOutcome::UNDETERMINED, std::string{},
-                           policy.name, AuthCache::None, policy_incarnation);
+                           policy.name, AuthCache::None, policy_incarnation,
+                           "cache_miss_no_issuer");
             return true;
         }
         resp = MakeServiceUnavailable(realm, 5,
                                         "authentication unavailable");
         RecordVerdict(resp, VerifyOutcome::UNDETERMINED, std::string{},
-                       policy.name, AuthCache::None, policy_incarnation);
+                       policy.name, AuthCache::None, policy_incarnation,
+                       "cache_miss_no_issuer");
         return false;
     }
 
@@ -880,7 +906,8 @@ bool AuthManager::InvokeMiddleware(HttpRequest& req,
             resp = MakeUnauthorized(realm, vr.error_code,
                                      vr.error_description);
             RecordVerdict(resp, VerifyOutcome::DENY_401, chosen->name(),
-                           policy.name, AuthCache::None, policy_incarnation);
+                           policy.name, AuthCache::None, policy_incarnation,
+                           vr.log_reason);
             return false;
         }
         case VerifyOutcome::DENY_403: {
@@ -893,7 +920,8 @@ bool AuthManager::InvokeMiddleware(HttpRequest& req,
             resp = MakeForbidden(realm, vr.error_description,
                                   policy.required_scopes);
             RecordVerdict(resp, VerifyOutcome::DENY_403, chosen->name(),
-                           policy.name, AuthCache::None, policy_incarnation);
+                           policy.name, AuthCache::None, policy_incarnation,
+                           vr.log_reason);
             return false;
         }
         case VerifyOutcome::UNDETERMINED: {
@@ -911,13 +939,14 @@ bool AuthManager::InvokeMiddleware(HttpRequest& req,
                 req.auth.emplace(std::move(advisory));
                 RecordVerdict(resp, VerifyOutcome::UNDETERMINED,
                                chosen->name(), policy.name, AuthCache::None,
-                               policy_incarnation);
+                               policy_incarnation, vr.log_reason);
                 return true;
             }
             resp = MakeServiceUnavailable(realm, vr.retry_after_sec,
                                             "authentication unavailable");
             RecordVerdict(resp, VerifyOutcome::UNDETERMINED, chosen->name(),
-                           policy.name, AuthCache::None, policy_incarnation);
+                           policy.name, AuthCache::None, policy_incarnation,
+                           vr.log_reason);
             return false;
         }
     }
@@ -1124,7 +1153,8 @@ void AuthManager::RecordVerdict(HttpResponse& resp,
                                   const std::string& issuer,
                                   const std::string& policy,
                                   AuthCache cache,
-                                  std::optional<uint64_t> captured_incarnation) {
+                                  std::optional<uint64_t> captured_incarnation,
+                                  std::string_view deny_reason) {
     switch (outcome) {
       case VerifyOutcome::ALLOW:
         total_allowed_.fetch_add(1, std::memory_order_relaxed);
@@ -1139,6 +1169,45 @@ void AuthManager::RecordVerdict(HttpResponse& resp,
     }
     BumpPerPolicy(issuer, policy, outcome, captured_incarnation);
     StampDebugHeader(resp, DecisionLabel(outcome), issuer, CacheLabel(cache));
+
+    // Observability emit: reactor.auth.requests{outcome, issuer, reason}.
+    // ALLOW always carries reason="ok"; deny/undetermined runs the caller's
+    // log-style reason through StripReasonTail + CanonicalReasonLabel to
+    // bound cardinality to the closed vocabulary in auth_metrics.h.
+    if (obs_manager_) {
+        try {
+            const auto& cat = obs_manager_->catalog();
+            if (cat.reactor_auth_requests != nullptr) {
+                const char* outcome_label = DecisionLabel(outcome);
+                const char* reason_label =
+                    (outcome == VerifyOutcome::ALLOW)
+                        ? "ok"
+                        : CanonicalReasonLabel(StripReasonTail(deny_reason));
+                cat.reactor_auth_requests->Add(
+                    1.0,
+                    {{"outcome", outcome_label},
+                     {"issuer", IssuerLabelOrUnknown(issuer)},
+                     {"reason", reason_label}});
+            }
+        } catch (...) {
+            // Defensive: observability is best-effort; never propagate.
+        }
+    }
+}
+
+void AuthManager::EmitCacheLookup(const char* outcome,
+                                    const std::string& issuer) const noexcept {
+    if (obs_manager_ == nullptr || outcome == nullptr) return;
+    try {
+        const auto& cat = obs_manager_->catalog();
+        if (cat.reactor_auth_cache_lookups == nullptr) return;
+        cat.reactor_auth_cache_lookups->Add(
+            1.0,
+            {{"outcome", outcome},
+             {"issuer", IssuerLabelOrUnknown(issuer)}});
+    } catch (...) {
+        // Defensive: observability is best-effort; never propagate.
+    }
 }
 
 uint64_t AuthManager::PolicyIncarnation(const std::string& policy_name) const {
@@ -1249,8 +1318,11 @@ void AuthManager::InvokeAsyncMiddleware(
             logging::SanitizeLogValue(policy.name));
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidRequest,
                                  "authorization required");
+        const std::string_view reason_label =
+            log_label == "bad_scheme" ? "malformed_token" : "missing_token";
         RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
-                       policy.name, AuthCache::None, policy_incarnation);
+                       policy.name, AuthCache::None, policy_incarnation,
+                       reason_label);
         state->SetSyncResult(AsyncMiddlewareResult::DENY);
         state->MarkCompletedSync();
         return;
@@ -1263,7 +1335,8 @@ void AuthManager::InvokeAsyncMiddleware(
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidRequest,
                                  "token too large");
         RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
-                       policy.name, AuthCache::None, policy_incarnation);
+                       policy.name, AuthCache::None, policy_incarnation,
+                       "policy_denied");
         state->SetSyncResult(AsyncMiddlewareResult::DENY);
         state->MarkCompletedSync();
         return;
@@ -1310,7 +1383,8 @@ void AuthManager::InvokeAsyncMiddleware(
             resp = MakeUnauthorized(realm, AuthErrorCode::InvalidToken,
                                      "issuer not accepted");
             RecordVerdict(resp, VerifyOutcome::DENY_401, std::string{},
-                           policy.name, AuthCache::None, policy_incarnation);
+                           policy.name, AuthCache::None, policy_incarnation,
+                           "iss_mismatch");
             state->SetSyncResult(AsyncMiddlewareResult::DENY);
             state->MarkCompletedSync();
             return;
@@ -1393,6 +1467,7 @@ void AuthManager::InvokeAsyncMiddleware(
             logging::SanitizePath(req.path),
             logging::SanitizeLogValue(chosen->name()),
             logging::SanitizeLogValue(policy.name));
+        // issuer_not_ready isn't in the closed vocab; collapse to other.
         if (policy.on_undetermined == kOnUndeterminedAllow) {
             AuthContext advisory;
             advisory.undetermined = true;
@@ -1401,14 +1476,15 @@ void AuthManager::InvokeAsyncMiddleware(
             req.auth.emplace(std::move(advisory));
             RecordVerdict(resp, VerifyOutcome::UNDETERMINED,
                            chosen->name(), policy.name, AuthCache::None,
-                           policy_incarnation);
+                           policy_incarnation, "other");
             sync_pass();
             return;
         }
         resp = MakeServiceUnavailable(realm, retry_after,
                                         "authentication unavailable");
         RecordVerdict(resp, VerifyOutcome::UNDETERMINED, chosen->name(),
-                       policy.name, AuthCache::None, policy_incarnation);
+                       policy.name, AuthCache::None, policy_incarnation,
+                       "other");
         state->SetSyncResult(AsyncMiddlewareResult::DENY);
         state->MarkCompletedSync();
         return;
@@ -1616,7 +1692,7 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                         manager->RecordVerdict(
                             rs, VerifyOutcome::UNDETERMINED,
                             issuer_name, policy_name, cache,
-                            incarnation);
+                            incarnation, log_reason);
                     }
                 };
             } else {
@@ -1645,7 +1721,7 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                         manager->RecordVerdict(
                             rs, VerifyOutcome::UNDETERMINED,
                             issuer_name, policy_name, cache,
-                            incarnation);
+                            incarnation, log_reason);
                     }
                 };
             }
@@ -1733,7 +1809,27 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                                 c.intro_stale_served->fetch_add(
                                     1, std::memory_order_relaxed);
                             }
+                            // Cache-lookup outcome: stale_serve fires
+                            // once per request rescued by the grace
+                            // window. The earlier "miss" emit at
+                            // dispatch time is intentionally NOT
+                            // rolled back — the dispatch was a real
+                            // miss; the rescue is a distinct event
+                            // operators want to see separately.
+                            if (c.manager) {
+                                c.manager->EmitCacheLookup(
+                                    "stale_serve", c.issuer_name);
+                            }
+                        } else if (c.manager) {
+                            // Stale entry existed but failed policy
+                            // re-check, OR no stale entry at all —
+                            // the live refresh failed without rescue.
+                            c.manager->EmitCacheLookup(
+                                "refresh_fail", c.issuer_name);
                         }
+                    } else if (c.manager) {
+                        c.manager->EmitCacheLookup(
+                            "refresh_fail", c.issuer_name);
                     }
                 }
             }
@@ -1831,7 +1927,7 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                   if (manager) {
                       manager->RecordVerdict(rs, VerifyOutcome::DENY_401,
                                               issuer_name, policy_name, cache,
-                                              incarnation);
+                                              incarnation, log_reason);
                   }
                   logging::Get()->info(
                       "auth_deny route={} issuer={} reason={} policy={}",
@@ -1860,7 +1956,7 @@ IntrospectionClient::DoneCallback MakeIntrospectionDoneCallback(
                   if (manager) {
                       manager->RecordVerdict(rs, VerifyOutcome::DENY_403,
                                               issuer_name, policy_name, cache,
-                                              incarnation);
+                                              incarnation, log_reason);
                   }
                   logging::Get()->info(
                       "auth_deny route={} issuer={} reason={} policy={}",
@@ -2043,6 +2139,13 @@ void AuthManager::InvokeAsyncIntrospection(
 
     if (hit.state == IntrospectionCache::LookupState::Fresh && hit.active) {
         introspection_cache_hit_.fetch_add(1, std::memory_order_relaxed);
+        // Cache outcome label mapping: Fresh+active and Fresh+!active are
+        // BOTH "hit" for reactor.auth.cache_lookups (the entry was found
+        // in the cache). The active/negative distinction is preserved in
+        // /stats counters and in X-Auth-Cache; the cache-lookups metric
+        // intentionally collapses to the closed vocab {hit, miss,
+        // stale_serve, refresh_fail}.
+        EmitCacheLookup("hit", issuer_name);
         // Re-run the per-request policy + issuer claim checks against the
         // cached ctx. The cache stores the IdP verdict (active=true) only;
         // the gateway's policy verdict is per-(token, route) and MUST be
@@ -2058,7 +2161,8 @@ void AuthManager::InvokeAsyncIntrospection(
                 logging::SanitizeLogValue(policy.name));
             resp = MakeUnauthorized(realm, vr.error_code, vr.error_description);
             RecordVerdict(resp, VerifyOutcome::DENY_401, issuer_name,
-                           policy.name, AuthCache::Hit, policy_incarnation);
+                           policy.name, AuthCache::Hit, policy_incarnation,
+                           vr.log_reason);
             state->SetSyncResult(AsyncMiddlewareResult::DENY);
             state->MarkCompletedSync();
             return;
@@ -2073,7 +2177,8 @@ void AuthManager::InvokeAsyncIntrospection(
             resp = MakeForbidden(realm, vr.error_description,
                                   policy.required_scopes);
             RecordVerdict(resp, VerifyOutcome::DENY_403, issuer_name,
-                           policy.name, AuthCache::Hit, policy_incarnation);
+                           policy.name, AuthCache::Hit, policy_incarnation,
+                           vr.log_reason);
             state->SetSyncResult(AsyncMiddlewareResult::DENY);
             state->MarkCompletedSync();
             return;
@@ -2096,6 +2201,7 @@ void AuthManager::InvokeAsyncIntrospection(
     if (hit.state == IntrospectionCache::LookupState::Fresh && !hit.active) {
         introspection_cache_negative_hit_.fetch_add(
             1, std::memory_order_relaxed);
+        EmitCacheLookup("hit", issuer_name);
         logging::Get()->info(
             "auth_deny route={} issuer={} reason=introspection_inactive policy={} cache=negative",
             logging::SanitizePath(req.path),
@@ -2104,7 +2210,8 @@ void AuthManager::InvokeAsyncIntrospection(
         resp = MakeUnauthorized(realm, AuthErrorCode::InvalidToken,
                                  "token is not active");
         RecordVerdict(resp, VerifyOutcome::DENY_401, issuer_name,
-                       policy.name, AuthCache::Negative, policy_incarnation);
+                       policy.name, AuthCache::Negative, policy_incarnation,
+                       "introspection_inactive");
         state->SetSyncResult(AsyncMiddlewareResult::DENY);
         state->MarkCompletedSync();
         return;
@@ -2120,6 +2227,7 @@ void AuthManager::InvokeAsyncIntrospection(
     // the POST when known-degraded; serve fresh otherwise") without giving
     // the auth subsystem direct visibility into CircuitBreakerManager.
     introspection_cache_miss_.fetch_add(1, std::memory_order_relaxed);
+    EmitCacheLookup("miss", issuer_name);
 
     // The IdP roundtrip is now committed (cache miss + non-stale). Allocate
     // auth.idp_check (or emit auth.pending_start) here so it describes
@@ -2189,7 +2297,7 @@ void AuthManager::InvokeAsyncIntrospection(
             // occurred on this dispatcher-index error path.
             manager->RecordVerdict(rs, VerifyOutcome::UNDETERMINED,
                                     issuer_name, policy_name,
-                                    AuthCache::None, incarnation);
+                                    AuthCache::None, incarnation, "other");
         };
         state->Complete(std::move(payload));
         return;
@@ -2281,6 +2389,10 @@ void AuthManager::InvokeIntrospectionUncached(
         uint64_t policy_incarnation) {
     (void)resp;
     introspection_cache_miss_.fetch_add(1, std::memory_order_relaxed);
+    // The uncached path is exercised when TokenHasher::Hash returns nullopt
+    // or when the issuer's cache is missing. Every call here is by
+    // construction a cache miss — emit accordingly.
+    EmitCacheLookup("miss", issuer->name());
 
     const std::string sanitized_req_path = logging::SanitizePath(req.path);
     const int retry_after_sec = snap.introspection.timeout_sec;
@@ -2339,7 +2451,7 @@ void AuthManager::InvokeIntrospectionUncached(
             // dispatcher-index error branch — see InvokeAsyncIntrospection.
             manager->RecordVerdict(rs, VerifyOutcome::UNDETERMINED,
                                     issuer_name, policy_name,
-                                    AuthCache::None, incarnation);
+                                    AuthCache::None, incarnation, "other");
         };
         state->Complete(std::move(payload));
         return;

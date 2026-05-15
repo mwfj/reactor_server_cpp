@@ -17,14 +17,7 @@
 #include "observability/span_exporter.h"
 #include "observability/span_processor.h"
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <cstddef>
-#include <deque>
-#include <memory>
-#include <mutex>
-#include <thread>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 
@@ -46,7 +39,8 @@ struct BatchSpanProcessorOptions {
 class BatchSpanProcessor final : public SpanProcessor {
 public:
     BatchSpanProcessor(std::shared_ptr<SpanExporter> exporter,
-                        BatchSpanProcessorOptions    options = {});
+                        BatchSpanProcessorOptions    options = {},
+                        ObservabilityManager*        manager = nullptr);
 
     BatchSpanProcessor(const BatchSpanProcessor&) = delete;
     BatchSpanProcessor& operator=(const BatchSpanProcessor&) = delete;
@@ -56,6 +50,38 @@ public:
     void OnEnd(SpanData data) override;
     void SignalShutdown() override;
     void JoinWorkers(std::chrono::milliseconds deadline) override;
+
+    // Self-metric escape hatch — returns the ObservabilityManager pointer
+    // captured at ctor (atomic-loaded so DisarmManager's null-store is
+    // visible across threads). When the manager destructs it calls
+    // DisarmManager(), which atomically clears this pointer. All emit
+    // paths null-check the loaded value, so any BSP that outlives its
+    // manager (e.g. a stray user-held shared_ptr<Span> keeping BSP alive
+    // past ~ObservabilityManager) sees null and skips self-metric emit
+    // instead of dereferencing a dead catalog_ / meter_provider_.
+    //
+    // After the tracer_provider_ reorder in observability_manager.h,
+    // ~BatchSpanProcessor's JoinWorkers normally runs while catalog_ and
+    // meter_provider_ are still alive (tracer_provider_ destructs first,
+    // dropping every Tracer's processor_ ref; span_processor_ destructs
+    // next, dropping the last manager-owned ref; ~BSP joins the worker
+    // before catalog/meter_provider die). DisarmManager() is the safety
+    // net for the multi-holder case where external code holds extra refs
+    // to the SpanProcessor — see OBSERVABILITY pitfall
+    // "Worker-owning shared_ptr with multiple ref-holders".
+    ObservabilityManager* manager() const noexcept override {
+        return manager_.load(std::memory_order_acquire);
+    }
+
+    // Atomically null the manager pointer so self-metric emit paths
+    // see nullptr and skip. Called by ~ObservabilityManager BEFORE
+    // member destruction begins so that any future OnEnd / End /
+    // DropWithoutEnd from spans that survive the dtor cannot dereference
+    // the about-to-be-destroyed catalog_ / meter_provider_. Idempotent;
+    // safe to call multiple times.
+    void DisarmManager() noexcept {
+        manager_.store(nullptr, std::memory_order_release);
+    }
 
     // Live-reloadable knobs.
     void Reload(size_t new_max_export_batch_size,
@@ -119,6 +145,10 @@ private:
     std::vector<SpanData> DrainBatch(size_t cap);
 
     std::shared_ptr<SpanExporter>  exporter_;
+    // Atomic so DisarmManager()'s release-store is visible to the
+    // worker thread + every emit path. See manager() / DisarmManager()
+    // for the lifetime invariant + multi-holder safety net.
+    std::atomic<ObservabilityManager*> manager_;
     BatchSpanProcessorOptions      options_;
     // Atomic snapshot of live-reloadable fields — read-without-lock by
     // the worker on every iteration so reload visibility is immediate.

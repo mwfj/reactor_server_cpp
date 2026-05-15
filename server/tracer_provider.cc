@@ -9,11 +9,13 @@ namespace OBSERVABILITY_NAMESPACE {
 TracerProvider::TracerProvider(std::shared_ptr<const Resource> resource,
                                 std::shared_ptr<SpanProcessor>  processor,
                                 std::shared_ptr<const Sampler>  sampler,
-                                std::shared_ptr<RandomSource>   random)
+                                std::shared_ptr<RandomSource>   random,
+                                ObservabilityManager*           manager)
     : resource_(std::move(resource)),
       processor_(std::move(processor)),
       sampler_(std::move(sampler)),
-      random_(std::move(random)) {}
+      random_(std::move(random)),
+      manager_(manager) {}
 
 Tracer* TracerProvider::GetTracer(const std::string& name,
                                     const std::string& version) {
@@ -30,7 +32,7 @@ Tracer* TracerProvider::GetTracer(const std::string& name,
 
     auto scope    = std::make_shared<InstrumentationScope>(name, version);
     auto tracer   = std::make_unique<Tracer>(
-        std::move(scope), resource_, processor_, sampler_, random_);
+        std::move(scope), resource_, processor_, sampler_, random_, manager_);
     Tracer* raw = tracer.get();
     tracers_.emplace(std::move(key), std::move(tracer));
     return raw;

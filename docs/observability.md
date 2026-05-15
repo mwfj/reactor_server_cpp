@@ -217,7 +217,7 @@ Tail-sampling is out of scope (see "Out of scope" below). For high-RPS deploymen
 
 3. Route-override sampling is evaluated **direct**, not wrapped by `ParentBased`. `always_off` will drop sampled-parent traces — that is the operator's documented intent (the `/health` row above is the canonical use case).
 
-4. Tune the batch processor: under high RPS, raise `max_queue_size` (default 2048) and `max_export_batch_size` (default 512). A queue-overflow drop increments the `dropped_on_overflow_` counter on the BSP — surface it via the self-metrics catalog when that lands.
+4. Tune the batch processor: under high RPS, raise `max_queue_size` (default 2048) and `max_export_batch_size` (default 512). A queue-overflow drop increments `reactor.otel.spans.dropped_queue_full` on `/metrics` (see "Pipeline health" below).
 
 ---
 
@@ -261,10 +261,14 @@ Total shutdown time is bounded by `cli.shutdown_drain_timeout_sec` (default 30s)
 3. Check the Collector receives traffic from the gateway upstream IP/port (`tcpdump -i any -n port 4318`).
 4. Inspect the gateway's structured logs for `OtlpHttpExporter` failures — non-2xx responses are logged at `warn` with the response status.
 5. If the sampler is `trace_id_ratio` with low ratio, generate enough traffic — or raise the ratio temporarily.
-6. The BSP drops spans on queue overflow rather than blocking. Two drop counters are accessible programmatically: `BatchSpanProcessor::dropped_on_overflow()` (queue full) and `BatchSpanProcessor::dropped_on_export_failure()` (non-retryable export, retry budget exhausted, or exporter exception). Until they're surfaced via Prometheus, watch the structured logs:
-    - `BatchSpanProcessor: non-retryable export failure; dropping batch (N spans, attempt=K)` — the collector returned 4xx (excluding 429) or rejected the payload outright.
-    - `BatchSpanProcessor: retryable export failed after N attempts; dropping batch (M spans)` — retry budget exhausted (network blips, repeated 5xx).
-    - `BatchSpanProcessor::Export threw: ... (dropping N spans)` — exporter raised; treated as a non-retryable failure.
+6. The BSP drops spans on queue overflow rather than blocking. Drop counters now surface via `/metrics`:
+    - `reactor.otel.spans.dropped_queue_full` — queue overflow.
+    - `reactor.otel.spans.exported{outcome=non_retryable_fail}` — collector returned 4xx (excluding 429), exporter exception, or the payload was rejected outright. Sums batch spans, not events.
+    - `reactor.otel.spans.exported{outcome=retryable_fail}` — retryable export attempt that will be retried (or eventually counted as `non_retryable_fail` if the retry budget is exhausted).
+   Structured-log lines provide additional context (attempt counts, batch sizes):
+    - `BatchSpanProcessor: non-retryable export failure; dropping batch (N spans, attempt=K)`
+    - `BatchSpanProcessor: retryable export failed after N attempts; dropping batch (M spans)`
+    - `BatchSpanProcessor::Export threw: ... (dropping N spans)` — exporter raised; treated as non-retryable.
 
 ### Metric scrapes return `404`
 
@@ -281,6 +285,8 @@ http_server_request_duration_seconds{route="/api/checkout/*",method="GET",status
 ```
 
 If you see `__overflow__` series in `/metrics`, either the upstream emitting the offending value has unbounded cardinality (status code from external API; user-id label) or the configured cap is too low. The cap is a process-startup field today (per-key SIGHUP is restart-only).
+
+The gateway also emits a self-metric per overflow event: `reactor.otel.cardinality_overflow{label_key="<key>"}`. Watch for sustained rises on a specific `label_key` — that's the surface for the alert.
 
 ### `traces.propagators` rejected on reload
 
@@ -373,6 +379,111 @@ When SIGHUP changes `metrics.prometheus.path`, the gateway logs a warn ("restart
 
 > **Breaking (Phase 3):** `metrics.prometheus.path = "/"` is now rejected at boot when `metrics.exporter = "prometheus_pull"`. Previously the sampler self-noise auto-prepend silently no-op'd on this value, leaving `/metrics` traffic to feed its own traces; the loud-fail makes the misconfig visible immediately. Set a distinct path (the default `/metrics` is the canonical choice).
 
+---
+
+## Metrics reference
+
+The gateway emits four families of metrics under `/metrics`. All series carry the configured `resource.*` labels (service.name, service.version, service.instance.id) on top of the per-metric labels documented below. Counter names get a `_total` suffix in Prometheus exposition (e.g., `reactor_otel_spans_created` → `reactor_otel_spans_created_total`).
+
+### Pipeline health — `reactor.otel.*`
+
+These metrics describe the OTel pipeline itself. Surface them on a dashboard alongside collector health so operators can attribute span loss to gateway vs. collector vs. network.
+
+| Metric | Type | Labels | Useful for |
+|---|---|---|---|
+| `reactor.otel.spans.created` | Counter | (none) | Baseline span volume. Compare against `spans.exported{outcome=success}` to detect drop. |
+| `reactor.otel.spans.dropped_unsampled` | Counter | (none) | Spans dropped by the sampler. Expected to be large with low-ratio sampling. |
+| `reactor.otel.spans.dropped_unended` | Counter | (none) | Spans destroyed via shutdown kill loop or dtor backstop without `End()`. Should be ~0 on healthy steady-state; rises during graceful shutdown drain. Persistent non-zero in steady-state = a code path missing `FinalizeIfSnapshot`. |
+| `reactor.otel.spans.dropped_queue_full` | Counter | (none) | BSP queue overflow drops. If non-zero, either `traces.batch.max_queue_size` is too small for the configured `schedule_delay_ms`, or the exporter is consistently slower than the producer. |
+| `reactor.otel.spans.exported` | Counter | `outcome` ∈ `{success, retryable_fail, non_retryable_fail}` | Export attempt outcomes. `retryable_fail` rate indicates collector unhealth (5xx or 429); `non_retryable_fail` indicates payload rejection (4xx, exporter exception, schema mismatch). |
+| `reactor.otel.export.duration` | Histogram (seconds) | `signal` ∈ `{traces, metrics}` | Export attempt latency. Pair with `spans.exported` rate to compute effective throughput. Tail latency rising = collector saturation. |
+| `reactor.otel.metrics_export_skipped` | Counter | (none) | PMR ticks that skipped `Export()` because `metrics.enabled=false`. A monotonic baseline equal to `uptime / export_interval` is normal when metrics are disabled. |
+| `reactor.otel.cardinality_overflow` | Counter | `label_key` | Per-label cap-edge events. A persistent rise on a specific `label_key` indicates either operator-misconfigured cap (too low) OR the upstream producing the label has unbounded cardinality (e.g., a free-form `route` parameter). |
+| `reactor.otel.snapshots_killed_on_timeout` | Counter | (none) | Snapshots terminated by the shutdown kill loop. Non-zero only during shutdown; persistent rise across multiple restarts means the drain budget is too tight for in-flight traffic. |
+
+### Connection telemetry — `reactor.net.*`, `reactor.tls.*`, `reactor.http.connections.*`
+
+Fleet-wide connection state, split by layer so transport-truth and application-truth stay separable.
+
+| Metric | Type | Labels | Useful for |
+|---|---|---|---|
+| `reactor.net.connections.active` | UpDownCounter | (none) | Live transport-level inbound connections. Includes connections in TLS handshake AND pre-classification raw TCP. |
+| `reactor.net.connections.accepted` | Counter | (none) | All accepts since boot. Combined with the active gauge, gives accept rate + average lifetime. |
+| `reactor.tls.handshakes` | Counter | `outcome` ∈ `{success, failure}` | TLS handshake outcomes. `failure` rate spikes indicate ALPN mismatch, cipher mismatch, expired cert on the client side, or handshake timeout. |
+| `reactor.http.connections.active` | UpDownCounter | `protocol` ∈ `{http/1.1, h2, websocket}` | Per-protocol inbound connection count. Increments at PROTOCOL-CONFIRMED time (H1 first-request-parse, H2 preface, WS upgrade success). |
+| `reactor.http.connections.accepted` | Counter | `protocol` ∈ `{http/1.1, h2, websocket}` | Per-protocol accepted counter. The pre-existing Phase 3 series. |
+
+**Operator interpretation tips:**
+
+- The relationship `net.accepted - sum(http.accepted{protocol=*}) - tls.handshakes{outcome=failure}` gives the count of connections that completed transport setup but never reached an application protocol — typically socket-scan / port-probe traffic, or clients that disconnected before sending the first byte.
+- A WS upgrade transitions the gauge atomically: `http.connections.active{protocol=http/1.1}` decrements as `{protocol=websocket}` increments. A consistent gap means a code path is failing to call `HandOffToWebSocket()`.
+- `net.connections.active > sum(http.connections.active{protocol=*}) + tls_handshakes_in_progress` indicates pre-classification raw-TCP connections (clients that opened the socket but haven't sent any bytes yet).
+
+### Upstream pool — `reactor.upstream.pool.*`, `http.client.active_requests`
+
+Pool saturation gauges with the closed `outcome` vocabulary for checkout-wait histograms. All series labelled `{reactor.upstream.service}` (the per-upstream name from `upstreams[].name`).
+
+| Metric | Type | Labels | Useful for |
+|---|---|---|---|
+| `reactor.upstream.pool.connections.idle` | UpDownCounter | `reactor.upstream.service` | Idle conns in the pool, ready for checkout. Sustained 0 = pool under-provisioned. |
+| `reactor.upstream.pool.connections.active` | UpDownCounter | `reactor.upstream.service` | In-use conns. Sustained `active == max_connections` = pool saturated; checkout will queue or reject. |
+| `reactor.upstream.pool.checkout.wait.duration` | Histogram (seconds) | `reactor.upstream.service`, `outcome` ∈ `{immediate, queued_satisfied, cancelled, rejected, created, queue_timeout}` | Per-checkout latency by exit path. `immediate` = idle reuse hit; `created` = had to spawn a new conn (includes connect latency); `queued_satisfied` = waited for an existing conn to return; `cancelled` = waiter's owning transaction dropped before service; `rejected` = pool queue cap hit at submit time; `queue_timeout` = waited longer than `pool.connect_timeout_ms` without ever being served. |
+| `http.client.active_requests` | UpDownCounter | `reactor.upstream.service` | In-flight per-attempt requests against the upstream. Includes RETRIES — N attempts on a single transaction produce N concurrent `+1`s. Returns to zero on natural finalize, kill loop, or dtor backstop via CAS-safe drain. |
+
+**Operator interpretation tips:**
+
+- `checkout.wait.duration{outcome=queued_satisfied}` p99 rising indicates pool exhaustion — bump `pool.max_connections` or shorten upstream response latency.
+- High `outcome=created` rate with stable `outcome=immediate` = the pool isn't sized for the request rate; conn spawn cost dominates.
+- Persistent `outcome=rejected` = `pool.checkout_queue_max_size` is hit; either raise the queue limit or back-pressure the inbound side.
+- `http.client.active_requests` significantly higher than the inbound `http.server.active_requests` on the same upstream's traffic indicates a retry-heavy workload (or a stuck attempt being held by the response timer).
+
+### Feature middleware — `reactor.{auth, rate_limit, circuit_breaker, dns}.*`
+
+Authoritative source for in-the-loop traffic-management telemetry. `/stats` JSON continues to surface the same counters; the OTel series are useful for time-series dashboards and alerting.
+
+#### `reactor.dns.*`
+
+| Metric | Type | Labels | Vocabulary |
+|---|---|---|---|
+| `reactor.dns.resolves` | Counter | `outcome` | `{success, cache_hit, nxdomain, timeout, servfail, other_error}` |
+
+- `cache_hit` = literal IP short-circuit (no actual DNS call).
+- `nxdomain` includes literal-parse failures (treated as "no such name").
+
+#### `reactor.rate_limit.*`
+
+| Metric | Type | Labels | Vocabulary |
+|---|---|---|---|
+| `reactor.rate_limit.decisions` | Counter | `zone`, `decision` | `decision ∈ {admit, reject, dry_run_reject}` |
+| `reactor.rate_limit.tokens` | Histogram (tokens) | `zone` | Remaining-tokens snapshot at decision time |
+
+- `decision=dry_run_reject` fires when the zone is in `dry_run` mode — operator sees would-reject traffic without enforcement.
+- The `tokens` histogram lets operators see how close the zone is to the bucket floor across traffic patterns.
+
+#### `reactor.circuit_breaker.*`
+
+| Metric | Type | Labels | Vocabulary |
+|---|---|---|---|
+| `reactor.circuit_breaker.state` | UpDownCounter | `service`, `state` | `state ∈ {closed, open, half_open}` |
+| `reactor.circuit_breaker.transitions` | Counter | `service`, `from`, `to`, `trigger` | `from`, `to` ∈ `{closed, open, half_open}`; `trigger ∈ {consecutive, rate, probe_success, probe_fail, open_elapsed, dry_run_disabled}` |
+| `reactor.circuit_breaker.rejected` | Counter | `service`, `reason` | `reason ∈ {open, open_dry_run, half_open_full, half_open_recovery_failing}` |
+
+- The `state` gauge is per-slice-summed: a `service` with N partitions starts at `{state=closed}=N` and transitions balance across the slices. A non-zero `{state=half_open}` series persisting beyond `half_open` durations is a stuck slice.
+- `trigger=dry_run_disabled` is the synthetic same-state OPEN→OPEN signal that fires when `dry_run` flips `true→false` while the breaker is open — it lets operators see when shadow mode ended.
+- `rejected{reason=open_dry_run}` = traffic that WOULD have been rejected in enforce mode but was admitted under shadow.
+
+#### `reactor.auth.*`
+
+| Metric | Type | Labels | Vocabulary |
+|---|---|---|---|
+| `reactor.auth.requests` | Counter | `outcome`, `issuer`, `reason` | `outcome ∈ {allow, deny, undetermined}`; ALLOW emits `reason=ok`; deny `reason ∈ {missing_token, expired_token, malformed_token, signature_invalid, jwt_verify_failed, aud_mismatch, iss_mismatch, introspection_inactive, introspection_error, policy_denied, cache_miss_no_issuer, other}`; undetermined fires when an on-undetermined policy can't classify (IdP unreachable, cache miss, etc.) |
+| `reactor.auth.cache.lookups` | Counter | `outcome`, `issuer` | `outcome ∈ {hit, miss, stale_serve, refresh_fail}` |
+| `reactor.auth.jwks.refreshes` | Counter | `issuer`, `outcome` | `outcome ∈ {success, network_error, parse_error}` |
+
+- The `reason` label on `auth.requests` is bounded by the closed vocabulary above — the helper strips unbounded tails (e.g., `jwt_verify_failed: openssl says X` → `jwt_verify_failed`) before emit. Full log lines (with the tail) are preserved at the structured-log emit site for diagnostics.
+- `cache.lookups{outcome=stale_serve}` rising on a specific issuer = JWKS refresh is failing AND the stale-serve fallback is keeping traffic flowing. Combine with `jwks.refreshes{outcome=network_error}` on the same issuer to confirm.
+- Both positive-cache and negative-cache hits emit `outcome=hit` — the cache's perspective ("we had an answer ready") is more useful than the verdict split.
+
 ### Self-handler graceful shutdown
 
 A route handler that needs to terminate the server (e.g. an admin endpoint exposing `/shutdown`) must NOT call `HttpServer::Stop()` synchronously — that deadlocks the dispatcher. Use `HttpServer::ScheduleStopAfterCurrentResponse()` instead. The helper:
@@ -382,10 +493,17 @@ A route handler that needs to terminate the server (e.g. an admin endpoint expos
 - Drains the calling handler's `active_requests_` decrement naturally before the deferred Stop runs.
 - Idempotent — repeated/concurrent calls collapse via internal CAS.
 
-### `obs_kill_marshal` regression suite
+### Kill loop and the CASE B marshal
 
-A new test suite ratchets the documented kill-loop contract:
-- `kill_marshals_in_flight_` stays at 0 (RESERVED for a future per-dispatcher EnQueue marshal).
+`ObservabilityManager::KillOutstandingSnapshots` runs during the third shutdown phase to drain snapshots that didn't reach a natural finalize. Each snapshot's `owning_dispatcher` decides the path:
+
+- **Same-thread or no dispatcher** — kill runs inline (`KillSnapshotInline`).
+- **Cross-thread** — the manager bumps `kill_marshals_in_flight_`, enqueues the kill onto the owning dispatcher via `EnQueueDelayed(closure, 0ms)`, and an RAII guard decrements the counter when the closure exits (success, weak-pointer lock failure, or exception). If the dispatcher refuses the enqueue (already stopped), the bump is rolled back and the kill falls back to inline.
+
+`HttpServer::Stop`'s drain barrier waits on `kill_marshals_in_flight_` reaching zero (alongside `inflight_finalizations_` and `finalizers_in_progress_`), so the marshal cannot wedge the shutdown — the budget is bounded by `cli.shutdown_drain_timeout_sec`.
+
+The `obs_kill_marshal` regression suite (Phase 3) and `obs_kill_marshal_caseb` suite (Phase 4) together ratchet the contract:
+- `kill_marshals_in_flight_` is 0 at steady-state, rises above 0 during cross-thread kill, and returns to 0 before drain converges.
 - The `FinalizeFromSnapshot` CAS resolves multi-thread races: every snapshot is finalized exactly once.
 - `reactor.otel.snapshots_killed_on_timeout` Counter delta = N for N un-finalized survivors.
 
@@ -395,11 +513,12 @@ A new test suite ratchets the documented kill-loop contract:
 
 The following are deferred and not currently implemented — listed so future readers don't expect them.
 
-- **Connection-level metrics with protocol label.** `connections.active` / `connections.total` need protocol-label plumbing across 6+ inbound/outbound sites.
-- **BSP / PMR / Tracer self-metrics.** The BatchSpanProcessor and PeriodicMetricReader workers need a manager pointer for self-instrumentation.
-- **Per-dispatcher EnQueue kill marshal.** The `kill_marshals_in_flight_` counter is already wired into `WaitForAllAsyncDrain`'s predicate as RESERVED; the actual bump-pre-EnQueue / decrement-in-closure pair is deferred.
 - **Tail sampling.** Out of scope; deploy a Collector with the tail-sampling processor between the gateway and the trace backend.
 - **Histogram exemplars.** Out of scope.
 - **OTLP/protobuf.** OTLP/JSON is the only serializer; OTLP/protobuf may be added later for collector-side parity.
 - **B3, X-Ray propagators.** Only W3C and Jaeger ship today.
+- **Native gRPC client for OTLP.** Today's transport is HTTP/1.1 / HTTP/2 via the upstream pool; OTLP/JSON over HTTP/2 is the supported shape.
+- **Live-swap of `traces.otlp.upstream` / `metrics.otlp.upstream`.** Restart-required by design.
+- **Per-key `max_value_cardinality_per_label` SIGHUP.** Restart-only.
 - **Logs signal.** Logs continue via spdlog with trace correlation in the log format; the OpenTelemetry logs SDK is not wired.
+- **`/stats` reading from the OTel meter.** Today `/stats` and OTel emit in parallel from the same call sites (eventually consistent within ~1s). Eliminating the duplication is a Phase 5 cleanup.

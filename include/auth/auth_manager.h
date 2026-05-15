@@ -9,7 +9,6 @@
 #include "auth/token_hasher.h"
 #include "config/server_config.h"
 #include "http/http_router.h"
-#include <unordered_set>
 // <atomic>, <memory>, <mutex>, <unordered_map>, <vector> via common.h
 
 class UpstreamManager;
@@ -256,7 +255,16 @@ class AuthManager {
                         const std::string& issuer,
                         const std::string& policy,
                         AuthCache cache,
-                        std::optional<uint64_t> captured_incarnation = std::nullopt);
+                        std::optional<uint64_t> captured_incarnation = std::nullopt,
+                        std::string_view deny_reason = std::string_view{});
+
+    // Emit reactor.auth.cache_lookups{outcome, issuer}. outcome MUST be one
+    // of "hit", "miss", "stale_serve", "refresh_fail". No-op when the
+    // observability manager isn't wired. Public so the introspection
+    // resume finalizers (anonymous-namespace helpers) can call it via a
+    // captured manager pointer.
+    void EmitCacheLookup(const char* outcome,
+                          const std::string& issuer) const noexcept;
 
     // Returns the current incarnation for `policy_name`. Always >= 1 for
     // a policy that has ever been part of a reconcile (or that has been

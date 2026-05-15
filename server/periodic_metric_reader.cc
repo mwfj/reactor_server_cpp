@@ -2,15 +2,21 @@
 
 #include "common.h"
 #include "log/logger.h"
+#include "observability/counter.h"
+#include "observability/histogram.h"
+#include "observability/metrics_catalog.h"
+#include "observability/observability_manager.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 
 PeriodicMetricReader::PeriodicMetricReader(
     MeterProvider*                  provider,
     std::shared_ptr<MetricExporter> exporter,
-    MeterReaderOptions              options)
+    MeterReaderOptions              options,
+    ObservabilityManager*           manager)
     : provider_(provider),
       exporter_(std::move(exporter)),
+      manager_(manager),
       interval_ns_(options.export_interval.count() * 1'000'000),
       timeout_ns_(options.export_timeout.count() * 1'000'000) {
     // See BatchSpanProcessor for the rationale on publish-before-launch.
@@ -39,7 +45,12 @@ void PeriodicMetricReader::WorkerLoop() {
         const bool shutdown = shutting_down_.load(std::memory_order_acquire);
         lk.unlock();
 
-        if (!provider_ || !exporter_) {
+        // Load provider_ atomically every iteration so DisarmProvider()
+        // (called from ~ObservabilityManager) becomes visible promptly.
+        // External holders can keep this PMR alive past manager teardown;
+        // the disarm makes the dereference below safe.
+        auto* prov = provider_.load(std::memory_order_acquire);
+        if (!prov || !exporter_) {
             if (shutdown) break;
             continue;
         }
@@ -54,8 +65,9 @@ void PeriodicMetricReader::WorkerLoop() {
             // Snapshot the provider's current series state and hand to
             // exporter. The snapshot is a consistent point-in-time view
             // produced under the provider's series-map lock.
+            const auto t0 = std::chrono::steady_clock::now();
             try {
-                MetricsSnapshot snap = provider_->Snapshot();
+                MetricsSnapshot snap = prov->Snapshot();
                 const auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::nanoseconds(
                         timeout_ns_.load(std::memory_order_acquire));
@@ -67,6 +79,29 @@ void PeriodicMetricReader::WorkerLoop() {
             } catch (...) {
                 logging::Get()->error(
                     "PeriodicMetricReader::Export threw unknown exception");
+            }
+            // Self-metric: per-shard atomic write; emits even on
+            // exception so duration always covers the attempt. Atomic
+            // load picks up DisarmManager's null-store if the manager
+            // has already started teardown.
+            if (auto* mgr = manager_.load(std::memory_order_acquire)) {
+                const auto& cat = mgr->catalog();
+                if (cat.reactor_otel_export_duration != nullptr) {
+                    const double elapsed_s =
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t0).count();
+                    cat.reactor_otel_export_duration->Record(
+                        elapsed_s, {{"signal", "metrics"}});
+                }
+            }
+        } else {
+            // Self-metric: bump skip counter so operators see SIGHUP-
+            // driven metrics.enabled=false dampening the push side.
+            if (auto* mgr = manager_.load(std::memory_order_acquire)) {
+                const auto& cat = mgr->catalog();
+                if (cat.reactor_otel_metrics_export_skipped != nullptr) {
+                    cat.reactor_otel_metrics_export_skipped->Add(1.0, {});
+                }
             }
         }
 

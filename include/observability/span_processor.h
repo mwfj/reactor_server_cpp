@@ -13,12 +13,11 @@
 //   - BatchSpanProcessor — production export path.
 
 #include "observability/span_data.h"
-
-#include <chrono>
-#include <mutex>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
+
+class ObservabilityManager;
 
 class SpanProcessor {
 public:
@@ -57,6 +56,14 @@ public:
     //   - deadline <  0: unbounded wait until the drain completes.
     //   - deadline >  0: bounded wait, return when drained or expired.
     virtual void ForceFlush(std::chrono::milliseconds /*deadline*/) {}
+
+    // Self-metric escape hatch. Span code paths (e.g. DropWithoutEnd)
+    // need to bump observability self-metrics through whichever processor
+    // the Tracer was constructed with. Returning nullptr disables self-
+    // metric emission — the default for Noop / InMemory processors, where
+    // test fixtures usually don't wire a manager. BatchSpanProcessor
+    // overrides to return the pointer captured at construction time.
+    virtual ObservabilityManager* manager() const noexcept { return nullptr; }
 };
 
 // In-memory processor that retains SpanData for inspection. Test-only;
@@ -80,9 +87,24 @@ public:
         return spans_.size();
     }
 
+    // Optional self-metric wiring for tests that need to verify Span
+    // code paths reaching back through the processor. Production uses
+    // BatchSpanProcessor (captures manager at ctor); this hook lets a
+    // test fixture plumb a manager pointer AFTER ObservabilityManager
+    // construction (which itself takes the processor by shared_ptr).
+    // Atomic so a flush worker on another thread observes a publish-
+    // ordered write.
+    void set_manager(ObservabilityManager* m) noexcept {  // test-only — production wires via BatchSpanProcessor ctor
+        manager_.store(m, std::memory_order_release);
+    }
+    ObservabilityManager* manager() const noexcept override {
+        return manager_.load(std::memory_order_acquire);
+    }
+
 private:
     mutable std::mutex     mtx_;
     std::vector<SpanData>  spans_;
+    std::atomic<ObservabilityManager*> manager_{nullptr};
 };
 
 // Drop-everything processor — used when traces are disabled but the
