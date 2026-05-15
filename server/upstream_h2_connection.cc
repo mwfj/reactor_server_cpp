@@ -981,14 +981,19 @@ bool UpstreamH2Connection::IsShutdownDrainComplete(
 
 bool UpstreamH2Connection::IsUsable() const {
     if (dead_ || !session_ || goaway_seen_ || !cfg_) return false;
-    if (cfg_->max_concurrent_streams_pref == 0) return false;
-    uint32_t cap = cfg_->max_concurrent_streams_pref;
-    if (session_) {
-        uint32_t peer = nghttp2_session_get_remote_settings(
-            session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
-        if (peer > 0 && peer < cap) cap = peer;
-    }
+    const uint32_t cap = EffectiveMaxStreams();
+    if (cap == 0) return false;
     return static_cast<uint32_t>(active_streams_) < cap;
+}
+
+uint32_t UpstreamH2Connection::EffectiveMaxStreams() const {
+    if (!cfg_ || !session_) return 0;
+    if (cfg_->max_concurrent_streams_pref == 0) return 0;
+    uint32_t cap = cfg_->max_concurrent_streams_pref;
+    uint32_t peer = nghttp2_session_get_remote_settings(
+        session_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS);
+    if (peer > 0 && peer < cap) cap = peer;
+    return cap;
 }
 
 void UpstreamH2Connection::MarkDead() {

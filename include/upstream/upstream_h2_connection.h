@@ -201,6 +201,16 @@ public:
     // per-upstream max_concurrent_streams_pref cap.
     bool IsUsable() const;
 
+    // Effective per-session stream cap — the same clamp `IsUsable()`
+    // applies: `min(cfg_->max_concurrent_streams_pref, peer SETTINGS)`.
+    // Used by saturation / preconnect policy so utilization ratios
+    // reflect the wire-level cap (when the peer's
+    // MAX_CONCURRENT_STREAMS is below our local pref, the session
+    // saturates at the peer value, not the local one). Returns 0 if
+    // `cfg_->max_concurrent_streams_pref == 0` (mirrors IsUsable's
+    // "no cap configured → unusable" early-out) or session is null.
+    uint32_t EffectiveMaxStreams() const;
+
     // Frame-callback hooks. Public so the static C callbacks in the .cc
     // can forward to them via `static_cast<UpstreamH2Connection*>(user)`.
     void OnPingAck();

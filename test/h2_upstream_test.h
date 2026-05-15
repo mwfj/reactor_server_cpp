@@ -8756,7 +8756,18 @@ static void TestT6_AcquireH2ConnectionEmptyLeaseFallsBackToFirstUsable() {
             part->InitiateShutdown(0);
             cleanup_done.set_value();
         });
-        cleanup_fut.wait_for(std::chrono::seconds(2));
+        // Capture wait_for status so a silent timeout (cleanup task
+        // queued but never drained) doesn't leave the partition holding
+        // a dangling transport_ pointer to a soon-to-destruct uc.
+        // InitiateShutdown(0) is synchronous and completes in
+        // microseconds; a timeout here means the dispatcher is wedged.
+        auto cleanup_status = cleanup_fut.wait_for(std::chrono::seconds(2));
+        if (cleanup_status != std::future_status::ready) {
+            TestFramework::RecordTest(
+                "H2Upstream T6: AcquireH2Connection empty-lease falls back to first-usable",
+                false, "cleanup dispatcher task did not run within 2s");
+            return;
+        }
 
         TestFramework::RecordTest(
             "H2Upstream T6: AcquireH2Connection empty-lease falls back to first-usable",
@@ -9063,6 +9074,135 @@ static void TestP5_PreconnectSkippedCapCounter() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest("H2Upstream P5: preconnect_skipped_cap_count increments when cap saturated",
                                   false, e.what());
+    }
+}
+
+// P6 — Regression: MaybePreconnectH2 must NOT fire when a fleet-wide
+// spare (another usable session with utilization below the watermark)
+// already exists. Without this gate, the scenario "session A at 60%
+// (in window), session B at 0% (spare)" leads each new request to
+// pick A → fire another preconnect → fill the pool with idle warm
+// spares until pool.max_connections is exhausted.
+//
+// Discriminator: configure `pool.max_connections = 2` with 2 sessions
+// already inserted. The fix's fleet-wide gate fires BEFORE the cap
+// check → `preconnect_skipped_cap_count_` stays at 0. Without the
+// gate, control reaches the cap check → counter increments by 1.
+// This is the only test-observable difference between the two paths
+// because OpenNewH2Connection fails for no-TLS in either case.
+//
+// Setup: two synthetic H2 sessions inserted into the partition. A is
+// driven to 6/10 = 60% (in the [50%, 80%) window). B is left at 0%
+// (the spare).
+static void TestP6_PreconnectSkippedWhenSpareExists() {
+    std::cout << "\n[TEST] H2Upstream P6: MaybePreconnectH2 skips when fleet-wide spare exists..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        // pool.max_connections = 0 + 2 inserted synthetic H2 sessions:
+        // TotalCount returns the count of idle/active/connecting
+        // UpstreamConnections (NOT H2 sessions, see TotalCount comment).
+        // With no UpstreamConnections allocated and max=0, the cap-check
+        // `TotalCount() (0) >= partition_max_connections_ (0)` evaluates
+        // true → `preconnect_skipped_cap_count_` increments. The
+        // fleet-wide gate must short-circuit BEFORE that check so the
+        // counter stays at 0. This is the test-observable discriminator
+        // between the two paths.
+        cfg.pool.max_connections = 0;
+        cfg.http2.saturation_open_pct      = 80;
+        cfg.http2.preconnect_watermark_pct = 50;
+        cfg.http2.max_concurrent_streams_pref = 10;
+        UpstreamManager mgr({cfg}, {disp});
+        mgr.CommitHttp2Snapshots({cfg});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream P6: preconnect skipped when spare exists",
+                false, "null part");
+            return;
+        }
+
+        // Sinks before H2 conns — sinks-must-outlive-session contract.
+        RecordingSink sinks_a[6];
+
+        auto h2_cfg = std::make_shared<Http2UpstreamConfig>();
+        h2_cfg->enabled = true;
+        h2_cfg->max_concurrent_streams_pref = 10;
+        h2_cfg->ping_idle_sec = 0;
+        h2_cfg->ping_timeout_sec = 0;
+        h2_cfg->goaway_drain_timeout_sec = 0;
+
+        auto session_a = std::make_unique<UpstreamH2Connection>(nullptr, h2_cfg);
+        auto session_b = std::make_unique<UpstreamH2Connection>(nullptr, h2_cfg);
+        if (!session_a->Init() || !session_b->Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream P6: preconnect skipped when spare exists",
+                false, "Init failed");
+            return;
+        }
+        UpstreamH2Connection* raw_a = session_a.get();
+        UpstreamH2Connection* raw_b = session_b.get();
+
+        std::promise<std::tuple<int64_t,int64_t,int64_t>> result;
+        auto fut = result.get_future();
+        disp->EnQueue([&]() {
+            part->InsertH2ConnectionForTesting("svc", std::move(session_a));
+            part->InsertH2ConnectionForTesting("svc", std::move(session_b));
+            // Drive A to 60% utilization (6/10) — in the watermark window.
+            for (int i = 0; i < 6; ++i) {
+                raw_a->SubmitRequest("GET","https","h","/",{},""  ,&sinks_a[i]);
+            }
+            // B has 0 streams = 0% — below 50% watermark → operator
+            // signal "this session is spare capacity".
+            int64_t before_fired = part->preconnect_fired_count();
+            int64_t before_skip  = part->preconnect_skipped_cap_count();
+            // Picked session is A (the in-window one). Without the
+            // fleet-wide gate, this reaches the cap-check and bumps
+            // `preconnect_skipped_cap_count_`. With the gate, neither
+            // counter advances.
+            part->MaybePreconnectH2("svc", 9999, *raw_a);
+            int64_t after_fired = part->preconnect_fired_count();
+            int64_t after_skip  = part->preconnect_skipped_cap_count();
+            // Cleanup: clear A's stream refs and tear down both
+            // synthetic sessions inline so destruction order is safe.
+            raw_a->FailAllStreams(-1, "test-cleanup");
+            raw_b->FailAllStreams(-1, "test-cleanup");
+            part->InitiateShutdown(0);
+            result.set_value({after_fired - before_fired,
+                              after_skip - before_skip,
+                              before_skip});
+        });
+        auto status = fut.wait_for(std::chrono::seconds(5));
+        if (status != std::future_status::ready) {
+            TestFramework::RecordTest(
+                "H2Upstream P6: preconnect skipped when fleet-wide spare exists",
+                false, "dispatcher task did not complete within 5s");
+            return;
+        }
+        auto vals = fut.get();
+        int64_t delta_fired = std::get<0>(vals);
+        int64_t delta_skip  = std::get<1>(vals);
+
+        // PASS criteria:
+        //   1. delta_fired == 0 (no successful probe — true either way)
+        //   2. delta_skip  == 0 (fleet-wide gate short-circuited BEFORE
+        //                       the cap-check; without the gate this
+        //                       would be 1)
+        bool pass = (delta_fired == 0) && (delta_skip == 0);
+
+        TestFramework::RecordTest(
+            "H2Upstream P6: preconnect skipped when fleet-wide spare exists",
+            pass,
+            pass ? "" :
+            (std::string("delta_fired=") + std::to_string(delta_fired) +
+             " delta_skip=" + std::to_string(delta_skip)).c_str());
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream P6: preconnect skipped when fleet-wide spare exists",
+            false, e.what());
     }
 }
 
@@ -9698,6 +9838,7 @@ void RunAllH2UpstreamTests() {
     TestP3_PreconnectValidationWatermarkBelowSaturation();
     TestP4_PreconnectFiredCounter();
     TestP5_PreconnectSkippedCapCounter();
+    TestP6_PreconnectSkippedWhenSpareExists();
 
     // Config validation (TestPC series)
     TestPC1_SaturationPctOutOfRange();

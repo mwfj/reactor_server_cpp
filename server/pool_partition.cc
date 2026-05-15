@@ -1064,8 +1064,7 @@ bool PoolPartition::ShouldOpenAdditionalH2Conn(
     auto cfg = LoadHttp2ConfigSnapshot();
     if (!cfg || cfg->saturation_open_pct == 0) return false;
     if (TotalCount() >= partition_max_connections_) return false;
-    const uint32_t max_streams_pref = cfg->max_concurrent_streams_pref;
-    if (max_streams_pref == 0) return false;  // infinite capacity
+    if (cfg->max_concurrent_streams_pref == 0) return false;
     // CollectUsableForUpstream reaps expired entries inline, which
     // mutates h2_table_. Dispatcher-thread-only, idempotent: dead
     // entries don't count toward saturation either way.
@@ -1073,8 +1072,13 @@ bool PoolPartition::ShouldOpenAdditionalH2Conn(
     if (candidates.empty()) return false;  // cold-start handles first
     const int threshold = cfg->saturation_open_pct;
     for (auto* c : candidates) {
+        // EffectiveMaxStreams clamps to peer SETTINGS — a session that
+        // hit its peer-imposed limit BELOW our local pref is saturated
+        // at the peer cap; using local pref alone hides that pressure.
+        const uint32_t eff_cap = c->EffectiveMaxStreams();
+        if (eff_cap == 0) continue;  // session not usable — skip
         const int ratio_pct = ComputeStreamUtilizationPct(
-            c->active_stream_count(), max_streams_pref);
+            c->active_stream_count(), eff_cap);
         if (ratio_pct < threshold) return false;  // one still has slack
     }
     return true;
@@ -1089,7 +1093,6 @@ UpstreamH2Connection* PoolPartition::FindUsableH2ConnectionSaturation(
     if (!cfg || cfg->saturation_open_pct == 0) {
         return FindUsableH2Connection(upstream_name);
     }
-    const uint32_t max_streams_pref = cfg->max_concurrent_streams_pref;
     const int threshold = cfg->saturation_open_pct;
     auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
     for (auto* candidate : candidates) {
@@ -1100,9 +1103,10 @@ UpstreamH2Connection* PoolPartition::FindUsableH2ConnectionSaturation(
             candidate->MarkDead();
             continue;
         }
-        if (max_streams_pref == 0) return candidate;  // infinite cap
+        const uint32_t eff_cap = candidate->EffectiveMaxStreams();
+        if (eff_cap == 0) continue;  // session not usable — skip
         const int ratio_pct = ComputeStreamUtilizationPct(
-            candidate->active_stream_count(), max_streams_pref);
+            candidate->active_stream_count(), eff_cap);
         if (ratio_pct < threshold) return candidate;
         // Over threshold — skip; caller may use fallback path or
         // trigger a capacity probe.
@@ -1124,16 +1128,38 @@ void PoolPartition::MaybePreconnectH2(
     // reload AND our read. Defensive: skip the probe in that case
     // (the firing condition is undefined when saturation is off).
     if (cfg->saturation_open_pct == 0) return;
-    const uint32_t max_streams_pref = cfg->max_concurrent_streams_pref;
-    if (max_streams_pref == 0) return;  // infinite capacity
+    if (cfg->max_concurrent_streams_pref == 0) return;  // infinite capacity
+    // Use the picked session's EFFECTIVE cap (peer SETTINGS-clamped) so
+    // utilization tracks the wire-level cap, not the configured one.
+    const uint32_t picked_cap = picked_session.EffectiveMaxStreams();
+    if (picked_cap == 0) return;  // picked session not usable
     const int ratio_pct = ComputeStreamUtilizationPct(
-        picked_session.active_stream_count(), max_streams_pref);
+        picked_session.active_stream_count(), picked_cap);
     // Firing condition: in the (watermark, saturation) window. AT/below
     // watermark → no preconnect (operator says we're not stressed yet).
     // AT/above saturation → saturation routing already opens a fresh
     // probe; preconnect would duplicate.
     if (ratio_pct < cfg->preconnect_watermark_pct) return;
     if (ratio_pct >= cfg->saturation_open_pct) return;
+
+    // Fleet-wide spare check: do not open another warm spare if one
+    // already exists. Without this, A at 60% (in window) + B at 0%
+    // (spare) → each request picks A and fires another preconnect
+    // until pool.max_connections fills with idle warm spares.
+    // Spare = any OTHER usable session whose utilization is below the
+    // watermark (operator's "this session has slack" signal).
+    auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
+    for (auto* c : candidates) {
+        if (c == &picked_session) continue;  // not a spare; this is the picked one
+        const uint32_t cap = c->EffectiveMaxStreams();
+        if (cap == 0) continue;  // not usable — skip
+        const int cand_pct = ComputeStreamUtilizationPct(
+            c->active_stream_count(), cap);
+        if (cand_pct < cfg->preconnect_watermark_pct) {
+            // Spare already available — skip preconnect.
+            return;
+        }
+    }
     // Delegate the actual probe to StartH2CapacityProbe so the
     // capacity-probe semantics (shutdown / in-flight-probe / cap
     // gates) are applied uniformly. Note: StartH2CapacityProbe
@@ -1718,21 +1744,36 @@ void PoolPartition::CloseIdleMatchingEndpointOnDispatcher(
 void PoolPartition::PollShutdownDrain() {
     if (!alive_->load(std::memory_order_acquire)) return;
     const auto now = std::chrono::steady_clock::now();
-    // Snapshot raw pointers first — iterating the live table while
-    // Extract mutates its vectors would invalidate iterators.
-    // CollectAll is non-destructive; Extract returns a unique_ptr (or
-    // null if a concurrent reap chain already moved the conn out).
+    // Two-phase walk to defuse a reentrant-erase UAF: `DestroyOnDispatcher`
+    // synchronously fires `FailAllStreams` → `sink->OnError(...)` for every
+    // surviving stream; a sink callback can reenter partition code that
+    // calls `FindUsableH2Connection` / `CollectUsableForUpstream`, which
+    // reaps `IsExpired` entries from `h2_table_` mid-walk. If a still-to-
+    // be-processed raw pointer in our snapshot is the one reaped, the next
+    // iteration's `IsShutdownDrainComplete` reads freed memory.
+    //
+    // Phase 1: walk the snapshot, Extract every drain-complete session
+    // into a local owning vector. The unique_ptrs keep the H2 conns
+    // alive across any reentrant `h2_table_` mutations.
+    // Phase 2: destroy from the local vector — reentrant lookups find
+    // an empty h2_table_ (post-Extract) and cannot dangling-pointer us.
     auto snap = h2_table_.CollectAll();
+    std::vector<std::unique_ptr<UpstreamH2Connection>> to_destroy;
+    to_destroy.reserve(snap.size());
     for (auto* conn : snap) {
         if (!conn->IsShutdownDrainComplete(now)) continue;
-        auto owned = h2_table_.Extract(conn);
-        if (!owned) continue;  // concurrent extract — skip
+        if (auto owned = h2_table_.Extract(conn)) {
+            to_destroy.push_back(std::move(owned));
+        }
+    }
+    for (auto& owned : to_destroy) {
         // Canonical 6-step teardown (alive flip → null callbacks →
         // remove timer → teardown session → fail streams → mark
         // closing). The dtor's safety-net path short-circuits on
-        // `destroyed_on_dispatcher_=true` when `owned` lapses at
-        // the end of this iteration.
+        // `destroyed_on_dispatcher_=true` when `owned` lapses at the
+        // end of the local vector's iteration.
         owned->DestroyOnDispatcher();
+        if (!alive_->load(std::memory_order_acquire)) return;
     }
     // Also drain pending-destroy stash so its donated leases release
     // and outstanding_conns_ decrements toward zero. This is the same
