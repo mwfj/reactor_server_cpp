@@ -97,10 +97,13 @@ public:
     void ReturnConnection(UpstreamConnection* conn,
                           bool was_donated_to_h2 = false);
 
-    // Return an H2 stream slot to the partition. Alive tokens were
-    // validated by the lease before this call.
-    // TODO: dispatch DrainH2StreamWaitersForHost from the body so
-    // queued H2_STREAM_SLOT waiters get admitted on slot release.
+    // Lease-destructor callback for a non-donated H2 stream lease.
+    // Structural no-op: slot-release admission is driven by
+    // UpstreamH2Connection::RunDeferredEraseWalk, which decrements
+    // active_streams_ and invokes DrainH2StreamWaitersForHost +
+    // DrainAnyWaitersForFastH2 in the canonical spot. See the .cc
+    // body for the case analysis. Donated H2 leases bypass this
+    // method via the donated_to_h2_ check in ~UpstreamLease.
     void ReturnH2Stream(UpstreamH2Connection* h2_conn, int32_t stream_id,
                         std::shared_ptr<std::atomic<bool>> partition_alive,
                         std::shared_ptr<std::atomic<bool>> conn_alive);

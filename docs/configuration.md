@@ -317,7 +317,7 @@ The proxy engine can dispatch outbound requests over multiplexed HTTP/2 instead 
 | `ping_idle_sec` | 60 | yes | Send a PING after this many seconds of inactivity (0 disables) |
 | `ping_timeout_sec` | 10 | yes | Close the H2 connection if a PING goes unanswered for this long (0 disables) |
 | `goaway_drain_timeout_sec` | 30 | yes | Bound on how long to wait for in-flight streams after GOAWAY |
-| `saturation_open_pct` | 0 | yes | Multi-conn-per-host threshold (1–99). When all existing sessions are at or above this percent of `max_concurrent_streams_pref`, `AcquireH2Connection` opens an additional H2 connection (capped by `pool.max_connections`). `0` disables — pool collapses to one H2 connection per upstream per dispatcher. |
+| `saturation_open_pct` | 0 | yes | Multi-conn-per-host threshold (1–100). When all existing sessions are at or above this percent of `max_concurrent_streams_pref`, `AcquireH2Connection` opens an additional H2 connection (capped by `pool.max_connections`). `100` opens only when the picked session is exactly at peer cap; `0` disables — pool collapses to one H2 connection per upstream per dispatcher. |
 | `preconnect_watermark_pct` | 0 | yes | Predictive warm-spare threshold (must satisfy `0 < pct < saturation_open_pct`). When a picked session's utilization first crosses this watermark, `MaybePreconnectH2` opens a probe connection so the next saturation event has a ready spare. Requires `saturation_open_pct > 0`; `0` disables. |
 
 **TLS requirement:** `http2.enabled = true` requires `tls.enabled = true` (no h2c support). `http2.prefer = "always"` additionally rejects at config-load if TLS is disabled.

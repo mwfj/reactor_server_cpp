@@ -1073,7 +1073,6 @@ bool PoolPartition::ShouldOpenAdditionalH2Conn(
     if (candidates.empty()) return false;  // cold-start handles first
     const int threshold = cfg->saturation_open_pct;
     for (auto* c : candidates) {
-        if (!c) continue;
         const int ratio_pct = ComputeStreamUtilizationPct(
             c->active_stream_count(), max_streams_pref);
         if (ratio_pct < threshold) return false;  // one still has slack
@@ -1094,7 +1093,6 @@ UpstreamH2Connection* PoolPartition::FindUsableH2ConnectionSaturation(
     const int threshold = cfg->saturation_open_pct;
     auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
     for (auto* candidate : candidates) {
-        if (!candidate) continue;
         UpstreamConnection* t = candidate->transport();
         if (!t || !ConnectionEndpointMatches(*t)) {
             // Endpoint stale (post-reload IP swap). Mark dead — the
@@ -1230,11 +1228,11 @@ UpstreamH2Connection* PoolPartition::FindUsableH2Connection(
     // saturation / preconnect) or fall back.
     auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
     for (auto* candidate : candidates) {
-        UpstreamConnection* t = candidate ? candidate->transport() : nullptr;
+        UpstreamConnection* t = candidate->transport();
         if (t && ConnectionEndpointMatches(*t)) {
             return candidate;
         }
-        if (candidate) candidate->MarkDead();
+        candidate->MarkDead();
     }
     return nullptr;
 }
@@ -1560,7 +1558,7 @@ void PoolPartition::InitiateShutdown(int server_drain_timeout_sec) {
         // that mutate the table; iterating the live table would invalidate.
         auto snap = h2_table_.CollectAll();
         for (auto* conn : snap) {
-            if (conn) conn->BeginShutdownDrain(drain_budget_ms);
+            conn->BeginShutdownDrain(drain_budget_ms);
             if (!alive->load(std::memory_order_acquire)) return;
         }
         // Kick off the poll loop. PollShutdownDrain re-arms itself while
@@ -1717,7 +1715,6 @@ void PoolPartition::PollShutdownDrain() {
     // null if a concurrent reap chain already moved the conn out).
     auto snap = h2_table_.CollectAll();
     for (auto* conn : snap) {
-        if (!conn) continue;
         if (!conn->IsShutdownDrainComplete(now)) continue;
         auto owned = h2_table_.Extract(conn);
         if (!owned) continue;  // concurrent extract — skip
@@ -2633,13 +2630,15 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         // Record the H1Only outcome for prefer="auto" (the only prefer
         // mode that reaches this branch — prefer="always" routes
         // through the alpn_not_h2_under_prefer_always fail path above;
-        // prefer="never" doesn't probe). The endpoint captured here is
-        // the one the just-completed probe targeted; a future DNS swap
-        // produces a new ResolvedEndpoint pointer, so the endpoint-
-        // match check naturally invalidates this entry.
+        // prefer="never" doesn't probe). Use the transport's captured
+        // endpoint (the one the probe targeted) rather than
+        // LoadResolvedEndpoint(): a reload may have published a new
+        // endpoint after the DNS-swap check above passed, and keying
+        // this stale H1Only result against the new endpoint would
+        // wrongly suppress H2 probing to the freshly-rotated backend.
         RecordH2NegotiationOutcome(
             upstream_name, port, H2NegotiationOutcome::H1Only,
-            LoadResolvedEndpoint());
+            uc_raw ? uc_raw->captured_endpoint() : nullptr);
         ReclassifyH2WaitersToAny(upstream_name, port);
         // Asymmetry note: no inflight_leases_ bump here (unlike the
         // ALPN-h2 success branch at line ~2063). AdoptAsH1Connection
@@ -2690,7 +2689,7 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
             "down and scheduling replacement probe",
             upstream_name, port);
         InvalidateH2NegotiationCacheForEndpoint(uc_raw->captured_endpoint());
-        shell->DestroyOnDispatcher();
+        if (shell) shell->DestroyOnDispatcher();
         if (auto owned = ExtractFromConnecting(uc_raw)) {
             DestroyConnection(std::move(owned));
         }
@@ -2796,13 +2795,14 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
 
     h2_table_.Insert(upstream_name, std::move(shell));
     // Record the H2Negotiated outcome against the endpoint the probe
-    // ran on. A subsequent capacity / preconnect probe to the same
-    // endpoint won't be cache-blocked (H2Negotiated entries never
-    // short-circuit ShouldSkipH2ProbeForEndpoint, which gates only on
-    // H1Only).
+    // ran on (transport-captured) rather than LoadResolvedEndpoint() —
+    // see the ALPN-h1 branch comment for the reload-race rationale.
+    // H2Negotiated entries never short-circuit ShouldSkipH2ProbeForEndpoint
+    // (which gates only on H1Only), but keying consistently against the
+    // probe's endpoint keeps eviction logic uniform across branches.
     RecordH2NegotiationOutcome(
         upstream_name, port, H2NegotiationOutcome::H2Negotiated,
-        LoadResolvedEndpoint());
+        uc_raw ? uc_raw->captured_endpoint() : nullptr);
     DrainAnyWaitersForFastH2();
     DrainH2StreamWaitersForHost(upstream_name, port);
 }

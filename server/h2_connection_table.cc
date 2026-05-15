@@ -114,14 +114,12 @@ std::unique_ptr<UpstreamH2Connection> H2ConnectionTable::Extract(
 
 std::vector<std::unique_ptr<UpstreamH2Connection>>
 H2ConnectionTable::ExtractAll() {
-    // Count first + reserve so push_back below is noexcept — without
-    // this, a mid-loop bad_alloc would leave by_upstream_ in
-    // moved-but-not-cleared state (null entries in the vectors,
-    // skipped clear()) on rethrow.
-    size_t total = 0;
-    for (auto& [_, conns] : by_upstream_) total += conns.size();
+    // reserve() up-front so push_back below is noexcept — without this,
+    // a mid-loop bad_alloc would leave by_upstream_ in moved-but-not-
+    // cleared state (null entries in the vectors, skipped clear()) on
+    // rethrow.
     std::vector<std::unique_ptr<UpstreamH2Connection>> out;
-    out.reserve(total);
+    out.reserve(TotalConnections());
     for (auto& [_, conns] : by_upstream_) {
         for (auto& c : conns) {
             if (c) out.push_back(std::move(c));
@@ -133,9 +131,7 @@ H2ConnectionTable::ExtractAll() {
 
 std::vector<UpstreamH2Connection*> H2ConnectionTable::CollectAll() const {
     std::vector<UpstreamH2Connection*> out;
-    size_t total = 0;
-    for (const auto& [_, conns] : by_upstream_) total += conns.size();
-    out.reserve(total);
+    out.reserve(TotalConnections());
     for (const auto& [_, conns] : by_upstream_) {
         for (const auto& c : conns) {
             if (c) out.push_back(c.get());

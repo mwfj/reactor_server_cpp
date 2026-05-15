@@ -923,33 +923,45 @@ bool ProxyTransaction::TryDispatchExistingH2Session() {
     if (!partition) return false;
     auto cfg = partition->LoadHttp2ConfigSnapshot();
     if (!cfg || !cfg->enabled || cfg->prefer == "never") return false;
-    // Prefer an under-threshold session. When all sessions are
-    // over-threshold AND policy says open another, fire a capacity
-    // probe (for FUTURE requests) and let THIS request fall through
-    // to StartCheckoutAsync — the regular checkout path will either
-    // pick an over-threshold session via AcquireH2Connection's
-    // first-usable fallback OR materialize a fresh transport that
-    // becomes a new H2 conn after ALPN.
+    // Prefer an under-threshold session.
     auto existing = partition->FindUsableH2ConnectionSaturation(service_name_);
     if (!existing) {
+        // No under-threshold session. Fire a capacity probe for FUTURE
+        // requests if policy allows.
         if (partition->ShouldOpenAdditionalH2Conn(service_name_)) {
             partition->StartH2CapacityProbe(service_name_, upstream_port_);
         }
-        return false;
+        // Fallback: an over-threshold session may still have stream
+        // capacity (active_streams_ < max_concurrent_streams_pref AND
+        // utilization ≥ saturation_open_pct percent). Reuse it for
+        // THIS request rather than queuing in StartCheckoutAsync —
+        // CheckoutAsync's `TotalCount() < partition_max_connections_`
+        // gate doesn't know about per-H2-session stream capacity, so
+        // when cap is reached the request would queue while the
+        // multiplexed session sits with free streams. The just-fired
+        // probe handles FUTURE load growth; this branch unblocks the
+        // current request.
+        existing = partition->FindUsableH2Connection(service_name_);
+        if (!existing) {
+            // No usable H2 session at all. Fall through to checkout
+            // which creates a new transport (under cap) or queues.
+            return false;
+        }
+    } else {
+        // Under-threshold session picked. Predictive preconnect fires
+        // if the session is in the (watermark, saturation) window so
+        // the next request finds an additional session already warming
+        // up. MaybePreconnectH2 is a no-op when preconnect_watermark_pct
+        // == 0 (disabled fast path) and self-gates on cap / in-flight-probe.
+        partition->MaybePreconnectH2(service_name_, upstream_port_, *existing);
     }
-    // Under-threshold session picked. Predictive preconnect fires if
-    // the session is in the (watermark, saturation) window so the next
-    // request finds an additional session already warming up.
-    // MaybePreconnectH2 is a no-op when preconnect_watermark_pct == 0
-    // (disabled fast path) and self-gates on cap / in-flight-probe.
-    partition->MaybePreconnectH2(service_name_, upstream_port_, *existing);
-    // Existing under-threshold session is reusable. Skip CheckoutAsync
-    // entirely and dispatch through the H2 path with an EMPTY lease —
-    // DispatchH2's AcquireH2Connection FAST branch returns the same
-    // session without touching the lease, and lease_ stays empty (the
-    // existing session owns its own donated lease for transport
-    // lifetime). Advance to SENDING_REQUEST as if OnCheckoutReady had
-    // granted us a lease.
+    // Reusable session in hand (under- or over-threshold). Skip
+    // CheckoutAsync entirely and dispatch through the H2 path with an
+    // EMPTY lease — DispatchH2's AcquireH2Connection FAST branch returns
+    // the same session without touching the lease, and lease_ stays
+    // empty (the existing session owns its own donated lease for
+    // transport lifetime). Advance to SENDING_REQUEST as if
+    // OnCheckoutReady had granted us a lease.
     state_ = State::SENDING_REQUEST;
     DispatchH2();
     return true;
