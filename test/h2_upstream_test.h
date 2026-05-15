@@ -8633,6 +8633,146 @@ static void TestT5_CapacityProbeRejectedOnShutdown() {
     }
 }
 
+// T6 — Regression: AcquireH2Connection with an EMPTY lease must fall
+// back to FindUsableH2Connection when every existing session is over
+// the saturation threshold AND the cap still has room. The empty-lease
+// signal comes from TryDispatchExistingH2Session, which has already
+// picked an over-threshold session and re-enters DispatchH2 to multiplex
+// the request onto it. Without the fallback, AcquireH2Connection drops
+// into fresh-construct, sees lease.Get() == null, and returns null —
+// the caller then surfaces a spurious CONNECT_FAILURE / 502 even though
+// a usable multiplexed session is sitting right there with free streams.
+// Reproduces the common cap-not-reached case (cap=5, 1 session at 90%
+// of max_concurrent_streams_pref=10) the round-1 fix missed.
+//
+// Setup nuance: FindUsableH2Connection checks
+// `ConnectionEndpointMatches(*candidate->transport())`, so the synthetic
+// H2 session must wrap an UpstreamConnection whose captured_endpoint()
+// matches the partition's published resolved_endpoint_. We grab the
+// partition's endpoint via the public LoadResolvedEndpoint() accessor
+// and pass it to the UpstreamConnection ctor. ConnectionHandler is
+// null (no real socket needed — the test never sends bytes).
+static void TestT6_AcquireH2ConnectionEmptyLeaseFallsBackToFirstUsable() {
+    std::cout << "\n[TEST] H2Upstream T6: AcquireH2Connection empty-lease fallback to first-usable..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        cfg.pool.max_connections = 5;                       // room for more
+        cfg.http2.saturation_open_pct = 80;                 // 80% threshold
+        cfg.http2.max_concurrent_streams_pref = 10;
+        UpstreamManager mgr({cfg}, {disp});
+        mgr.CommitHttp2Snapshots({cfg});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream T6: AcquireH2Connection empty-lease fallback",
+                false, "null part");
+            return;
+        }
+
+        // Build an UpstreamConnection whose captured_endpoint matches
+        // the partition's published one. ConnectionHandler is null —
+        // no real socket needed because the test never sends bytes.
+        // Lifetime: the unique_ptr outlives the h2 conn (declared
+        // BEFORE so it destructs AFTER).
+        auto endpoint = part->LoadResolvedEndpoint();
+        auto uc = std::make_unique<UpstreamConnection>(
+            /*conn=*/nullptr, "127.0.0.1", 9999, endpoint);
+
+        // Build the H2 session wrapping the synthetic transport.
+        // Sinks-must-outlive-session: declare RecordingSink array first.
+        RecordingSink sinks[9];
+        auto h2_cfg = std::make_shared<Http2UpstreamConfig>();
+        h2_cfg->enabled = true;
+        h2_cfg->max_concurrent_streams_pref = 10;
+        h2_cfg->ping_idle_sec = 0;
+        h2_cfg->ping_timeout_sec = 0;
+        h2_cfg->goaway_drain_timeout_sec = 0;
+        auto h2_conn = std::make_unique<UpstreamH2Connection>(uc.get(), h2_cfg);
+        if (!h2_conn->Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream T6: AcquireH2Connection empty-lease fallback",
+                false, "Init failed");
+            return;
+        }
+        UpstreamH2Connection* raw = h2_conn.get();
+
+        std::promise<std::tuple<void*, void*, bool, bool>> result;
+        auto fut = result.get_future();
+        disp->EnQueue([&]() {
+            part->InsertH2ConnectionForTesting("svc", std::move(h2_conn));
+            // Drive utilization to 90% (over saturation_open_pct=80).
+            for (int i = 0; i < 9; ++i) {
+                raw->SubmitRequest("GET","https","h","/",{},""  ,&sinks[i]);
+            }
+            // Saturation pick should reject this session (90% > 80%).
+            bool sat_returns_null =
+                (part->FindUsableH2ConnectionSaturation("svc") == nullptr);
+            // FindUsable should still return it (9 streams < 10 cap).
+            bool first_usable_returns_session =
+                (part->FindUsableH2Connection("svc") == raw);
+            // Empty lease — mirrors TryDispatchExistingH2Session's flow.
+            UpstreamLease empty_lease;
+            UpstreamH2Connection* acquired =
+                part->AcquireH2Connection("svc", empty_lease);
+            result.set_value({static_cast<void*>(acquired),
+                              static_cast<void*>(raw),
+                              sat_returns_null,
+                              first_usable_returns_session});
+        });
+        auto vals = (fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready)
+                    ? fut.get()
+                    : std::tuple<void*, void*, bool, bool>{nullptr, nullptr, false, false};
+
+        void* acquired = std::get<0>(vals);
+        void* expected = std::get<1>(vals);
+        bool sat_null  = std::get<2>(vals);
+        bool fu_ok     = std::get<3>(vals);
+
+        // PASS criteria:
+        //   1. Saturation gate confirmed: pick is null
+        //   2. FindUsable confirmed: returns the over-threshold session
+        //   3. AcquireH2Connection returned the SAME session (regression)
+        bool pass = sat_null && fu_ok &&
+                    (acquired != nullptr) &&
+                    (acquired == expected);
+
+        // Tear down the H2 session in the partition BEFORE `uc`
+        // exits scope. ~UpstreamH2Connection accesses transport_ (the
+        // raw pointer captured from `uc`); a stray dangling pointer
+        // when the partition's dtor runs (which fires AFTER `uc`
+        // destructs in LIFO order) would UAF. Forcing the H2 retire
+        // path now keeps the lifetime invariant intact.
+        std::promise<void> cleanup_done;
+        auto cleanup_fut = cleanup_done.get_future();
+        disp->EnQueue([&]() {
+            raw->FailAllStreams(-1, "test-cleanup");
+            // InitiateShutdown(0) extracts every H2 session from the
+            // table and destroys them inline. The H2 conn's dtor runs
+            // here while `uc` is still alive.
+            part->InitiateShutdown(0);
+            cleanup_done.set_value();
+        });
+        cleanup_fut.wait_for(std::chrono::seconds(2));
+
+        TestFramework::RecordTest(
+            "H2Upstream T6: AcquireH2Connection empty-lease falls back to first-usable",
+            pass,
+            pass ? "" :
+            (std::string("acquired=") + std::to_string(reinterpret_cast<uintptr_t>(acquired)) +
+             " expected=" + std::to_string(reinterpret_cast<uintptr_t>(expected)) +
+             " sat_null=" + std::to_string(sat_null) +
+             " fu_ok=" + std::to_string(fu_ok)).c_str());
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream T6: AcquireH2Connection empty-lease falls back to first-usable",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Preconnect probe tests (TestP series)
 // ---------------------------------------------------------------------------
@@ -8778,13 +8918,14 @@ static void TestP3_PreconnectValidationWatermarkBelowSaturation() {
     }
 }
 
-// P4 — preconnect_fired_count increments when MaybePreconnectH2 fires.
+// P4 — preconnect_fired_count counts only SUCCESSFUL probe dispatches.
 // Uses a partition at cap=2 (room for a second conn) with a session
-// whose stream ratio sits in the watermark-to-saturation window.
-// Because OpenNewH2Connection requires TLS, the probe will fail
-// (no real socket), but the counter increments before the socket path.
+// whose stream ratio sits in the watermark-to-saturation window, but
+// OpenNewH2Connection fails because there's no TLS context. The counter
+// must stay at 0 — counting failed probes would misreport probe activity
+// to operators reading the gauge.
 static void TestP4_PreconnectFiredCounter() {
-    std::cout << "\n[TEST] H2Upstream P4: preconnect_fired_count increments on probe dispatch..." << std::endl;
+    std::cout << "\n[TEST] H2Upstream P4: preconnect_fired_count does not count failed probes..." << std::endl;
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
@@ -8827,9 +8968,12 @@ static void TestP4_PreconnectFiredCounter() {
             for (int i = 0; i < 6; ++i)
                 raw->SubmitRequest("GET","https","h","/",{},""  ,&sinks[i]);
             int64_t before = part->preconnect_fired_count();
-            // MaybePreconnect fires because ratio is in window and cap has room.
-            // OpenNewH2Connection will fail (no TLS context), but the counter
-            // is bumped before the actual socket path.
+            // MaybePreconnectH2 enters the firing branch (ratio in window,
+            // cap has room) but OpenNewH2Connection rejects with no TLS
+            // context. The counter must NOT increment on the failed
+            // dispatch — operator gauges should reflect probe success,
+            // not attempts. Bumping on attempt would lie about probe
+            // activity in TLS-misconfig / shutdown / cap-race paths.
             part->MaybePreconnectH2("svc", 9999, *raw);
             int64_t after = part->preconnect_fired_count();
             // Clear stream refs before sinks go out of scope.
@@ -8838,14 +8982,14 @@ static void TestP4_PreconnectFiredCounter() {
         });
         auto vals = (fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready)
                     ? fut.get() : std::pair<int64_t,int64_t>{-1,-1};
-        bool pass = (vals.first == 0) && (vals.second == 1);
-        TestFramework::RecordTest("H2Upstream P4: preconnect_fired_count increments on probe dispatch",
+        bool pass = (vals.first == 0) && (vals.second == 0);
+        TestFramework::RecordTest("H2Upstream P4: preconnect_fired_count does not count failed probes",
                                   pass,
                                   pass ? "" :
                                   (std::string("before=") + std::to_string(vals.first) +
                                    " after=" + std::to_string(vals.second)).c_str());
     } catch (const std::exception& e) {
-        TestFramework::RecordTest("H2Upstream P4: preconnect_fired_count increments on probe dispatch",
+        TestFramework::RecordTest("H2Upstream P4: preconnect_fired_count does not count failed probes",
                                   false, e.what());
     }
 }
@@ -9546,6 +9690,7 @@ void RunAllH2UpstreamTests() {
     TestT3_FindUsableSaturationNullWhenAboveThreshold();
     TestT4_FindUsableSaturationReturnsBelowThreshold();
     TestT5_CapacityProbeRejectedOnShutdown();
+    TestT6_AcquireH2ConnectionEmptyLeaseFallsBackToFirstUsable();
 
     // Preconnect (TestP series)
     TestP1_PreconnectDisabledByDefault();

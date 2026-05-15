@@ -1165,8 +1165,12 @@ void PoolPartition::MaybePreconnectH2(
         "(ratio_pct={}, watermark={}, saturation={})",
         upstream_name, port, ratio_pct,
         cfg->preconnect_watermark_pct, cfg->saturation_open_pct);
-    preconnect_fired_count_.fetch_add(1, std::memory_order_relaxed);
-    OpenNewH2Connection(upstream_name, port);
+    // Only count successful dispatches (OpenNewH2Connection returns
+    // false for missing TLS context / shutdown / construct errors;
+    // a pre-bump would lie about probe activity in those failure paths).
+    if (OpenNewH2Connection(upstream_name, port)) {
+        preconnect_fired_count_.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void PoolPartition::StartH2CapacityProbe(
@@ -1354,9 +1358,14 @@ UpstreamH2Connection* PoolPartition::AcquireH2Connection(
     if (auto* existing = FindUsableH2ConnectionSaturation(upstream_name)) {
         return existing;
     }
-    if (!ShouldOpenAdditionalH2Conn(upstream_name)) {
-        // No new conn warranted (saturation disabled / cap reached /
-        // no candidates over threshold). Fall back to first-usable.
+    // Fall back to first-usable when (a) saturation policy does not
+    // warrant a new conn, OR (b) the caller passed an empty lease.
+    // The empty-lease case fires when TryDispatchExistingH2Session has
+    // already picked an over-threshold-but-usable session and re-enters
+    // through DispatchH2 → AcquireH2Connection: fresh-construct is
+    // impossible without a transport handle in the lease, so the only
+    // viable answer is to return that same session via FindUsable.
+    if (!ShouldOpenAdditionalH2Conn(upstream_name) || !lease.Get()) {
         if (auto* existing = FindUsableH2Connection(upstream_name)) {
             return existing;
         }

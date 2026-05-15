@@ -947,6 +947,11 @@ bool ProxyTransaction::TryDispatchExistingH2Session() {
             // which creates a new transport (under cap) or queues.
             return false;
         }
+        logging::Get()->debug(
+            "TryDispatchExistingH2Session: reusing over-threshold H2 "
+            "session for service={} client_fd={} — capacity probe "
+            "(if any) handles future load",
+            service_name_, client_fd_);
     } else {
         // Under-threshold session picked. Predictive preconnect fires
         // if the session is in the (watermark, saturation) window so
