@@ -6439,6 +6439,12 @@ static void TestS19_GoawayWithSurvivorsBelowKeepsDraining() {
 static void TestS20_DrainAnyWaitersRequeuesWithoutUsableSession() {
     std::cout << "\n[TEST] H2Upstream S20: DrainAnyWaitersForFastH2 requeues without session..." << std::endl;
     try {
+        // Counters BEFORE the manager — UpstreamManager destructor fires
+        // queued waiters' error_callbacks during InitiateShutdown.
+        // The lambdas capture &error_calls/&ready_calls by reference,
+        // so the atomics must outlive `mgr`.
+        std::atomic<int> ready_calls{0}, error_calls{0};
+
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
         UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
@@ -6454,7 +6460,6 @@ static void TestS20_DrainAnyWaitersRequeuesWithoutUsableSession() {
             return;
         }
 
-        std::atomic<int> ready_calls{0}, error_calls{0};
         std::promise<void> queued;
         auto queued_fut = queued.get_future();
 
@@ -6549,6 +6554,9 @@ static void TestS21_TotalCountExcludesH2Containers() {
 static void TestS22_DrainH2StreamSlotRequeuesWhenNoSession() {
     std::cout << "\n[TEST] H2Upstream S22: DrainH2StreamWaitersForHost requeues when no session..." << std::endl;
     try {
+        // Counters BEFORE mgr — error_callbacks fire from ~UpstreamManager.
+        std::atomic<int> ready_calls{0}, error_calls{0};
+
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
         UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
@@ -6564,7 +6572,6 @@ static void TestS22_DrainH2StreamSlotRequeuesWhenNoSession() {
             return;
         }
 
-        std::atomic<int> ready_calls{0}, error_calls{0};
         std::promise<void> done;
         auto fut = done.get_future();
         disp->EnQueue([&]() {
@@ -6643,6 +6650,9 @@ static void TestS23_DrainHelpersEarlyReturnOnEmptyQueue() {
 static void TestS24_DrainH2StreamWaitersForHostKeepsAllEntries() {
     std::cout << "\n[TEST] H2Upstream S24: DrainH2StreamWaitersForHost keeps all entries..." << std::endl;
     try {
+        // Counters BEFORE mgr — error_callbacks fire from ~UpstreamManager.
+        std::atomic<int> ready_calls{0}, error_calls{0};
+
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
         UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
@@ -6658,7 +6668,6 @@ static void TestS24_DrainH2StreamWaitersForHostKeepsAllEntries() {
             return;
         }
 
-        std::atomic<int> ready_calls{0}, error_calls{0};
         std::promise<void> done;
         auto fut = done.get_future();
         disp->EnQueue([&]() {
@@ -6702,6 +6711,9 @@ static void TestS24_DrainH2StreamWaitersForHostKeepsAllEntries() {
 static void TestS25_DrainAnyWaitersShutdownFiresError() {
     std::cout << "\n[TEST] H2Upstream S25: DrainAnyWaitersForFastH2 honors shutdown..." << std::endl;
     try {
+        // Counters BEFORE mgr — error_callbacks fire from ~UpstreamManager.
+        std::atomic<int> ready_calls{0}, error_calls{0};
+
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
         UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
@@ -6717,7 +6729,6 @@ static void TestS25_DrainAnyWaitersShutdownFiresError() {
             return;
         }
 
-        std::atomic<int> ready_calls{0}, error_calls{0};
         std::promise<void> done;
         auto fut = done.get_future();
         disp->EnQueue([&]() {
@@ -6777,6 +6788,8 @@ static void TestS26_CapacityAwareDrainStopsAtCap() {
     // fires sink->OnError on the live stream this test submits; sink
     // must outlive mgr to avoid a vtable use-after-free.
     RecordingSink sink;
+    // Counters BEFORE mgr — error_callbacks fire from ~UpstreamManager.
+    std::atomic<int> ready_calls{0}, error_calls{0};
     try {
         auto disp = std::make_shared<Dispatcher>();
         auto t = StartDispatcher(disp);
@@ -6811,7 +6824,6 @@ static void TestS26_CapacityAwareDrainStopsAtCap() {
         }
         UpstreamH2Connection* h2_raw = h2_conn.get();
 
-        std::atomic<int> ready_calls{0}, error_calls{0};
         // Records which waiter index fired its ready_callback. FIFO
         // contract: the first enqueued waiter (index 0) must win the
         // sole cap-1 slot — NOT any of the later-enqueued waiters.
@@ -7421,13 +7433,14 @@ static void TestL1_LeasePopulatedAfterSubmit() {
         h2_cfg->ping_idle_sec = 0;
         h2_cfg->ping_timeout_sec = 0;
         h2_cfg->goaway_drain_timeout_sec = 0;
+        // Sink before conn — sinks-must-outlive-session contract.
+        RecordingSink sink;
         UpstreamH2Connection conn(nullptr, h2_cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest("H2Upstream L1: h2_lease_ populated after SubmitRequest",
                                      false, "Init failed");
             return;
         }
-        RecordingSink sink;
         int32_t sid = conn.SubmitRequest("GET", "https", "host", "/", {}, "", &sink);
         // On a null transport, SubmitRequest queues the frame in nghttp2's
         // internal output buffer. A non-negative return means a stream was
@@ -7566,10 +7579,11 @@ static void TestL5_SubmitOnDeadSessionReturnsMinusOne() {
         auto h2_cfg = std::make_shared<Http2UpstreamConfig>();
         h2_cfg->enabled = true;
         h2_cfg->max_concurrent_streams_pref = 10;
+        // Sink before conn — sinks-must-outlive-session contract.
+        RecordingSink sink;
         UpstreamH2Connection conn(nullptr, h2_cfg);
         // Do NOT call Init() so the internal session_ is null.
 
-        RecordingSink sink;
         int32_t sid = conn.SubmitRequest("GET", "https", "host", "/", {}, "", &sink);
         bool pass = (sid == -1);
         TestFramework::RecordTest("H2Upstream L5: SubmitRequest on dead session returns -1",
@@ -7936,13 +7950,14 @@ static void TestA3_4_DrainCompleteAfterDeadline() {
         h2_cfg->ping_idle_sec = 0;
         h2_cfg->ping_timeout_sec = 0;
         h2_cfg->goaway_drain_timeout_sec = 30;
+        // Sink before conn — sinks-must-outlive-session contract.
+        RecordingSink sink;
         UpstreamH2Connection conn(nullptr, h2_cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest("H2Upstream A3.4: drain complete after deadline", false, "Init failed");
             return;
         }
 
-        RecordingSink sink;
         // Submit a stream to simulate in-flight work.
         conn.SubmitRequest("GET", "https", "host", "/", {}, "", &sink);
 
@@ -7979,6 +7994,8 @@ static void TestA3_5_BeginShutdownDrainIdempotent() {
         h2_cfg->ping_idle_sec = 0;
         h2_cfg->ping_timeout_sec = 0;
         h2_cfg->goaway_drain_timeout_sec = 30;
+        // Sink before conn — sinks-must-outlive-session contract.
+        RecordingSink sink;
         UpstreamH2Connection conn(nullptr, h2_cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest("H2Upstream A3.5: BeginShutdownDrain idempotent", false, "Init failed");
@@ -7986,7 +8003,6 @@ static void TestA3_5_BeginShutdownDrainIdempotent() {
         }
 
         // Submit a stream so the deadline is relevant.
-        RecordingSink sink;
         conn.SubmitRequest("GET", "https", "h", "/", {}, "", &sink);
 
         conn.BeginShutdownDrain(10000);
@@ -9089,13 +9105,14 @@ static void TestS33_ShutdownDrainWithStream() {
         h2_cfg->ping_idle_sec = 0;
         h2_cfg->ping_timeout_sec = 0;
         h2_cfg->goaway_drain_timeout_sec = 30;
+        // Sink before conn — sinks-must-outlive-session contract.
+        RecordingSink sink;
         UpstreamH2Connection conn(nullptr, h2_cfg);
         if (!conn.Init()) {
             TestFramework::RecordTest("H2Upstream S33: shutdown drain with stream", false, "Init failed");
             return;
         }
 
-        RecordingSink sink;
         conn.SubmitRequest("GET", "https", "host", "/", {}, "", &sink);
 
         conn.BeginShutdownDrain(30000);
