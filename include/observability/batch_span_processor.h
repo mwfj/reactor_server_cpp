@@ -17,14 +17,7 @@
 #include "observability/span_exporter.h"
 #include "observability/span_processor.h"
 
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <cstddef>
-#include <deque>
-#include <memory>
-#include <mutex>
-#include <thread>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

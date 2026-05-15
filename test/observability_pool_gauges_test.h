@@ -210,6 +210,11 @@ ObservabilityConfig MakeObsConfig(const std::string& service) {
     return cfg;
 }
 
+}  // namespace
+
+// GatewayFixture lives at namespace scope (not in the anonymous namespace)
+// so the inline test functions that capture it by reference in lambdas keep
+// matching linkage with the type — avoids -Wsubobject-linkage.
 struct GatewayFixture {
     std::shared_ptr<InMemorySpanProcessor> processor =
         std::make_shared<InMemorySpanProcessor>();
@@ -223,8 +228,6 @@ struct GatewayFixture {
             std::make_shared<RandomSource>(0xBADC0DEULL));
     }
 };
-
-}  // namespace
 
 // ---------------------------------------------------------------------
 // Test 1 — A single proxied request leaves the pool with exactly one

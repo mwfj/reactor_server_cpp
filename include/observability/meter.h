@@ -75,8 +75,8 @@ private:
     // destructs as part of ~ObservabilityManager's body). Forwarded
     // into every MetricLabelRegistry constructed by GetCounter /
     // GetUpDownCounter / GetHistogram so the slow path can emit
-    // `reactor.otel.cardinality_overflow`. See
-    // batch_span_processor.h::manager() docstring for the SHUTDOWN
+    // `reactor.otel.cardinality_overflow`. 
+    // See batch_span_processor.h::manager() docstring for the SHUTDOWN
     // CAVEAT that applies to any code path consuming manager_->
     // sub-members.
     // (Today this dtor is default and emits nothing — caveat applies

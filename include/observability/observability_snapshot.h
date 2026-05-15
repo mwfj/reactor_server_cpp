@@ -147,13 +147,9 @@ struct ObservabilitySnapshot {
     Dispatcher*                              owning_dispatcher = nullptr;
 
     // Number of outstanding +1s on http.client.active_requests for this
-    // transaction. Incremented once per attempt at SetupAttemptObservability
-    // (retries increment multiple times). Decremented via
-    // TryDecrementIfPositive (below) at FinalizeAttemptSpan AND in
-    // repeated calls from the kill-loop / dtor drain — only the
-    // winning caller emits the matching -1. Acq/rel ordering on the
-    // CAS keeps the natural finalize racer and the kill-loop drain
-    // from emitting duplicate -1s.
+    // transaction. 
+    // Acq/rel ordering on the CAS keeps the natural finalize racer 
+    // and the kill-loop drain from emitting duplicate -1s.
     std::atomic<int> attempt_active_inflight_{0};
 
     // Captured by SetupAttemptObservability at link time so the kill

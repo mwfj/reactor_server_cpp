@@ -230,8 +230,7 @@ public:
     // constructed. Forwards into every existing PoolPartition so pool
     // gauge / histogram emits can begin. Pre-call, partitions skip emits
     // (obs_manager_ stays null). Lifetime: in HttpServer's declaration
-    // order, observability_manager_ is declared AFTER upstream_manager_
-    // (~line 600 vs ~line 551 in include/http/http_server.h), so
+    // order, observability_manager_ is declared AFTER upstream_manager_, so
     // reverse-destruction destroys observability_manager_ FIRST. The
     // production path is safe because ~HttpServer calls Stop() first;
     // Stop() drives InitiateShutdown while obs is still alive. In abnormal

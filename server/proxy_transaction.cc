@@ -817,17 +817,18 @@ void ProxyTransaction::SetupAttemptObservability() {
         // loop / dtor backstop reads this under the same mutex to
         // emit residual -1s with the correct label.
         if (obs_snapshot_) {
-            std::lock_guard<std::mutex> g(obs_snapshot_->link_mtx);
-            if (obs_snapshot_->upstream_service_for_metrics.empty()) {
-                obs_snapshot_->upstream_service_for_metrics = service_name_;
+            {
+                std::lock_guard<std::mutex> g(obs_snapshot_->link_mtx);
+                if (obs_snapshot_->upstream_service_for_metrics.empty()) {
+                    obs_snapshot_->upstream_service_for_metrics = service_name_;
+                }
             }
-        }
-        // Per-attempt +1: the snapshot tracks its outstanding count so
-        // the kill / dtor backstop can drain whatever remains.
-        if (obs_snapshot_) {
+            // Per-attempt +1: the snapshot tracks its outstanding count so
+            // the kill / dtor backstop can drain whatever remains.
             obs_snapshot_->attempt_active_inflight_.fetch_add(
                 1, std::memory_order_relaxed);
         }
+        
         // Bump http.client.active_requests; matching -1 in
         // FinalizeAttemptSpan (CAS-gated on attempt_active_inflight_)
         // OR in the kill-loop / dtor backstop for survivors.

@@ -241,8 +241,7 @@ public:
     // exception, test fixtures that drop the server without Stop()) relies
     // on every emit site null-checking obs_manager_ before touching catalog().
     // Mirrors the lifetime docstring on BatchSpanProcessor::manager().
-    void SetObservabilityManager(
-        OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept;
+    void SetObservabilityManager(OBSERVABILITY_NAMESPACE::ObservabilityManager* obs_manager) noexcept;
 
 private:
     struct WorkItem;

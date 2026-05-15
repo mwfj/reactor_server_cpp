@@ -7,8 +7,6 @@
 #include "callbacks.h"
 #include "observability/common.h"
 
-#include <memory>
-#include <string>
 
 // Forward declaration (no need to include full TLS headers)
 class TlsConnection;
@@ -259,17 +257,15 @@ public:
     // catalog instrument pointers under the assumption that the
     // ObservabilityManager outlives this connection (every ConnectionHandler
     // is destroyed before the ObservabilityManager via the documented
-    // four-phase shutdown — see OBSERVABILITY_DESIGN.md §13). Bumps
-    // `reactor.net.connections.active` +1 and
-    // `reactor.net.connections.accepted` +1 on first call; the matching
-    // -1 against the active gauge fires from ~ConnectionHandler.
-    void AttachTransportObservability(
-        OBSERVABILITY_NAMESPACE::ObservabilityManager* mgr);
+    // four-phase shutdown). 
+    // Bumps `reactor.net.connections.active` +1 and `reactor.net.connections.accepted` +1 on first call; 
+    // the matching -1 against the active gauge fires from ~ConnectionHandler.
+    void AttachTransportObservability(OBSERVABILITY_NAMESPACE::ObservabilityManager* mgr);
     // Called once when the L7 protocol becomes known (HTTP/1.1 after
-    // first parse, HTTP/2 after preface accept). Bumps
-    // `reactor.http.connections.active{protocol=<label>}` +1; dtor
-    // and HandOffToWebSocket fire the matching -1. Double-confirm
-    // is a logic error and is logged.
+    // first parse, HTTP/2 after preface accept). 
+    // Bumps `reactor.http.connections.active{protocol=<label>}` +1; dtor
+    // and HandOffToWebSocket fire the matching -1. 
+    // Double-confirm is a logic error and is logged.
     void MarkApplicationProtocolConfirmed(const char* protocol_label);
     // WS upgrade handoff — decrements the labeled HTTP gauge against
     // the previously-confirmed protocol and clears the label so the

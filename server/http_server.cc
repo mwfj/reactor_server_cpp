@@ -24,9 +24,6 @@
 #include "log/logger.h"
 #include "log/log_utils.h"
 #include <netdb.h>                        // getaddrinfo (bind-host resolve)
-#include <algorithm>
-#include <set>
-#include <unordered_set>
 
 // Definition of the per-thread sync push slot. See declaration in
 // include/http/http_server.h. Initial value is nullptr — the helper

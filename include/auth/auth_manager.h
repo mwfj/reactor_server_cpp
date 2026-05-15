@@ -9,7 +9,6 @@
 #include "auth/token_hasher.h"
 #include "config/server_config.h"
 #include "http/http_router.h"
-#include <unordered_set>
 // <atomic>, <memory>, <mutex>, <unordered_map>, <vector> via common.h
 
 class UpstreamManager;

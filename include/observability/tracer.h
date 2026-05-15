@@ -72,10 +72,7 @@ public:
 
     // Self-metric escape hatch — returns the ObservabilityManager pointer
     // installed at construction time, or null when constructed without
-    // one (test fixtures). See batch_span_processor.h::manager() docstring
-    // for the SHUTDOWN CAVEAT that applies to any code path consuming
-    // manager_-> sub-members (catalog, meter_provider, metric_reader) —
-    // those may already be destroyed by the time worker drains run.
+    // one (test fixtures).
     ObservabilityManager* manager() const noexcept { return manager_; }
 
     // StartSpan — the only span constructor. Returns a non-null
@@ -105,11 +102,7 @@ private:
     std::shared_ptr<RandomSource>               random_;
 
     // Raw pointer; manager storage outlives every Tracer (TracerProvider
-    // destructs as part of ~ObservabilityManager's body). See
-    // batch_span_processor.h::manager() docstring for the SHUTDOWN CAVEAT
-    // that applies to any code path consuming manager_-> sub-members
-    // (catalog, meter_provider, metric_reader) — those may already be
-    // destroyed by the time ~TracerProvider's drain runs.
+    // destructs as part of ~ObservabilityManager's body).
     ObservabilityManager*                       manager_ = nullptr;
 };
 

@@ -60,8 +60,7 @@ struct DnsResolver::PoolState {
     // (which only see PoolState) can emit reactor.dns.resolves{outcome}.
     // Read under relaxed-acquire ordering on the emit hot path; written
     // by DnsResolver::SetObservabilityManager before any worker spawns.
-    std::atomic<OBSERVABILITY_NAMESPACE::ObservabilityManager*>
-        obs_manager{nullptr};
+    std::atomic<OBSERVABILITY_NAMESPACE::ObservabilityManager*> obs_manager{nullptr};
 };
 
 // ---------------------------------------------------------------------------

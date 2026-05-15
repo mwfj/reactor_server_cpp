@@ -20,17 +20,7 @@
 // cap_full latches, the unique_lock is never taken again for that key.
 
 #include "observability/attr_value.h"
-
-#include <atomic>
-#include <cstddef>
-#include <memory>
-#include <shared_mutex>
-#include <string>
-#include <string_view>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

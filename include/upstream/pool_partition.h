@@ -406,21 +406,9 @@ private:
     // Non-owning. Installed by UpstreamManager::SetObservabilityManager
     // (during MarkServerReady) AFTER ObservabilityManager construction.
     // Lifetime: in HttpServer's declaration order, observability_manager_
-    // is declared AFTER upstream_manager_ (~line 600 vs ~line 551 in
-    // include/http/http_server.h), so reverse-destruction destroys
-    // observability_manager_ FIRST. The production path is safe because
-    // ~HttpServer calls Stop() first, which drives InitiateShutdown
-    // while obs is still alive. In abnormal teardown (mid-startup throw,
-    // test fixture dropped without Stop()), the safety-net ~UpstreamManager
-    // path MUST null-guard: PoolPartition::~PoolPartition nulls this field
-    // before any emit, so the helpers' null-guards on obs_manager_ fire.
-    //
-    // Atomic because SetObservabilityManager runs on MarkServerReady's
-    // thread (conn dispatcher) while emit helpers read from the owning
-    // partition's dispatcher. Release/acquire pairs with the setter.
-    // Mirrors RateLimiter::obs_manager_'s atomic-pointer pattern.
-    std::atomic<OBSERVABILITY_NAMESPACE::ObservabilityManager*>
-        obs_manager_{nullptr};
+    // is declared AFTER upstream_manager_ , so reverse-destruction destroys
+    // observability_manager_ FIRST.
+    std::atomic<OBSERVABILITY_NAMESPACE::ObservabilityManager*> obs_manager_{nullptr};
 
     // C++17 note: `std::atomic_load_explicit(shared_ptr*)` is the
     // standard-compliant form. C++20 deprecates the free-function
@@ -653,8 +641,6 @@ private:
     void EmitActiveGaugeDelta(double delta);
     // duration_sec ≈ 0 for immediate / rejected; positive for created /
     // queued_satisfied / cancelled / queue_timeout. outcome label
-    // allowlist enforced by the catalog cap (cap=8, see
-    // metrics_catalog.cc — 6 documented outcomes + two slots of
-    // headroom).
+    // allowlist enforced by the catalog cap (cap=8).
     void EmitCheckoutWaitDuration(double duration_sec, const char* outcome);
 };

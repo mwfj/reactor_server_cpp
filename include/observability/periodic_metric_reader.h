@@ -91,20 +91,11 @@ public:
 
     // Atomically null the manager pointer so the worker's self-metric
     // emit path sees nullptr and skips. Called by ~ObservabilityManager
-    // BEFORE member destruction begins. Idempotent. Mirrors
-    // BatchSpanProcessor::DisarmManager — see that docstring for the
-    // multi-holder safety rationale.
+    // BEFORE member destruction begins. Idempotent.
     void DisarmManager() noexcept {
         manager_.store(nullptr, std::memory_order_release);
     }
 
-    // Atomically null the MeterProvider pointer so the worker's
-    // Snapshot path observes nullptr on its next iteration and skips
-    // the dereference. Symmetric to DisarmManager. Required because
-    // RegisterMetricReader takes a shared_ptr<PeriodicMetricReader>;
-    // an external holder (test fixture, future code) can keep PMR
-    // alive past ~ObservabilityManager and the worker would otherwise
-    // dereference a dead meter_provider_. Idempotent.
     void DisarmProvider() noexcept {
         provider_.store(nullptr, std::memory_order_release);
     }

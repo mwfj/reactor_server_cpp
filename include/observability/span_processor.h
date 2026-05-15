@@ -13,11 +13,7 @@
 //   - BatchSpanProcessor — production export path.
 
 #include "observability/span_data.h"
-
-#include <atomic>
-#include <chrono>
-#include <mutex>
-#include <vector>
+#include "../common.h"
 
 namespace OBSERVABILITY_NAMESPACE {
 

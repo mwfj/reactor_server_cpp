@@ -124,8 +124,7 @@ private:
     // connection can emit `protocol=websocket` independently of the
     // ConnectionHandler-owned `http/1.1` / `h2` gauges. dtor issues
     // the matching -1 under `ws_protocol_active_counted_`.
-    OBSERVABILITY_NAMESPACE::UpDownCounter*
-        http_connections_active_counter_ = nullptr;
+    OBSERVABILITY_NAMESPACE::UpDownCounter* http_connections_active_counter_ = nullptr;
     // Manager kept alive for the connection's lifetime so the atomic
     // pointed to by ws_messages_enabled_flag_ stays valid even when
     // the snapshot's `manager` weak_ptr would otherwise allow the
