@@ -3195,7 +3195,9 @@ void HttpServer::Stop() {
             // this window finalize via the normal path against still-
             // live snapshots.
             if (upstream_manager_) {
-                upstream_manager_->InitiateShutdown();
+                upstream_manager_->InitiateShutdown(
+                    shutdown_drain_timeout_sec_.load(
+                        std::memory_order_relaxed));
                 upstream_manager_->WaitForDrain(budget_left());
             }
             // Step 3 — kill survivors + BeginShutdown AFTER upstream
@@ -3360,7 +3362,9 @@ void HttpServer::Stop() {
             // with task pump until leases return, and force-close
             // stragglers.
             if (upstream_manager_) {
-                upstream_manager_->InitiateShutdown();
+                upstream_manager_->InitiateShutdown(
+                    shutdown_drain_timeout_sec_.load(
+                        std::memory_order_relaxed));
                 static constexpr int UP_PUMP_MS = 200;
                 auto up_deadline =
                     std::chrono::steady_clock::now() + dt_budget_left();

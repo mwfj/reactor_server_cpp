@@ -76,8 +76,40 @@ public:
     // True when the underlying nghttp2_session has emitted or received
     // a GOAWAY. Once true, no new streams may be submitted on this
     // connection — the table walker reaps it once the live stream
-    // count reaches zero.
+    // count reaches zero. Dual-source field: set by the peer-GOAWAY
+    // frame-recv callback (existing semantic) AND by `BeginShutdownDrain`
+    // (local-emitted GOAWAY during partition shutdown). Both
+    // sources produce the same "stop new submission" effect via
+    // `IsUsable()` returning false. `shutdown_drain_active_` further
+    // distinguishes the shutdown-bounded local drain (force-close at
+    // `shutdown_drain_deadline_`) from peer-driven drains (bounded by
+    // `Tick`'s independent `goaway_drain_timeout_sec` consultation).
     bool goaway_seen() const { return goaway_seen_; }
+
+    // Begin a graceful shutdown drain. Emits a local NGHTTP2_NO_ERROR
+    // GOAWAY to the peer, sets `goaway_seen_` so `IsUsable()` rejects
+    // future stream submission immediately, and records the deadline
+    // for `IsShutdownDrainComplete`. Idempotent — repeat calls
+    // (concurrent SIGTERM/SIGINT) are no-ops. Dispatcher-thread-only.
+    // `deadline_ms` is the budget remaining for in-flight streams to
+    // complete naturally; on exhaustion, the partition's drain poll
+    // tears the session down via `DestroyOnDispatcher` (force-close).
+    void BeginShutdownDrain(int deadline_ms);
+
+    // True when this session can be retired by the partition's
+    // shutdown drain poll: either (a) the transport is already dead,
+    // (b) every stream has drained naturally, or (c) the per-conn
+    // drain budget has elapsed (force-close path). The poll consults
+    // this AFTER every iteration's snapshot to decide which sessions
+    // to Extract + DestroyOnDispatcher; callers do not distinguish
+    // the three outcomes at this gate.
+    bool IsShutdownDrainComplete(std::chrono::steady_clock::time_point now) const;
+
+    // True iff BeginShutdownDrain has fired on this session. Lets the
+    // partition's poll loop distinguish "session was tracked at
+    // CollectAll snapshot time but is mid-shutdown-drain" from
+    // "session is in normal operation". Read-only accessor.
+    bool shutdown_drain_active() const { return shutdown_drain_active_; }
 
     // Last stream id from the most recent GOAWAY, or -1 if none.
     int32_t goaway_last_stream_id() const { return goaway_last_stream_id_; }
@@ -306,6 +338,13 @@ private:
     // without this bound, a stuck stream would pin the partition slot
     // forever.
     std::chrono::steady_clock::time_point goaway_seen_at_{};
+
+    // Shutdown-drain state. Set by BeginShutdownDrain (idempotent);
+    // consulted by IsShutdownDrainComplete + the partition's drain
+    // poll loop. The deadline gate is the safety net for streams
+    // that never complete on their own (force-close upper bound).
+    bool shutdown_drain_active_ = false;
+    std::chrono::steady_clock::time_point shutdown_drain_deadline_{};
     std::chrono::steady_clock::time_point last_activity_at_{};
     std::optional<std::chrono::steady_clock::time_point> pending_ping_at_;
 

@@ -34,8 +34,12 @@ public:
     // Get the partition for a specific dispatcher (by index)
     PoolPartition* GetPartition(size_t dispatcher_index);
 
-    // Shutdown all partitions (enqueues to each dispatcher)
-    void InitiateShutdown();
+    // Shutdown all partitions (enqueues to each dispatcher).
+    // server_drain_timeout_sec plumbed through from UpstreamManager so
+    // each partition's H2 graceful-drain budget is bounded by the
+    // whole-server shutdown SLA. See UpstreamManager::InitiateShutdown
+    // for the 0-sentinel semantic.
+    void InitiateShutdown(int server_drain_timeout_sec = 0);
 
     // Reload-time endpoint swap. For each partition, release-stores the
     // new endpoint and enqueues a best-effort idle-cleanup task if the

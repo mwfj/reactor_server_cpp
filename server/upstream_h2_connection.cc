@@ -937,6 +937,48 @@ UpstreamH2Stream* UpstreamH2Connection::GetStream(int32_t stream_id) {
     return it == streams_.end() ? nullptr : it->second.get();
 }
 
+void UpstreamH2Connection::BeginShutdownDrain(int deadline_ms) {
+    if (shutdown_drain_active_) return;  // idempotent
+    // Capture peer-GOAWAY state BEFORE we set goaway_seen_ ourselves.
+    // The emit/flush below is skipped when the peer already sent GOAWAY:
+    // queuing a second GOAWAY onto a transport about to be torn down is
+    // wasted work (nghttp2 would happily enqueue it; we skip it instead,
+    // mirroring DestroyOnDispatcher and ~UpstreamH2Connection).
+    const bool peer_goaway_already = goaway_seen_;
+    shutdown_drain_active_ = true;
+    // Mark the session as no-longer-usable BEFORE any I/O. The same
+    // goaway_seen_ field used by peer-emitted GOAWAY: setting it here
+    // means IsUsable() returns false on the very next selection call
+    // (saturation routing / FindUsable / SubmitRequest) so no new
+    // stream is admitted onto a session we are about to GOAWAY.
+    // goaway_seen_at_ is set for Tick's independent drain-timeout
+    // consultation; the per-session shutdown deadline below is a
+    // distinct safety net specific to the shutdown path.
+    const auto now = std::chrono::steady_clock::now();
+    if (!goaway_seen_) {
+        goaway_seen_ = true;
+        goaway_seen_at_ = now;
+    }
+    shutdown_drain_deadline_ = now + std::chrono::milliseconds(deadline_ms);
+
+    // Emit a local GOAWAY(NO_ERROR) and push it onto the wire only when
+    // the peer has not yet sent its own GOAWAY. The peer learns its
+    // `last_stream_id` and can choose to terminate any in-flight streams
+    // or finish them cleanly.
+    if (session_ && !peer_goaway_already) {
+        nghttp2_session_terminate_session(session_, NGHTTP2_NO_ERROR);
+        if (!in_receive_data_) FlushSend();
+    }
+}
+
+bool UpstreamH2Connection::IsShutdownDrainComplete(
+        std::chrono::steady_clock::time_point now) const {
+    if (dead_) return true;
+    if (streams_.empty()) return true;
+    if (shutdown_drain_active_ && now >= shutdown_drain_deadline_) return true;
+    return false;
+}
+
 bool UpstreamH2Connection::IsUsable() const {
     if (dead_ || !session_ || goaway_seen_ || !cfg_) return false;
     if (cfg_->max_concurrent_streams_pref == 0) return false;

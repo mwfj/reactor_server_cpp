@@ -63,7 +63,16 @@ public:
     void EvictExpired(size_t dispatcher_index);
 
     // Initiate graceful shutdown of all pools.
-    void InitiateShutdown();
+    // server_drain_timeout_sec=0 means "shut down immediately with no
+    // graceful H2 drain" (the destructor's safety-net call passes 0;
+    // an operator setting server.shutdown_drain_timeout_sec=0 opts out
+    // of graceful drain). The graceful-drain helper computes
+    // drain_budget_ms = (server_drain_timeout_sec <= 0 || per_conn <= 0)
+    //   ? 0 : min(server, per_conn) * 1000; budget == 0 routes to the
+    // immediate-destroy path. Operators wanting a non-zero per-conn
+    // drain must set BOTH server.shutdown_drain_timeout_sec > 0 AND
+    // http2.goaway_drain_timeout_sec > 0.
+    void InitiateShutdown(int server_drain_timeout_sec = 0);
 
     // Blocking wait for upstream connections to drain. On timeout, enqueues
     // ForceCloseActive which zombifies active connections but does NOT destroy

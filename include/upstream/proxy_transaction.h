@@ -216,28 +216,6 @@ public:
     static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
 
 private:
-    // True iff h2_conn_ is set and BOTH alive tokens still observe the
-    // session as live. Pair-invariant (the three fields are mutated
-    // together at 3 sites) makes the pointer check redundant today;
-    // kept as defense-in-depth so the impl matches the contract docs
-    // and mirrors UpstreamLease's two-token semantic byte-for-byte.
-    bool H2ConnAlive() const noexcept {
-        if (h2_conn_ == nullptr) return false;
-        // Canonical order: partition_alive THEN conn_alive — matches
-        // UpstreamLease::operator bool() H2 branch + GetH2Connection()
-        // for byte-for-byte parity. Future readers verifying the
-        // invariant get the same load sequence at every site.
-        if (!h2_partition_alive_ ||
-            !h2_partition_alive_->load(std::memory_order_acquire)) {
-            return false;
-        }
-        if (!h2_conn_alive_ ||
-            !h2_conn_alive_->load(std::memory_order_acquire)) {
-            return false;
-        }
-        return true;
-    }
-
     // Allowlist for H2-path retries from OnError. H1 retries from
     // OnUpstreamData; H2 retries flow through OnError because the H2
     // codec surfaces every transport-level failure via sink->OnError
@@ -424,18 +402,21 @@ private:
 
     // H2 dispatch state. `h2_path_` flips true once DispatchH2 has
     // successfully submitted a stream; cleanup paths gate H1-specific
-    // teardown on `!h2_path_`. The dual-token shape (raw pointer +
-    // shared alive-flag) lets a mid-flight Cleanup / Cancel issue
-    // RST_STREAM if the H2 session is still alive, while
-    // short-circuiting safely if the session was destroyed in between.
-    UpstreamH2Connection* h2_conn_ = nullptr;
-    std::shared_ptr<std::atomic<bool>> h2_conn_alive_;
-    // Partition liveness token captured alongside the conn alive token.
-    // Defense-in-depth: today partition teardown destroys every H2 conn
-    // first (flipping conn_alive_), but checking both makes H2ConnAlive()
-    // symmetric with UpstreamLease::GetH2Connection() — no divergence
-    // when the planned migration to UpstreamLease h2_lease_ lands.
-    std::shared_ptr<std::atomic<bool>> h2_partition_alive_;
+    // teardown on `!h2_path_`. The H2 session and stream slot live
+    // inside `h2_lease_` (Kind::H2) — the lease carries the raw
+    // session pointer plus the (partition_alive, conn_alive) dual-token
+    // pair so a mid-flight Cleanup / Cancel issue RST_STREAM only if
+    // both observers still see the session as live, short-circuiting
+    // safely if it was destroyed in between.
+    //
+    // The lease is constructed AFTER `SubmitRequest` returns a valid
+    // `stream_id` (DispatchH2 immediately after the stream-id capture);
+    // submit-failure rollback paths leave the lease default-empty
+    // (no destructor work to do, no `ReturnH2Stream` BUG-log on -1).
+    // Donated H2 leases (the H2 session's permanent transport lease)
+    // route through `MarkDonatedToH2`; this per-transaction lease is
+    // never marked donated.
+    UpstreamLease h2_lease_;
     int32_t h2_stream_id_ = -1;
     bool h2_path_ = false;
 

@@ -67,6 +67,27 @@ UpstreamH2Connection* H2ConnectionTable::FindUsable(
     return nullptr;
 }
 
+std::vector<UpstreamH2Connection*>
+H2ConnectionTable::CollectUsableForUpstream(
+    const std::string& upstream_name)
+{
+    std::vector<UpstreamH2Connection*> out;
+    auto it = by_upstream_.find(upstream_name);
+    if (it == by_upstream_.end()) return out;
+    auto& conns = it->second;
+
+    // Reap expired inline so the returned set reflects only currently
+    // usable connections (mirrors FindUsable's side effect).
+    auto end = std::remove_if(conns.begin(), conns.end(), IsExpired);
+    conns.erase(end, conns.end());
+
+    out.reserve(conns.size());
+    for (auto& c : conns) {
+        if (c && c->IsUsable()) out.push_back(c.get());
+    }
+    return out;
+}
+
 void H2ConnectionTable::Insert(
     const std::string& upstream_name,
     std::unique_ptr<UpstreamH2Connection> conn)
@@ -107,6 +128,19 @@ H2ConnectionTable::ExtractAll() {
         }
     }
     by_upstream_.clear();
+    return out;
+}
+
+std::vector<UpstreamH2Connection*> H2ConnectionTable::CollectAll() const {
+    std::vector<UpstreamH2Connection*> out;
+    size_t total = 0;
+    for (const auto& [_, conns] : by_upstream_) total += conns.size();
+    out.reserve(total);
+    for (const auto& [_, conns] : by_upstream_) {
+        for (const auto& c : conns) {
+            if (c) out.push_back(c.get());
+        }
+    }
     return out;
 }
 

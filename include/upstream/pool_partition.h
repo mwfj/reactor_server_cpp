@@ -161,6 +161,37 @@ public:
     // `AcquireH2Connection(service_name_, ...)`.
     void StartH2ReplacementConnect(const std::string& upstream_name, int port);
 
+    // Predictive preconnect: called from the dispatch site when the
+    // picked H2 session's stream utilization is BELOW
+    // `saturation_open_pct` but AT/ABOVE `preconnect_watermark_pct`.
+    // Disabled fast path: `preconnect_watermark_pct == 0` short-
+    // circuits at top of method. Fires a fresh H2 probe via
+    // `OpenNewH2Connection` directly — does NOT use
+    // `StartH2CapacityProbe` because that helper's
+    // `ShouldOpenAdditionalH2Conn` policy gate returns false when ANY
+    // conn is under-saturation, which is exactly the preconnect firing
+    // condition. The shutdown / in-flight-probe / cap-saturated gates
+    // are inlined instead. Slot-starvation prevention: skips the probe
+    // when `TotalCount() >= partition_max_connections_` so a
+    // speculative probe cannot consume the only slot under cap=1.
+    // picked_session must be a pointer obtained from
+    // `FindUsableH2ConnectionSaturation` on the SAME dispatcher cycle.
+    // Lifetime is bounded by dispatcher single-threadedness; do not
+    // store the reference across event-loop boundaries.
+    void MaybePreconnectH2(
+        const std::string& upstream_name, int port,
+        const UpstreamH2Connection& picked_session);
+
+    // Saturation capacity probe. Distinct from `StartH2ReplacementConnect`
+    // (which is for GOAWAY-driven replacement and explicitly refuses when
+    // any usable session exists). Capacity probe ADMITS alongside usable
+    // sessions when `ShouldOpenAdditionalH2Conn(upstream_name)` returns
+    // true. Shares the shutdown / in-flight-probe / cap-saturated gates
+    // with the replacement helper. Idempotent if a probe is already
+    // in flight. See UPSTREAM_H2_DISPATCH.md pitfall contrasting the
+    // two helper semantics.
+    void StartH2CapacityProbe(const std::string& upstream_name, int port);
+
     // ALPN-h1 adoption: claim an H2 probe's transport for the H1 idle
     // pool (prefer="auto" path from OnH2ConnectHandshakeComplete).
     // By-ref + commit-at-end (push_back is the commit point): on throw,
@@ -178,9 +209,17 @@ public:
     // Evict expired idle connections. Called by timer handler.
     void EvictExpired();
 
-    // Shutdown: close idle, reject new checkouts, force-close connecting.
+    // Shutdown: close idle, reject new checkouts, force-close connecting,
+    // graceful-drain H2 sessions bounded by
+    // min(http2.goaway_drain_timeout_sec, server_drain_timeout_sec).
     // Must run on the partition's dispatcher thread (mutates containers).
-    void InitiateShutdown();
+    // server_drain_timeout_sec=0 means "shut down immediately with no
+    // graceful H2 drain" (destructor's safety-net call passes 0; an
+    // operator setting server.shutdown_drain_timeout_sec=0 opts out).
+    // Operators wanting a non-zero per-conn drain must set BOTH
+    // server.shutdown_drain_timeout_sec > 0 AND
+    // http2.goaway_drain_timeout_sec > 0.
+    void InitiateShutdown(int server_drain_timeout_sec = 0);
 
     // Cross-thread safe variant of InitiateShutdown: enqueues the work
     // onto the owning dispatcher, tracked by inflight_tasks_ so the
@@ -188,7 +227,7 @@ public:
     // so that if the partition is destroyed before the lambda runs, the
     // task is a no-op instead of a use-after-free on freed containers.
     // Called by UpstreamHostPool::InitiateShutdown from the stopper thread.
-    void ScheduleInitiateShutdown();
+    void ScheduleInitiateShutdown(int server_drain_timeout_sec = 0);
 
     // Force-close all active connections. Called after drain timeout.
     // Must run on the partition's dispatcher thread.
@@ -282,11 +321,46 @@ public:
     UpstreamH2Connection* FindUsableH2Connection(
         const std::string& upstream_name);
 
+    // Saturation routing policy gate. True when (a)
+    // `saturation_open_pct > 0` AND (b) `TotalCount() <
+    // partition_max_connections_` (slot-starvation prevention) AND
+    // (c) every CURRENTLY-USABLE conn for `upstream_name` has
+    // `active_streams * 100 / max_concurrent_streams_pref >=
+    // saturation_open_pct`. Edge cases: `saturation_open_pct == 0`
+    // returns false (disabled fast path); empty candidate list
+    // returns false (cold-start handles the first conn);
+    // `max_concurrent_streams_pref == 0` treats the conn as infinite
+    // capacity (never saturated). Single LoadHttp2ConfigSnapshot read
+    // at the top so per-candidate evaluations use the same captured
+    // config. Dispatcher-thread-only.
+    bool ShouldOpenAdditionalH2Conn(
+        const std::string& upstream_name);
+
+    // Saturation-aware variant of FindUsableH2Connection. Returns
+    // the first endpoint-fresh USABLE conn whose stream-utilization
+    // ratio is BELOW `saturation_open_pct`. When the gate is disabled
+    // (`saturation_open_pct == 0`), delegates to FindUsableH2Connection
+    // verbatim. Returns null when no under-threshold endpoint-fresh
+    // candidate exists; the caller decides whether to admit a new
+    // probe (via StartH2CapacityProbe) or fall back to
+    // FindUsableH2Connection (over-threshold conn is still better
+    // than blocking the request).
+    UpstreamH2Connection* FindUsableH2ConnectionSaturation(
+        const std::string& upstream_name);
+
     // Stats (dispatcher-thread-only reads)
     size_t IdleCount() const { return idle_conns_.size(); }
     size_t ActiveCount() const { return active_conns_.size(); }
     size_t ConnectingCount() const { return connecting_conns_.size(); }
     size_t H2TableCount() const { return h2_table_.TotalConnections(); }
+
+    // Preconnect probe counters (relaxed reads — stale snapshots acceptable).
+    int64_t preconnect_fired_count() const noexcept {
+        return preconnect_fired_count_.load(std::memory_order_relaxed);
+    }
+    int64_t preconnect_skipped_cap_count() const noexcept {
+        return preconnect_skipped_cap_count_.load(std::memory_order_relaxed);
+    }
 
     // Partition liveness token. Captured by callers that outlive a
     // partition-destroy (delayed dispatcher tasks, donated H2 leases,
@@ -556,6 +630,31 @@ private:
     // survives the H2 shell's destruction.
     std::deque<HostPortKey> pending_h2_replacement_targets_;
 
+    // H2 ALPN negotiation outcome cache. Records "the most recent ALPN
+    // probe for this (upstream_name, port) against `endpoint` resolved
+    // to {H1Only, H2Negotiated}". Consulted at H2 probe initiation
+    // (`OpenNewH2Connection`) — when the cached outcome is H1Only AND
+    // the cached endpoint matches the current `LoadResolvedEndpoint()`
+    // AND prefer="auto", refuse the probe to avoid wasteful TCP+TLS
+    // round-trips that we already know will negotiate h1. The endpoint
+    // capture ensures DNS swaps automatically invalidate the cache
+    // (the endpoint pointer in the entry differs from the current one).
+    // Invalidation: explicit on reload-push (CloseIdleMatchingEndpoint…)
+    // AND on DNS-swap detected mid-probe (1.B.4 in the plan); LRU
+    // eviction at `kH2NegotiationCacheCap`. Dispatcher-thread-only.
+    enum class H2NegotiationOutcome { H1Only, H2Negotiated };
+    struct H2NegotiationCacheEntry {
+        H2NegotiationOutcome outcome;
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> endpoint;
+    };
+    static constexpr size_t kH2NegotiationCacheCap = 256;
+    std::unordered_map<HostPortKey, H2NegotiationCacheEntry>
+        h2_negotiation_outcome_;
+    // FIFO insertion-order tracker for LRU-style eviction when the cache
+    // hits `kH2NegotiationCacheCap`. On overflow, the front entry is
+    // dropped. Re-recording an existing key moves the key to the back.
+    std::deque<HostPortKey> h2_negotiation_outcome_order_;
+
     // True when a self-rescheduling wait-queue purge chain is already
     // scheduled. Prevents spawning duplicate chains per queued waiter.
     // Cleared when the chain terminates (queue empty or shutdown).
@@ -564,6 +663,13 @@ private:
     // EnqueueIdleCleanupOnEndpointChange (reload thread) — must be atomic.
     // Mirror of manager_shutting_down_ which is already std::atomic<bool>.
     std::atomic<bool> shutting_down_{false};
+
+    // Preconnect probe telemetry. Incremented by MaybePreconnectH2 on
+    // each path: fired_count on successful probe dispatch, skipped_cap_count
+    // when the cap-saturated gate prevents the probe. Memory-order-relaxed:
+    // stats counters that tolerate slightly stale snapshots.
+    std::atomic<int64_t> preconnect_fired_count_{0};
+    std::atomic<int64_t> preconnect_skipped_cap_count_{0};
 
     // Internal helpers
     void CreateNewConnection(ReadyCallback ready_cb, ErrorCallback error_cb);
@@ -589,6 +695,42 @@ private:
                                       int port, int outcome,
                                       const std::string& alpn);
 
+
+    // Graceful-drain poll. Self-rescheduling task kicked off by
+    // InitiateShutdown's graceful path. Each iteration snapshots
+    // `h2_table_` via `CollectAll` (non-destructive), and for each
+    // session reporting `IsShutdownDrainComplete(now)`, extracts the
+    // unique_ptr from the table and runs `DestroyOnDispatcher` on it
+    // (canonical 6-step teardown). Re-arms itself via EnQueueDelayed
+    // while any session or pending-destroy stash entry remains.
+    // Dispatcher-thread-only. The deadline gate inside
+    // IsShutdownDrainComplete guarantees the loop terminates even if
+    // streams never complete naturally.
+    void PollShutdownDrain();
+
+    // ALPN negotiation outcome cache helpers — see h2_negotiation_outcome_
+    // docs above. Records the most recent ALPN outcome for
+    // (upstream_name, port) against `endpoint`. Touches the LRU deque;
+    // evicts the oldest entry on cap overflow.
+    void RecordH2NegotiationOutcome(
+        const std::string& upstream_name, int port,
+        H2NegotiationOutcome outcome,
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> endpoint);
+    // Returns true iff cache says H1Only for (upstream_name, port) AND
+    // the cached endpoint matches `current_endpoint`. Caller only
+    // consults this when prefer="auto"; prefer="always" deliberately
+    // re-attempts the probe so the operator sees the alpn-mismatch
+    // failure each request (terminal at the dispatch site).
+    bool ShouldSkipH2ProbeForEndpoint(
+        const std::string& upstream_name, int port,
+        const std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>&
+            current_endpoint) const;
+    // Drop every cache entry whose `endpoint == old_ep`. Called from
+    // the on-dispatcher reload-push cleanup
+    // (CloseIdleMatchingEndpointOnDispatcher).
+    void InvalidateH2NegotiationCacheForEndpoint(
+        const std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>&
+            old_ep);
 
     // Dispatcher-thread-only: close idle connections that captured old_ep.
     // Called from EnqueueIdleCleanupOnEndpointChange's enqueued task.

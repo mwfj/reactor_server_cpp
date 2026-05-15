@@ -975,6 +975,10 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     h2, "saturation_open_pct",
                     upstream.http2.saturation_open_pct,
                     up_ctx + ".http2");
+                upstream.http2.preconnect_watermark_pct = ParseStrictInt(
+                    h2, "preconnect_watermark_pct",
+                    upstream.http2.preconnect_watermark_pct,
+                    up_ctx + ".http2");
             }
 
             config.upstreams.push_back(std::move(upstream));
@@ -2157,6 +2161,36 @@ void ConfigLoader::ValidateHotReloadable(
                     idx + " ('" + u.name +
                     "'): http2.saturation_open_pct must be in [0, 100]");
             }
+            if (h2.preconnect_watermark_pct < 0 ||
+                h2.preconnect_watermark_pct > 100) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.preconnect_watermark_pct must be in [0, 100]");
+            }
+            // Cross-field validation: reject configurations that would
+            // produce a silent no-op or a defeated prediction.
+            // preconnect requires saturation enforcement (else its
+            // firing condition `ratio < saturation_open_pct` is always
+            // false). preconnect must fire BEFORE saturation (else
+            // preconnect either never fires OR fires AT saturation
+            // which defeats the prediction).
+            if (h2.preconnect_watermark_pct > 0 &&
+                h2.saturation_open_pct == 0) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.preconnect_watermark_pct > 0 requires "
+                    "http2.saturation_open_pct > 0 (preconnect has no "
+                    "fallback admission path without saturation)");
+            }
+            if (h2.preconnect_watermark_pct > 0 &&
+                h2.saturation_open_pct > 0 &&
+                h2.preconnect_watermark_pct >= h2.saturation_open_pct) {
+                throw std::invalid_argument(
+                    idx + " ('" + u.name +
+                    "'): http2.preconnect_watermark_pct must be < "
+                    "http2.saturation_open_pct (preconnect must fire "
+                    "before saturation, not at/after)");
+            }
         }
 
         const auto& cb = u.circuit_breaker;
@@ -3121,6 +3155,32 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                     throw std::invalid_argument(
                         idx + " ('" + u.name +
                         "'): http2.saturation_open_pct must be in [0, 100]");
+                }
+                if (h2.preconnect_watermark_pct < 0 ||
+                    h2.preconnect_watermark_pct > 100) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.preconnect_watermark_pct must be in "
+                        "[0, 100]");
+                }
+                // Mirror Validate's cross-field rules at SIGHUP time so
+                // an operator cannot reach a silent-no-op shape via
+                // reload (per AUTH_CONFIG.md pitfall "Hot-reload
+                // validator doesn't cover a live-reloadable subsystem").
+                if (h2.preconnect_watermark_pct > 0 &&
+                    h2.saturation_open_pct == 0) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.preconnect_watermark_pct > 0 requires "
+                        "http2.saturation_open_pct > 0");
+                }
+                if (h2.preconnect_watermark_pct > 0 &&
+                    h2.saturation_open_pct > 0 &&
+                    h2.preconnect_watermark_pct >= h2.saturation_open_pct) {
+                    throw std::invalid_argument(
+                        idx + " ('" + u.name +
+                        "'): http2.preconnect_watermark_pct must be < "
+                        "http2.saturation_open_pct");
                 }
             }
 
@@ -4134,6 +4194,7 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             hj["ping_timeout_sec"] = u.http2.ping_timeout_sec;
             hj["goaway_drain_timeout_sec"] = u.http2.goaway_drain_timeout_sec;
             hj["saturation_open_pct"] = u.http2.saturation_open_pct;
+            hj["preconnect_watermark_pct"] = u.http2.preconnect_watermark_pct;
             uj["http2"] = hj;
         }
         j["upstreams"].push_back(uj);

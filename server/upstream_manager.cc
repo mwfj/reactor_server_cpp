@@ -319,14 +319,16 @@ void UpstreamManager::EvictExpired(size_t dispatcher_index) {
     }
 }
 
-void UpstreamManager::InitiateShutdown() {
-    logging::Get()->info("UpstreamManager initiating shutdown");
+void UpstreamManager::InitiateShutdown(int server_drain_timeout_sec) {
+    logging::Get()->info(
+        "UpstreamManager initiating shutdown (server_drain_timeout_sec={})",
+        server_drain_timeout_sec);
     // Set the atomic flag BEFORE enqueueing per-partition shutdown tasks.
     // CheckoutAsync checks this flag synchronously, preventing new checkouts
     // between the flag set and the per-partition InitiateShutdown execution.
     shutting_down_.store(true, std::memory_order_release);
     for (auto& [name, pool] : pools_) {
-        pool->InitiateShutdown();
+        pool->InitiateShutdown(server_drain_timeout_sec);
     }
 }
 
