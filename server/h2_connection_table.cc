@@ -1,4 +1,5 @@
 #include "upstream/h2_connection_table.h"
+#include "upstream/proxy_transaction.h"  // RESULT_UPSTREAM_DISCONNECT / RESULT_GOAWAY_MAYBE_PROCESSED
 #include "log/logger.h"
 
 namespace {
@@ -180,9 +181,26 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
                 auto victim = std::move(*it);
                 it = conns.erase(it);
                 victim->MarkDead();
-                victim->FailAllStreams(
-                    -1, victim->goaway_seen() ? "h2 GOAWAY drain timeout"
-                                              : "h2 PING timeout");
+                // PING timeout is a transport-level liveness failure —
+                // map to UPSTREAM_DISCONNECT so breaker counts it as
+                // upstream health (matches the on-message/close/error
+                // fan-out sites in PoolPartition). GOAWAY drain timeout
+                // means peer announced GOAWAY (last_stream_id >= ours
+                // at admission) and never finished the stream — RFC 9113
+                // §6.8 leaves "did the peer process it?" unknowable, so
+                // map to GOAWAY_MAYBE_PROCESSED for breaker-neutral
+                // response-level retry on idempotent methods. Raw -1
+                // (RESULT_CHECKOUT_FAILED) misclassified both as
+                // connect-failure on the breaker.
+                if (victim->goaway_seen()) {
+                    victim->FailAllStreams(
+                        ProxyTransaction::RESULT_GOAWAY_MAYBE_PROCESSED,
+                        "h2 GOAWAY drain timeout");
+                } else {
+                    victim->FailAllStreams(
+                        ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                        "h2 PING timeout");
+                }
             } else if (c->goaway_seen() && c->active_stream_count() == 0) {
                 // Mark dead before erasing so any weak_ptr observer
                 // racing the destructor sees `IsDead() == true` instead
