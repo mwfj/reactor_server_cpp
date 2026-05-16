@@ -1,4 +1,5 @@
 #include "upstream/h2_connection_table.h"
+#include "upstream/proxy_transaction.h"  // RESULT_UPSTREAM_DISCONNECT / RESULT_GOAWAY_MAYBE_PROCESSED
 #include "log/logger.h"
 
 namespace {
@@ -67,6 +68,26 @@ UpstreamH2Connection* H2ConnectionTable::FindUsable(
     return nullptr;
 }
 
+std::vector<UpstreamH2Connection*>
+H2ConnectionTable::CollectUsableForUpstream(const std::string& upstream_name)
+{
+    std::vector<UpstreamH2Connection*> out;
+    auto it = by_upstream_.find(upstream_name);
+    if (it == by_upstream_.end()) return out;
+    auto& conns = it->second;
+
+    // Reap expired inline so the returned set reflects only currently
+    // usable connections (mirrors FindUsable's side effect).
+    auto end = std::remove_if(conns.begin(), conns.end(), IsExpired);
+    conns.erase(end, conns.end());
+
+    out.reserve(conns.size());
+    for (auto& c : conns) {
+        if (c && c->IsUsable()) out.push_back(c.get());
+    }
+    return out;
+}
+
 void H2ConnectionTable::Insert(
     const std::string& upstream_name,
     std::unique_ptr<UpstreamH2Connection> conn)
@@ -93,20 +114,42 @@ std::unique_ptr<UpstreamH2Connection> H2ConnectionTable::Extract(
 
 std::vector<std::unique_ptr<UpstreamH2Connection>>
 H2ConnectionTable::ExtractAll() {
-    // Count first + reserve so push_back below is noexcept — without
-    // this, a mid-loop bad_alloc would leave by_upstream_ in
-    // moved-but-not-cleared state (null entries in the vectors,
-    // skipped clear()) on rethrow.
-    size_t total = 0;
-    for (auto& [_, conns] : by_upstream_) total += conns.size();
+    // reserve() up-front so push_back below is noexcept — without this,
+    // a mid-loop bad_alloc would leave by_upstream_ in moved-but-not-
+    // cleared state (null entries in the vectors, skipped clear()) on
+    // rethrow.
     std::vector<std::unique_ptr<UpstreamH2Connection>> out;
-    out.reserve(total);
+    out.reserve(TotalConnections());
     for (auto& [_, conns] : by_upstream_) {
         for (auto& c : conns) {
             if (c) out.push_back(std::move(c));
         }
     }
     by_upstream_.clear();
+    return out;
+}
+
+std::vector<std::pair<std::string, std::unique_ptr<UpstreamH2Connection>>>
+H2ConnectionTable::ExtractAllWithKeys() {
+    std::vector<std::pair<std::string, std::unique_ptr<UpstreamH2Connection>>> out;
+    out.reserve(TotalConnections());
+    for (auto& [name, conns] : by_upstream_) {
+        for (auto& c : conns) {
+            if (c) out.emplace_back(name, std::move(c));
+        }
+    }
+    by_upstream_.clear();
+    return out;
+}
+
+std::vector<UpstreamH2Connection*> H2ConnectionTable::CollectAll() const {
+    std::vector<UpstreamH2Connection*> out;
+    out.reserve(TotalConnections());
+    for (const auto& [_, conns] : by_upstream_) {
+        for (const auto& c : conns) {
+            if (c) out.push_back(c.get());
+        }
+    }
     return out;
 }
 
@@ -134,6 +177,21 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
                 it = conns.erase(it);
                 continue;
             }
+            if (c->shutdown_drain_active()) {
+                // Locally-initiated shutdown via
+                // PoolPartition::InitiateShutdown → BeginShutdownDrain.
+                // BeginShutdownDrain sets goaway_seen_=true to drive
+                // nghttp2's drain machinery, but the GOAWAY is OURS, not
+                // the peer's. PollShutdownDrain owns the canonical
+                // teardown for these sessions (DestroyOnDispatcher's
+                // 6-step sequence + lease release). Letting TickAll
+                // fire here would classify local shutdown as peer
+                // GOAWAY (RESULT_GOAWAY_MAYBE_PROCESSED) and bypass
+                // the canonical teardown. Skip exclusively — the
+                // shutdown_drain_deadline_ enforces the timeout.
+                ++it;
+                continue;
+            }
             int idle = cfg->ping_idle_sec;
             int timeout = cfg->ping_timeout_sec;
             int goaway_drain = cfg->goaway_drain_timeout_sec;
@@ -150,9 +208,26 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
                 auto victim = std::move(*it);
                 it = conns.erase(it);
                 victim->MarkDead();
-                victim->FailAllStreams(
-                    -1, victim->goaway_seen() ? "h2 GOAWAY drain timeout"
-                                              : "h2 PING timeout");
+                // PING timeout is a transport-level liveness failure —
+                // map to UPSTREAM_DISCONNECT so breaker counts it as
+                // upstream health (matches the on-message/close/error
+                // fan-out sites in PoolPartition). GOAWAY drain timeout
+                // means peer announced GOAWAY (last_stream_id >= ours
+                // at admission) and never finished the stream — RFC 9113
+                // §6.8 leaves "did the peer process it?" unknowable, so
+                // map to GOAWAY_MAYBE_PROCESSED for breaker-neutral
+                // response-level retry on idempotent methods. Raw -1
+                // (RESULT_CHECKOUT_FAILED) misclassified both as
+                // connect-failure on the breaker.
+                if (victim->goaway_seen()) {
+                    victim->FailAllStreams(
+                        ProxyTransaction::RESULT_GOAWAY_MAYBE_PROCESSED,
+                        "h2 GOAWAY drain timeout");
+                } else {
+                    victim->FailAllStreams(
+                        ProxyTransaction::RESULT_UPSTREAM_DISCONNECT,
+                        "h2 PING timeout");
+                }
             } else if (c->goaway_seen() && c->active_stream_count() == 0) {
                 // Mark dead before erasing so any weak_ptr observer
                 // racing the destructor sees `IsDead() == true` instead

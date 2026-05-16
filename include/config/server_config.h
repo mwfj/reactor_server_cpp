@@ -50,7 +50,8 @@ struct Http2Config {
 //   Live:         max_concurrent_streams_pref, initial_window_size,
 //                 max_frame_size, header_table_size, max_header_list_size,
 //                 ping_idle_sec, ping_timeout_sec,
-//                 goaway_drain_timeout_sec, saturation_open_pct
+//                 goaway_drain_timeout_sec, saturation_open_pct,
+//                 preconnect_watermark_pct
 struct Http2UpstreamConfig {
     bool enabled = false;
     std::string prefer = "auto";                 // "auto" | "always" | "never"
@@ -63,6 +64,11 @@ struct Http2UpstreamConfig {
     int ping_timeout_sec = 10;                   // close conn if no PONG within this
     int goaway_drain_timeout_sec = 30;           // bound on graceful drain
     int saturation_open_pct = 0;                 // 0 disables saturation routing
+    // 0 disables predictive preconnect. Must be in [0, 100]. When > 0,
+    // also requires saturation_open_pct > 0 (validator rejects the
+    // silent-no-op shape) AND preconnect_watermark_pct < saturation_open_pct
+    // (the prediction must fire BEFORE saturation actually trips).
+    int preconnect_watermark_pct = 0;
 
     // Full equality: every field. Used by tests + serialization round-trips.
     bool operator==(const Http2UpstreamConfig& o) const {
@@ -75,7 +81,8 @@ struct Http2UpstreamConfig {
                ping_idle_sec == o.ping_idle_sec &&
                ping_timeout_sec == o.ping_timeout_sec &&
                goaway_drain_timeout_sec == o.goaway_drain_timeout_sec &&
-               saturation_open_pct == o.saturation_open_pct;
+               saturation_open_pct == o.saturation_open_pct &&
+               preconnect_watermark_pct == o.preconnect_watermark_pct;
     }
     bool operator!=(const Http2UpstreamConfig& o) const { return !(*this == o); }
 

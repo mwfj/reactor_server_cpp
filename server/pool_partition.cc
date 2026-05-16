@@ -203,6 +203,13 @@ static void ClearTransportCallbacks(UpstreamConnection* conn) {
     }
 }
 
+// Saturation ratio in percent. Caller guarantees max_streams_pref > 0.
+static int ComputeStreamUtilizationPct(uint32_t streams,
+                                       uint32_t max_streams_pref) {
+    return static_cast<int>(
+        (static_cast<uint64_t>(streams) * 100u) / max_streams_pref);
+}
+
 PoolPartition::~PoolPartition() {
     // Atomic write — stops new purge chains from being scheduled.
     alive_->store(false, std::memory_order_release);
@@ -561,7 +568,11 @@ void PoolPartition::DrainH2StreamWaitersForHost(
             // notified inline. Return early.
             return;
         }
-        UpstreamH2Connection* h2 = h2_table_.FindUsable(upstream_name);
+        // Use endpoint-aware lookup so a DNS-swapped stale session
+        // does not wake the waiter only for SubmitRequest's freshness
+        // check to fail. FindUsableH2Connection marks stale candidates
+        // dead inline so subsequent CollectUsableForUpstream skips them.
+        UpstreamH2Connection* h2 = FindUsableH2Connection(upstream_name);
         if (!h2 || !h2->IsUsable()) {
             // No usable session right now — requeue everything we still
             // have. The next slot-free (RunDeferredEraseWalk) or fresh
@@ -653,7 +664,10 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
             if (e.error_callback) e.error_callback(CHECKOUT_SHUTTING_DOWN);
             continue;
         }
-        UpstreamH2Connection* h2 = h2_table_.FindUsable(service_name_);
+        // Endpoint-aware lookup — see DrainH2StreamWaitersForHost above
+        // for rationale. A DNS-swapped stale candidate must not be
+        // surfaced as usable to ANY-kind waiters.
+        UpstreamH2Connection* h2 = FindUsableH2Connection(service_name_);
         if (!h2) {
             // No usable session right now (no session, all dead, or
             // cap reached by a sibling already served this drain).
@@ -971,23 +985,29 @@ void PoolPartition::ReturnH2Stream(
     UpstreamH2Connection* h2_conn, int32_t stream_id,
     std::shared_ptr<std::atomic<bool>> /*partition_alive*/,
     std::shared_ptr<std::atomic<bool>> /*conn_alive*/) {
-    // Reaching this entry means an UpstreamLease::Kind::H2 destructor
-    // ran with partition_live=true AND conn_alive observed live — but
-    // no production caller of the H2 lease-vending path exists yet
-    // (stream teardown flows through OnStreamClose / ResetStream /
-    // RunDeferredEraseWalk). Existing tests construct H2-kind leases
-    // with partition=nullptr (partition_live=false), short-circuiting
-    // Release BEFORE reaching here. So error-level is correct today:
-    // any invocation indicates a production caller wired the H2
-    // lease-vending path without the matching DrainH2StreamWaitersForHost
-    // dispatch — exactly the bug the pitfall-doc rule guards against.
-    // FIXME: implement DrainH2StreamWaitersForHost dispatch once the
-    // h2_lease_ migration on ProxyTransaction lands.
-    logging::Get()->error(
-        "BUG: PoolPartition::ReturnH2Stream called without a wired "
-        "H2-lease vending path (h2_conn={}, stream_id={}) — H2 stream "
-        "slot release dropped; queued H2_STREAM_SLOT waiters will not "
-        "be admitted.",
+    // Structural no-op for SUBMITTED H2 streams. The slot-release
+    // admission path lives in `UpstreamH2Connection::RunDeferredEraseWalk`
+    // — the SOLE site of `--active_streams_` for submitted streams. That
+    // walker ALSO invokes `DrainH2StreamWaitersForHost` +
+    // `DrainAnyWaitersForFastH2` immediately after the decrement.
+    //
+    // By the time a non-donated `UpstreamLease::Kind::H2` lease
+    // destructor reaches this method, one of two things has
+    // happened: (a) the stream completed via peer close-stream and
+    // the walker already drained, OR (b) `ProxyTransaction::Cleanup`
+    // called `ResetStream` (via lease accessors) and the eventual
+    // walker pass will drain. In NEITHER case does this method
+    // have remaining work — adding a drain here would either
+    // double-fire (case a) or fire against stale capacity (case b
+    // before walker runs).
+    //
+    // Donated H2 leases (the H2 session's permanent transport
+    // lease) skip this path via the `donated_to_h2_` check in the
+    // `UpstreamLease` destructor (`upstream_lease.cc`).
+    logging::Get()->debug(
+        "PoolPartition::ReturnH2Stream: lease destruction "
+        "(h2_conn={}, stream_id={}) — slot-release admission "
+        "handled by RunDeferredEraseWalk; no-op",
         static_cast<const void*>(h2_conn), stream_id);
 }
 
@@ -1046,19 +1066,197 @@ std::shared_ptr<void> PoolPartition::MakeInflightGuard() {
     });
 }
 
+bool PoolPartition::ShouldOpenAdditionalH2Conn(
+    const std::string& upstream_name)
+{
+    auto cfg = LoadHttp2ConfigSnapshot();
+    if (!cfg || cfg->saturation_open_pct == 0) return false;
+    if (TotalCount() >= partition_max_connections_) return false;
+    if (cfg->max_concurrent_streams_pref == 0) return false;
+    // CollectUsableForUpstream reaps expired entries inline, which
+    // mutates h2_table_. Dispatcher-thread-only, idempotent: dead
+    // entries don't count toward saturation either way.
+    auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
+    if (candidates.empty()) return false;  // cold-start handles first
+    const int threshold = cfg->saturation_open_pct;
+    for (auto* c : candidates) {
+        // EffectiveMaxStreams clamps to peer SETTINGS — a session that
+        // hit its peer-imposed limit BELOW our local pref is saturated
+        // at the peer cap; using local pref alone hides that pressure.
+        const uint32_t eff_cap = c->EffectiveMaxStreams();
+        if (eff_cap == 0) continue;  // session not usable — skip
+        const int ratio_pct = ComputeStreamUtilizationPct(
+            c->active_stream_count(), eff_cap);
+        if (ratio_pct < threshold) return false;  // one still has slack
+    }
+    return true;
+}
+
+UpstreamH2Connection* PoolPartition::FindUsableH2ConnectionSaturation(
+    const std::string& upstream_name)
+{
+    auto cfg = LoadHttp2ConfigSnapshot();
+    // Disabled fast path — saturation_open_pct=0 collapses to the
+    // existing first-usable semantic.
+    if (!cfg || cfg->saturation_open_pct == 0) {
+        return FindUsableH2Connection(upstream_name);
+    }
+    const int threshold = cfg->saturation_open_pct;
+    auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
+    for (auto* candidate : candidates) {
+        if (!IsEndpointFreshOrMarkDead(*candidate)) continue;
+        const uint32_t eff_cap = candidate->EffectiveMaxStreams();
+        if (eff_cap == 0) continue;  // session not usable — skip
+        const int ratio_pct = ComputeStreamUtilizationPct(
+            candidate->active_stream_count(), eff_cap);
+        if (ratio_pct < threshold) return candidate;
+        // Over threshold — skip; caller may use fallback path or
+        // trigger a capacity probe.
+    }
+    return nullptr;
+}
+
+void PoolPartition::MaybePreconnectH2(
+    const std::string& upstream_name, int port,
+    const UpstreamH2Connection& picked_session)
+{
+    auto cfg = LoadHttp2ConfigSnapshot();
+    if (!cfg) return;
+    if (cfg->preconnect_watermark_pct == 0) return;  // disabled fast path
+    // Validator already rejects (preconnect > 0 && saturation == 0)
+    // at both Validate and ValidateHotReloadable, but check the SIGHUP
+    // race window here too: the snapshot we just loaded may have
+    // saturation flipped to 0 between when the operator submitted the
+    // reload AND our read. Defensive: skip the probe in that case
+    // (the firing condition is undefined when saturation is off).
+    if (cfg->saturation_open_pct == 0) return;
+    if (cfg->max_concurrent_streams_pref == 0) return;  // infinite capacity
+    // Use the picked session's EFFECTIVE cap (peer SETTINGS-clamped) so
+    // utilization tracks the wire-level cap, not the configured one.
+    const uint32_t picked_cap = picked_session.EffectiveMaxStreams();
+    if (picked_cap == 0) return;  // picked session not usable
+    const int ratio_pct = ComputeStreamUtilizationPct(
+        picked_session.active_stream_count(), picked_cap);
+    // Firing condition: in the (watermark, saturation) window. AT/below
+    // watermark → no preconnect (operator says we're not stressed yet).
+    // AT/above saturation → saturation routing already opens a fresh
+    // probe; preconnect would duplicate.
+    if (ratio_pct < cfg->preconnect_watermark_pct) return;
+    if (ratio_pct >= cfg->saturation_open_pct) return;
+
+    // Fleet-wide spare check: skip preconnect if any OTHER endpoint-fresh
+    // session is below the watermark (operator's "slack available" signal).
+    // Without this, A at 60% + B at 0% → each request picks A and fires
+    // a preconnect, filling pool.max_connections with idle warm spares.
+    auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
+    for (auto* c : candidates) {
+        if (c == &picked_session) continue;
+        if (!IsEndpointFreshOrMarkDead(*c)) continue;
+        const uint32_t cap = c->EffectiveMaxStreams();
+        if (cap == 0) continue;
+        const int cand_pct = ComputeStreamUtilizationPct(
+            c->active_stream_count(), cap);
+        if (cand_pct < cfg->preconnect_watermark_pct) return;  // spare found
+    }
+    // Delegate the actual probe to StartH2CapacityProbe so the
+    // capacity-probe semantics (shutdown / in-flight-probe / cap
+    // gates) are applied uniformly. Note: StartH2CapacityProbe
+    // itself consults ShouldOpenAdditionalH2Conn which returns false
+    // when ANY conn is under-saturation. The picked session is
+    // currently under-saturation (firing condition above) — so
+    // ShouldOpenAdditionalH2Conn returns false, and the preconnect
+    // would be skipped. That's the wrong policy for preconnect:
+    // saturation-routing wants ALL conns saturated; preconnect wants
+    // ANY conn at/above watermark. We therefore bypass the
+    // ShouldOpenAdditionalH2Conn gate by inlining the remaining
+    // (cap + in-flight-probe) checks.
+    if (shutting_down_.load(std::memory_order_acquire) ||
+        manager_shutting_down_.load(std::memory_order_acquire)) {
+        return;
+    }
+    HostPortKey key{upstream_name, port};
+    if (h2_connecting_conns_.count(key) > 0) return;  // probe in flight
+    if (TotalCount() >= partition_max_connections_) {
+        preconnect_skipped_cap_count_.fetch_add(1, std::memory_order_relaxed);
+        logging::Get()->warn(
+            "MaybePreconnectH2 skipped (TotalCount {} >= cap {}) "
+            "upstream={}:{} — slot starvation prevention",
+            TotalCount(), partition_max_connections_, upstream_name, port);
+        return;
+    }
+    logging::Get()->debug(
+        "MaybePreconnectH2: firing preconnect probe upstream={}:{} "
+        "(ratio_pct={}, watermark={}, saturation={})",
+        upstream_name, port, ratio_pct,
+        cfg->preconnect_watermark_pct, cfg->saturation_open_pct);
+    // Only count successful dispatches (OpenNewH2Connection returns
+    // false for missing TLS context / shutdown / construct errors;
+    // a pre-bump would lie about probe activity in those failure paths).
+    if (OpenNewH2Connection(upstream_name, port)) {
+        preconnect_fired_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void PoolPartition::StartH2CapacityProbe(
+    const std::string& upstream_name, int port)
+{
+    if (shutting_down_.load(std::memory_order_acquire) ||
+        manager_shutting_down_.load(std::memory_order_acquire)) {
+        logging::Get()->debug(
+            "StartH2CapacityProbe skipped (shutdown) upstream={}:{}",
+            upstream_name, port);
+        return;
+    }
+    HostPortKey key{upstream_name, port};
+    if (h2_connecting_conns_.count(key) > 0) {
+        logging::Get()->debug(
+            "StartH2CapacityProbe skipped (in-flight probe exists) "
+            "upstream={}:{}",
+            upstream_name, port);
+        return;
+    }
+    // Policy gate: the WHOLE point of capacity probe is admitting
+    // alongside existing usable sessions when saturation/preconnect
+    // says we need more capacity. Unlike StartH2ReplacementConnect
+    // (which refuses on `FindUsable != nullptr`), this helper OMITS
+    // the "any usable session exists" check — but it still defers
+    // to the policy gate so we don't probe unnecessarily.
+    if (!ShouldOpenAdditionalH2Conn(upstream_name)) {
+        logging::Get()->debug(
+            "StartH2CapacityProbe skipped (policy says no more probes) "
+            "upstream={}:{}",
+            upstream_name, port);
+        return;
+    }
+    if (TotalCount() >= partition_max_connections_) {
+        // Cap-saturated — defensive duplicate of the gate inside
+        // ShouldOpenAdditionalH2Conn (which already covers this);
+        // warn-level so operators see the cap pressure correlated
+        // with capacity-probe attempts.
+        logging::Get()->warn(
+            "StartH2CapacityProbe skipped (TotalCount {} >= cap {}) "
+            "upstream={}:{} — capacity probe deferred",
+            TotalCount(), partition_max_connections_, upstream_name, port);
+        return;
+    }
+    OpenNewH2Connection(upstream_name, port);
+}
+
 UpstreamH2Connection* PoolPartition::FindUsableH2Connection(
     const std::string& upstream_name)
 {
-    // Post-reload IP swap: mark stale-endpoint session dead so
-    // FindUsable() skips it; in-flight streams complete naturally
-    // (H1-keepalive parity). Reaped by stream-completion, transport
-    // close/error, or ping/GOAWAY-drain timeout.
-    if (auto* existing = h2_table_.FindUsable(upstream_name)) {
-        UpstreamConnection* t = existing->transport();
-        if (t && ConnectionEndpointMatches(*t)) {
-            return existing;
-        }
-        existing->MarkDead();
+    // Multi-conn-per-host walk (B2.2). Iterate every usable candidate
+    // for the upstream; for each, check endpoint freshness against
+    // the partition's current resolved_endpoint_. The first
+    // endpoint-fresh candidate wins; stale candidates are marked
+    // dead inline so a subsequent FindUsable / CollectUsable skips
+    // them (existing pre-B2 semantic preserved). Returns null when
+    // no endpoint-fresh usable session exists for the upstream — the
+    // caller decides whether to admit a new probe (cold-start /
+    // saturation / preconnect) or fall back.
+    auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
+    for (auto* candidate : candidates) {
+        if (IsEndpointFreshOrMarkDead(*candidate)) return candidate;
     }
     return nullptr;
 }
@@ -1171,15 +1369,28 @@ void PoolPartition::WireH2SessionTransportCallbacks(
 UpstreamH2Connection* PoolPartition::AcquireH2Connection(
     const std::string& upstream_name, UpstreamLease& lease)
 {
-    // Reuse a multiplexed session if one is still healthy AND its
-    // transport matches the partition's currently-published endpoint.
-    // Same FindUsableH2Connection helper that ProxyTransaction's
-    // pre-checkout fast path uses — caller's lease (if any) is
-    // untouched on the reuse branch. See FindUsableH2Connection's
-    // doc comment for the H1-keepalive-parity / dead-conn reap chain.
-    if (auto* existing = FindUsableH2Connection(upstream_name)) {
+    // Saturation-aware reuse: try an under-threshold endpoint-fresh
+    // session first; if one exists, multiplex onto it (caller's lease
+    // is untouched). If every usable session is over-threshold, decide
+    // whether to admit a new H2 conn (via the fresh-construct branch
+    // below) OR fall back to an over-threshold session for THIS
+    // request (saturated session is still better than blocking).
+    if (auto* existing = FindUsableH2ConnectionSaturation(upstream_name)) {
         return existing;
     }
+    // Fall back to first-usable when (a) saturation policy does not
+    // warrant a new conn, OR (b) the caller passed an empty lease.
+    // The empty-lease case fires when TryDispatchExistingH2Session has
+    // already picked an over-threshold-but-usable session and re-enters
+    // through DispatchH2 → AcquireH2Connection: fresh-construct is
+    // impossible without a transport handle in the lease, so the only
+    // viable answer is to return that same session via FindUsable.
+    if (!ShouldOpenAdditionalH2Conn(upstream_name) || !lease.Get()) {
+        if (auto* existing = FindUsableH2Connection(upstream_name)) {
+            return existing;
+        }
+    }
+    // Saturation says open a new one. Fall through to fresh-construct.
 
     auto cfg = LoadHttp2ConfigSnapshot();
     if (!cfg || !cfg->enabled) return nullptr;
@@ -1217,15 +1428,15 @@ UpstreamH2Connection* PoolPartition::AcquireH2Connection(
     return raw;
 }
 
-void PoolPartition::ScheduleInitiateShutdown() {
+void PoolPartition::ScheduleInitiateShutdown(int server_drain_timeout_sec) {
     // Direct call if no dispatcher (degenerate/test path).
     if (!dispatcher_) {
-        InitiateShutdown();
+        InitiateShutdown(server_drain_timeout_sec);
         return;
     }
     // Already on the dispatcher thread — run inline.
     if (dispatcher_->is_dispatcher_thread()) {
-        InitiateShutdown();
+        InitiateShutdown(server_drain_timeout_sec);
         return;
     }
     // Dispatcher already stopped (threads joined) — EnQueue would silently
@@ -1235,7 +1446,7 @@ void PoolPartition::ScheduleInitiateShutdown() {
     // thread exists to race with container mutations, so touching
     // idle_conns_/connecting_conns_ from the stopper thread is safe.
     if (dispatcher_->was_stopped()) {
-        InitiateShutdown();
+        InitiateShutdown(server_drain_timeout_sec);
         return;
     }
     // Off-thread: enqueue and track via MakeInflightGuard so ~PoolPartition
@@ -1244,11 +1455,12 @@ void PoolPartition::ScheduleInitiateShutdown() {
     // the destructor is a no-op instead of a UAF on freed containers.
     auto guard = MakeInflightGuard();
     std::weak_ptr<std::atomic<bool>> alive_weak = alive_;
-    dispatcher_->EnQueue([this, alive_weak, guard]() {
-        auto alive = alive_weak.lock();
-        if (!alive || !alive->load(std::memory_order_acquire)) return;
-        InitiateShutdown();
-    });
+    dispatcher_->EnQueue(
+        [this, alive_weak, guard, server_drain_timeout_sec]() {
+            auto alive = alive_weak.lock();
+            if (!alive || !alive->load(std::memory_order_acquire)) return;
+            InitiateShutdown(server_drain_timeout_sec);
+        });
 }
 
 void PoolPartition::ScheduleForceCloseActive() {
@@ -1273,7 +1485,23 @@ void PoolPartition::ScheduleForceCloseActive() {
     });
 }
 
-void PoolPartition::InitiateShutdown() {
+// Compute the H2 graceful-drain budget in milliseconds.
+// server_drain_timeout_sec=0 means "shut down immediately with no
+// graceful H2 drain" (safety-net destructor call passes 0; an
+// operator setting `server.shutdown_drain_timeout_sec=0` opts out).
+// Per-conn `http2.goaway_drain_timeout_sec=0` likewise opts out at
+// the connection level. Either zero → 0 (immediate-destroy path);
+// both non-zero → min(server, per_conn) * 1000 so the per-conn drain
+// is bounded by the whole-server SLA. Operators wanting a non-zero
+// per-conn drain must set BOTH fields to positive values.
+static int ComputeShutdownDrainBudgetMs(int per_conn_sec,
+                                        int server_sec) {
+    if (per_conn_sec <= 0 || server_sec <= 0) return 0;
+    int min_sec = std::min(per_conn_sec, server_sec);
+    return min_sec * 1000;
+}
+
+void PoolPartition::InitiateShutdown(int server_drain_timeout_sec) {
     // Hoist alive_ onto the stack — ForceClose on connecting sockets fires
     // the close callback which invokes the waiter's user error_callback,
     // and the wait-queue rejection loop below invokes error_callback directly.
@@ -1327,22 +1555,66 @@ void PoolPartition::InitiateShutdown() {
         if (!alive->load(std::memory_order_acquire)) return;
     }
 
-    // Retire H2 sessions explicitly so each donated lease releases its
-    // outstanding_conns_ slot BEFORE WaitForDrain blocks. Otherwise
-    // idle H2 sessions wedge the manager destructor until drain
-    // timeout (see UPSTREAM_PROXY.md). Mid-loop `alive` flip is safe:
-    // local unique_ptr dtors complete the teardown at scope exit via
-    // the safety-net path. The safety-net omits step-3 timer-removal
-    // (RemoveTimerConnectionIfMatch is a dispatcher-only op), so any
-    // deadline-timer registration on the transport survives — that's
-    // harmless under shutdown because the dispatcher is being torn
-    // down and timer ticks no longer fan out.
-    auto h2_to_destroy = h2_table_.ExtractAll();
-    for (auto& conn : h2_to_destroy) {
-        if (conn) conn->DestroyOnDispatcher();
-        if (!alive->load(std::memory_order_acquire)) return;
-        // unique_ptr lapses at scope end → dtor's destroyed_on_dispatcher_
-        // short-circuit fires; lease was released by step 5 above.
+    // Retire H2 sessions. Two paths: graceful drain (drain_budget_ms > 0)
+    // OR immediate kill (drain_budget_ms == 0). The graceful path emits
+    // GOAWAY on each session via BeginShutdownDrain (which also sets
+    // goaway_seen_ so IsUsable rejects new submissions immediately),
+    // then schedules PollShutdownDrain to reap sessions as they complete
+    // OR force-close them at the deadline. The immediate path uses
+    // ExtractAll + DestroyOnDispatcher (mirrors the pre-Phase-4
+    // behavior — used by the destructor safety-net call where any
+    // wait would block destruction).
+    auto h2_cfg_for_drain = LoadHttp2ConfigSnapshot();
+    const int per_conn_drain_sec = h2_cfg_for_drain
+        ? h2_cfg_for_drain->goaway_drain_timeout_sec : 0;
+    const int drain_budget_ms = ComputeShutdownDrainBudgetMs(
+        per_conn_drain_sec, server_drain_timeout_sec);
+    if (drain_budget_ms <= 0) {
+        // Immediate kill (legacy path / destructor safety-net).
+        auto h2_to_destroy = h2_table_.ExtractAll();
+        for (auto& conn : h2_to_destroy) {
+            if (conn) conn->DestroyOnDispatcher();
+            if (!alive->load(std::memory_order_acquire)) return;
+        }
+    } else {
+        // Graceful drain. Sessions stay tracked while in-flight streams
+        // complete; PollShutdownDrain reaps each on IsShutdownDrainComplete.
+        // Take ownership BEFORE BeginShutdownDrain: a synchronous close-cb
+        // chain can reach back into h2_table_ via CollectUsableForUpstream,
+        // which inline-reaps IsExpired entries — owning unique_ptrs out of
+        // the table means the reentrant lookup sees an empty table instead
+        // of dangling pointers to entries the loop is still processing.
+        auto owned = h2_table_.ExtractAllWithKeys();
+        for (auto& [_, conn] : owned) {
+            if (!conn) continue;
+            conn->BeginShutdownDrain(drain_budget_ms);
+            if (!alive->load(std::memory_order_acquire)) return;
+        }
+        for (auto& [name, conn] : owned) {
+            if (conn) h2_table_.Insert(name, std::move(conn));
+        }
+        // Kick off the poll loop. PollShutdownDrain re-arms itself while
+        // any session is still draining; idempotent if the table is
+        // already empty (it's a no-op).
+        if (dispatcher_ && !dispatcher_->was_stopped()) {
+            auto guard = MakeInflightGuard();
+            std::weak_ptr<std::atomic<bool>> alive_weak = alive_;
+            dispatcher_->EnQueueDelayed(
+                [this, alive_weak, guard]() {
+                    auto local = alive_weak.lock();
+                    if (!local || !local->load(std::memory_order_acquire)) return;
+                    PollShutdownDrain();
+                },
+                std::chrono::milliseconds(50));
+        } else {
+            // No dispatcher to schedule on — fall back to immediate
+            // kill so we don't leave sessions stranded.
+            auto h2_to_destroy = h2_table_.ExtractAll();
+            for (auto& conn : h2_to_destroy) {
+                if (conn) conn->DestroyOnDispatcher();
+                if (!alive->load(std::memory_order_acquire)) return;
+            }
+        }
     }
 
     // Connecting H2 probes: extract first, then destroy. Mirrors the
@@ -1458,6 +1730,147 @@ void PoolPartition::CloseIdleMatchingEndpointOnDispatcher(
             ++it;
         }
     }
+    // Drop cached H2 negotiation outcomes that referenced the old
+    // endpoint. The endpoint-match check in ShouldSkipH2ProbeForEndpoint
+    // is the primary gate (stale entries would harmlessly miss); this
+    // sweep keeps the cache lean so it doesn't accumulate unreachable
+    // entries across reload churn.
+    InvalidateH2NegotiationCacheForEndpoint(old_ep);
+}
+
+void PoolPartition::PollShutdownDrain() {
+    if (!alive_->load(std::memory_order_acquire)) return;
+    const auto now = std::chrono::steady_clock::now();
+    // Two-phase walk to defuse a reentrant-erase UAF: `DestroyOnDispatcher`
+    // synchronously fires `FailAllStreams` → `sink->OnError(...)` for every
+    // surviving stream; a sink callback can reenter partition code that
+    // calls `FindUsableH2Connection` / `CollectUsableForUpstream`, which
+    // reaps `IsExpired` entries from `h2_table_` mid-walk. If a still-to-
+    // be-processed raw pointer in our snapshot is the one reaped, the next
+    // iteration's `IsShutdownDrainComplete` reads freed memory.
+    //
+    // Phase 1: walk the snapshot, Extract every drain-complete session
+    // into a local owning vector. The unique_ptrs keep the H2 conns
+    // alive across any reentrant `h2_table_` mutations.
+    // Phase 2: destroy from the local vector — reentrant lookups find
+    // an empty h2_table_ (post-Extract) and cannot dangling-pointer us.
+    auto snap = h2_table_.CollectAll();
+    std::vector<std::unique_ptr<UpstreamH2Connection>> to_destroy;
+    to_destroy.reserve(snap.size());
+    for (auto* conn : snap) {
+        if (!conn->IsShutdownDrainComplete(now)) continue;
+        if (auto owned = h2_table_.Extract(conn)) {
+            to_destroy.push_back(std::move(owned));
+        }
+    }
+    for (auto& owned : to_destroy) {
+        // Canonical 6-step teardown (alive flip → null callbacks →
+        // remove timer → teardown session → fail streams → mark
+        // closing). The dtor's safety-net path short-circuits on
+        // `destroyed_on_dispatcher_=true` when `owned` lapses at the
+        // end of the local vector's iteration.
+        owned->DestroyOnDispatcher();
+        if (!alive_->load(std::memory_order_acquire)) return;
+    }
+    // Also drain pending-destroy stash so its donated leases release
+    // and outstanding_conns_ decrements toward zero. This is the same
+    // helper the normal recv-flush chain calls — calling it here
+    // catches any victims that arrived during shutdown (e.g. peer
+    // GOAWAYs while we were draining).
+    ReapPendingDestroyH2Conns();
+
+    // Re-arm while any session is still draining OR any pending-destroy
+    // victim awaits its post-flush reap. Loop exits naturally when both
+    // are empty — every IsShutdownDrainComplete predicate eventually
+    // fires on the deadline branch even if streams never complete.
+    if ((h2_table_.TotalConnections() == 0 &&
+         pending_destroy_h2_conns_.empty()) ||
+        !dispatcher_ || dispatcher_->was_stopped()) {
+        // Drain complete (or dispatcher gone — bail). Signal any
+        // manager-level WaitForDrain waiters.
+        MaybeSignalDrain();
+        return;
+    }
+    auto guard = MakeInflightGuard();
+    std::weak_ptr<std::atomic<bool>> alive_weak = alive_;
+    dispatcher_->EnQueueDelayed(
+        [this, alive_weak, guard]() {
+            auto local = alive_weak.lock();
+            if (!local || !local->load(std::memory_order_acquire)) return;
+            PollShutdownDrain();
+        },
+        std::chrono::milliseconds(50));
+}
+
+void PoolPartition::RecordH2NegotiationOutcome(
+    const std::string& upstream_name, int port,
+    H2NegotiationOutcome outcome,
+    std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> endpoint)
+{
+    if (!endpoint) return;  // No endpoint to key the cache on.
+    HostPortKey key{upstream_name, port};
+    auto it = h2_negotiation_outcome_.find(key);
+    if (it == h2_negotiation_outcome_.end()) {
+        // Cap enforcement before inserting a new key.
+        if (h2_negotiation_outcome_.size() >= kH2NegotiationCacheCap &&
+            !h2_negotiation_outcome_order_.empty()) {
+            HostPortKey evict = h2_negotiation_outcome_order_.front();
+            h2_negotiation_outcome_order_.pop_front();
+            h2_negotiation_outcome_.erase(evict);
+            logging::Get()->warn(
+                "PoolPartition: h2_negotiation_outcome cache cap reached "
+                "({}); evicting LRU entry {}:{}",
+                kH2NegotiationCacheCap, evict.host, evict.port);
+        }
+        h2_negotiation_outcome_[key] = {outcome, std::move(endpoint)};
+        h2_negotiation_outcome_order_.push_back(key);
+    } else {
+        // Update outcome + endpoint; refresh insertion order to back.
+        it->second.outcome = outcome;
+        it->second.endpoint = std::move(endpoint);
+        auto order_it = std::find(h2_negotiation_outcome_order_.begin(),
+                                  h2_negotiation_outcome_order_.end(), key);
+        if (order_it != h2_negotiation_outcome_order_.end()) {
+            h2_negotiation_outcome_order_.erase(order_it);
+        }
+        h2_negotiation_outcome_order_.push_back(key);
+    }
+}
+
+bool PoolPartition::ShouldSkipH2ProbeForEndpoint(
+    const std::string& upstream_name, int port,
+    const std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>&
+        current_endpoint) const
+{
+    if (!current_endpoint) return false;
+    auto it = h2_negotiation_outcome_.find(HostPortKey{upstream_name, port});
+    if (it == h2_negotiation_outcome_.end()) return false;
+    if (it->second.outcome != H2NegotiationOutcome::H1Only) return false;
+    // Endpoint identity comparison (shared_ptr equality): a DNS swap
+    // produces a fresh ResolvedEndpoint object even if the address
+    // happens to be the same, so this correctly invalidates after
+    // re-resolution.
+    return it->second.endpoint == current_endpoint;
+}
+
+void PoolPartition::InvalidateH2NegotiationCacheForEndpoint(
+    const std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint>& old_ep)
+{
+    if (!old_ep) return;
+    for (auto it = h2_negotiation_outcome_.begin();
+         it != h2_negotiation_outcome_.end();) {
+        if (it->second.endpoint == old_ep) {
+            HostPortKey k = it->first;
+            it = h2_negotiation_outcome_.erase(it);
+            auto order_it = std::find(h2_negotiation_outcome_order_.begin(),
+                                       h2_negotiation_outcome_order_.end(), k);
+            if (order_it != h2_negotiation_outcome_order_.end()) {
+                h2_negotiation_outcome_order_.erase(order_it);
+            }
+        } else {
+            ++it;
+        }
+    }
 }
 
 void PoolPartition::ForceCloseActive() {
@@ -1519,6 +1932,13 @@ void PoolPartition::ForceCloseActive() {
             try { w.on_msg(w.transport, empty); } catch (...) {}
         }
     }
+}
+
+bool PoolPartition::IsEndpointFreshOrMarkDead(UpstreamH2Connection& c) const {
+    UpstreamConnection* t = c.transport();
+    if (t && ConnectionEndpointMatches(*t)) return true;
+    c.MarkDead();
+    return false;
 }
 
 bool PoolPartition::ConnectionEndpointMatches(
@@ -1937,6 +2357,18 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
     auto cfg = LoadHttp2ConfigSnapshot();
     if (!cfg || !cfg->enabled || cfg->prefer == "never") return false;
 
+    // Skip probe when prefer="auto" and the cache says H1Only for the
+    // current endpoint. prefer="always" deliberately re-attempts so the
+    // operator-config rejection surfaces every request. prefer="never"
+    // already short-circuited above.
+    if (cfg->prefer == "auto" &&
+        ShouldSkipH2ProbeForEndpoint(upstream_name, port, endpoint)) {
+        logging::Get()->debug(
+            "OpenNewH2Connection: skipping probe (cache says H1Only) "
+            "upstream={}:{}", upstream_name, port);
+        return false;
+    }
+
     const InetAddr& addr = endpoint->addr;
     const sa_family_t family =
         (addr.family() == InetAddr::Family::kIPv6) ? AF_INET6 : AF_INET;
@@ -2088,6 +2520,12 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
         conn_handler->SetErrorCb(std::move(classify_and_dispatch));
 
         conn_handler->RegisterOutboundCallbacks();
+
+        // Map insert can throw bad_alloc on key allocation before the
+        // noexcept unique_ptr move-assign — inside the try so the
+        // rollback path tears down outstanding_conns_ + connecting_conns_
+        // atomically.
+        h2_connecting_conns_[HostPortKey{upstream_name, port}] = std::move(h2);
     } catch (const std::exception& e) {
         logging::Get()->error(
             "OpenNewH2Connection: setup failed for {}:{}: {}",
@@ -2101,8 +2539,6 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
         rollback();
         return false;
     }
-
-    h2_connecting_conns_[HostPortKey{upstream_name, port}] = std::move(h2);
     return true;
 }
 
@@ -2175,6 +2611,32 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
                  "alpn_not_h2_under_prefer_always");
             return;
         }
+        // DNS swap mid-probe detection: the probe's captured endpoint
+        // (in `uc_raw->captured_endpoint()`) is compared to the
+        // partition's current `resolved_endpoint_` via `ConnectionEndpointMatches`; 
+        // on mismatch a reload published a new endpoint while the probe was in flight. 
+        // The negotiated h1 transport is keyed against the stale endpoint → must not
+        // be adopted into idle_conns_. 
+        // Roll back, drop the (now-stale) cache entry, and trigger a replacement probe so queued
+        // waiters get serviced against the fresh endpoint.
+        if (uc_raw && !ConnectionEndpointMatches(*uc_raw)) {
+            logging::Get()->info(
+                "OnH2ConnectHandshakeComplete: DNS swap mid-probe "
+                "detected on alpn-h1 fallback for {}:{}; rolling back "
+                "and scheduling replacement probe",
+                upstream_name, port);
+            InvalidateH2NegotiationCacheForEndpoint(uc_raw->captured_endpoint());
+            if (shell) shell->DestroyOnDispatcher();
+            if (auto owned = ExtractFromConnecting(uc_raw)) {
+                DestroyConnection(std::move(owned));
+            }
+            FailH2StreamSlotWaiters(upstream_name, port,
+                                    CHECKOUT_CONNECT_FAILED,
+                                    "dns_swap_mid_h2_probe (alpn-h1)");
+            StartH2ReplacementConnect(upstream_name, port);
+            return;
+        }
+
         // prefer=auto: hand the negotiated h1 transport to the H1 idle
         // pool so a subsequent H1 dispatch can borrow it without a
         // second TCP/TLS handshake. Queued H2_STREAM_SLOT waiters for
@@ -2222,6 +2684,18 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         // does not wipe the callbacks WirePoolCallbacks just installed
         // on the idle conn.
         if (shell) shell->MarkTransferred();
+        // Record the H1Only outcome for prefer="auto" (the only prefer
+        // mode that reaches this branch — prefer="always" routes
+        // through the alpn_not_h2_under_prefer_always fail path above;
+        // prefer="never" doesn't probe). Use the transport's captured
+        // endpoint (the one the probe targeted) rather than
+        // LoadResolvedEndpoint(): a reload may have published a new
+        // endpoint after the DNS-swap check above passed, and keying
+        // this stale H1Only result against the new endpoint would
+        // wrongly suppress H2 probing to the freshly-rotated backend.
+        RecordH2NegotiationOutcome(
+            upstream_name, port, H2NegotiationOutcome::H1Only,
+            uc_raw ? uc_raw->captured_endpoint() : nullptr);
         ReclassifyH2WaitersToAny(upstream_name, port);
         // Asymmetry note: no inflight_leases_ bump here (unlike the
         // ALPN-h2 success branch at line ~2063). AdoptAsH1Connection
@@ -2251,6 +2725,35 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         }
         FailH2StreamSlotWaiters(upstream_name, port, CHECKOUT_CONNECT_FAILED,
                                 "h2 shell missing on alpn-h2 success");
+        return;
+    }
+
+    // DNS swap mid-probe detection: the probe targeted
+    // `uc_raw->captured_endpoint()`; if the partition's
+    // `resolved_endpoint_` was swapped during the probe window,
+    // installing this transport as an H2 session would route every
+    // future stream to the stale IP. Tear down, drop the (now-stale)
+    // cache entry, and trigger a replacement probe against the current
+    // endpoint so queued H2_STREAM_SLOT waiters resume. Mirrors the
+    // alpn-h1 fallback's gate above byte-for-byte; the recheck is the
+    // same, only the cleanup branches differ (h2 success has not yet
+    // wired anything, so no MarkTransferred / AdoptAsH1Connection
+    // rollback is needed).
+    if (uc_raw && !ConnectionEndpointMatches(*uc_raw)) {
+        logging::Get()->info(
+            "OnH2ConnectHandshakeComplete: DNS swap mid-probe "
+            "detected on alpn-h2 success path for {}:{}; tearing "
+            "down and scheduling replacement probe",
+            upstream_name, port);
+        InvalidateH2NegotiationCacheForEndpoint(uc_raw->captured_endpoint());
+        if (shell) shell->DestroyOnDispatcher();
+        if (auto owned = ExtractFromConnecting(uc_raw)) {
+            DestroyConnection(std::move(owned));
+        }
+        FailH2StreamSlotWaiters(upstream_name, port,
+                                CHECKOUT_CONNECT_FAILED,
+                                "dns_swap_mid_h2_probe (alpn-h2)");
+        StartH2ReplacementConnect(upstream_name, port);
         return;
     }
 
@@ -2348,6 +2851,15 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
                                     dispatcher_));
 
     h2_table_.Insert(upstream_name, std::move(shell));
+    // Record the H2Negotiated outcome against the endpoint the probe
+    // ran on (transport-captured) rather than LoadResolvedEndpoint() —
+    // see the ALPN-h1 branch comment for the reload-race rationale.
+    // H2Negotiated entries never short-circuit ShouldSkipH2ProbeForEndpoint
+    // (which gates only on H1Only), but keying consistently against the
+    // probe's endpoint keeps eviction logic uniform across branches.
+    RecordH2NegotiationOutcome(
+        upstream_name, port, H2NegotiationOutcome::H2Negotiated,
+        uc_raw ? uc_raw->captured_endpoint() : nullptr);
     DrainAnyWaitersForFastH2();
     DrainH2StreamWaitersForHost(upstream_name, port);
 }
@@ -2370,7 +2882,12 @@ void PoolPartition::StartH2ReplacementConnect(
             upstream_name, port);
         return;
     }
-    if (h2_table_.FindUsable(upstream_name) != nullptr) {
+    // Endpoint-aware: a stale-endpoint candidate (DNS swapped between
+    // GOAWAY and now) must NOT suppress the replacement probe — the
+    // queued waiters need a fresh session. FindUsableH2Connection
+    // marks stale candidates dead inline so they're removed from the
+    // table before the gate decides.
+    if (FindUsableH2Connection(upstream_name) != nullptr) {
         logging::Get()->debug(
             "StartH2ReplacementConnect skipped (usable session exists) "
             "upstream={}:{}",

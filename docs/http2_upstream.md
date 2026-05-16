@@ -116,6 +116,11 @@ A successful H2 request flow shows: `submit` → `OnHeaders` → `OnBodyChunk` (
 - **`donated_h2_leases`** — long-lived leases held by multiplexed H2 sessions (one per live `UpstreamH2Connection`). Stays positive across the H2 session's lifetime; explicitly excluded from the shutdown-drain predicate so idle sessions don't wedge `Stop()`.
 - **`off_dispatcher_release_drops`** — safety counter; non-zero means lease releases ran off the partition's dispatcher thread and skipped the partition mutation. Should stay zero in healthy production. If you see it rising, expect `Stop()` to wedge until `shutdown_drain_timeout_sec`.
 
+`/stats` also exposes Phase 4 H2 preconnect counters under `h2_upstream`:
+
+- **`preconnect_fired`** — successful predictive preconnect probes dispatched across all upstream partitions.
+- **`preconnect_skipped_cap`** — preconnect attempts skipped because `pool.max_connections` was already at capacity.
+
 The following per-session metrics show up only in logs at debug/info level today (planned for `/stats` exposure in a future release):
 
 - H2 connection count per upstream (one log line per `Init` and per retire).
@@ -135,12 +140,27 @@ The defaults are conservative and work for most deployments. Tune only if you ob
 
 ---
 
+## Graceful shutdown
+
+When `Stop()` (or SIGTERM/SIGINT) fires, the gateway initiates a per-partition shutdown drain. For each live H2 session the partition calls `BeginShutdownDrain` (emitting a local `GOAWAY(NO_ERROR)` so the peer learns its last-stream-id) and then polls every 50ms via `PollShutdownDrain` until either every in-flight stream completes naturally OR the configured drain deadline elapses.
+
+**The drain deadline requires BOTH knobs to be non-zero:**
+
+- `http2.goaway_drain_timeout_sec` (per-upstream, default 30s) — the per-session GOAWAY drain bound.
+- `server.shutdown_drain_timeout_sec` (process-wide, default **30s**, range 0–300) — the umbrella shutdown budget. `0` means "no managed drain — destructor safety-net only" and forces immediate teardown.
+
+The effective per-session drain is `min(server.shutdown_drain_timeout_sec * 1000, http2.goaway_drain_timeout_sec * 1000)` in milliseconds. Either knob at `0` collapses the drain to immediate kill, so to extend the drain BOTH must be non-zero. A common shape is `server.shutdown_drain_timeout_sec ≥ max(http2.goaway_drain_timeout_sec)` across every upstream so the umbrella budget covers the longest per-upstream drain. Raising `http2.goaway_drain_timeout_sec` alone never exceeds the umbrella cap.
+
+`PollShutdownDrain` owns the canonical 6-step teardown (`DestroyOnDispatcher`) for shutdown-draining sessions; `TickAll`'s PING/GOAWAY classification skips them so local shutdown is never reported as peer GOAWAY.
+
+---
+
 ## Caveats
 
 - **No h2c (cleartext H2)** — H2 outbound requires TLS. `http2.enabled = true` with `tls.enabled = false` is rejected at config load.
 - **No server push** — disabled in the SETTINGS preface (H2 server push is rarely useful for a proxy client).
 - **No mid-stream SETTINGS update** — reloads apply to NEW connections only. Existing sessions keep their construction-time settings.
-- **One H2 connection per upstream per dispatcher** — until saturation routing lands (`saturation_open_pct`), each partition holds one multiplexed connection per upstream. For very-high-fanout workloads this can be a bottleneck; mitigate by increasing the dispatcher count.
+- **Multiple H2 connections via saturation routing** — `saturation_open_pct` (1–100, default 0=disabled) controls when a second H2 connection is opened PROACTIVELY. When the active-stream utilization of every existing session is at or above that percentage of `max_concurrent_streams_pref` AND `pool.max_connections` allows, `ShouldOpenAdditionalH2Conn` triggers an additional connection. `preconnect_watermark_pct` (0 < watermark < saturation_open_pct) opens a warm standby connection proactively before the saturation threshold is hit. Both fields require `saturation_open_pct > 0` to have effect. The useful range is `1..99`; `100` is functionally equivalent to disabled (the gate only sees `IsUsable()` candidates whose `active < cap`, so the integer ratio_pct maxes at 99 — `100` never trips). With default `saturation_open_pct=0` (or `100`), proactive saturation routing is OFF — but the hard-cap safety valve still applies: if every existing session has reached its effective stream cap, the next request will still construct a fresh H2 transport up to `pool.max_connections` rather than queuing. Set `pool.max_connections=1` to constrain the pool to exactly one H2 connection per upstream per dispatcher (further demand then queues via `pool.max_queued`) — matching the pre-Phase 4 behavior.
 - **Per-stream backpressure is not strictly bounded by `initial_window_size`** — the proxy lets nghttp2 manage stream-level flow control with auto-`WINDOW_UPDATE` enabled, so the upstream's effective window is continuously refreshed as bytes are delivered to the on-data-chunk callback. In practice per-stream upstream buffering tracks the auto-update cadence (~`initial_window_size` worth of bytes outstanding under steady traffic) plus the `StreamingResponseSender` high-water mark on the downstream side, but it is not a hard cap: a slow downstream client paired with a fast H2 upstream can buffer somewhat more depending on `MAX_FRAME_SIZE` and how quickly chunks are read. For workloads with bursty downstream stalls and a high `initial_window_size`, watch RSS and consider lowering the window size. A future refinement will disable auto-update and pause per-stream consumption via `nghttp2_session_consume_stream` to enforce a strict cap.
 - **CONNECT method is rejected** with 502 + `X-H2-Limitation: connect-not-supported`. The H2 codec emits `:scheme` and `:path` on every request, which RFC 9113 §8.5 forbids on CONNECT pseudo-headers; rather than emit a malformed request, the gateway rejects deterministically. Use an H1 upstream for CONNECT tunnelling.
 - **Truncation observability** — when a backend declares `Content-Length` and closes early, when it returns body bytes on a `204 No Content` / `304 Not Modified` / `HEAD` response that should have no body, or when it sends more bytes than `Content-Length` declared, nghttp2's HTTP messaging enforcement detects the violation and the gateway surfaces it as `RESULT_UPSTREAM_DISCONNECT` (the same bucket as a torn TCP connection). A dedicated `RESULT_TRUNCATED_RESPONSE` code exists in the binary for defense-in-depth but is not normally observable in production. If you need to distinguish "peer reset / TCP drop" from "framing violation", correlate by upstream-side response logs. Truncated responses count toward circuit-breaker upstream-failure totals via the `RESULT_TRUNCATED_RESPONSE` → `UPSTREAM_DISCONNECT` `FailureKind` mapping.

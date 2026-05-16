@@ -119,14 +119,30 @@ PoolPartition* UpstreamHostPool::GetPartition(size_t dispatcher_index) {
     return partitions_[dispatcher_index].get();
 }
 
-void UpstreamHostPool::InitiateShutdown() {
+int64_t UpstreamHostPool::preconnect_fired_count() const noexcept {
+    int64_t total = 0;
+    for (const auto& partition : partitions_) {
+        if (partition) total += partition->preconnect_fired_count();
+    }
+    return total;
+}
+
+int64_t UpstreamHostPool::preconnect_skipped_cap_count() const noexcept {
+    int64_t total = 0;
+    for (const auto& partition : partitions_) {
+        if (partition) total += partition->preconnect_skipped_cap_count();
+    }
+    return total;
+}
+
+void UpstreamHostPool::InitiateShutdown(int server_drain_timeout_sec) {
     // Route through PoolPartition::ScheduleInitiateShutdown so the enqueue
     // is tracked by the partition's inflight_tasks_ counter. The partition
     // destructor blocks on that counter before freeing containers, which
     // eliminates the standalone-teardown race where a queued InitiateShutdown
     // lambda could run after the partition had been freed.
     for (auto& partition : partitions_) {
-        partition->ScheduleInitiateShutdown();
+        partition->ScheduleInitiateShutdown(server_drain_timeout_sec);
     }
 }
 

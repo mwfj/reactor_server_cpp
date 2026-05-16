@@ -87,6 +87,7 @@ Reference config at `config/server.example.json`:
     "max_body_size": 1048576,
     "max_ws_message_size": 16777216,
     "request_timeout_sec": 30,
+    "shutdown_drain_timeout_sec": 30,
     "tls": {
         "enabled": false,
         "cert_file": "",
@@ -295,7 +296,8 @@ The proxy engine can dispatch outbound requests over multiplexed HTTP/2 instead 
                 "ping_idle_sec": 60,
                 "ping_timeout_sec": 10,
                 "goaway_drain_timeout_sec": 30,
-                "saturation_open_pct": 0
+                "saturation_open_pct": 0,
+                "preconnect_watermark_pct": 0
             }
         }
     ]
@@ -316,7 +318,8 @@ The proxy engine can dispatch outbound requests over multiplexed HTTP/2 instead 
 | `ping_idle_sec` | 60 | yes | Send a PING after this many seconds of inactivity (0 disables) |
 | `ping_timeout_sec` | 10 | yes | Close the H2 connection if a PING goes unanswered for this long (0 disables) |
 | `goaway_drain_timeout_sec` | 30 | yes | Bound on how long to wait for in-flight streams after GOAWAY |
-| `saturation_open_pct` | 0 | yes | Future use — saturation-mode routing not yet enforced |
+| `saturation_open_pct` | 0 | yes | Multi-conn-per-host threshold (1–100). When all existing sessions are at or above this percent of `max_concurrent_streams_pref`, `AcquireH2Connection` opens an additional H2 connection (capped by `pool.max_connections`). The useful range is `1..99`: `100` is functionally equivalent to disabled because the gate only sees `IsUsable()` candidates (`active < cap`), so the integer ratio_pct maxes at 99 — `100` never trips. `0` disables PROACTIVE saturation expansion. Note: with `0` (or `100`), if every existing session is already at its effective stream cap (peer `MAX_CONCURRENT_STREAMS` clamped by `max_concurrent_streams_pref`), the next request still constructs a fresh H2 transport via `pool.max_connections` rather than queuing — this is a hard-cap safety valve, not saturation routing. To collapse the pool to exactly one H2 connection per upstream per dispatcher, set `pool.max_connections=1` (extra demand then queues at `pool.max_queued`). |
+| `preconnect_watermark_pct` | 0 | yes | Predictive warm-spare threshold (must satisfy `0 < pct < saturation_open_pct`). When a picked session's utilization first crosses this watermark, `MaybePreconnectH2` opens a probe connection so the next saturation event has a ready spare. Requires `saturation_open_pct > 0`; `0` disables. |
 
 **TLS requirement:** `http2.enabled = true` requires `tls.enabled = true` (no h2c support). `http2.prefer = "always"` additionally rejects at config-load if TLS is disabled.
 

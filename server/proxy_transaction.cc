@@ -923,14 +923,50 @@ bool ProxyTransaction::TryDispatchExistingH2Session() {
     if (!partition) return false;
     auto cfg = partition->LoadHttp2ConfigSnapshot();
     if (!cfg || !cfg->enabled || cfg->prefer == "never") return false;
-    auto existing = partition->FindUsableH2Connection(service_name_);
-    if (!existing) return false;
-    // Existing session is reusable. Skip CheckoutAsync entirely and
-    // dispatch through the H2 path with an EMPTY lease — DispatchH2's
-    // AcquireH2Connection FAST branch returns the same session without
-    // touching the lease, and lease_ stays empty (the existing session
-    // owns its own donated lease for transport lifetime). Advance to
-    // SENDING_REQUEST as if OnCheckoutReady had granted us a lease.
+    // Prefer an under-threshold session.
+    auto existing = partition->FindUsableH2ConnectionSaturation(service_name_);
+    if (!existing) {
+        // No under-threshold session. Fire a capacity probe for FUTURE
+        // requests if policy allows.
+        if (partition->ShouldOpenAdditionalH2Conn(service_name_)) {
+            partition->StartH2CapacityProbe(service_name_, upstream_port_);
+        }
+        // Fallback: an over-threshold session may still have stream
+        // capacity (active_streams_ < max_concurrent_streams_pref AND
+        // utilization ≥ saturation_open_pct percent). Reuse it for
+        // THIS request rather than queuing in StartCheckoutAsync —
+        // CheckoutAsync's `TotalCount() < partition_max_connections_`
+        // gate doesn't know about per-H2-session stream capacity, so
+        // when cap is reached the request would queue while the
+        // multiplexed session sits with free streams. The just-fired
+        // probe handles FUTURE load growth; this branch unblocks the
+        // current request.
+        existing = partition->FindUsableH2Connection(service_name_);
+        if (!existing) {
+            // No usable H2 session at all. Fall through to checkout
+            // which creates a new transport (under cap) or queues.
+            return false;
+        }
+        logging::Get()->debug(
+            "TryDispatchExistingH2Session: reusing over-threshold H2 "
+            "session for service={} client_fd={} — capacity probe "
+            "(if any) handles future load",
+            service_name_, client_fd_);
+    } else {
+        // Under-threshold session picked. Predictive preconnect fires
+        // if the session is in the (watermark, saturation) window so
+        // the next request finds an additional session already warming
+        // up. MaybePreconnectH2 is a no-op when preconnect_watermark_pct
+        // == 0 (disabled fast path) and self-gates on cap / in-flight-probe.
+        partition->MaybePreconnectH2(service_name_, upstream_port_, *existing);
+    }
+    // Reusable session in hand (under- or over-threshold). Skip
+    // CheckoutAsync entirely and dispatch through the H2 path with an
+    // EMPTY lease — DispatchH2's AcquireH2Connection FAST branch returns
+    // the same session without touching the lease, and lease_ stays
+    // empty (the existing session owns its own donated lease for
+    // transport lifetime). Advance to SENDING_REQUEST as if
+    // OnCheckoutReady had granted us a lease.
     state_ = State::SENDING_REQUEST;
     DispatchH2();
     return true;
@@ -1296,9 +1332,6 @@ void ProxyTransaction::DispatchH2() {
     // == 0 opts out of the response-wait timer; stall protection stays
     // on via SEND_STALL_FALLBACK_MS.
     h2_path_ = true;
-    h2_conn_ = h2;
-    h2_conn_alive_ = h2->alive_token();
-    h2_partition_alive_ = h2->partition_alive_token();
     state_ = State::SENDING_REQUEST;
     h2_response_timeout_armed_ = false;
     h2_request_fully_sent_ = false;
@@ -1328,9 +1361,8 @@ void ProxyTransaction::DispatchH2() {
         h2_path_ = false;
         h2_response_timeout_armed_ = false;
         h2_request_fully_sent_ = false;
-        h2_conn_ = nullptr;
-        h2_conn_alive_.reset();
-        h2_partition_alive_.reset();
+        // h2_lease_ was not constructed yet (construction happens AFTER
+        // a successful stream_id capture below); nothing to release.
         logging::Get()->warn(
             "ProxyTransaction H2 submit failed client_fd={} service={} "
             "attempt={}", client_fd_, service_name_, attempt_);
@@ -1343,6 +1375,22 @@ void ProxyTransaction::DispatchH2() {
     }
 
     h2_stream_id_ = stream_id;
+
+    // Construct the H2 lease NOW (post-submit) so its destructor's
+    // ReturnH2Stream call carries the real stream_id. Constructing
+    // earlier (e.g. at line 1298 alongside h2_path_=true) would invoke
+    // ReturnH2Stream(h2, -1, ...) on submit-failure, tripping the
+    // BUG-log defense at PoolPartition::ReturnH2Stream. The dual-token
+    // pair (partition_alive, conn_alive) gates GetH2Connection() so a
+    // mid-flight session/partition destruction short-circuits cleanly.
+    // The off-dispatcher counter + dispatcher are captured so an
+    // off-thread Release can fire bookkeeping without dereferencing
+    // partition_ during its destruction window.
+    h2_lease_ = UpstreamLease(
+        h2, stream_id, partition,
+        partition->alive_token(), h2->alive_token(),
+        partition->OffDispatcherReleaseDropsPtr(),
+        partition->dispatcher_ptr());
 
     // Wake any ANY-kind waiters that queued during the connect window.
     // Done HERE (not inside AcquireH2Connection's construct branch) so
@@ -2620,21 +2668,27 @@ void ProxyTransaction::Cleanup() {
     // (empty) guard decrements the old counter immediately.
     inflight_guard_ = CIRCUIT_BREAKER_NAMESPACE::RetryBudget::InFlightGuard{};
 
-    // H2 path: the transport is owned by the multiplexed
-    // UpstreamH2Connection — its callbacks are bound to the H2 session
-    // for its full lifetime, NOT to this single stream. Issue
-    // RST_STREAM (if the session is still alive) and let the session
-    // continue serving sibling streams; do NOT touch transport
-    // callbacks or release a lease (the lease was donated to the H2
-    // connection at dispatch time).
+    // H2 path: two leases are in flight.
+    //   (1) Transport lease — donated to the UpstreamH2Connection for its
+    //       full lifetime at dispatch time; its callbacks are bound to the
+    //       H2 session and must NOT be touched here. Issue RST_STREAM so
+    //       the session can continue serving sibling streams.
+    //   (2) Per-stream h2_lease_ — holds the stream slot on the H2 session.
+    //       Released explicitly via h2_lease_.Release() below so the slot
+    //       frees immediately rather than waiting for the lease destructor.
     if (h2_path_) {
-        if (h2_stream_id_ >= 0 && H2ConnAlive()) {
-            h2_conn_->ResetStream(h2_stream_id_);
+        if (h2_stream_id_ >= 0) {
+            if (auto* h2 = h2_lease_.GetH2Connection()) {
+                h2->ResetStream(h2_lease_.GetH2StreamId());
+            }
         }
         h2_stream_id_ = -1;
-        h2_conn_ = nullptr;
-        h2_conn_alive_.reset();
-        h2_partition_alive_.reset();
+        // Release the lease BEFORE flipping h2_path_=false at the end
+        // of this block. The lease destructor's ReturnH2Stream call
+        // logs at debug-level (slot-release admission is the walker's
+        // job via RunDeferredEraseWalk); donated leases are skipped
+        // automatically via MarkDonatedToH2 / kind_ check.
+        h2_lease_.Release();
         // Bump send-stall generation BEFORE the h2_path_ flip so any
         // in-flight send-stall closure no-ops on its eventual fire.
         // Same pattern as h2_response_timeout_generation_ below.

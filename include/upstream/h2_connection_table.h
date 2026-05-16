@@ -50,6 +50,16 @@ public:
     // `conn->alive_token()` alongside the raw pointer.
     UpstreamH2Connection* FindUsable(const std::string& upstream_name);
 
+    // Multi-conn-per-host selection helper. Returns every usable
+    // connection for `upstream_name` in insertion order, reaping
+    // expired entries inline. Caller is expected to apply per-candidate
+    // predicates (endpoint freshness, saturation threshold) and pick
+    // one. Pointers are non-owning and only valid on the dispatcher;
+    // FIFO order matches admission order so the oldest session is
+    // preferred when other criteria tie.
+    std::vector<UpstreamH2Connection*> CollectUsableForUpstream(
+        const std::string& upstream_name);
+
     // Append a freshly Init()'d connection. Caller has already donated
     // the lease via UpstreamH2Connection::AdoptLease.
     void Insert(const std::string& upstream_name,
@@ -76,6 +86,23 @@ public:
     // donated leases drop and the partition's outstanding_conns_
     // counter reaches zero before WaitForDrain times out.
     std::vector<std::unique_ptr<UpstreamH2Connection>> ExtractAll();
+
+    // Like ExtractAll but preserves the upstream-name key per entry.
+    // Used by InitiateShutdown so the caller can re-insert after a
+    // section where a reentrant FindUsable must see an empty table.
+    std::vector<std::pair<std::string, std::unique_ptr<UpstreamH2Connection>>>
+        ExtractAllWithKeys();
+
+    // Non-destructive snapshot of every tracked connection — returns raw
+    // pointers in arbitrary upstream-bucket order, preserving per-bucket
+    // insertion order. Lifetime contract: pointers are non-owning AND
+    // are only safe to use on the dispatcher AND must be Extract'd with
+    // a null-check (a concurrent reap chain may have moved the conn to
+    // pending_destroy_h2_conns_ between snapshot and Extract). Used by
+    // PoolPartition::InitiateShutdown's graceful-drain poll loop so
+    // walk-and-erase iteration over by_upstream_ does not invalidate
+    // its own iterators. Distinct from ExtractAll which is destructive.
+    std::vector<UpstreamH2Connection*> CollectAll() const;
 
 private:
     std::unordered_map<std::string,
