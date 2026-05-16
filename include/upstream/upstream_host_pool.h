@@ -52,6 +52,8 @@ public:
     const std::string& host() const { return host_; }
     int port() const { return port_; }
     size_t partition_count() const { return partitions_.size(); }
+    int64_t preconnect_fired_count() const noexcept;
+    int64_t preconnect_skipped_cap_count() const noexcept;
 
 private:
     std::string service_name_;

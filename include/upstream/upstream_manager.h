@@ -126,6 +126,8 @@ public:
         return off_dispatcher_release_drops_ptr_->load(
             std::memory_order_acquire);
     }
+    int64_t h2_preconnect_fired_count() const noexcept;
+    int64_t h2_preconnect_skipped_cap_count() const noexcept;
 
 #ifdef REACTOR_BUILDING_TESTS
     // Test-only: adjust the lease counters by signed deltas. Tests that

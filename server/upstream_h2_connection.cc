@@ -1052,6 +1052,16 @@ void UpstreamH2Connection::ResetStream(int32_t stream_id) {
     if (dead_) return;
     auto it = streams_.find(stream_id);
     if (it == streams_.end()) return;
+    if (it->second &&
+        (it->second->pending_erase_ || it->second->peer_already_closed_)) {
+        // The stream is already terminal from nghttp2's point of view
+        // (for example Cleanup re-entered from OnStreamClose). Detach the
+        // sink so the transaction can complete safely, but do not submit an
+        // invalid RST_STREAM against a closed stream.
+        DetachSink(stream_id);
+        DropDrainEntriesForStream(stream_id);
+        return;
+    }
     // Detach the sink before submitting RST_STREAM so the eventual
     // OnStreamClose does not fire OnError on a transaction that has
     // already moved on (e.g. a retry in progress). The drain-queue

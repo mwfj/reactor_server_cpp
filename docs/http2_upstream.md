@@ -116,6 +116,11 @@ A successful H2 request flow shows: `submit` → `OnHeaders` → `OnBodyChunk` (
 - **`donated_h2_leases`** — long-lived leases held by multiplexed H2 sessions (one per live `UpstreamH2Connection`). Stays positive across the H2 session's lifetime; explicitly excluded from the shutdown-drain predicate so idle sessions don't wedge `Stop()`.
 - **`off_dispatcher_release_drops`** — safety counter; non-zero means lease releases ran off the partition's dispatcher thread and skipped the partition mutation. Should stay zero in healthy production. If you see it rising, expect `Stop()` to wedge until `shutdown_drain_timeout_sec`.
 
+`/stats` also exposes Phase 4 H2 preconnect counters under `h2_upstream`:
+
+- **`preconnect_fired`** — successful predictive preconnect probes dispatched across all upstream partitions.
+- **`preconnect_skipped_cap`** — preconnect attempts skipped because `pool.max_connections` was already at capacity.
+
 The following per-session metrics show up only in logs at debug/info level today (planned for `/stats` exposure in a future release):
 
 - H2 connection count per upstream (one log line per `Init` and per retire).

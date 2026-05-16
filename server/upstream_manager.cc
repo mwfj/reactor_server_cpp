@@ -273,6 +273,22 @@ UpstreamManager::~UpstreamManager() {
     logging::Get()->debug("UpstreamManager destroyed");
 }
 
+int64_t UpstreamManager::h2_preconnect_fired_count() const noexcept {
+    int64_t total = 0;
+    for (const auto& [_, pool] : pools_) {
+        if (pool) total += pool->preconnect_fired_count();
+    }
+    return total;
+}
+
+int64_t UpstreamManager::h2_preconnect_skipped_cap_count() const noexcept {
+    int64_t total = 0;
+    for (const auto& [_, pool] : pools_) {
+        if (pool) total += pool->preconnect_skipped_cap_count();
+    }
+    return total;
+}
+
 void UpstreamManager::CheckoutAsync(
     const std::string& service_name,
     size_t dispatcher_index,

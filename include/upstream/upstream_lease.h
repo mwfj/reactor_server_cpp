@@ -6,7 +6,7 @@
 
 class UpstreamConnection;
 class UpstreamH2Connection;
-class UpstreamH2Stream;
+struct UpstreamH2Stream;
 class PoolPartition;
 class Dispatcher;
 

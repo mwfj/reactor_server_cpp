@@ -473,6 +473,13 @@ MakeStatsHandler(HttpServer* server, const ServerConfig& config) {
                 lh["off_dispatcher_release_drops"] =
                     upm->off_dispatcher_release_drops();
                 root["lease_health"] = std::move(lh);
+
+                nlohmann::json h2;
+                h2["preconnect_fired"] =
+                    upm->h2_preconnect_fired_count();
+                h2["preconnect_skipped_cap"] =
+                    upm->h2_preconnect_skipped_cap_count();
+                root["h2_upstream"] = std::move(h2);
             }
             // Render the JSON, then re-open the trailing '}' so
             // AppendAuthSnapshot can splice in the auth fields without

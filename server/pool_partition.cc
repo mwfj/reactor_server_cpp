@@ -206,7 +206,8 @@ static void ClearTransportCallbacks(UpstreamConnection* conn) {
 // Saturation ratio in percent. Caller guarantees max_streams_pref > 0.
 static int ComputeStreamUtilizationPct(uint32_t streams,
                                        uint32_t max_streams_pref) {
-    return static_cast<int>((streams * 100u) / max_streams_pref);
+    return static_cast<int>(
+        (static_cast<uint64_t>(streams) * 100u) / max_streams_pref);
 }
 
 PoolPartition::~PoolPartition() {
