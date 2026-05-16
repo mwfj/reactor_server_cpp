@@ -324,20 +324,19 @@ public:
     UpstreamH2Connection* FindUsableH2Connection(
         const std::string& upstream_name);
 
-    // Saturation routing policy gate. True when (a)
-    // `saturation_open_pct > 0` AND (b) `TotalCount() <
-    // partition_max_connections_` (slot-starvation prevention) AND
+    // Saturation routing policy gate. 
+    // True when (a) `saturation_open_pct > 0` AND 
+    // (b) `TotalCount() < partition_max_connections_` (slot-starvation prevention) AND
     // (c) every CURRENTLY-USABLE conn for `upstream_name` has
     // `active_streams * 100 / max_concurrent_streams_pref >=
-    // saturation_open_pct`. Edge cases: `saturation_open_pct == 0`
-    // returns false (disabled fast path); empty candidate list
-    // returns false (cold-start handles the first conn);
+    // saturation_open_pct`. 
+    // Edge cases: `saturation_open_pct == 0` returns false (disabled fast path); 
+    // empty candidate list returns false (cold-start handles the first conn);
     // `max_concurrent_streams_pref == 0` treats the conn as infinite
     // capacity (never saturated). Single LoadHttp2ConfigSnapshot read
     // at the top so per-candidate evaluations use the same captured
     // config. Dispatcher-thread-only.
-    bool ShouldOpenAdditionalH2Conn(
-        const std::string& upstream_name);
+    bool ShouldOpenAdditionalH2Conn(const std::string& upstream_name);
 
     // Saturation-aware variant of FindUsableH2Connection. Returns
     // the first endpoint-fresh USABLE conn whose stream-utilization
@@ -348,8 +347,7 @@ public:
     // probe (via StartH2CapacityProbe) or fall back to
     // FindUsableH2Connection (over-threshold conn is still better
     // than blocking the request).
-    UpstreamH2Connection* FindUsableH2ConnectionSaturation(
-        const std::string& upstream_name);
+    UpstreamH2Connection* FindUsableH2ConnectionSaturation(const std::string& upstream_name);
 
     // Stats (dispatcher-thread-only reads)
     size_t IdleCount() const { return idle_conns_.size(); }

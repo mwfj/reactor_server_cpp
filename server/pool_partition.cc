@@ -2613,12 +2613,11 @@ void PoolPartition::OnH2ConnectHandshakeComplete(
         }
         // DNS swap mid-probe detection: the probe's captured endpoint
         // (in `uc_raw->captured_endpoint()`) is compared to the
-        // partition's current `resolved_endpoint_` via
-        // `ConnectionEndpointMatches`; on mismatch a reload published
-        // a new endpoint while the probe was in flight. The negotiated
-        // h1 transport is keyed against the stale endpoint → must not
-        // be adopted into idle_conns_. Roll back, drop the (now-stale)
-        // cache entry, and trigger a replacement probe so queued
+        // partition's current `resolved_endpoint_` via `ConnectionEndpointMatches`; 
+        // on mismatch a reload published a new endpoint while the probe was in flight. 
+        // The negotiated h1 transport is keyed against the stale endpoint → must not
+        // be adopted into idle_conns_. 
+        // Roll back, drop the (now-stale) cache entry, and trigger a replacement probe so queued
         // waiters get serviced against the fresh endpoint.
         if (uc_raw && !ConnectionEndpointMatches(*uc_raw)) {
             logging::Get()->info(

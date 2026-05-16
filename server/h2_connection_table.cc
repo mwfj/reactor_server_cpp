@@ -69,8 +69,7 @@ UpstreamH2Connection* H2ConnectionTable::FindUsable(
 }
 
 std::vector<UpstreamH2Connection*>
-H2ConnectionTable::CollectUsableForUpstream(
-    const std::string& upstream_name)
+H2ConnectionTable::CollectUsableForUpstream(const std::string& upstream_name)
 {
     std::vector<UpstreamH2Connection*> out;
     auto it = by_upstream_.find(upstream_name);
