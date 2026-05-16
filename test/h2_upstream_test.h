@@ -9567,17 +9567,11 @@ static void TestS34_InitiateShutdownGracefulDrain() {
     }
 }
 
-// S34b — Reentrancy guard for InitiateShutdown's graceful-drain loop.
-// BeginShutdownDrain's synchronous FlushSend can fire transport close-cb
-// → FailAllStreams → sink->OnError → reentrant FindUsable/CollectUsable
-// which inline-reaps IsExpired (goaway_seen + empty streams) entries.
-// Without the ExtractAllWithKeys + re-insert fix, the raw snapshot would
-// dangle when a sibling close-cb's FailAllStreams empties streams_ and
-// the reentrant lookup reaps the unique_ptr the loop is still working
-// through. This test verifies: (a) every session in the snapshot reaches
-// BeginShutdownDrain (goaway_seen + shutdown_drain_active both true),
-// and (b) every session is re-inserted into h2_table_ for
-// PollShutdownDrain to handle (none silently lost).
+// S34b — InitiateShutdown's graceful drain must (a) put every session
+// through BeginShutdownDrain and (b) leave every session tracked in
+// h2_table_ for PollShutdownDrain. The extract-before-drain pattern
+// owns the unique_ptrs across the loop so a synchronous close-cb chain
+// can't dangle the iterator via inline IsExpired reap.
 static void TestS34b_InitiateShutdownReentrancyMultipleSessions() {
     std::cout << "\n[TEST] H2Upstream S34b: InitiateShutdown multi-session reentrancy guard..." << std::endl;
     try {
@@ -9701,22 +9695,13 @@ static void TestS34b_InitiateShutdownReentrancyMultipleSessions() {
     }
 }
 
-// S34c — Direct property test of the reentrant-safety guard inside
-// PoolPartition::InitiateShutdown's graceful-drain loop. The production
-// UAF surface is: BeginShutdownDrain → FlushSend fails → transport
-// close-cb fires synchronously → MarkDead + FailAllStreams → sink
-// OnError → ProxyTransaction MaybeRetry → AcquireH2Connection →
-// h2_table_.CollectUsableForUpstream (inline-reaps IsExpired entries).
-// Unit-test fixtures can't trigger the synchronous close-cb chain
-// without a real socket, so S34b verifies the structural outcome
-// (sessions re-inserted post-drain) but cannot demonstrate the
-// reentrant lookup landing on an empty table mid-loop. This test
-// drives the property directly via the H2ConnectionTable helper that
-// InitiateShutdown uses: ExtractAllWithKeys → reentrant lookups see
-// empty → re-insert → table restored. Any reentrant FindUsable /
-// CollectUsableForUpstream during the simulated drain window returns
-// null/empty rather than dangling raw pointers — proving the UAF
-// guard regardless of which sink triggers the reentry in production.
+// S34c — While `ExtractAllWithKeys` owns the unique_ptrs, h2_table_ must
+// appear empty to reentrant lookups so a synchronous close-cb chain
+// can't dangle on a mid-loop entry. After re-insert the table must
+// match the original count. Unit tests can't force a real synchronous
+// close-cb without a socket, so this test drives the property via the
+// helper directly — proving the UAF guard independent of which sink
+// triggers the reentry in production.
 static void TestS34c_ExtractAllWithKeysIsolatesTableDuringDrain() {
     std::cout << "\n[TEST] H2Upstream S34c: ExtractAllWithKeys isolates table during drain..." << std::endl;
     try {
@@ -9745,23 +9730,14 @@ static void TestS34c_ExtractAllWithKeysIsolatesTableDuringDrain() {
         bool pre_total_ok = (table.TotalConnections() == kSessions);
         bool pre_find_ok  = (table.FindUsable("svc") != nullptr);
 
-        // Phase 1: take ownership (mirrors InitiateShutdown's first step).
         auto owned = table.ExtractAllWithKeys();
 
-        // Phase 2: while owned, any reentrant FindUsable / Collect must
-        // see an empty table. This is what protects the production drain
-        // loop from a synchronous-close-cb reentry reaping mid-iteration
-        // entries (the very UAF that triggered this round of review).
+        // Reentrant lookups during the owned-window must see empty.
         bool during_total_ok   = (table.TotalConnections() == 0);
         bool during_find_ok    = (table.FindUsable("svc") == nullptr);
         bool during_collect_ok =
             table.CollectUsableForUpstream("svc").empty();
 
-        // Simulate drain by calling BeginShutdownDrain on each owned
-        // session. Without proper isolation, a reentrant CollectUsable
-        // here would reap IsExpired (goaway_seen + streams empty)
-        // entries and dangle the loop's raw iterator. Owned vector
-        // keeps unique_ptrs alive across this loop regardless.
         for (auto& [_, conn] : owned) {
             if (conn) conn->BeginShutdownDrain(5000);
         }

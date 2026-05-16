@@ -582,6 +582,13 @@ private:
     // the wiring is in place for when reload-time endpoint replacement lands.
     bool ConnectionEndpointMatches(const UpstreamConnection& c) const;
 
+    // True if `c`'s transport is non-null and its captured endpoint matches
+    // the partition's current resolved endpoint. Otherwise marks `c` dead
+    // and returns false. Shared by every H2 candidate-walk that filters by
+    // endpoint freshness (FindUsableH2Connection, FindUsableH2ConnectionSaturation,
+    // MaybePreconnectH2 spare check).
+    bool IsEndpointFreshOrMarkDead(UpstreamH2Connection& c) const;
+
     size_t partition_max_connections_;
 
     // Shared atomic flag cleared in destructor. Atomic because it's written

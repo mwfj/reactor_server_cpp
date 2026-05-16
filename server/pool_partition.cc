@@ -1104,13 +1104,7 @@ UpstreamH2Connection* PoolPartition::FindUsableH2ConnectionSaturation(
     const int threshold = cfg->saturation_open_pct;
     auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
     for (auto* candidate : candidates) {
-        UpstreamConnection* t = candidate->transport();
-        if (!t || !ConnectionEndpointMatches(*t)) {
-            // Endpoint stale (post-reload IP swap). Mark dead — the
-            // table walker reaps on next CollectUsable.
-            candidate->MarkDead();
-            continue;
-        }
+        if (!IsEndpointFreshOrMarkDead(*candidate)) continue;
         const uint32_t eff_cap = candidate->EffectiveMaxStreams();
         if (eff_cap == 0) continue;  // session not usable — skip
         const int ratio_pct = ComputeStreamUtilizationPct(
@@ -1150,35 +1144,19 @@ void PoolPartition::MaybePreconnectH2(
     if (ratio_pct < cfg->preconnect_watermark_pct) return;
     if (ratio_pct >= cfg->saturation_open_pct) return;
 
-    // Fleet-wide spare check: do not open another warm spare if one
-    // already exists. Without this, A at 60% (in window) + B at 0%
-    // (spare) → each request picks A and fires another preconnect
-    // until pool.max_connections fills with idle warm spares.
-    // Spare = any OTHER usable session whose utilization is below the
-    // watermark (operator's "this session has slack" signal).
-    //
-    // Endpoint-aware: a stale-endpoint candidate (DNS swapped, session
-    // about to be retired) must NOT count as a spare — otherwise
-    // preconnect is suppressed on a session that won't survive the
-    // next dispatch. Mark stale candidates dead inline so the next
-    // FindUsable / CollectUsable skips them (mirrors
-    // FindUsableH2Connection's defensive eviction).
+    // Fleet-wide spare check: skip preconnect if any OTHER endpoint-fresh
+    // session is below the watermark (operator's "slack available" signal).
+    // Without this, A at 60% + B at 0% → each request picks A and fires
+    // a preconnect, filling pool.max_connections with idle warm spares.
     auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
     for (auto* c : candidates) {
-        if (c == &picked_session) continue;  // not a spare; this is the picked one
-        UpstreamConnection* t = c->transport();
-        if (!t || !ConnectionEndpointMatches(*t)) {
-            c->MarkDead();
-            continue;
-        }
+        if (c == &picked_session) continue;
+        if (!IsEndpointFreshOrMarkDead(*c)) continue;
         const uint32_t cap = c->EffectiveMaxStreams();
-        if (cap == 0) continue;  // not usable — skip
+        if (cap == 0) continue;
         const int cand_pct = ComputeStreamUtilizationPct(
             c->active_stream_count(), cap);
-        if (cand_pct < cfg->preconnect_watermark_pct) {
-            // Spare already available — skip preconnect.
-            return;
-        }
+        if (cand_pct < cfg->preconnect_watermark_pct) return;  // spare found
     }
     // Delegate the actual probe to StartH2CapacityProbe so the
     // capacity-probe semantics (shutdown / in-flight-probe / cap
@@ -1278,11 +1256,7 @@ UpstreamH2Connection* PoolPartition::FindUsableH2Connection(
     // saturation / preconnect) or fall back.
     auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
     for (auto* candidate : candidates) {
-        UpstreamConnection* t = candidate->transport();
-        if (t && ConnectionEndpointMatches(*t)) {
-            return candidate;
-        }
-        candidate->MarkDead();
+        if (IsEndpointFreshOrMarkDead(*candidate)) return candidate;
     }
     return nullptr;
 }
@@ -1603,27 +1577,13 @@ void PoolPartition::InitiateShutdown(int server_drain_timeout_sec) {
             if (!alive->load(std::memory_order_acquire)) return;
         }
     } else {
-        // Graceful drain. BeginShutdownDrain emits GOAWAY + sets
-        // goaway_seen_ + records the deadline; the session stays in
-        // h2_table_ while in-flight streams complete. PollShutdownDrain
-        // (kicked off below) reaps each session as IsShutdownDrainComplete
-        // becomes true (streams empty / transport dead / deadline elapsed).
-        //
-        // Reentrant-delete UAF guard: BeginShutdownDrain → FlushSend can
-        // fail synchronously, fire transport close-cb → FailAllStreams →
-        // sink->OnError → ProxyTransaction::MaybeRetry → AcquireH2Connection
-        // → h2_table_.CollectUsableForUpstream (which reaps IsExpired
-        // entries inline). After BeginShutdownDrain runs, the session is
-        // (goaway_seen=true, streams=empty) → IsExpired=true. A raw
-        // snapshot would dangle when the synchronous chain reaps the
-        // unique_ptr the loop is currently working through (or any
-        // later snapshot entry that became expired via a sibling close-
-        // cb's FailAllStreams). Take owning unique_ptrs out of h2_table_
-        // BEFORE the BeginShutdownDrain loop; reentrant FindUsable then
-        // sees an empty table (shutting_down_ is already set so no fresh
-        // admissions). Re-insert under the preserved upstream-name key
-        // after the loop completes so PollShutdownDrain can walk them
-        // via the canonical reap path.
+        // Graceful drain. Sessions stay tracked while in-flight streams
+        // complete; PollShutdownDrain reaps each on IsShutdownDrainComplete.
+        // Take ownership BEFORE BeginShutdownDrain: a synchronous close-cb
+        // chain can reach back into h2_table_ via CollectUsableForUpstream,
+        // which inline-reaps IsExpired entries — owning unique_ptrs out of
+        // the table means the reentrant lookup sees an empty table instead
+        // of dangling pointers to entries the loop is still processing.
         auto owned = h2_table_.ExtractAllWithKeys();
         for (auto& [_, conn] : owned) {
             if (!conn) continue;
@@ -1972,6 +1932,13 @@ void PoolPartition::ForceCloseActive() {
             try { w.on_msg(w.transport, empty); } catch (...) {}
         }
     }
+}
+
+bool PoolPartition::IsEndpointFreshOrMarkDead(UpstreamH2Connection& c) const {
+    UpstreamConnection* t = c.transport();
+    if (t && ConnectionEndpointMatches(*t)) return true;
+    c.MarkDead();
+    return false;
 }
 
 bool PoolPartition::ConnectionEndpointMatches(
@@ -2554,16 +2521,10 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
 
         conn_handler->RegisterOutboundCallbacks();
 
-        // Final commit: stash the H2 shell into the connecting map. This
-        // can throw bad_alloc on key allocation BEFORE consuming h2 (the
-        // unique_ptr move-assign is noexcept, so a thrown insert leaves
-        // h2 intact and us in a partial-state where outstanding_conns_
-        // is bumped, transport sits in connecting_conns_, and callbacks
-        // are wired pointing at the about-to-destruct h2. Putting the
-        // commit inside the try ensures the shared rollback fires and
-        // tears everything down atomically — pitfall rule "bump + push
-        // + wire is one transaction" extended to "bump + push + wire +
-        // stash".
+        // Map insert can throw bad_alloc on key allocation before the
+        // noexcept unique_ptr move-assign — inside the try so the
+        // rollback path tears down outstanding_conns_ + connecting_conns_
+        // atomically.
         h2_connecting_conns_[HostPortKey{upstream_name, port}] = std::move(h2);
     } catch (const std::exception& e) {
         logging::Get()->error(
