@@ -1395,6 +1395,13 @@ int32_t UpstreamH2Connection::SubmitRequest(
                 }
             }
             MarkDead();
+            // Drain the pending-erase queue inline so the just-marked
+            // stream is removed from streams_ and active_streams_ is
+            // decremented. Otherwise active_streams_ stays >0, IsExpired
+            // never trips (gates on `active_stream_count() == 0 &&
+            // (IsDead() || goaway_seen())`), and the dead session
+            // occupies its partition slot until shutdown.
+            RunDeferredEraseWalk();
             return -1;
         }
     }

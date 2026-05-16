@@ -9701,6 +9701,107 @@ static void TestS34b_InitiateShutdownReentrancyMultipleSessions() {
     }
 }
 
+// S34c — Direct property test of the reentrant-safety guard inside
+// PoolPartition::InitiateShutdown's graceful-drain loop. The production
+// UAF surface is: BeginShutdownDrain → FlushSend fails → transport
+// close-cb fires synchronously → MarkDead + FailAllStreams → sink
+// OnError → ProxyTransaction MaybeRetry → AcquireH2Connection →
+// h2_table_.CollectUsableForUpstream (inline-reaps IsExpired entries).
+// Unit-test fixtures can't trigger the synchronous close-cb chain
+// without a real socket, so S34b verifies the structural outcome
+// (sessions re-inserted post-drain) but cannot demonstrate the
+// reentrant lookup landing on an empty table mid-loop. This test
+// drives the property directly via the H2ConnectionTable helper that
+// InitiateShutdown uses: ExtractAllWithKeys → reentrant lookups see
+// empty → re-insert → table restored. Any reentrant FindUsable /
+// CollectUsableForUpstream during the simulated drain window returns
+// null/empty rather than dangling raw pointers — proving the UAF
+// guard regardless of which sink triggers the reentry in production.
+static void TestS34c_ExtractAllWithKeysIsolatesTableDuringDrain() {
+    std::cout << "\n[TEST] H2Upstream S34c: ExtractAllWithKeys isolates table during drain..." << std::endl;
+    try {
+        H2ConnectionTable table;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 5;
+
+        constexpr size_t kSessions = 3;
+        std::vector<UpstreamH2Connection*> raws;
+        for (size_t i = 0; i < kSessions; ++i) {
+            auto conn = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+            if (!conn->Init()) {
+                TestFramework::RecordTest(
+                    "H2Upstream S34c: ExtractAllWithKeys isolates table during drain",
+                    false, "Init failed");
+                return;
+            }
+            raws.push_back(conn.get());
+            table.Insert("svc", std::move(conn));
+        }
+
+        bool pre_total_ok = (table.TotalConnections() == kSessions);
+        bool pre_find_ok  = (table.FindUsable("svc") != nullptr);
+
+        // Phase 1: take ownership (mirrors InitiateShutdown's first step).
+        auto owned = table.ExtractAllWithKeys();
+
+        // Phase 2: while owned, any reentrant FindUsable / Collect must
+        // see an empty table. This is what protects the production drain
+        // loop from a synchronous-close-cb reentry reaping mid-iteration
+        // entries (the very UAF that triggered this round of review).
+        bool during_total_ok   = (table.TotalConnections() == 0);
+        bool during_find_ok    = (table.FindUsable("svc") == nullptr);
+        bool during_collect_ok =
+            table.CollectUsableForUpstream("svc").empty();
+
+        // Simulate drain by calling BeginShutdownDrain on each owned
+        // session. Without proper isolation, a reentrant CollectUsable
+        // here would reap IsExpired (goaway_seen + streams empty)
+        // entries and dangle the loop's raw iterator. Owned vector
+        // keeps unique_ptrs alive across this loop regardless.
+        for (auto& [_, conn] : owned) {
+            if (conn) conn->BeginShutdownDrain(5000);
+        }
+
+        // Phase 3: re-insert under preserved keys.
+        for (auto& [name, conn] : owned) {
+            if (conn) table.Insert(name, std::move(conn));
+        }
+
+        bool post_total_ok = (table.TotalConnections() == kSessions);
+        // Every session must have reached BeginShutdownDrain state.
+        bool all_draining = true;
+        for (auto* r : raws) {
+            if (!r || !r->goaway_seen() || !r->shutdown_drain_active()) {
+                all_draining = false;
+                break;
+            }
+        }
+
+        bool pass = pre_total_ok && pre_find_ok && during_total_ok &&
+                    during_find_ok && during_collect_ok && post_total_ok &&
+                    all_draining;
+        TestFramework::RecordTest(
+            "H2Upstream S34c: ExtractAllWithKeys isolates table during drain",
+            pass,
+            pass ? "" :
+            (std::string("pre_total=") + std::to_string(pre_total_ok) +
+             " pre_find=" + std::to_string(pre_find_ok) +
+             " during_total=" + std::to_string(during_total_ok) +
+             " during_find=" + std::to_string(during_find_ok) +
+             " during_collect=" + std::to_string(during_collect_ok) +
+             " post_total=" + std::to_string(post_total_ok) +
+             " all_draining=" + std::to_string(all_draining)).c_str());
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S34c: ExtractAllWithKeys isolates table during drain",
+            false, e.what());
+    }
+}
+
 // S35 — Race condition shape: concurrent ShouldOpenAdditionalH2Conn reads
 // from dispatcher thread while FailAllStreams mutates active_streams_ on
 // the same thread.  Uses promise/future to serialize — verifies no crash.
@@ -10075,6 +10176,7 @@ void RunAllH2UpstreamTests() {
     TestS33_ShutdownDrainWithStream();
     TestS34_InitiateShutdownGracefulDrain();
     TestS34b_InitiateShutdownReentrancyMultipleSessions();
+    TestS34c_ExtractAllWithKeysIsolatesTableDuringDrain();
     TestS35_ConcurrentSaturationAndFailAll();
     TestS36_InsertAndShutdownNoLeak();
 }

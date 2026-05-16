@@ -2552,6 +2552,18 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
         conn_handler->SetErrorCb(std::move(classify_and_dispatch));
 
         conn_handler->RegisterOutboundCallbacks();
+
+        // Final commit: stash the H2 shell into the connecting map. This
+        // can throw bad_alloc on key allocation BEFORE consuming h2 (the
+        // unique_ptr move-assign is noexcept, so a thrown insert leaves
+        // h2 intact and us in a partial-state where outstanding_conns_
+        // is bumped, transport sits in connecting_conns_, and callbacks
+        // are wired pointing at the about-to-destruct h2. Putting the
+        // commit inside the try ensures the shared rollback fires and
+        // tears everything down atomically — pitfall rule "bump + push
+        // + wire is one transaction" extended to "bump + push + wire +
+        // stash".
+        h2_connecting_conns_[HostPortKey{upstream_name, port}] = std::move(h2);
     } catch (const std::exception& e) {
         logging::Get()->error(
             "OpenNewH2Connection: setup failed for {}:{}: {}",
@@ -2565,8 +2577,6 @@ bool PoolPartition::OpenNewH2Connection(const std::string& upstream_name,
         rollback();
         return false;
     }
-
-    h2_connecting_conns_[HostPortKey{upstream_name, port}] = std::move(h2);
     return true;
 }
 
