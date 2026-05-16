@@ -8130,6 +8130,65 @@ static void TestA3_7_SaturationSkipsDrainingSession() {
     }
 }
 
+// A3.8 — Regression for the TickAll / shutdown-drain conflation finding.
+// BeginShutdownDrain sets `goaway_seen_=true` to drive nghttp2's drain
+// machinery, but the GOAWAY is OURS, not the peer's. PollShutdownDrain
+// owns the canonical 6-step DestroyOnDispatcher teardown for these
+// sessions. TickAll must skip them — otherwise (a) the `goaway_seen() &&
+// active_stream_count() == 0` branch would mark dead + erase without the
+// canonical teardown, and (b) the Tick-returns-false (drain-deadline)
+// branch would fan out FailAllStreams with RESULT_GOAWAY_MAYBE_PROCESSED
+// — a peer-GOAWAY-specific result code — masquerading local shutdown as
+// peer-initiated drain.
+static void TestA3_8_TickAllSkipsShutdownDrainingSessions() {
+    std::cout << "\n[TEST] H2Upstream A3.8: TickAll skips shutdown-draining sessions..." << std::endl;
+    try {
+        H2ConnectionTable table;
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 5;
+
+        auto conn = std::make_unique<UpstreamH2Connection>(nullptr, cfg);
+        if (!conn->Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream A3.8: TickAll skips shutdown-draining sessions",
+                false, "Init failed");
+            return;
+        }
+        conn->BeginShutdownDrain(5000);
+        // Locally-initiated shutdown — both goaway_seen_ AND
+        // shutdown_drain_active_ are now true.
+        if (!conn->goaway_seen() || !conn->shutdown_drain_active()) {
+            TestFramework::RecordTest(
+                "H2Upstream A3.8: TickAll skips shutdown-draining sessions",
+                false, "BeginShutdownDrain did not set expected flags");
+            return;
+        }
+        table.Insert("svc", std::move(conn));
+
+        // Advance well past goaway_drain_timeout_sec — without the skip
+        // gate, the goaway_seen+empty-streams branch in TickAll would
+        // MarkDead + erase the connection (depriving PollShutdownDrain
+        // of the canonical teardown path).
+        auto future = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        table.TickAll(future);
+
+        bool still_present = (table.TotalConnections() == 1);
+        TestFramework::RecordTest(
+            "H2Upstream A3.8: TickAll skips shutdown-draining sessions",
+            still_present,
+            still_present ? "" :
+            "shutdown-draining session was reaped by TickAll instead of PollShutdownDrain");
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream A3.8: TickAll skips shutdown-draining sessions",
+            false, e.what());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Multi-connection per host tests (TestB2 series)
 // ---------------------------------------------------------------------------
@@ -9816,6 +9875,7 @@ void RunAllH2UpstreamTests() {
     TestA3_5_BeginShutdownDrainIdempotent();
     TestA3_6_CollectAllIncludesDrainingSession();
     TestA3_7_SaturationSkipsDrainingSession();
+    TestA3_8_TickAllSkipsShutdownDrainingSessions();
 
     // Multi-conn per host (TestB2 series)
     TestB2_1_CollectUsableForUpstreamMultiConn();

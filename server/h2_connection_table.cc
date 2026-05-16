@@ -165,6 +165,21 @@ void H2ConnectionTable::TickAll(std::chrono::steady_clock::time_point now) {
                 it = conns.erase(it);
                 continue;
             }
+            if (c->shutdown_drain_active()) {
+                // Locally-initiated shutdown via
+                // PoolPartition::InitiateShutdown → BeginShutdownDrain.
+                // BeginShutdownDrain sets goaway_seen_=true to drive
+                // nghttp2's drain machinery, but the GOAWAY is OURS, not
+                // the peer's. PollShutdownDrain owns the canonical
+                // teardown for these sessions (DestroyOnDispatcher's
+                // 6-step sequence + lease release). Letting TickAll
+                // fire here would classify local shutdown as peer
+                // GOAWAY (RESULT_GOAWAY_MAYBE_PROCESSED) and bypass
+                // the canonical teardown. Skip exclusively — the
+                // shutdown_drain_deadline_ enforces the timeout.
+                ++it;
+                continue;
+            }
             int idle = cfg->ping_idle_sec;
             int timeout = cfg->ping_timeout_sec;
             int goaway_drain = cfg->goaway_drain_timeout_sec;
