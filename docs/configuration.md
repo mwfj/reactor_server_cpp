@@ -87,6 +87,7 @@ Reference config at `config/server.example.json`:
     "max_body_size": 1048576,
     "max_ws_message_size": 16777216,
     "request_timeout_sec": 30,
+    "shutdown_drain_timeout_sec": 30,
     "tls": {
         "enabled": false,
         "cert_file": "",
