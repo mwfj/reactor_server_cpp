@@ -87,6 +87,18 @@ public:
     // counter reaches zero before WaitForDrain times out.
     std::vector<std::unique_ptr<UpstreamH2Connection>> ExtractAll();
 
+    // Same as ExtractAll but preserves the upstream-name key for each
+    // entry. Used by PoolPartition::InitiateShutdown's graceful-drain
+    // path to take ownership across the BeginShutdownDrain loop (whose
+    // synchronous FlushSend can fire transport close-cb → FailAllStreams
+    // → sink OnError → reentrant FindUsable → reap of expired entries
+    // — destroying the unique_ptr the loop is still working through).
+    // Caller re-inserts each entry under its preserved key after the
+    // unsafe section completes; PollShutdownDrain then walks the
+    // re-populated table normally.
+    std::vector<std::pair<std::string, std::unique_ptr<UpstreamH2Connection>>>
+        ExtractAllWithKeys();
+
     // Non-destructive snapshot of every tracked connection — returns raw
     // pointers in arbitrary upstream-bucket order, preserving per-bucket
     // insertion order. Lifetime contract: pointers are non-owning AND

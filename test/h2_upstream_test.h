@@ -6796,7 +6796,16 @@ static void TestS26_CapacityAwareDrainStopsAtCap() {
         UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
         cfg.pool.max_connections = 0;  // force every CheckoutAsync to queue ANY
         cfg.http2.max_concurrent_streams_pref = 1;
+        // The synthetic UpstreamConnection must outlive `mgr` because the
+        // h2 session inserted into `mgr`'s partition holds it as
+        // `transport_`; mgr's destructor cascades through h2_table_ which
+        // touches transport_->MarkClosing() during DestroyOnDispatcher.
+        // Declare uc BEFORE mgr so LIFO destruction puts uc last. The
+        // resolved-endpoint pointer also outlives mgr.
+        std::unique_ptr<UpstreamConnection> uc;
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> uc_endpoint;
         UpstreamManager mgr({cfg}, {disp});
+        mgr.CommitHttp2Snapshots({cfg});
         DispatcherThreadGuard dtg{disp, t};
 
         auto* part = mgr.GetPoolPartition("svc", 0);
@@ -6807,15 +6816,22 @@ static void TestS26_CapacityAwareDrainStopsAtCap() {
             return;
         }
 
-        // Build an UpstreamH2Connection (null transport — wire path
-        // unused; we only exercise the partition-side state machine).
+        // Build the synthetic transport whose captured_endpoint matches the
+        // partition's resolved_endpoint_ — required so DrainAnyWaitersForFastH2's
+        // endpoint-aware FindUsableH2Connection returns this session instead
+        // of marking it dead. ConnectionHandler is null because the test
+        // never sends bytes; this just satisfies the endpoint check.
+        uc_endpoint = part->LoadResolvedEndpoint();
+        uc = std::make_unique<UpstreamConnection>(
+            /*conn=*/nullptr, "127.0.0.1", 9999, uc_endpoint);
+
         auto h2_cfg = std::make_shared<Http2UpstreamConfig>();
         h2_cfg->enabled = true;
         h2_cfg->max_concurrent_streams_pref = 1;
         h2_cfg->ping_idle_sec = 0;
         h2_cfg->ping_timeout_sec = 0;
         h2_cfg->goaway_drain_timeout_sec = 0;
-        auto h2_conn = std::make_unique<UpstreamH2Connection>(nullptr, h2_cfg);
+        auto h2_conn = std::make_unique<UpstreamH2Connection>(uc.get(), h2_cfg);
         if (!h2_conn->Init()) {
             TestFramework::RecordTest(
                 "H2Upstream S26: capacity-aware ANY drain stops at cap",
@@ -9172,6 +9188,12 @@ static void TestP6_PreconnectSkippedWhenSpareExists() {
         cfg.http2.saturation_open_pct      = 80;
         cfg.http2.preconnect_watermark_pct = 50;
         cfg.http2.max_concurrent_streams_pref = 10;
+        // Synthetic UpstreamConnections must outlive `mgr` (h2 sessions
+        // in mgr's partition reference them as transport_ during dtor's
+        // MarkClosing). Declare BEFORE mgr so LIFO destruction tears down
+        // mgr first.
+        std::unique_ptr<UpstreamConnection> uc_a, uc_b;
+        std::shared_ptr<const NET_DNS_NAMESPACE::ResolvedEndpoint> endpoint;
         UpstreamManager mgr({cfg}, {disp});
         mgr.CommitHttp2Snapshots({cfg});
         DispatcherThreadGuard dtg{disp, t};
@@ -9187,6 +9209,15 @@ static void TestP6_PreconnectSkippedWhenSpareExists() {
         // Sinks before H2 conns — sinks-must-outlive-session contract.
         RecordingSink sinks_a[6];
 
+        // Carry the partition's resolved endpoint so the spare-check's
+        // endpoint-aware filter does not mark them dead.
+        // ConnectionHandler is null — synthetic transport; test never sends.
+        endpoint = part->LoadResolvedEndpoint();
+        uc_a = std::make_unique<UpstreamConnection>(
+            /*conn=*/nullptr, "127.0.0.1", 9999, endpoint);
+        uc_b = std::make_unique<UpstreamConnection>(
+            /*conn=*/nullptr, "127.0.0.1", 9999, endpoint);
+
         auto h2_cfg = std::make_shared<Http2UpstreamConfig>();
         h2_cfg->enabled = true;
         h2_cfg->max_concurrent_streams_pref = 10;
@@ -9194,8 +9225,8 @@ static void TestP6_PreconnectSkippedWhenSpareExists() {
         h2_cfg->ping_timeout_sec = 0;
         h2_cfg->goaway_drain_timeout_sec = 0;
 
-        auto session_a = std::make_unique<UpstreamH2Connection>(nullptr, h2_cfg);
-        auto session_b = std::make_unique<UpstreamH2Connection>(nullptr, h2_cfg);
+        auto session_a = std::make_unique<UpstreamH2Connection>(uc_a.get(), h2_cfg);
+        auto session_b = std::make_unique<UpstreamH2Connection>(uc_b.get(), h2_cfg);
         if (!session_a->Init() || !session_b->Init()) {
             TestFramework::RecordTest(
                 "H2Upstream P6: preconnect skipped when spare exists",
@@ -9533,6 +9564,140 @@ static void TestS34_InitiateShutdownGracefulDrain() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest("H2Upstream S34: InitiateShutdown graceful drain via BeginShutdownDrain",
                                   false, e.what());
+    }
+}
+
+// S34b — Reentrancy guard for InitiateShutdown's graceful-drain loop.
+// BeginShutdownDrain's synchronous FlushSend can fire transport close-cb
+// → FailAllStreams → sink->OnError → reentrant FindUsable/CollectUsable
+// which inline-reaps IsExpired (goaway_seen + empty streams) entries.
+// Without the ExtractAllWithKeys + re-insert fix, the raw snapshot would
+// dangle when a sibling close-cb's FailAllStreams empties streams_ and
+// the reentrant lookup reaps the unique_ptr the loop is still working
+// through. This test verifies: (a) every session in the snapshot reaches
+// BeginShutdownDrain (goaway_seen + shutdown_drain_active both true),
+// and (b) every session is re-inserted into h2_table_ for
+// PollShutdownDrain to handle (none silently lost).
+static void TestS34b_InitiateShutdownReentrancyMultipleSessions() {
+    std::cout << "\n[TEST] H2Upstream S34b: InitiateShutdown multi-session reentrancy guard..." << std::endl;
+    try {
+        auto disp = std::make_shared<Dispatcher>();
+        auto t = StartDispatcher(disp);
+        UpstreamConfig cfg = MakeH2UpstreamConfig("svc", "127.0.0.1", 9999);
+        cfg.pool.max_connections = 4;
+        cfg.http2.saturation_open_pct = 80;
+        cfg.http2.max_concurrent_streams_pref = 10;
+        cfg.http2.goaway_drain_timeout_sec = 5;
+        UpstreamManager mgr({cfg}, {disp});
+        // CommitHttp2Snapshots so InitiateShutdown's
+        // LoadHttp2ConfigSnapshot returns the configured per-conn drain.
+        // Without it, per_conn_drain_sec=0 → drain_budget_ms=0 →
+        // immediate-kill path, bypassing the graceful-drain code that
+        // owns the reentrancy fix.
+        mgr.CommitHttp2Snapshots({cfg});
+        DispatcherThreadGuard dtg{disp, t};
+
+        auto* part = mgr.GetPoolPartition("svc", 0);
+        if (!part) {
+            TestFramework::RecordTest(
+                "H2Upstream S34b: InitiateShutdown multi-session reentrancy guard",
+                false, "null part");
+            return;
+        }
+
+        constexpr size_t kSessions = 3;
+        std::vector<std::unique_ptr<UpstreamH2Connection>> staged;
+        staged.reserve(kSessions);
+        std::vector<UpstreamH2Connection*> raws;
+        raws.reserve(kSessions);
+        for (size_t i = 0; i < kSessions; ++i) {
+            auto h2_cfg = std::make_shared<Http2UpstreamConfig>();
+            h2_cfg->enabled = true;
+            h2_cfg->max_concurrent_streams_pref = 10;
+            h2_cfg->ping_idle_sec = 0;
+            h2_cfg->ping_timeout_sec = 0;
+            h2_cfg->goaway_drain_timeout_sec = 5;
+            auto h2_conn = std::make_unique<UpstreamH2Connection>(nullptr, h2_cfg);
+            if (!h2_conn->Init()) {
+                TestFramework::RecordTest(
+                    "H2Upstream S34b: InitiateShutdown multi-session reentrancy guard",
+                    false, "Init failed");
+                return;
+            }
+            raws.push_back(h2_conn.get());
+            staged.push_back(std::move(h2_conn));
+        }
+        // Bulk-insert on dispatcher. unique_ptrs are moved via shared_ptr
+        // wrapper so the std::function captures stay copy-constructible.
+        auto staged_shared =
+            std::make_shared<std::vector<std::unique_ptr<UpstreamH2Connection>>>(
+                std::move(staged));
+        {
+            std::promise<void> ack;
+            auto ack_fut = ack.get_future();
+            disp->EnQueue([&, staged_shared]() {
+                for (auto& c : *staged_shared) {
+                    if (c) part->InsertH2ConnectionForTesting("svc", std::move(c));
+                }
+                staged_shared->clear();
+                ack.set_value();
+            });
+            ack_fut.wait();
+        }
+
+        std::promise<std::tuple<bool, bool, size_t>> result;
+        auto fut = result.get_future();
+        disp->EnQueue([&]() {
+            // Pre-shutdown: every session is admissible (not draining).
+            bool pre_clean = true;
+            for (auto* r : raws) {
+                if (!r) { pre_clean = false; break; }
+                if (r->goaway_seen() || r->shutdown_drain_active()) {
+                    pre_clean = false;
+                    break;
+                }
+            }
+
+            part->InitiateShutdown(5);
+
+            // Post-shutdown invariants:
+            //   1. Every session reached BeginShutdownDrain — goaway_seen
+            //      AND shutdown_drain_active are both true.
+            //   2. Every session is still tracked in h2_table_ so
+            //      PollShutdownDrain owns the teardown (the ExtractAll-
+            //      WithKeys path re-inserts after the drain loop).
+            // PollShutdownDrain runs on a 50ms timer; by the time we
+            // observe here (microseconds later, same dispatcher) the
+            // re-insert has happened but no PollShutdownDrain iteration
+            // has fired yet.
+            bool all_draining = true;
+            for (auto* r : raws) {
+                if (!r || !r->goaway_seen() || !r->shutdown_drain_active()) {
+                    all_draining = false;
+                    break;
+                }
+            }
+            size_t post_count = part->H2TableCount();
+            result.set_value({pre_clean, all_draining, post_count});
+        });
+        auto vals = (fut.wait_for(std::chrono::seconds(5)) == std::future_status::ready)
+                    ? fut.get() : std::tuple<bool, bool, size_t>{false, false, 0};
+        bool pre_clean = std::get<0>(vals);
+        bool all_draining = std::get<1>(vals);
+        size_t post_count = std::get<2>(vals);
+        bool pass = pre_clean && all_draining && (post_count == kSessions);
+        TestFramework::RecordTest(
+            "H2Upstream S34b: InitiateShutdown multi-session reentrancy guard",
+            pass,
+            pass ? "" :
+            (std::string("pre_clean=") + std::to_string(pre_clean) +
+             " all_draining=" + std::to_string(all_draining) +
+             " post_count=" + std::to_string(post_count) +
+             " expected=" + std::to_string(kSessions)).c_str());
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream S34b: InitiateShutdown multi-session reentrancy guard",
+            false, e.what());
     }
 }
 
@@ -9909,6 +10074,7 @@ void RunAllH2UpstreamTests() {
     TestS32_SaturationGateSwitches();
     TestS33_ShutdownDrainWithStream();
     TestS34_InitiateShutdownGracefulDrain();
+    TestS34b_InitiateShutdownReentrancyMultipleSessions();
     TestS35_ConcurrentSaturationAndFailAll();
     TestS36_InsertAndShutdownNoLeak();
 }

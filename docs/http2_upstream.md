@@ -142,9 +142,9 @@ When `Stop()` (or SIGTERM/SIGINT) fires, the gateway initiates a per-partition s
 **The drain deadline requires BOTH knobs to be non-zero:**
 
 - `http2.goaway_drain_timeout_sec` (per-upstream, default 30s) — the per-session GOAWAY drain bound.
-- `server.shutdown_drain_timeout_sec` (process-wide, default **0**) — the umbrella shutdown budget. The default `0` means "no managed drain — destructor safety-net only," which forces the H2 session deadline to the closest expiry the partition can synthesize.
+- `server.shutdown_drain_timeout_sec` (process-wide, default **30s**, range 0–300) — the umbrella shutdown budget. `0` means "no managed drain — destructor safety-net only" and forces immediate teardown.
 
-Operators who want H2 sessions to actually wait for in-flight streams MUST set `server.shutdown_drain_timeout_sec > 0`. A common shape is `server.shutdown_drain_timeout_sec ≥ http2.goaway_drain_timeout_sec` across every upstream so the umbrella budget covers the longest per-upstream drain. If `server.shutdown_drain_timeout_sec = 0`, raising `http2.goaway_drain_timeout_sec` alone does NOT extend the actual drain — the umbrella budget is the cap.
+The effective per-session drain is `min(server.shutdown_drain_timeout_sec * 1000, http2.goaway_drain_timeout_sec * 1000)` in milliseconds. Either knob at `0` collapses the drain to immediate kill, so to extend the drain BOTH must be non-zero. A common shape is `server.shutdown_drain_timeout_sec ≥ max(http2.goaway_drain_timeout_sec)` across every upstream so the umbrella budget covers the longest per-upstream drain. Raising `http2.goaway_drain_timeout_sec` alone never exceeds the umbrella cap.
 
 `PollShutdownDrain` owns the canonical 6-step teardown (`DestroyOnDispatcher`) for shutdown-draining sessions; `TickAll`'s PING/GOAWAY classification skips them so local shutdown is never reported as peer GOAWAY.
 

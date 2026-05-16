@@ -130,6 +130,19 @@ H2ConnectionTable::ExtractAll() {
     return out;
 }
 
+std::vector<std::pair<std::string, std::unique_ptr<UpstreamH2Connection>>>
+H2ConnectionTable::ExtractAllWithKeys() {
+    std::vector<std::pair<std::string, std::unique_ptr<UpstreamH2Connection>>> out;
+    out.reserve(TotalConnections());
+    for (auto& [name, conns] : by_upstream_) {
+        for (auto& c : conns) {
+            if (c) out.emplace_back(name, std::move(c));
+        }
+    }
+    by_upstream_.clear();
+    return out;
+}
+
 std::vector<UpstreamH2Connection*> H2ConnectionTable::CollectAll() const {
     std::vector<UpstreamH2Connection*> out;
     out.reserve(TotalConnections());

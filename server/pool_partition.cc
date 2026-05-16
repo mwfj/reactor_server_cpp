@@ -567,7 +567,11 @@ void PoolPartition::DrainH2StreamWaitersForHost(
             // notified inline. Return early.
             return;
         }
-        UpstreamH2Connection* h2 = h2_table_.FindUsable(upstream_name);
+        // Use endpoint-aware lookup so a DNS-swapped stale session
+        // does not wake the waiter only for SubmitRequest's freshness
+        // check to fail. FindUsableH2Connection marks stale candidates
+        // dead inline so subsequent CollectUsableForUpstream skips them.
+        UpstreamH2Connection* h2 = FindUsableH2Connection(upstream_name);
         if (!h2 || !h2->IsUsable()) {
             // No usable session right now — requeue everything we still
             // have. The next slot-free (RunDeferredEraseWalk) or fresh
@@ -659,7 +663,10 @@ void PoolPartition::DrainAnyWaitersForFastH2() {
             if (e.error_callback) e.error_callback(CHECKOUT_SHUTTING_DOWN);
             continue;
         }
-        UpstreamH2Connection* h2 = h2_table_.FindUsable(service_name_);
+        // Endpoint-aware lookup — see DrainH2StreamWaitersForHost above
+        // for rationale. A DNS-swapped stale candidate must not be
+        // surfaced as usable to ANY-kind waiters.
+        UpstreamH2Connection* h2 = FindUsableH2Connection(service_name_);
         if (!h2) {
             // No usable session right now (no session, all dead, or
             // cap reached by a sibling already served this drain).
@@ -1148,9 +1155,21 @@ void PoolPartition::MaybePreconnectH2(
     // until pool.max_connections fills with idle warm spares.
     // Spare = any OTHER usable session whose utilization is below the
     // watermark (operator's "this session has slack" signal).
+    //
+    // Endpoint-aware: a stale-endpoint candidate (DNS swapped, session
+    // about to be retired) must NOT count as a spare — otherwise
+    // preconnect is suppressed on a session that won't survive the
+    // next dispatch. Mark stale candidates dead inline so the next
+    // FindUsable / CollectUsable skips them (mirrors
+    // FindUsableH2Connection's defensive eviction).
     auto candidates = h2_table_.CollectUsableForUpstream(upstream_name);
     for (auto* c : candidates) {
         if (c == &picked_session) continue;  // not a spare; this is the picked one
+        UpstreamConnection* t = c->transport();
+        if (!t || !ConnectionEndpointMatches(*t)) {
+            c->MarkDead();
+            continue;
+        }
         const uint32_t cap = c->EffectiveMaxStreams();
         if (cap == 0) continue;  // not usable — skip
         const int cand_pct = ComputeStreamUtilizationPct(
@@ -1588,13 +1607,30 @@ void PoolPartition::InitiateShutdown(int server_drain_timeout_sec) {
         // h2_table_ while in-flight streams complete. PollShutdownDrain
         // (kicked off below) reaps each session as IsShutdownDrainComplete
         // becomes true (streams empty / transport dead / deadline elapsed).
-        // Snapshot raw pointers BEFORE BeginShutdownDrain because the
-        // FlushSend inside it may synchronously invoke transport callbacks
-        // that mutate the table; iterating the live table would invalidate.
-        auto snap = h2_table_.CollectAll();
-        for (auto* conn : snap) {
+        //
+        // Reentrant-delete UAF guard: BeginShutdownDrain → FlushSend can
+        // fail synchronously, fire transport close-cb → FailAllStreams →
+        // sink->OnError → ProxyTransaction::MaybeRetry → AcquireH2Connection
+        // → h2_table_.CollectUsableForUpstream (which reaps IsExpired
+        // entries inline). After BeginShutdownDrain runs, the session is
+        // (goaway_seen=true, streams=empty) → IsExpired=true. A raw
+        // snapshot would dangle when the synchronous chain reaps the
+        // unique_ptr the loop is currently working through (or any
+        // later snapshot entry that became expired via a sibling close-
+        // cb's FailAllStreams). Take owning unique_ptrs out of h2_table_
+        // BEFORE the BeginShutdownDrain loop; reentrant FindUsable then
+        // sees an empty table (shutting_down_ is already set so no fresh
+        // admissions). Re-insert under the preserved upstream-name key
+        // after the loop completes so PollShutdownDrain can walk them
+        // via the canonical reap path.
+        auto owned = h2_table_.ExtractAllWithKeys();
+        for (auto& [_, conn] : owned) {
+            if (!conn) continue;
             conn->BeginShutdownDrain(drain_budget_ms);
             if (!alive->load(std::memory_order_acquire)) return;
+        }
+        for (auto& [name, conn] : owned) {
+            if (conn) h2_table_.Insert(name, std::move(conn));
         }
         // Kick off the poll loop. PollShutdownDrain re-arms itself while
         // any session is still draining; idempotent if the table is
@@ -2875,7 +2911,12 @@ void PoolPartition::StartH2ReplacementConnect(
             upstream_name, port);
         return;
     }
-    if (h2_table_.FindUsable(upstream_name) != nullptr) {
+    // Endpoint-aware: a stale-endpoint candidate (DNS swapped between
+    // GOAWAY and now) must NOT suppress the replacement probe — the
+    // queued waiters need a fresh session. FindUsableH2Connection
+    // marks stale candidates dead inline so they're removed from the
+    // table before the gate decides.
+    if (FindUsableH2Connection(upstream_name) != nullptr) {
         logging::Get()->debug(
             "StartH2ReplacementConnect skipped (usable session exists) "
             "upstream={}:{}",
