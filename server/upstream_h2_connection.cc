@@ -1702,6 +1702,9 @@ ssize_t UpstreamH2Connection::StreamingDataSourceReadCallback(
     switch (rc) {
         case http::BodyStreamResult::OK: {
             if (bytes_read > 0) {
+                // Local keepalive — guards the OnRequestBodySourceConsumed
+                // call in case it re-enters Cleanup → ResetStream → DetachSink.
+                auto keepalive = s.streaming_abort_callback;  // NOLINT
                 s.sink->OnRequestBodySourceConsumed(bytes_read);
             }
             return static_cast<ssize_t>(bytes_read);
@@ -1728,6 +1731,9 @@ ssize_t UpstreamH2Connection::StreamingDataSourceReadCallback(
 
         case http::BodyStreamResult::END_OF_STREAM: {
             if (bytes_read > 0) {
+                // Local keepalive — guards the OnRequestBodySourceConsumed
+                // call in case it re-enters Cleanup → ResetStream → DetachSink.
+                auto keepalive = s.streaming_abort_callback;  // NOLINT
                 s.sink->OnRequestBodySourceConsumed(bytes_read);
             }
             const auto& trailers = s.body_stream->Trailers();

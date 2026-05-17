@@ -252,11 +252,22 @@ static int OnDataChunkRecvCallback(
     auto* stream = self->FindStream(stream_id);
     if (!stream) return 0;
 
-    // Check body size limit
+    // Check body size limit. Streaming uses `pushed_body_bytes`; buffered
+    // uses `AccumulatedBodySize`. The two are mutually exclusive (streaming
+    // never calls AppendBody; buffered never bumps pushed_body_bytes), so
+    // summing them works regardless of route_mode.
+    const size_t already_seen =
+        stream->AccumulatedBodySize() + stream->GetRequest().pushed_body_bytes;
     if (self->MaxBodySize() > 0 &&
-        stream->AccumulatedBodySize() + len > self->MaxBodySize()) {
+        already_seen + len > self->MaxBodySize()) {
         logging::Get()->warn("HTTP/2 stream {} body exceeds max size ({})",
                              stream_id, self->MaxBodySize());
+        // For streaming routes, signal the consumer side so the proxy
+        // sees an aborted body_stream → 413 PayloadTooLarge.
+        if (stream->route_mode() == http::RouteRequestMode::Streaming) {
+            auto* body_stream = stream->GetRequest().body_stream.get();
+            if (body_stream) body_stream->Abort("body_size_limit_exceeded");
+        }
         // Only count if not already counted/rejected in the HEADERS path
         if (!stream->IsRejected() && self->Callbacks().request_count_callback)
             self->Callbacks().request_count_callback();
@@ -276,12 +287,13 @@ static int OnDataChunkRecvCallback(
     // Reject DATA that exceeds the declared Content-Length, or any DATA
     // when content-length: 0 was declared. Without this, a malformed peer
     // can force unbounded body buffering when max_body_size is high.
+    // Same mutual-exclusion logic as max-body above.
     const auto& req = stream->GetRequest();
     bool cl_violated = false;
     if (stream->HasContentLength() && len > 0) {
         if (req.content_length == 0) {
             cl_violated = true;  // content-length: 0 but non-empty DATA
-        } else if (stream->AccumulatedBodySize() + len > req.content_length) {
+        } else if (already_seen + len > req.content_length) {
             cl_violated = true;  // body exceeds declared length
         }
     }
@@ -574,13 +586,29 @@ static int OnFrameRecvCallback(
                     bscfg.high_water_bytes = self->StreamingHighWaterBytes();
                     bscfg.low_water_bytes  = self->StreamingLowWaterBytes();
                     // on_bytes_consumed: when the consumer frees capacity,
-                    // manually emit WINDOW_UPDATE for the stream.
+                    // submit WINDOW_UPDATE for the stream AND flush it onto
+                    // the wire. The producer's flow-control window only
+                    // advances after the peer receives WINDOW_UPDATE; if we
+                    // submit to nghttp2 but never call SendPendingFrames(),
+                    // the upload deadlocks the moment the peer hits the
+                    // initial window cap. ReceiveData's tail flush only
+                    // runs when more bytes arrive — which won't happen
+                    // while the peer waits on flow control.
                     bscfg.on_bytes_consumed =
                         [owner_weak, sid](size_t n) {
-                            if (auto handler = owner_weak.lock()) {
-                                if (auto s = handler->GetSession()) {
-                                    s->ConsumeStreamingRequestBytes(sid, n, 0);
-                                }
+                            auto handler = owner_weak.lock();
+                            if (!handler) return;
+                            auto s = handler->GetSession();
+                            if (!s) return;
+                            s->ConsumeStreamingRequestBytes(sid, n, 0);
+                            // Flush WINDOW_UPDATE to the wire. Guard against
+                            // re-entry: ConsumeStreamingRequestBytes may be
+                            // invoked from inside mem_recv2 (sub-threshold
+                            // path) and SendPendingFrames pulls mem_send2,
+                            // which is unsafe re-entrantly. The outer
+                            // OnRawData tail flushes in that case.
+                            if (!s->InReceiveData()) {
+                                s->SendPendingFrames();
                             }
                         };
                     auto body_stream = std::make_shared<http::ChunkQueueBodyStream>(

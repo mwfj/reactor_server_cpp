@@ -227,9 +227,22 @@ static int on_body(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
     if (self->streaming_body_stream_) {
-        // Streaming path: push chunks directly to the body stream.
-        // Body size limit is not enforced here; the upstream handler is
-        // responsible for bounding the stream via high-water backpressure.
+        // Streaming path: enforce cumulative max_body_size BEFORE push.
+        // Without this gate chunked / no-CL uploads stream indefinitely
+        // and bypass the DoS-cap that buffered routes honor — Push
+        // accepts every chunk because backpressure throttles inbound
+        // but does not bound total ingestion.
+        if (self->max_body_size_ > 0) {
+            const size_t pushed = self->request_.pushed_body_bytes;
+            if (pushed >= self->max_body_size_ ||
+                length > self->max_body_size_ - pushed) {
+                self->streaming_body_stream_->Abort("body_size_limit_exceeded");
+                self->has_error_ = true;
+                self->error_message_ = "Body size exceeds maximum (streaming)";
+                self->error_type_ = HttpParser::ParseError::BODY_TOO_LARGE;
+                return HPE_USER;
+            }
+        }
         self->streaming_body_stream_->Push(std::string(at, length));
         self->request_.pushed_body_bytes += length;
         return 0;

@@ -21,11 +21,11 @@
 //     J9d Abort after partial read surfaces ABORTED
 //     J9e WaitForData fires once even when already-EOS
 //     J9f 100 consecutive H2 requests: connection-level window not permanently drained
-//     J9i Streaming request body is readable from route handler
-//     J9i_prompt AbortReason set correctly
-//     J9i_late_abort Push after Abort is silently dropped
-//     J9i_client_abort Abort + ABORTED classification
-//     J9i_reentrant Double-Abort is idempotent
+//     BodyStream AbortReason set correctly
+//     BodyStream Push after Abort is silently dropped
+//     BodyStream ABORTED classification on client abort
+//     BodyStream Double-Abort is idempotent
+//     StreamingRoute Streaming request body is readable from route handler
 //     J11 StreamingResponseSender can relay chunks as they arrive (inbound streaming relay)
 
 #include "test_framework.h"
@@ -609,8 +609,8 @@ void TestJ9e_WaitForDataOnEOS() {
 // ---------------------------------------------------------------------------
 // J9i: AbortReason set correctly
 // ---------------------------------------------------------------------------
-void TestJ9i_prompt_AbortReason() {
-    std::cout << "\n[TEST] J9i_prompt: ChunkQueueBodyStream: AbortReason set on Abort..."
+void TestBodyStream_AbortReasonSet() {
+    std::cout << "\n[TEST] BodyStream: AbortReason set on Abort..."
               << std::endl;
     try {
         http::ChunkQueueBodyStream::Config cfg;
@@ -624,18 +624,18 @@ void TestJ9i_prompt_AbortReason() {
             "aborted=" + std::to_string(stream.Aborted()) +
             " reason=" + stream.AbortReason();
         TestFramework::RecordTest(
-            "J9i_prompt: ChunkQueueBodyStream: AbortReason set on Abort", pass, err);
+            "BodyStream: AbortReason set on Abort", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "J9i_prompt: ChunkQueueBodyStream: AbortReason set on Abort", false, e.what());
+            "BodyStream: AbortReason set on Abort", false, e.what());
     }
 }
 
 // ---------------------------------------------------------------------------
 // J9i_late_abort: Push after Abort is silently dropped
 // ---------------------------------------------------------------------------
-void TestJ9i_late_abort_PushAfterAbort() {
-    std::cout << "\n[TEST] J9i_late_abort: ChunkQueueBodyStream: Push after Abort dropped..."
+void TestBodyStream_PushAfterAbortDropped() {
+    std::cout << "\n[TEST] BodyStream: Push after Abort silently dropped..."
               << std::endl;
     try {
         http::ChunkQueueBodyStream::Config cfg;
@@ -649,18 +649,18 @@ void TestJ9i_late_abort_PushAfterAbort() {
             "BytesQueued=" + std::to_string(stream.BytesQueued()) +
             " aborted=" + std::to_string(stream.Aborted());
         TestFramework::RecordTest(
-            "J9i_late_abort: ChunkQueueBodyStream: Push after Abort dropped", pass, err);
+            "BodyStream: Push after Abort silently dropped", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "J9i_late_abort: ChunkQueueBodyStream: Push after Abort dropped", false, e.what());
+            "BodyStream: Push after Abort silently dropped", false, e.what());
     }
 }
 
 // ---------------------------------------------------------------------------
 // J9i_client_abort: Abort + ABORTED classification
 // ---------------------------------------------------------------------------
-void TestJ9i_client_abort_Classification() {
-    std::cout << "\n[TEST] J9i_client_abort: ChunkQueueBodyStream: ABORTED classification..."
+void TestBodyStream_AbortedClassification() {
+    std::cout << "\n[TEST] BodyStream: ABORTED classification on client abort..."
               << std::endl;
     try {
         http::ChunkQueueBodyStream::Config cfg;
@@ -680,18 +680,18 @@ void TestJ9i_client_abort_Classification() {
             "result=" + std::to_string(static_cast<int>(result)) +
             " reason=" + stream.AbortReason();
         TestFramework::RecordTest(
-            "J9i_client_abort: ChunkQueueBodyStream: ABORTED classification", pass, err);
+            "BodyStream: ABORTED classification on client abort", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "J9i_client_abort: ChunkQueueBodyStream: ABORTED classification", false, e.what());
+            "BodyStream: ABORTED classification on client abort", false, e.what());
     }
 }
 
 // ---------------------------------------------------------------------------
 // J9i_reentrant: Double-Abort is idempotent (first Abort wins)
 // ---------------------------------------------------------------------------
-void TestJ9i_reentrant_DoubleAbort() {
-    std::cout << "\n[TEST] J9i_reentrant: ChunkQueueBodyStream: double Abort idempotent..."
+void TestBodyStream_DoubleAbortIdempotent() {
+    std::cout << "\n[TEST] BodyStream: double Abort is idempotent..."
               << std::endl;
     try {
         http::ChunkQueueBodyStream::Config cfg;
@@ -703,10 +703,10 @@ void TestJ9i_reentrant_DoubleAbort() {
         bool pass = stream.Aborted() && stream.AbortReason() == "first-abort";
         std::string err = pass ? "" : "AbortReason=" + stream.AbortReason();
         TestFramework::RecordTest(
-            "J9i_reentrant: ChunkQueueBodyStream: double Abort idempotent", pass, err);
+            "BodyStream: double Abort is idempotent", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "J9i_reentrant: ChunkQueueBodyStream: double Abort idempotent", false, e.what());
+            "BodyStream: double Abort is idempotent", false, e.what());
     }
 }
 
@@ -845,8 +845,8 @@ void TestJ9_StreamingRouteBodyStream() {
 // ---------------------------------------------------------------------------
 // J9i: Integration — Streaming body readable from route handler (chunked TE)
 // ---------------------------------------------------------------------------
-void TestJ9i_StreamingChunkedBody() {
-    std::cout << "\n[TEST] J9i: Integration: streaming chunked body readable from handler..."
+void TestStreamingRouteHandler_ReadChunkedBody() {
+    std::cout << "\n[TEST] StreamingRoute: chunked body readable from handler..."
               << std::endl;
     try {
         std::atomic<size_t> received_bytes{0};
@@ -930,10 +930,108 @@ void TestJ9i_StreamingChunkedBody() {
             "received=" + std::to_string(received_bytes.load()) +
             " want=" + std::to_string(expected) + " resp=" + response.substr(0, 40);
         TestFramework::RecordTest(
-            "J9i: Integration: streaming chunked body readable from handler", pass, err);
+            "StreamingRoute: chunked body readable from handler", pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "J9i: Integration: streaming chunked body readable from handler", false, e.what());
+            "StreamingRoute: chunked body readable from handler", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BodyStream WaitForData re-arm semantics: WaitForData fires once on the
+// first Push, and re-arming after the fire delivers the next Push too.
+// Exercises the WOULD_BLOCK → WaitForData → Push → re-arm cycle that the
+// upstream H2 data-source callback relies on (server/upstream_h2_connection.cc
+// `case http::BodyStreamResult::WOULD_BLOCK`).
+// ---------------------------------------------------------------------------
+void TestBodyStream_WaitForDataReArm() {
+    std::cout << "\n[TEST] BodyStream: WaitForData re-arm across gaps..."
+              << std::endl;
+    try {
+        http::ChunkQueueBodyStream::Config cfg;
+        cfg.high_water_bytes = 1024;
+        cfg.low_water_bytes  = 256;
+        http::ChunkQueueBodyStream bs(std::move(cfg));
+
+        std::atomic<int> fires{0};
+        auto cb = [&fires]() { fires.fetch_add(1, std::memory_order_relaxed); };
+
+        // Empty → WOULD_BLOCK.
+        char buf[64];
+        size_t n = 0;
+        auto r1 = bs.Read(buf, sizeof(buf), &n);
+        bool pass = (r1 == http::BodyStreamResult::WOULD_BLOCK && n == 0);
+
+        // Arm WaitForData; verify it fires on first Push.
+        bs.WaitForData(cb);
+        bs.Push("hello");
+        bool first_fired = WaitFor([&]() {
+            return fires.load(std::memory_order_relaxed) >= 1;
+        }, std::chrono::milliseconds(500));
+        pass = pass && first_fired;
+
+        // Drain; re-Read should succeed.
+        n = 0;
+        auto r2 = bs.Read(buf, sizeof(buf), &n);
+        pass = pass && (r2 == http::BodyStreamResult::OK && n == 5);
+
+        // Re-arm; verify second Push also triggers the callback.
+        bs.WaitForData(cb);
+        bs.Push("world");
+        bool second_fired = WaitFor([&]() {
+            return fires.load(std::memory_order_relaxed) >= 2;
+        }, std::chrono::milliseconds(500));
+        pass = pass && second_fired;
+
+        std::string err = pass ? "" :
+            "fires=" + std::to_string(fires.load());
+        TestFramework::RecordTest(
+            "BodyStream: WaitForData re-arm across gaps", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "BodyStream: WaitForData re-arm across gaps", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BodyStream: WaitForData fires on Abort (consumer must observe the abort
+// even when blocked on WOULD_BLOCK). Models the path where the producer
+// aborts mid-upload and the consumer's outstanding wait must wake.
+// ---------------------------------------------------------------------------
+void TestBodyStream_WaitForDataFiresOnAbort() {
+    std::cout << "\n[TEST] BodyStream: WaitForData fires on Abort..."
+              << std::endl;
+    try {
+        http::ChunkQueueBodyStream::Config cfg;
+        cfg.high_water_bytes = 1024;
+        cfg.low_water_bytes  = 256;
+        http::ChunkQueueBodyStream bs(std::move(cfg));
+
+        std::atomic<bool> fired{false};
+        bs.WaitForData([&fired]() {
+            fired.store(true, std::memory_order_release);
+        });
+
+        bs.Abort("peer_reset");
+        bool ok_wake = WaitFor([&]() {
+            return fired.load(std::memory_order_acquire);
+        }, std::chrono::milliseconds(500));
+
+        char buf[16];
+        size_t n = 0;
+        auto r = bs.Read(buf, sizeof(buf), &n);
+        bool pass = ok_wake && (r == http::BodyStreamResult::ABORTED) &&
+                    (bs.AbortReason() == "peer_reset");
+
+        std::string err = pass ? "" :
+            "fired=" + std::to_string(fired.load()) +
+            " result=" + std::to_string(static_cast<int>(r)) +
+            " reason='" + bs.AbortReason() + "'";
+        TestFramework::RecordTest(
+            "BodyStream: WaitForData fires on Abort", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "BodyStream: WaitForData fires on Abort", false, e.what());
     }
 }
 
@@ -1488,10 +1586,10 @@ void RunAllStreamingRequestTests() {
     TestJ9c_CloseEmptyIdempotent();
     TestJ9d_AbortAfterPartialRead();
     TestJ9e_WaitForDataOnEOS();
-    TestJ9i_prompt_AbortReason();
-    TestJ9i_late_abort_PushAfterAbort();
-    TestJ9i_client_abort_Classification();
-    TestJ9i_reentrant_DoubleAbort();
+    TestBodyStream_AbortReasonSet();
+    TestBodyStream_PushAfterAbortDropped();
+    TestBodyStream_AbortedClassification();
+    TestBodyStream_DoubleAbortIdempotent();
 
     // RetryPolicy streaming-related tests.
     TestJ10_IsMethodRetryableForReplay();
@@ -1510,9 +1608,15 @@ void RunAllStreamingRequestTests() {
     TestWaitForDataCallbackOnAbort();
     TestConcurrentPushRead();
 
+    // BodyStream WaitForData semantics (re-arm, fires-on-abort).
+    // Exercise the WOULD_BLOCK → WaitForData → Push/Abort → re-arm cycle
+    // that the upstream H2 data-source callback relies on.
+    TestBodyStream_WaitForDataReArm();
+    TestBodyStream_WaitForDataFiresOnAbort();
+
     // Integration tests — real HttpServer.
     TestJ9_StreamingRouteBodyStream();
-    TestJ9i_StreamingChunkedBody();
+    TestStreamingRouteHandler_ReadChunkedBody();
     TestJ9f_ConsecutiveRequests();
     TestJ11_StreamingRelayChunks();
     TestBufferedModeBodyUnchanged();
