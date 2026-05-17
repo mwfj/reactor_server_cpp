@@ -138,6 +138,9 @@ public:
     void DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler);
     void RouteAsync(const std::string& method, const std::string& path,
                     HttpRouter::AsyncHandler handler);
+    // 4-arg overload — explicit per-route options (e.g. Streaming mode).
+    void RouteAsync(const std::string& method, const std::string& path,
+                    HttpRouter::AsyncHandler handler, http::RouteOptions options);
 
     // Proxy route registration: forward all requests matching route_pattern
     // to the named upstream service. The upstream must be configured in the

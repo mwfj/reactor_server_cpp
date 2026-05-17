@@ -22,6 +22,8 @@ public:
     void SetStreamCloseCallback(StreamCloseCallback callback);
     void SetStreamOpenCallback(StreamOpenCallback callback);
     void SetRequestCountCallback(HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback callback);
+    void SetResolveRouteOptionsCallback(
+        HTTP2_CALLBACKS_NAMESPACE::ResolveRouteOptionsCallback callback);
 
     // Set request limits (applied per-stream)
     void SetMaxBodySize(size_t max);
@@ -171,6 +173,11 @@ public:
         return shutdown_requested_.load(std::memory_order_acquire);
     }
 
+    // No-op on H2: H2 has no streaming_upload_in_flight_ flag. Called by the
+    // generic MakeAsyncResumeCallback aborted-body guard so it can call
+    // handle->ClearStreamingUploadInFlight() without template specialization.
+    void ClearStreamingUploadInFlight() {}
+
     // Per-stream async-abort hooks. Installed by the server's async
     // request dispatcher after the complete() closure is built for a
     // deferred stream. Fired by the deadline-driven safety-cap path
@@ -298,6 +305,13 @@ private:
     StreamCloseCallback pending_stream_close_cb_;
     StreamOpenCallback pending_stream_open_cb_;
     HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback pending_request_count_cb_;
+    HTTP2_CALLBACKS_NAMESPACE::ResolveRouteOptionsCallback pending_resolve_route_options_cb_;
+
+    // Streaming watermark config — captured from Http2Config at setup time and
+    // applied to the session via SetStreamingConfig during Initialize().
+    size_t streaming_high_water_ = 262144;
+    size_t streaming_low_water_  = 65536;
+    size_t streaming_window_update_ = 32768;
 
     // Per-stream safety-cap abort hooks. See SetStreamAbortHook.
     std::unordered_map<int32_t, std::function<void()>> stream_abort_hooks_;

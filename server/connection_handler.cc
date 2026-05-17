@@ -1117,6 +1117,13 @@ void ConnectionHandler::ResumeReadPump() {
     if (!read_pump_paused_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
+    // A.5 — a non-zero counted-disable keeps the pump paused even after
+    // the binary flag is cleared. Re-arm the binary flag to preserve the
+    // invariant: pump is paused iff `paused_flag OR count>0`.
+    if (read_disable_count_.load(std::memory_order_acquire) > 0) {
+        read_pump_paused_.store(true, std::memory_order_release);
+        return;
+    }
 
     uint64_t expected_epoch =
         on_message_cb_epoch_.load(std::memory_order_acquire);
@@ -1143,6 +1150,30 @@ void ConnectionHandler::ResumeReadPump() {
     }
 
     fn();
+}
+
+void ConnectionHandler::IncReadDisable() {
+    const int prev = read_disable_count_.fetch_add(1, std::memory_order_acq_rel);
+    if (prev == 0) {
+        PauseReadPump();
+    }
+}
+
+void ConnectionHandler::DecReadDisable() {
+    const int prev = read_disable_count_.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev <= 0) {
+        // Unbalanced decrement — log and revert. A bug in the caller, but
+        // safer to recover than to underflow.
+        read_disable_count_.fetch_add(1, std::memory_order_acq_rel);
+        logging::Get()->error(
+            "ConnectionHandler::DecReadDisable unbalanced (count was {}); reverting",
+            prev);
+        return;
+    }
+    if (prev == 1 && !is_closing_.load(std::memory_order_acquire) &&
+        !close_after_write_.load(std::memory_order_acquire)) {
+        ResumeReadPump();
+    }
 }
 
 void ConnectionHandler::RunOnDispatcher(std::function<void()> task) {

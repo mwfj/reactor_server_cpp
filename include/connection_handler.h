@@ -106,6 +106,14 @@ private:
     std::atomic<uint64_t> on_message_cb_epoch_{0};
     std::atomic<bool> has_on_message_callback_{false};
 
+    // Counted read-pump pause (A.5). Cooperates with the existing binary
+    // `read_pump_paused_` atomic: read pump is paused if EITHER the binary
+    // flag is true OR this counter is non-zero. Used by inbound H1
+    // streaming to backpressure the socket while body_stream is above its
+    // high-water mark. Inc/Dec are dispatcher-thread-only; the load by
+    // PauseReadPump/ResumeReadPump uses acquire ordering.
+    std::atomic<int> read_disable_count_{0};
+
     // Observability — transport + protocol gauges. Wired by the
     // accept-time call to AttachTransportObservability; the
     // protocol-confirmed gauge is wired by MarkApplicationProtocolConfirmed
@@ -199,6 +207,17 @@ public:
     void ResumeReadPump();
     bool IsReadPumpPaused() const {
         return read_pump_paused_.load(std::memory_order_acquire);
+    }
+
+    // Counted backpressure pause/resume — A.5. Inc/Dec must be balanced;
+    // a non-zero count keeps the read pump paused even if the binary
+    // `read_pump_paused_` flag is cleared by ResumeReadPump. Used by
+    // inbound H1 streaming to throttle the socket while body_stream is
+    // above its high-water mark. Dispatcher-thread-only.
+    void IncReadDisable();
+    void DecReadDisable();
+    int ReadDisableCount() const {
+        return read_disable_count_.load(std::memory_order_acquire);
     }
 
     // Returns true if this connection has TLS (any state: handshake or ready).

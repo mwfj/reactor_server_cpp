@@ -7,6 +7,10 @@
 #include "observability/trace_context.h" // RequestTraceContext (complete type for std::optional<>)
 // <unordered_map> provided by common.h
 
+namespace http {
+class BodyStream;
+}
+
 // Forward declarations for observability types we hold as pointer /
 // shared_ptr (no header pull required at this point — full type only
 // needed at .cc construction sites).
@@ -21,6 +25,22 @@ struct HttpRequest {
     int http_minor = 1;
     std::map<std::string, std::string> headers;  // Header names stored lowercase
     std::string body;
+    // G1 (Phase 5) — streaming-request handle. Non-null in
+    // RouteRequestMode::Streaming; nullptr in Buffered mode. shared_ptr
+    // preserves HttpRequest's implicit copy ctor (3 async-resume sites
+    // make_shared<HttpRequest>(req)). When non-null, `body` is empty —
+    // chunks flow through the stream instead.
+    std::shared_ptr<http::BodyStream> body_stream;
+    // G3 — request trailers populated at end-of-stream for H2 streaming
+    // routes. Empty for H1 streaming and for all buffered routes.
+    std::vector<std::pair<std::string, std::string>> request_trailers;
+    // §4.5 max_body_size enforcement on streaming routes (cumulative
+    // bytes pushed to body_stream).
+    size_t pushed_body_bytes = 0;
+    // Per-request upstream deadline override (ms). 0 → use ProxyConfig
+    // default. Set by middleware (e.g. gRPC grpc-timeout decorator)
+    // BEFORE ProxyHandler::Handle runs.
+    int upstream_deadline_override_ms = 0;
     bool keep_alive = true;
     bool upgrade = false;         // Connection: Upgrade (for WebSocket)
     size_t content_length = 0;
@@ -176,6 +196,26 @@ struct HttpRequest {
         return headers.find(lower) != headers.end();
     }
 
+    // True if this request's framing implies a body (Transfer-Encoding
+    // present OR Content-Length > 0). Framing-only — does NOT consult the
+    // method (r9 F1 P0: a streaming proxy must forward explicitly framed
+    // bodies on GET/HEAD/DELETE).
+    static bool ExpectsRequestBody(
+        std::string_view /*method*/,
+        const std::map<std::string, std::string>& headers) {
+        // Parser stores header keys lowercase — direct find is safe.
+        auto te = headers.find("transfer-encoding");
+        if (te != headers.end() && !te->second.empty()) return true;
+        auto cl = headers.find("content-length");
+        if (cl != headers.end()) {
+            const std::string& v = cl->second;
+            char* end = nullptr;
+            uint64_t n = std::strtoull(v.c_str(), &end, 10);
+            if (end != v.c_str() && n > 0) return true;
+        }
+        return false;
+    }
+
     // Reset for reuse (keep-alive pipelining)
     void Reset() {
         method.clear();
@@ -186,6 +226,10 @@ struct HttpRequest {
         http_minor = 1;
         headers.clear();
         body.clear();
+        body_stream.reset();
+        request_trailers.clear();
+        pushed_body_bytes = 0;
+        upstream_deadline_override_ms = 0;
         keep_alive = true;
         upgrade = false;
         content_length = 0;

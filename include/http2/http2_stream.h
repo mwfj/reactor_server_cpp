@@ -2,7 +2,8 @@
 
 #include "http/http_request.h"
 #include "http/http_response.h"
-// <string>, <cstdint>, <memory> provided by common.h (via http_request.h)
+#include "http/route_options.h"
+// <string>, <cstdint>, <memory>, <vector> provided by common.h (via http_request.h)
 
 class ResponseDataSource {
 public:
@@ -70,6 +71,32 @@ public:
     int32_t StreamId() const { return stream_id_; }
     HttpRequest& GetRequest() { return request_; }
     const HttpRequest& GetRequest() const { return request_; }
+    HttpRequest* GetRequestPtr() { return &request_; }
+    const HttpRequest* GetRequestPtr() const { return &request_; }
+
+    // Per-stream request mode resolved at HEADERS-complete.
+    http::RouteRequestMode route_mode() const { return route_mode_; }
+    void set_route_mode(http::RouteRequestMode m) { route_mode_ = m; }
+
+    // Pending request trailers accumulated during the trailer HEADERS block.
+    // Promoted to HttpRequest::request_trailers at END_STREAM (Phase D).
+    std::vector<std::pair<std::string, std::string>>& pending_trailers() {
+        return pending_trailers_;
+    }
+
+    // Sub-threshold WINDOW_UPDATE batching. Bytes consumed by the outbound
+    // Read() path accumulate here; when the threshold is reached (or at
+    // stream end), ConsumeStreamingRequestBytes / ForceFlushStreamConsume
+    // emits the WINDOW_UPDATE and resets the counter.
+    void AccumulateConsumedBytes(size_t n) {
+        consumed_since_last_window_update_ += n;
+    }
+    size_t consumed_since_last_window_update() const {
+        return consumed_since_last_window_update_;
+    }
+    void reset_consumed_since_last_window_update() {
+        consumed_since_last_window_update_ = 0;
+    }
 
     // Track response state
     bool IsResponseHeadersSent() const { return response_headers_sent_; }
@@ -169,4 +196,17 @@ private:
     // counted against the handler's response budget.
     std::chrono::steady_clock::time_point dispatched_at_ =
         std::chrono::steady_clock::time_point::max();
+
+    // Streaming-route request mode (resolved at HEADERS-complete via
+    // resolve_route_options_callback). Defaults to Buffered so the
+    // existing code paths are unaffected when streaming is not configured.
+    http::RouteRequestMode route_mode_ = http::RouteRequestMode::Buffered;
+
+    // Accumulates trailer name/value pairs from the per-header callback;
+    // promoted to HttpRequest::request_trailers at END_STREAM (Phase D).
+    std::vector<std::pair<std::string, std::string>> pending_trailers_;
+
+    // Bytes consumed by the consumer since the last WINDOW_UPDATE emission.
+    // Threshold-batched to avoid per-chunk WINDOW_UPDATE floods.
+    size_t consumed_since_last_window_update_ = 0;
 };

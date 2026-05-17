@@ -13,6 +13,7 @@
 #include "circuit_breaker/retry_budget.h" // RetryBudget::InFlightGuard (member-by-value)
 #include "http/http_callbacks.h"
 #include "http/http_response.h"
+#include "http/body_stream.h"
 #include "observability/observability_snapshot.h"  // UpstreamTransactionLink
 #include "observability/trace_context.h"            // AttemptTraceContext / RequestTraceContext
 // <string>, <map>, <unordered_map>, <memory>, <functional>, <chrono>, <optional> provided by common.h
@@ -95,6 +96,19 @@ public:
     // `X-H2-Limitation: alpn-not-h2` in MakeErrorResponse so operators
     // see a distinct signal from generic checkout-failure.
     static constexpr int RESULT_H2_ALPN_NOT_NEGOTIATED = -14;
+    // v4 F5 P0 — streaming-retry-denied terminal codes. The denial reason
+    // is per-request semantics (source consumption / body-on-wire /
+    // queued-non-idempotent), distinct from RESULT_RETRY_BUDGET_EXHAUSTED
+    // which is pool-level budget arithmetic. All three map to 502
+    // BadGateway via MakeErrorResponse.
+    static constexpr int RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED     = -15;
+    static constexpr int RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE        = -16;
+    static constexpr int RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED = -17;
+    // v7 F4 P1 — proxy-side request-body-size enforcement. Fires when
+    // producer (inbound body-size enforcement at B.2 / C.x) aborts the
+    // body_stream with reason "body_size_limit_exceeded" AFTER the
+    // proxy has begun forwarding. Maps to 413 PayloadTooLarge.
+    static constexpr int RESULT_REQUEST_BODY_LIMIT_EXCEEDED                = -18;
 
     // Constructor copies all needed fields from client_request (method, path,
     // query, headers, body, params, dispatcher_index, client_ip, client_tls,
@@ -202,7 +216,11 @@ public:
     void OnComplete() override;
     void OnError(int error_code, const std::string& message) override;
     void OnRequestSubmitted() override;
-    void OnRequestBodyProgress() override;
+    void OnRequestHeadersSubmitted() override;
+    void OnRequestBodyProgress(size_t bytes_drained) override;
+    void OnRequestBodySourceConsumed(size_t bytes) override;
+    std::function<void(int, const std::string&)>
+    MakeDeferredErrorCallback() override;
 
     // Send-phase stall fallback budget when config_.response_timeout_ms == 0.
     // The response-wait timeout is operator-disable-able (set to 0), but the
@@ -454,6 +472,54 @@ private:
     // Reset by DispatchH2 init + Cleanup.
     bool h2_request_fully_sent_ = false;
 
+    // ---- G1 streaming-request state (Phase A.8) ----
+
+    // True when this transaction is forwarding a streaming-mode request.
+    // Set in DispatchH1/DispatchH2's streaming branch; preserved across
+    // retry resets where idempotent replay is safe (source not yet
+    // consumed; body not on wire).
+    bool is_streaming_request_ = false;
+
+    // Cumulative DATA bytes whose transport-drain has been observed
+    // (OnRequestBodyProgress). Drives the body-on-wire retry-denial
+    // check (RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE).
+    size_t body_bytes_written_to_upstream_ = 0;
+
+    // Cumulative bytes read from the body_stream source (consumer-side
+    // BodyStream::Read). Drives the source-consumed retry-denial check
+    // (RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED). Bumped via
+    // OnRequestBodySourceConsumed virtual.
+    size_t body_bytes_read_from_source_ = 0;
+    // Latched once Read drains any bytes — short-circuit for retry
+    // policy checks that don't need exact count.
+    bool source_consumed_ = false;
+
+    // True after request HEADERS hit the wire. Drives the headers-on-
+    // wire retry-denial check for non-idempotent methods
+    // (RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED).
+    bool request_headers_submitted_ = false;
+
+    // Per-request upstream-deadline override (ms). 0 = use ProxyConfig
+    // default. Plumbed in by middleware (e.g., gRPC `grpc-timeout`
+    // decorator) BEFORE Start(). Read once at DispatchH1/DispatchH2.
+    int upstream_deadline_override_ms_ = 0;
+
+    // H1-side parallel to h2_request_fully_sent_. Set when the H1
+    // streaming send loop emits its final chunk terminator. Used by
+    // SendH1StreamingRequest_'s send-stall fallback.
+    bool h1_request_fully_sent_ = false;
+
+    // Gate flag for OnUpstreamWriteComplete: intermediate chunk drains on the
+    // H1 streaming path MUST NOT transition state to AWAITING_RESPONSE.
+    // EmitH1ChunkedTrailers_ sets this true BEFORE the final SendRaw so the
+    // sole post-final-write OnUpstreamWriteComplete fires takes the normal
+    // transition path.
+    bool h1_streaming_send_complete_ = false;
+
+    // Active BodyStream for the current streaming request attempt.
+    // Non-null when is_streaming_request_=true and the send phase is active.
+    std::shared_ptr<http::BodyStream> body_stream_;
+
     // Last time the H2 codec emitted a request-side DATA frame.
     // Updated by OnRequestBodyProgress; inspected by the single
     // in-flight send-stall closure on fire. The closure re-queues
@@ -593,6 +659,26 @@ private:
     void OnCheckoutReady(UpstreamLease lease);
     void OnCheckoutError(int error_code);
 
+    // H1 streaming send path. Called from the streaming branch in
+    // DispatchH1. Implements the three-shape decision and starts the
+    // pull loop via WaitForData.
+    void SendH1StreamingRequest_(std::shared_ptr<http::BodyStream> body_stream);
+
+    // Continuation invoked from BodyStream::WaitForData callback.
+    // Pulls chunks until WOULD_BLOCK/EOS/ABORTED.
+    void PumpH1StreamingBody_();
+
+    // Emit the chunked terminator block (final chunk marker + trailers + CRLF).
+    // Sets h1_streaming_send_complete_ = true BEFORE the final SendRaw so
+    // OnUpstreamWriteComplete's guard permits the AWAITING_RESPONSE transition.
+    void EmitH1ChunkedTrailers_(
+        const std::vector<std::pair<std::string, std::string>>& trailers,
+        bool omit_last_chunk_marker);
+
+    // Build "METHOD path?query HTTP/1.1\r\n" + serialized rewritten_headers_.
+    // Excludes body framing (caller emits CL:0 or TE:chunked separately).
+    std::string BuildH1StreamingRequestHead_() const;
+
     // H1 dispatch: wires transport callbacks on the lease's transport
     // and serializes the request. Reads `lease_` (already moved in by
     // OnCheckoutReady) and assumes the transport is ready to write.
@@ -614,6 +700,11 @@ private:
     void OnUpstreamWriteComplete(std::shared_ptr<ConnectionHandler> conn);
     void OnResponseComplete();
     void MaybeRetry(RetryPolicy::RetryCondition condition);
+    // RST_STREAM the in-flight H2 stream (or MarkClosing on H1) when a
+    // pre-body retry is permitted. Enqueues a deferred walker run on the
+    // H2 path so the stream slot frees promptly without waiting for the
+    // next inbound-bytes drain.
+    void TombstonePreBodyHeadersForRetry_();
     // Terminal-failure delivery extracted from OnError so MaybeRetry's
     // retry-not-allowed fallback can avoid bouncing through OnError's
     // H2 retry escape hatch (would otherwise loop). Caller-owned

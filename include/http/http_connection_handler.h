@@ -23,6 +23,8 @@ public:
     void SetRequestCallback(RequestCallback callback);
     void SetRouteCheckCallback(RouteCheckCallback callback);
     void SetMiddlewareCallback(MiddlewareCallback callback);
+    void SetResolveRouteOptionsCallback(
+        HTTP_CALLBACKS_NAMESPACE::HttpConnResolveRouteOptionsCallback callback);
     // Install the async middleware callback for WS upgrades. Optional;
     // when not installed the WS upgrade path skips the async phase and
     // runs the sync path only.
@@ -225,6 +227,14 @@ public:
     // without recursion surprises.
     void StashDeferredBytes(const std::string& data);
 
+    // Clear the streaming-upload-in-flight flag. Called from the async-resume
+    // aborted-body guard (H.3) when the guard fires on the dispatcher thread.
+    // Mirrors the flag clear at the other four terminal sites enumerated at
+    // the field declaration above. H2's no-op counterpart on
+    // Http2ConnectionHandler keeps the generic MakeAsyncResumeCallback
+    // template clean.
+    void ClearStreamingUploadInFlight() { streaming_upload_in_flight_ = false; }
+
     // True if an async response is currently pending delivery.
     bool IsAsyncResponsePending() const { return deferred_response_pending_; }
 
@@ -272,6 +282,17 @@ private:
     // Tracks whether we've sent 100 Continue for the current request.
     // Reset when the parser is reset for the next pipelined request.
     bool sent_100_continue_ = false;
+
+    // Set true by the headers_complete_callback streaming dispatch path
+    // immediately before DispatchStreamingRoute; cleared at FIVE terminal
+    // sites so the OnRawData stash gate correctly bypasses buffering for
+    // mid-request body chunks on a streaming upload:
+    //   (a) on_message_complete via SetStreamingBodyCompleteCallback (happy path)
+    //   (b) HandleParseError at function entry
+    //   (c) CloseConnection at function entry
+    //   (d) parser_.Reset() site (symmetric with sent_100_continue_)
+    //   (e) async-resume aborted-body guard (H.3)
+    bool streaming_upload_in_flight_ = false;
 
     // Close the underlying connection (send response then close)
     void CloseConnection();

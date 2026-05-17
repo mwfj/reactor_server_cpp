@@ -161,6 +161,39 @@ public:
         UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink,
         bool client_te_trailers = false);
 
+    // Streaming-request entry point. Implements the three-shape decision
+    // (PureBodyless / EmptyBodyWithTrailers / Bodied) from the design.
+    // On success returns the stream_id (>= 1). On failure returns -1.
+    // sink->OnError is NOT fired here on submit failure; the caller
+    // (ProxyTransaction) classifies the result and routes through its own
+    // error path.
+    int32_t SubmitStreamingRequest(
+        UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink,
+        const std::string& method,
+        const std::string& scheme,
+        const std::string& authority,
+        const std::string& path_with_query,
+        const std::map<std::string, std::string>& rewritten_headers,
+        bool client_te_trailers,
+        std::shared_ptr<http::BodyStream> body_stream);
+
+    // Result codes for SubmitTrailer.
+    enum class SubmitTrailerResult {
+        OK,
+        NoTrailersSubmitted,
+        NoSuchStream,
+        InvalidTrailer,
+        SubmitFailed
+    };
+
+    // Submit outbound request trailers for an in-flight stream. Called from
+    // inside StreamingDataSourceReadCallback's END_OF_STREAM branch (within
+    // nghttp2's mem_send2 pass). Does NOT call FlushSend — the caller's
+    // outer mem_send2 pass serializes the trailer frame naturally.
+    SubmitTrailerResult SubmitTrailer(
+        int32_t stream_id,
+        const std::vector<std::pair<std::string, std::string>>& trailers);
+
     // Cancel an in-flight stream. Submits RST_STREAM with NGHTTP2_CANCEL
     // and flushes; defers the flush when called from inside HandleBytes
     // so the post-receive flush in the caller picks it up safely.
@@ -410,5 +443,13 @@ private:
     // been failed / reset. The sink is about to be detached so its
     // virtuals must not fire post-detach.
     void DropDrainEntriesForStream(int32_t stream_id);
+
+    // Data-source callback for non-PureBodyless streaming requests.
+    // `source->ptr` carries stream.get(); the callback reaches body_stream
+    // and sink via streams_.find(stream_id). Sibling of H2BodyReadCallback.
+    static ssize_t StreamingDataSourceReadCallback(
+        nghttp2_session* session, int32_t stream_id,
+        uint8_t* buf, size_t length, uint32_t* data_flags,
+        nghttp2_data_source* source, void* user_data);
 
 };

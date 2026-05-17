@@ -4608,7 +4608,7 @@ void TestN9bRequestBodyProgressFiresFromCodec() {
     struct ObservingSink : public RecordingSink {
         int progress_calls = 0;
         int submitted_calls = 0;
-        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestBodyProgress(size_t /*bytes_drained*/) override { ++progress_calls; }
         void OnRequestSubmitted() override { ++submitted_calls; }
     };
     try {
@@ -4667,7 +4667,7 @@ void TestN9dDeferredDrainSemantic() {
     struct ObservingSink : public RecordingSink {
         int progress_calls = 0;
         int submitted_calls = 0;
-        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestBodyProgress(size_t /*bytes_drained*/) override { ++progress_calls; }
         void OnRequestSubmitted() override { ++submitted_calls; }
     };
     try {
@@ -4753,7 +4753,7 @@ void TestN9eResetStreamDropsDrainEntries() {
     struct ObservingSink : public RecordingSink {
         int progress_calls = 0;
         int submitted_calls = 0;
-        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestBodyProgress(size_t /*bytes_drained*/) override { ++progress_calls; }
         void OnRequestSubmitted() override { ++submitted_calls; }
     };
     try {
@@ -4814,7 +4814,7 @@ void TestN9qResetSiblingDoesNotStarveDrainAttribution() {
     struct ObservingSink : public RecordingSink {
         int progress_calls = 0;
         int submitted_calls = 0;
-        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestBodyProgress(size_t /*bytes_drained*/) override { ++progress_calls; }
         void OnRequestSubmitted() override { ++submitted_calls; }
     };
     try {
@@ -4907,7 +4907,7 @@ void TestN9fPartialDrainOfFinalFrame() {
     struct ObservingSink : public RecordingSink {
         int progress_calls = 0;
         int submitted_calls = 0;
-        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestBodyProgress(size_t /*bytes_drained*/) override { ++progress_calls; }
         void OnRequestSubmitted() override { ++submitted_calls; }
     };
     try {
@@ -4984,7 +4984,7 @@ void TestN9gControlFrameByteAccounting() {
     struct ObservingSink : public RecordingSink {
         int progress_calls = 0;
         int submitted_calls = 0;
-        void OnRequestBodyProgress() override { ++progress_calls; }
+        void OnRequestBodyProgress(size_t /*bytes_drained*/) override { ++progress_calls; }
         void OnRequestSubmitted() override { ++submitted_calls; }
     };
     try {
@@ -5660,7 +5660,7 @@ void TestN7eWiringEarlyHeadersThenIntermediateDataDispatch() {
             headers_seen = true;
             return ok;
         }
-        void OnRequestBodyProgress() override {
+        void OnRequestBodyProgress(size_t /*bytes_drained*/) override {
             ++progress_calls_total;
             if (headers_seen) {
                 ++progress_calls_post_headers;

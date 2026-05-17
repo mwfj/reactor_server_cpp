@@ -279,6 +279,78 @@ void HttpRouter::RouteProxyAsync(const std::string& method,
     proxy_async_patterns_[method].insert(path);
 }
 
+void HttpRouter::Route(const std::string& method, const std::string& path,
+                        Handler handler, http::RouteOptions options) {
+    // Trie insert first so duplicate-pattern exception surfaces before
+    // route_options_ commit (mirrors the 3-arg sync_pattern_keys_ ordering).
+    Route(method, path, std::move(handler));
+    route_options_[method][path] = options;
+}
+
+void HttpRouter::RouteAsync(const std::string& method, const std::string& path,
+                             AsyncHandler handler, http::RouteOptions options) {
+    RouteAsync(method, path, std::move(handler));
+    route_options_[method][path] = options;
+}
+
+void HttpRouter::RouteProxyAsync(const std::string& method,
+                                  const std::string& path,
+                                  AsyncHandler handler,
+                                  http::RouteOptions options) {
+    RouteProxyAsync(method, path, std::move(handler));
+    route_options_[method][path] = options;
+}
+
+http::RouteOptions HttpRouter::ResolveOptionsAtHeaders(
+    const std::string& method, const std::string& path) const {
+    // Reuse the GetAsyncHandler precedence walk to find a matching pattern
+    // without populating req.params. GetAsyncHandler takes an HttpRequest
+    // and mutates params, so we use a throw-away request whose params we
+    // discard. HEAD→GET fallback resolves to the GET route's options.
+    HttpRequest scratch;
+    scratch.method = method;
+    scratch.path = path;
+    std::string matched_pattern;
+    bool head_fallback = false;
+
+    // Async-trie precedence first (matches step 2 of ResolveRouteMatch).
+    auto async_handler = GetAsyncHandler(scratch, &head_fallback, &matched_pattern);
+    std::string lookup_method = method;
+    if (head_fallback && method == "HEAD") {
+        lookup_method = "GET";
+    }
+    if (async_handler) {
+        auto mit = route_options_.find(lookup_method);
+        if (mit != route_options_.end()) {
+            auto pit = mit->second.find(matched_pattern);
+            if (pit != mit->second.end()) {
+                return pit->second;
+            }
+        }
+        return {};
+    }
+
+    // Sync-trie precedence (matches step 3 of ResolveRouteMatch).
+    auto try_sync = [&](const std::string& m) -> const http::RouteOptions* {
+        auto it = method_tries_.find(m);
+        if (it == method_tries_.end()) return nullptr;
+        std::unordered_map<std::string, std::string> tmp_params;
+        auto r = it->second.Search(path, tmp_params);
+        if (!r.handler) return nullptr;
+        auto mit = route_options_.find(m);
+        if (mit == route_options_.end()) return nullptr;
+        auto pit = mit->second.find(r.matched_pattern);
+        if (pit == mit->second.end()) return nullptr;
+        return &pit->second;
+    };
+    if (const auto* opts = try_sync(method)) return *opts;
+    // HEAD → GET fallback for the sync trie.
+    if (method == "HEAD") {
+        if (const auto* opts = try_sync("GET")) return *opts;
+    }
+    return {};
+}
+
 bool HttpRouter::IsProxyAsyncPattern(const std::string& method,
                                       const std::string& pattern) const {
     auto it = proxy_async_patterns_.find(method);

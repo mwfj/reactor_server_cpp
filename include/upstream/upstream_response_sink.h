@@ -27,12 +27,34 @@ public:
     // bodyless requests — sinks must be reentrant relative to submit.
     virtual void OnRequestSubmitted() {}
 
-    // Fired per intermediate request-side DATA frame on the wire (not
-    // a per-byte signal — frame coalescing collapses adjacent writes).
-    // H2 only. Sinks should gate refresh logic on their own state
-    // machine; the codec dispatches unconditionally.
-    virtual void OnRequestBodyProgress() {}
+    // Fired when the request HEADERS frame is on the wire (serialized
+    // into the transport send buffer). H2 fires from OnFrameSendCallback
+    // when frame->headers.cat == NGHTTP2_HCAT_REQUEST. H1 fires
+    // synchronously after transport->SendRaw(headers) returns. Per-stream
+    // fire-once. Default no-op.
+    virtual void OnRequestHeadersSubmitted() {}
 
+    // Fired per transport-drain accounting tick for the request-side
+    // body. `bytes_drained` is the byte count just acknowledged by the
+    // transport. Drives per-request progress accounting (e.g.
+    // body_bytes_written_to_upstream_).
+    virtual void OnRequestBodyProgress(size_t /*bytes_drained*/) {}
+
+    // Fired when bytes are consumed from the producer-side body source
+    // (used by the streaming body pipeline to refresh window credit
+    // accounting). `bytes` is the count just consumed.
+    virtual void OnRequestBodySourceConsumed(size_t /*bytes*/) {}
+
+    // Returns a self-contained callable the H2 connection invokes from a
+    // deferred dispatcher task to deliver a terminal OnError. The returned
+    // function MUST capture a STRONG owner so it is safe to invoke after
+    // every other ref to the sink has been released. Default returns an
+    // empty std::function — caller falls through to synchronous in-place
+    // dispatch.
+    virtual std::function<void(int, const std::string&)>
+    MakeDeferredErrorCallback() {
+        return {};
+    }
 };
 
 }  // namespace UPSTREAM_CALLBACKS_NAMESPACE

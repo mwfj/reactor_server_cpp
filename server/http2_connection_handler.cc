@@ -31,8 +31,18 @@ bool IsBodySuppressedStreamingResponse(
 class StreamingH2DataSource final : public ResponseDataSource,
                                     public std::enable_shared_from_this<StreamingH2DataSource> {
 public:
-    explicit StreamingH2DataSource(std::shared_ptr<ConnectionHandler> conn)
-        : conn_(std::move(conn)) {}
+    // Callable injected at construction by H2StreamingResponseSenderImpl.
+    // Captures handler weak_ptr + stream_id by value; called from inside the
+    // data-source read callback (inside nghttp2_session_mem_send2 on the
+    // handler's dispatcher). Dispatcher-thread-only.
+    using TrailerSubmitFn =
+        std::function<Http2Session::SubmitTrailersResult(
+            const std::vector<std::pair<std::string, std::string>>&)>;
+
+    explicit StreamingH2DataSource(std::shared_ptr<ConnectionHandler> conn,
+                                    TrailerSubmitFn trailer_submit)
+        : conn_(std::move(conn)),
+          trailer_submit_(std::move(trailer_submit)) {}
 
     void ConfigureWatermarks(size_t high_water_bytes) {
         if (high_water_bytes == 0) return;
@@ -102,6 +112,12 @@ public:
         finished_ = true;
     }
 
+    void FinishWithTrailers(
+        std::vector<std::pair<std::string, std::string>> trailers) {
+        pending_trailers_ = std::move(trailers);
+        Finish();
+    }
+
     void Abort() {
         aborted_ = true;
         finished_ = true;
@@ -114,7 +130,7 @@ public:
                       uint32_t* data_flags) override {
         if (size_ == 0) {
             if (finished_) {
-                *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+                EmitEofFlags_(data_flags);
                 return 0;
             }
             logging::Get()->debug(
@@ -132,7 +148,7 @@ public:
         size_ -= to_copy;
 
         if (size_ == 0 && finished_) {
-            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+            EmitEofFlags_(data_flags);
         }
         return static_cast<ssize_t>(to_copy);
     }
@@ -178,7 +194,40 @@ private:
         }
     }
 
+    // Called when size_==0 && finished_. If pending_trailers_ is non-empty,
+    // invokes trailer_submit_ and sets EOF|NO_END_STREAM on success so nghttp2
+    // knows to expect a trailing HEADERS frame. On an empty or failed submit,
+    // sets EOF alone. Clears pending_trailers_ after the attempt.
+    void EmitEofFlags_(uint32_t* data_flags) {
+        if (pending_trailers_.empty() || !trailer_submit_) {
+            *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+            return;
+        }
+        const size_t trailer_count = pending_trailers_.size();
+        auto status = trailer_submit_(pending_trailers_);
+        pending_trailers_.clear();
+        switch (status) {
+            case Http2Session::SubmitTrailersResult::OK:
+                // Trailer HEADERS frame is now queued; signal that END_STREAM
+                // comes with the trailers, not with this DATA frame.
+                *data_flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
+                break;
+            case Http2Session::SubmitTrailersResult::NoTrailersSubmitted:
+                // Post-sanitize set was empty — emit plain EOF.
+                *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+                break;
+            default:
+                logging::Get()->warn(
+                    "H2 SubmitTrailers failed status={} count={}",
+                    static_cast<int>(status), trailer_count);
+                *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+                break;
+        }
+    }
+
     std::shared_ptr<ConnectionHandler> conn_;
+    TrailerSubmitFn trailer_submit_;
+    std::vector<std::pair<std::string, std::string>> pending_trailers_;
     std::vector<char> buffer_;
     size_t read_off_ = 0;
     size_t write_off_ = 0;
@@ -246,7 +295,25 @@ public:
             claimed_response_ = true;
         }
         if (!data_source_) {
-            data_source_ = std::make_shared<StreamingH2DataSource>(conn);
+            // Capture handler weak_ptr + stream_id for the trailer-submit
+            // callable. The data source can outlive the sender impl (the stream
+            // owns the data source via Http2Stream::data_source_; sender impl is
+            // held only by weak ref in active_stream_sender_impls_). Locking
+            // the weak_ptr at submit time is the correctness gate — returns
+            // NoSuchStream if the handler is already gone.
+            std::weak_ptr<Http2ConnectionHandler> handler_weak = handler_;
+            const int32_t sid = stream_id_;
+            data_source_ = std::make_shared<StreamingH2DataSource>(
+                conn,
+                [handler_weak, sid](
+                    const std::vector<std::pair<std::string, std::string>>& tr)
+                    -> Http2Session::SubmitTrailersResult {
+                    auto h = handler_weak.lock();
+                    if (!h) return Http2Session::SubmitTrailersResult::NoSuchStream;
+                    auto* sess = h->GetSession();
+                    if (!sess) return Http2Session::SubmitTrailersResult::NoSuchStream;
+                    return sess->SubmitTrailers(sid, tr);
+                });
             data_source_->ConfigureWatermarks(high_water_);
         }
         body_suppressed_ = IsBodySuppressedStreamingResponse(
@@ -419,11 +486,6 @@ public:
                 stream_id_, terminal_, programmer_error_, data_source_ != nullptr);
             return SendResult::CLOSED;
         }
-        if (!trailers.empty()) {
-            logging::Get()->warn(
-                "H2 streaming trailers requested but not forwarded stream={}",
-                stream_id_);
-        }
         auto self = handler_.lock();
         auto* session = self && self->GetSession() ? self->GetSession() : nullptr;
         auto conn = self ? self->GetConnection() : nullptr;
@@ -507,7 +569,11 @@ public:
         // returns on `terminal_ && !from_programmer_error`, and the CAS
         // gate inside finalize_request_ would silently drop a later
         // override).
-        data_source_->Finish();
+        if (trailers.empty()) {
+            data_source_->Finish();
+        } else {
+            data_source_->FinishWithTrailers(trailers);
+        }
         if (!session->InReceiveData()) {
             int rv = session->ResumeStreamData(stream_id_);
             if (rv != 0) {
@@ -872,6 +938,14 @@ void Http2ConnectionHandler::SetRequestCountCallback(
     }
 }
 
+void Http2ConnectionHandler::SetResolveRouteOptionsCallback(
+    HTTP2_CALLBACKS_NAMESPACE::ResolveRouteOptionsCallback callback) {
+    pending_resolve_route_options_cb_ = std::move(callback);
+    if (session_) {
+        session_->SetResolveRouteOptionsCallback(pending_resolve_route_options_cb_);
+    }
+}
+
 void Http2ConnectionHandler::SetMaxBodySize(size_t max) {
     max_body_size_ = max;
     if (session_) {
@@ -946,6 +1020,14 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
         session_->SetRequestCountCallback(std::move(pending_request_count_cb_));
         pending_request_count_cb_ = nullptr;
     }
+    if (pending_resolve_route_options_cb_) {
+        session_->SetResolveRouteOptionsCallback(pending_resolve_route_options_cb_);
+        // Don't move — keep the stored copy so reloads can reinstall it.
+    }
+
+    // Push streaming watermark config into the session.
+    session_->SetStreamingConfig(
+        streaming_high_water_, streaming_low_water_, streaming_window_update_);
 
     // Apply body size limit. Header list size comes from h2_settings_
     // (passed to Http2Session constructor) and is advertised in SETTINGS.

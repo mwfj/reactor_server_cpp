@@ -3,7 +3,8 @@
 #include "common.h"
 #include "upstream/upstream_response_sink.h"
 #include "upstream/upstream_callbacks.h"
-// <cstdint>, <string>, <memory> provided by common.h.
+#include "http/body_stream.h"
+// <cstdint>, <string>, <memory>, <functional> provided by common.h.
 
 // Heap-held source that nghttp2 reads from when streaming a request body.
 // Owned by the UpstreamH2Stream that submitted the request — the data
@@ -44,6 +45,32 @@ struct UpstreamH2Stream {
     // Holds the request-body buffer used by the nghttp2 data provider
     // read_callback. Empty for bodyless requests.
     std::unique_ptr<UpstreamH2BodySource> body_source;
+
+    // Set for streaming requests. When non-null, nghttp2 reads from body_stream
+    // via UpstreamH2Connection::StreamingDataSourceReadCallback rather than from
+    // body_source. Mutually exclusive with body_source.
+    std::shared_ptr<http::BodyStream> body_stream;
+
+    // Fire-once flag for OnRequestHeadersSubmitted dispatch from
+    // OnFrameSendCallback's NGHTTP2_HEADERS/NGHTTP2_HCAT_REQUEST branch.
+    bool headers_submitted_callback_fired_ = false;
+
+    // Deferred terminal-classification fields for streaming-side aborts.
+    // StreamingDataSourceReadCallback's ABORTED branch stores classification
+    // here and returns TEMPORAL_CALLBACK_FAILURE; OnStreamClose then consumes
+    // these fields and dispatches the terminal sink->OnError on a clean stack.
+    bool streaming_abort_pending = false;
+    int streaming_abort_code = 0;
+    std::string streaming_abort_message;
+
+    // Per-stream txn keepalive + deferred terminal-error callback.
+    // Constructed at SubmitStreamingRequest time (while the OnCheckoutReady
+    // strong-self capture is on the stack). Serves double duty: (a) keeps the
+    // ProxyTransaction alive for the entire H2 stream lifetime so the raw
+    // `sink` pointer cannot dangle; (b) deferred terminal-error callback
+    // consumed by OnStreamClose's streaming-abort branch.
+    // Empty std::function = no keepalive (legacy/test sinks).
+    std::function<void(int, const std::string&)> streaming_abort_callback;
 
     // Set at submit time so frame callbacks can detect HEAD-on-NO_BODY
     // (RFC 9110 §9.3.2) without reaching back into the codec or proxy

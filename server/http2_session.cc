@@ -3,6 +3,8 @@
 #include "http/http_response.h"
 #include "http/http_server.h"  // HttpServer::FinalizeIfSnapshot
 #include "http/http_status.h"
+#include "http/http2_trailer_sanitizer.h"
+#include "http/body_stream_impl.h"
 #include "log/logger.h"
 
 #include <nghttp2/nghttp2.h>
@@ -193,7 +195,14 @@ static int OnHeaderCallback(
                                  frame->hd.stream_id, hdr_name);
             return reject_protocol_error();
         }
-        // Valid trailer field — discard content (application doesn't use trailers)
+        // Valid trailer field — accumulate for streaming routes; discard otherwise.
+        if (stream->route_mode() == http::RouteRequestMode::Streaming) {
+            auto result = http::SanitizeHttp2TrailerField(hdr_name, hdr_value);
+            if (result.classification == http::H2TrailerClassification::Accept) {
+                stream->pending_trailers().emplace_back(
+                    std::move(result.lower_name), hdr_value);
+            }
+        }
         return 0;
     }
 
@@ -291,7 +300,36 @@ static int OnDataChunkRecvCallback(
         return 0;
     }
 
-    stream->AppendBody(reinterpret_cast<const char*>(data), len);
+    if (stream->route_mode() == http::RouteRequestMode::Streaming) {
+        // Streaming path: push bytes to the body stream and track consumed
+        // bytes for manual WINDOW_UPDATE (auto-window-update is disabled).
+        // The body stream ownership is on HttpRequest::body_stream —
+        // ChunkQueueBodyStream was installed at headers-complete time.
+        auto* body_stream = stream->GetRequest().body_stream.get();
+        if (body_stream) {
+            body_stream->Push(std::string(reinterpret_cast<const char*>(data), len));
+        }
+        stream->GetRequest().pushed_body_bytes += len;
+        // Batched manual consume: accumulate until threshold, then emit.
+        self->ConsumeStreamingRequestBytes(stream_id, len,
+                                           self->StreamingWindowUpdateBytes());
+    } else {
+        // Buffered path: accumulate body and manually consume the bytes so
+        // the peer's flow-control window advances (auto-window-update off).
+        stream->AppendBody(reinterpret_cast<const char*>(data), len);
+        int rv_c = nghttp2_session_consume_stream(session, stream_id,
+                                                   static_cast<size_t>(len));
+        if (rv_c != 0) {
+            logging::Get()->warn("nghttp2_session_consume_stream failed "
+                                 "stream={} rv={}", stream_id, rv_c);
+        }
+        int rv_cc = nghttp2_session_consume_connection(session,
+                                                       static_cast<size_t>(len));
+        if (rv_cc != 0) {
+            logging::Get()->warn("nghttp2_session_consume_connection failed "
+                                 "stream={} rv={}", stream_id, rv_cc);
+        }
+    }
     return 0;
 }
 
@@ -514,15 +552,90 @@ static int OnFrameRecvCallback(
                 }
             }
         }
-        // else: NGHTTP2_HCAT_HEADERS = trailing headers (trailers).
-        // We don't process trailer content, but we do need to check END_STREAM.
 
-        // Check END_STREAM on both request headers and trailers
+        // B.3: For NGHTTP2_HCAT_REQUEST — after pseudo-header validation and
+        // Expect handling, resolve the route mode. If the route is Streaming
+        // and the request expects a body, construct a ChunkQueueBodyStream,
+        // attach it to the request, and dispatch now (without waiting for
+        // the body to arrive). Buffered mode falls through to the standard
+        // complete-then-dispatch path below.
+        if (frame->headers.cat == NGHTTP2_HCAT_REQUEST && !stream->IsRejected()) {
+            if (self->Callbacks().resolve_route_options_callback) {
+                const auto& req = stream->GetRequest();
+                auto opts = self->Callbacks().resolve_route_options_callback(
+                    req.method, req.path);
+                if (opts.request_mode == http::RouteRequestMode::Streaming &&
+                    !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+                    stream->set_route_mode(http::RouteRequestMode::Streaming);
+                    // Construct streaming body pipeline.
+                    auto owner_weak = self->WeakOwner();
+                    const int32_t sid = frame->hd.stream_id;
+                    http::ChunkQueueBodyStream::Config bscfg;
+                    bscfg.high_water_bytes = self->StreamingHighWaterBytes();
+                    bscfg.low_water_bytes  = self->StreamingLowWaterBytes();
+                    // on_bytes_consumed: when the consumer frees capacity,
+                    // manually emit WINDOW_UPDATE for the stream.
+                    bscfg.on_bytes_consumed =
+                        [owner_weak, sid](size_t n) {
+                            if (auto handler = owner_weak.lock()) {
+                                if (auto s = handler->GetSession()) {
+                                    s->ConsumeStreamingRequestBytes(sid, n, 0);
+                                }
+                            }
+                        };
+                    auto body_stream = std::make_shared<http::ChunkQueueBodyStream>(
+                        std::move(bscfg));
+                    stream->GetRequest().body_stream = body_stream;
+                    self->DispatchStreamRequestStreaming(stream, frame->hd.stream_id);
+                    break;
+                }
+            }
+        }
+
+        // NGHTTP2_HCAT_HEADERS (trailing headers): check END_STREAM and
+        // dispatch the trailer notification to streaming routes.
+        if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+            if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+                stream->MarkEndStream();
+            }
+
+            // D.3: Streaming trailer dispatch.
+            if (stream->route_mode() == http::RouteRequestMode::Streaming &&
+                !stream->IsRejected()) {
+                // CL-UNDERRUN check: if a content-length was declared, verify
+                // the streamed body matched before delivering trailers.
+                const auto& req = stream->GetRequest();
+                if (req.content_length > 0 &&
+                    stream->GetRequest().pushed_body_bytes < req.content_length) {
+                    logging::Get()->warn(
+                        "HTTP/2 stream {} streaming trailer: body underrun "
+                        "pushed={} declared={}",
+                        frame->hd.stream_id,
+                        stream->GetRequest().pushed_body_bytes,
+                        req.content_length);
+                    // Close the stream body with the partial data.
+                }
+                // Flush any sub-threshold consumed bytes before delivering EOS.
+                self->ForceFlushStreamConsume(frame->hd.stream_id);
+                auto* body_stream = stream->GetRequest().body_stream.get();
+                if (body_stream) {
+                    if (!stream->pending_trailers().empty()) {
+                        body_stream->PushTrailersAndClose(
+                            std::move(stream->pending_trailers()));
+                    } else {
+                        body_stream->CloseEmpty();
+                    }
+                }
+            }
+            break;
+        }
+
+        // Check END_STREAM on initial request headers (no-body request).
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
             stream->MarkEndStream();
         }
 
-        // If request is complete, dispatch now.
+        // If request is complete (buffered path), dispatch now.
         // Skip if stream was rejected (RST_STREAM sent for body-too-large, etc.)
         if (stream->IsRequestComplete() && !stream->IsRejected() &&
             self->Callbacks().request_callback) {
@@ -537,7 +650,28 @@ static int OnFrameRecvCallback(
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
             stream->MarkEndStream();
 
-            // Request with body is now complete — dispatch.
+            // B.2a: Streaming path EOS — close body stream.
+            if (stream->route_mode() == http::RouteRequestMode::Streaming &&
+                !stream->IsRejected()) {
+                // CL-UNDERRUN check for streaming path.
+                const auto& req = stream->GetRequest();
+                if (req.content_length > 0 &&
+                    req.pushed_body_bytes < req.content_length) {
+                    logging::Get()->warn(
+                        "HTTP/2 stream {} streaming DATA END_STREAM: body "
+                        "underrun pushed={} declared={}",
+                        frame->hd.stream_id,
+                        req.pushed_body_bytes, req.content_length);
+                }
+                self->ForceFlushStreamConsume(frame->hd.stream_id);
+                auto* body_stream = req.body_stream.get();
+                if (body_stream) {
+                    body_stream->CloseEmpty();
+                }
+                break;
+            }
+
+            // Request with body is now complete (buffered) — dispatch.
             // Skip if stream was rejected (RST_STREAM sent for body-too-large, etc.)
             if (stream->IsRequestComplete() && !stream->IsRejected() &&
                 self->Callbacks().request_callback) {
@@ -640,6 +774,13 @@ Http2Session::Http2Session(std::shared_ptr<ConnectionHandler> conn,
     }
     // Don't track closed streams for priority (saves memory)
     nghttp2_option_set_no_closed_streams(impl_->option, 1);
+    // Disable automatic WINDOW_UPDATE emission so inbound DATA bytes are
+    // consumed explicitly (buffered path: per-chunk; streaming path: batched
+    // via ConsumeStreamingRequestBytes / ForceFlushStreamConsume). Without
+    // this, nghttp2 emits a WINDOW_UPDATE for every DATA frame regardless of
+    // whether the application has actually processed the bytes, which defeats
+    // per-stream backpressure for streaming routes.
+    nghttp2_option_set_no_auto_window_update(impl_->option, 1);
 
     // Create server session
     int rv = nghttp2_session_server_new2(
@@ -1139,6 +1280,54 @@ int Http2Session::SubmitStreamingResponse(
     return 0;
 }
 
+Http2Session::SubmitTrailersResult Http2Session::SubmitTrailers(
+    int32_t stream_id,
+    const std::vector<std::pair<std::string, std::string>>& trailers)
+{
+    if (!impl_ || !impl_->session) {
+        return SubmitTrailersResult::SubmitFailed;
+    }
+    auto* nghttp2_stream = nghttp2_session_find_stream(impl_->session, stream_id);
+    if (!nghttp2_stream) {
+        return SubmitTrailersResult::NoSuchStream;
+    }
+
+    auto filtered = http::SanitizeHttp2TrailerFieldsForOutboundEmit(trailers);
+    if (filtered.empty()) {
+        return SubmitTrailersResult::NoTrailersSubmitted;
+    }
+
+    // NGHTTP2_NV_FLAG_NONE so nghttp2 copies the bytes. `filtered` is a local
+    // that dies on function return; NO_COPY would require backing memory to
+    // live until the matching on_frame_send. Same decision as the upstream-side
+    // SubmitTrailer in upstream_h2_connection.cc.
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(filtered.size());
+    for (const auto& [name, value] : filtered) {
+        nghttp2_nv nv;
+        nv.name    = reinterpret_cast<uint8_t*>(const_cast<char*>(name.data()));
+        nv.value   = reinterpret_cast<uint8_t*>(const_cast<char*>(value.data()));
+        nv.namelen = name.size();
+        nv.valuelen = value.size();
+        nv.flags   = NGHTTP2_NV_FLAG_NONE;
+        nva.push_back(nv);
+    }
+
+    int rv = nghttp2_submit_trailer(impl_->session, stream_id,
+                                    nva.data(), nva.size());
+    if (rv < 0) {
+        logging::Get()->warn(
+            "H2 SubmitTrailers failed stream={} rv={}", stream_id, nghttp2_strerror(rv));
+        return rv == NGHTTP2_ERR_INVALID_ARGUMENT
+                ? SubmitTrailersResult::InvalidTrailer
+                : SubmitTrailersResult::SubmitFailed;
+    }
+    // No FlushSend here — this is called from inside the data-source read
+    // callback (inside nghttp2_session_mem_send2). The trailer HEADERS frame
+    // serializes naturally as part of that same send pass.
+    return SubmitTrailersResult::OK;
+}
+
 // ---- HTTP/2 server push (RFC 9113 §8.4) ----
 
 bool Http2Session::PushEnabled() const {
@@ -1383,6 +1572,105 @@ int32_t Http2Session::SubmitPushPromise(
     return promised;
 }
 
+bool Http2Session::ConsumeStreamingRequestBytes(
+    int32_t stream_id, size_t consumed, size_t threshold) {
+
+    auto* stream = FindStream(stream_id);
+    if (!stream) return false;
+
+    stream->AccumulateConsumedBytes(consumed);
+    size_t accumulated = stream->consumed_since_last_window_update();
+
+    if (threshold == 0 || accumulated >= threshold) {
+        stream->reset_consumed_since_last_window_update();
+        if (accumulated == 0) return true;
+
+        int rv_s = nghttp2_session_consume_stream(
+            impl_->session, stream_id, accumulated);
+        if (rv_s != 0) {
+            logging::Get()->warn("nghttp2_session_consume_stream failed "
+                                 "stream={} rv={}", stream_id, rv_s);
+        }
+        int rv_c = nghttp2_session_consume_connection(
+            impl_->session, accumulated);
+        if (rv_c != 0) {
+            logging::Get()->warn("nghttp2_session_consume_connection failed "
+                                 "stream={} rv={}", stream_id, rv_c);
+        }
+        return true;
+    }
+    return false;
+}
+
+void Http2Session::ForceFlushStreamConsume(int32_t stream_id) {
+    auto* stream = FindStream(stream_id);
+    if (!stream) return;
+
+    size_t accumulated = stream->consumed_since_last_window_update();
+    if (accumulated == 0) return;
+
+    stream->reset_consumed_since_last_window_update();
+    int rv_s = nghttp2_session_consume_stream(
+        impl_->session, stream_id, accumulated);
+    if (rv_s != 0) {
+        logging::Get()->warn("nghttp2_session_consume_stream (force flush) "
+                             "failed stream={} rv={}", stream_id, rv_s);
+    }
+    int rv_c = nghttp2_session_consume_connection(impl_->session, accumulated);
+    if (rv_c != 0) {
+        logging::Get()->warn("nghttp2_session_consume_connection (force flush) "
+                             "failed stream={} rv={}", stream_id, rv_c);
+    }
+}
+
+void Http2Session::DispatchStreamRequestStreaming(
+    Http2Stream* stream, int32_t stream_id) {
+
+    // Count and decrement incomplete counter — same as DispatchStreamRequest.
+    if (callbacks_.request_count_callback) {
+        callbacks_.request_count_callback();
+    }
+    OnStreamNoLongerIncomplete();
+    stream->MarkCounterDecremented();
+
+    HttpRequest& req = stream->GetRequest();
+
+    if (conn_) {
+        req.dispatcher_index = conn_->dispatcher_index();
+        req.client_ip = conn_->ip_addr();
+        req.client_tls = conn_->HasTls();
+        req.client_fd = conn_->fd();
+        if (stream->HasScheme() && !stream->Scheme().empty()) {
+            req.url_scheme = stream->Scheme();
+        } else if (req.url_scheme.empty()) {
+            req.url_scheme = conn_->HasTls() ? "https" : "http";
+        }
+        req.network_protocol_version = "2";
+        req.owning_dispatcher = conn_->GetDispatcher();
+    }
+
+    // Streaming routes: do NOT check content-length vs accumulated body size
+    // (body hasn't arrived yet). Skip the CL-mismatch gate entirely.
+
+    HttpResponse response;
+    bool handler_threw = false;
+    try {
+        callbacks_.request_callback(Owner(), stream_id, req, response);
+    } catch (const std::exception& e) {
+        logging::Get()->error("Exception in HTTP/2 streaming request handler: {}",
+                              e.what());
+        response = HttpResponse::InternalError();
+        handler_threw = true;
+    }
+    if (handler_threw) {
+        HttpServer::FinalizeIfSnapshot(req, response, "handler_threw");
+    }
+    if (response.IsDeferred()) {
+        return;
+    }
+    SubmitResponse(stream_id, response);
+}
+
 void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id) {
     // Count every dispatched request — including those rejected below by
     // content-length checks. Matches HTTP/1's request_count_callback which
@@ -1588,6 +1876,9 @@ void Http2Session::MarkStreamForRemoval(int32_t stream_id) {
 
 void Http2Session::FlushDeferredRemovals() {
     for (int32_t id : streams_to_remove_) {
+        // Flush any sub-threshold consumed bytes before erasing. This covers
+        // abort paths and error paths where the EOS branch didn't run.
+        ForceFlushStreamConsume(id);
         streams_.erase(id);
     }
     streams_to_remove_.clear();
@@ -1719,6 +2010,11 @@ void Http2Session::SetStreamOpenCallback(
 void Http2Session::SetRequestCountCallback(
     HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback cb) {
     callbacks_.request_count_callback = std::move(cb);
+}
+
+void Http2Session::SetResolveRouteOptionsCallback(
+    HTTP2_CALLBACKS_NAMESPACE::ResolveRouteOptionsCallback cb) {
+    callbacks_.resolve_route_options_callback = std::move(cb);
 }
 
 // --- Flood protection ---

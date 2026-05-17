@@ -16,6 +16,10 @@ bool RetryPolicy::IsIdempotent(const std::string& method) {
         || method == "TRACE";
 }
 
+bool RetryPolicy::IsMethodRetryableForReplay(const std::string& method) const {
+    return IsIdempotent(method);
+}
+
 bool RetryPolicy::ShouldRetry(int attempt, const std::string& method,
                                RetryCondition condition,
                                bool headers_sent) const {

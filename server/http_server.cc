@@ -268,6 +268,42 @@ MakeAsyncResumeCallback(
              pre_dispatch, tweak_response, submit]() mutable {
             if (state->cancelled()) { do_bookkeeping(); return; }
             if (!pre_dispatch(*handle)) { do_bookkeeping(); return; }
+            // Aborted-body guard: if the inbound body-stream was aborted
+            // during the async-middleware suspend window (body-size
+            // enforcement fired, client disconnected mid-upload, or parser
+            // error mid-body), the request body is invalid and we MUST NOT
+            // forward it to the route handler. Map the abort reason to the
+            // appropriate HTTP status: body-size-limit overflow → 413
+            // PayloadTooLarge; any other abort → 400 BadRequest.
+            // tweak_response(err, threw=true) adds Connection: close on H1
+            // (H2's tweak_response is a no-op). ClearStreamingUploadInFlight
+            // is real on H1, a no-op on H2.
+            if (req->body_stream && req->body_stream->Aborted()) {
+                const std::string& reason = req->body_stream->AbortReason();
+                HttpResponse err;
+                const char* outcome_tag;
+                if (reason == "body_size_limit_exceeded") {
+                    err = HttpResponse::PayloadTooLarge();
+                    outcome_tag = "streaming_body_size_limit_during_async";
+                } else {
+                    err = HttpResponse::BadRequest();
+                    outcome_tag = "streaming_body_aborted_during_async";
+                }
+                const int err_status = err.GetStatusCode();
+                tweak_response(err, /*threw=*/true);
+                err.ClearDeferred();
+                handle->ClearStreamingUploadInFlight();
+                try {
+                    submit(*handle, *req, err, std::string{outcome_tag});
+                } catch (const std::exception& e) {
+                    logging::Get()->error(
+                        "Failed to send {} after body-abort-during-async: {}",
+                        err_status, e.what());
+                    HttpServer::FinalizeIfSnapshot(*req, err, "submit_failed");
+                }
+                do_bookkeeping();
+                return;
+            }
             // Mirror the sync-path catch in HttpConnectionHandler: on
             // user-handler / finalizer throw, replace the in-flight
             // response with a generic 500 so the client always gets a
@@ -1851,6 +1887,7 @@ void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler han
 void HttpServer::PutAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { if (RejectIfServerLive("PutAsync", path)) return; router_.RouteAsync("PUT",    path, std::move(handler)); }
 void HttpServer::DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler) { if (RejectIfServerLive("DeleteAsync", path)) return; router_.RouteAsync("DELETE", path, std::move(handler)); }
 void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler) { if (RejectIfServerLive("RouteAsync", path)) return; router_.RouteAsync(method, path, std::move(handler)); }
+void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler, http::RouteOptions options) { if (RejectIfServerLive("RouteAsync", path)) return; router_.RouteAsync(method, path, std::move(handler), std::move(options)); }
 
 void HttpServer::Proxy(const std::string& route_pattern,
                        const std::string& upstream_service_name) {
@@ -2629,6 +2666,9 @@ void HttpServer::RegisterProxyRoutes() {
                 // ownership and survives any later overwrite.
                 // RouteProxyAsync (NOT RouteAsync) so ResolveRouteMatch
                 // can demux this entry as RouteKind::Proxy at step (2).
+                // Pass explicit RouteOptions so the inbound dispatcher
+                // activates the streaming body-source path when the
+                // upstream config requests it.
                 router_.RouteProxyAsync(mr.method, pattern,
                     [handler](HttpRequest& request,
                               HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
@@ -2637,7 +2677,8 @@ void HttpServer::RegisterProxyRoutes() {
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                         handler->Handle(request, std::move(stream_sender),
                                         std::move(complete));
-                    });
+                    },
+                    http::RouteOptions{upstream.request_mode});
                 if (!derived_companion.empty() && pattern == derived_companion) {
                     router_.MarkProxyCompanion(mr.method, pattern);
                 }
@@ -4382,6 +4423,12 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             }
         }
     );
+
+    http_conn->SetResolveRouteOptionsCallback(
+        [this](const std::string& method, const std::string& path) {
+            return router_.ResolveOptionsAtHeaders(method, path);
+        }
+    );
 }
 
 void HttpServer::SafeNotifyWsClose(const std::shared_ptr<HttpConnectionHandler>& http_conn) {
@@ -5548,6 +5595,12 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
             // decrement), so the hook is a no-op on clean close and
             // releases bookkeeping on early close.
             self->FireAndEraseStreamAbortHook(stream_id);
+        }
+    );
+
+    h2_conn->SetResolveRouteOptionsCallback(
+        [this](const std::string& method, const std::string& path) {
+            return router_.ResolveOptionsAtHeaders(method, path);
         }
     );
 }

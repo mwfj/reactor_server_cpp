@@ -4,6 +4,7 @@
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
 #include "http/streaming_response_sender_utils.h"
+#include "http/body_stream_impl.h"
 #include "log/logger.h"
 #include "log/log_utils.h"
 #include "observability/observability_manager.h"  // ->FinalizeFromSnapshot mgr-method calls
@@ -632,7 +633,40 @@ private:
 }  // namespace
 
 HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> conn)
-    : conn_(std::move(conn)) {}
+    : conn_(std::move(conn)) {
+    // Wire parser streaming hooks once at construction — they capture `this`
+    // directly (safe: parser_ is a member, lifetime matches).
+    parser_.SetHeadersCompleteCallback([this]() {
+        if (!callbacks_.resolve_route_options_callback) return;
+        const HttpRequest& req = parser_.GetRequest();
+        auto opts = callbacks_.resolve_route_options_callback(req.method, req.path);
+        if (opts.request_mode != http::RouteRequestMode::Streaming) return;
+        if (req.complete) return;  // END_STREAM on headers — no body coming
+
+        std::weak_ptr<HttpConnectionHandler> weak_self = weak_from_this();
+        http::ChunkQueueBodyStream::Config cfg;
+        cfg.high_water_bytes = DEFAULT_STREAM_HIGH_WATER_BYTES;
+        cfg.low_water_bytes  = DEFAULT_STREAM_LOW_WATER_BYTES;
+        cfg.on_above_high_water = [weak_self]() {
+            if (auto self = weak_self.lock()) {
+                if (self->conn_) self->conn_->IncReadDisable();
+            }
+        };
+        cfg.on_below_low_water = [weak_self]() {
+            if (auto self = weak_self.lock()) {
+                if (self->conn_) self->conn_->DecReadDisable();
+            }
+        };
+        auto body_stream = std::make_shared<http::ChunkQueueBodyStream>(std::move(cfg));
+        parser_.set_streaming_body_stream(body_stream);
+        parser_.GetRequest().body_stream = body_stream;
+        streaming_upload_in_flight_ = true;
+    });
+
+    parser_.SetStreamingBodyCompleteCallback([this]() {
+        streaming_upload_in_flight_ = false;
+    });
+}
 
 void HttpConnectionHandler::SetRequestCallback(RequestCallback callback) {
     callbacks_.request_callback = std::move(callback);
@@ -644,6 +678,11 @@ void HttpConnectionHandler::SetRouteCheckCallback(RouteCheckCallback callback) {
 
 void HttpConnectionHandler::SetMiddlewareCallback(MiddlewareCallback callback) {
     callbacks_.middleware_callback = std::move(callback);
+}
+
+void HttpConnectionHandler::SetResolveRouteOptionsCallback(
+    HTTP_CALLBACKS_NAMESPACE::HttpConnResolveRouteOptionsCallback callback) {
+    callbacks_.resolve_route_options_callback = std::move(callback);
 }
 
 void HttpConnectionHandler::SetAsyncMiddlewareCallback(
@@ -1302,6 +1341,7 @@ void HttpConnectionHandler::OnWriteProgress(size_t remaining_bytes) {
 }
 
 void HttpConnectionHandler::CloseConnection() {
+    streaming_upload_in_flight_ = false;
     request_in_progress_ = false;
     conn_->SetDeadlineTimeoutCb(nullptr);
     conn_->SetDeadline(std::chrono::steady_clock::now() + std::chrono::seconds(30));
@@ -1327,6 +1367,7 @@ void HttpConnectionHandler::HandleUpgradedData(const std::string& data) {
 }
 
 void HttpConnectionHandler::HandleParseError() {
+    streaming_upload_in_flight_ = false;
     logging::Get()->warn("HTTP parse error fd={}: {}", conn_->fd(), parser_.GetError());
     // Count parse errors as requests for stats consistency with HTTP/2
     if (callbacks_.request_count_callback) {
@@ -1899,6 +1940,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             if (remaining > 0) {
                 StashDeferredBytes(std::string(buf, remaining));
             }
+            streaming_upload_in_flight_ = false;
             parser_.Reset();
             sent_100_continue_ = false;
             return false;
@@ -1947,6 +1989,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     remaining -= consumed;
 
     // Reset parser and per-request state for next request (keep-alive / pipelining)
+    streaming_upload_in_flight_ = false;
     parser_.Reset();
     sent_100_continue_ = false;
 
@@ -2373,7 +2416,13 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
     //
     // NetServer clears the input buffer after on_message_callback returns,
     // so without this stash the pipelined bytes would be lost entirely.
-    if (deferred_response_pending_) {
+    //
+    // Exception: when a streaming upload is in flight, body bytes must
+    // reach the parser (on_body → body_stream->Push), not be stashed.
+    // The deferred async request will have been started by the upstream
+    // path; the parser stays active until on_message_complete fires and
+    // clears streaming_upload_in_flight_.
+    if (deferred_response_pending_ && !streaming_upload_in_flight_) {
         StashDeferredBytes(data);
         return;
     }

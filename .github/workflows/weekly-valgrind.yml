@@ -98,7 +98,9 @@ jobs:
             obs_self_metrics \
             obs_connection_metrics \
             obs_pool_gauges \
-            obs_middleware_metrics ; do
+            obs_middleware_metrics \
+            streaming_request \
+            h2_trailer ; do
             echo "::group::valgrind test_runner $suite"
             valgrind \
               --error-exitcode=1 \

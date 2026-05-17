@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "http/streaming_response_sender.h"
+#include "http/route_options.h"
 // <functional>, <memory>, <string>, <cstdint> provided by common.h
 
 // Forward declarations
@@ -26,6 +27,13 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         HttpRequest& request,
         HttpResponse& response
     )>;
+
+    // Called at HEADERS-complete to resolve per-route options (e.g. request
+    // mode) without a full router dispatch. Returns default RouteOptions
+    // when no matching route exists (Buffered mode — preserves old behavior).
+    using HttpConnResolveRouteOptionsCallback =
+        std::function<http::RouteOptions(const std::string& method,
+                                          const std::string& path)>;
 
     // Async middleware callback for WS-upgrade dispatch. Returns true if
     // the chain completed synchronously, false on suspend. `out_state`
@@ -62,6 +70,9 @@ namespace HTTP_CALLBACKS_NAMESPACE {
         HttpConnUpgradeCallback       upgrade_callback       = nullptr;
         HttpConnRequestCountCallback  request_count_callback  = nullptr;
         HttpConnShutdownCheckCallback shutdown_check_callback = nullptr;
+        // Route options resolver — wired by HttpServer to enable per-route
+        // streaming upload dispatch. When null, all H1 uploads are buffered.
+        HttpConnResolveRouteOptionsCallback resolve_route_options_callback = nullptr;
     };
 
     // ---- HttpRouter async callbacks -------------------------------------------
