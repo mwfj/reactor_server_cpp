@@ -29,6 +29,13 @@ public:
     void SetMaxBodySize(size_t max);
     void SetMaxHeaderSize(size_t max);
     void SetRequestTimeout(int seconds);
+
+    // Configure inbound streaming-request watermarks. high > low > 0,
+    // window_update > 0. Applied to the session via SetStreamingConfig
+    // during Initialize(); has no effect if called after Initialize().
+    void SetStreamingWatermarks(size_t high_water_bytes,
+                                size_t low_water_bytes,
+                                size_t window_update_bytes);
     // Absolute safety cap for async (counter-decremented) streams that
     // never submit a response. Computed by HttpServer from upstream
     // configs so it honors the largest configured proxy.response_timeout_ms.

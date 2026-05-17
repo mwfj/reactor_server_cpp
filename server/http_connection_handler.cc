@@ -645,8 +645,12 @@ HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> 
 
         std::weak_ptr<HttpConnectionHandler> weak_self = weak_from_this();
         http::ChunkQueueBodyStream::Config cfg;
-        cfg.high_water_bytes = DEFAULT_STREAM_HIGH_WATER_BYTES;
-        cfg.low_water_bytes  = DEFAULT_STREAM_LOW_WATER_BYTES;
+        // Configured watermarks override the class defaults. 0 means
+        // "no operator config supplied" (e.g. direct-ctor test paths).
+        cfg.high_water_bytes = (streaming_high_water_bytes_ > 0)
+            ? streaming_high_water_bytes_ : DEFAULT_STREAM_HIGH_WATER_BYTES;
+        cfg.low_water_bytes  = (streaming_low_water_bytes_ > 0)
+            ? streaming_low_water_bytes_ : DEFAULT_STREAM_LOW_WATER_BYTES;
         cfg.on_above_high_water = [weak_self]() {
             if (auto self = weak_self.lock()) {
                 if (self->conn_) self->conn_->IncReadDisable();
@@ -692,6 +696,12 @@ void HttpConnectionHandler::SetAsyncMiddlewareCallback(
 
 void HttpConnectionHandler::SetUpgradeCallback(UpgradeCallback callback) {
     callbacks_.upgrade_callback = std::move(callback);
+}
+
+void HttpConnectionHandler::SetStreamingWatermarks(
+    size_t high_water_bytes, size_t low_water_bytes) {
+    streaming_high_water_bytes_ = high_water_bytes;
+    streaming_low_water_bytes_  = low_water_bytes;
 }
 
 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender

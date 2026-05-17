@@ -1802,6 +1802,19 @@ HttpServer::HttpServer(ServerConfig config)
     h2_settings_.max_header_list_size   = config.http2.max_header_list_size;
     h2_settings_.enable_push            = config.http2.enable_push;
 
+    // Snapshot streaming watermarks from config. Live-reload via Reload()
+    // updates these atomics and walks live handlers to push the new values.
+    h1_streaming_high_water_.store(
+        config.http1.streaming.high_water_bytes, std::memory_order_relaxed);
+    h1_streaming_low_water_.store(
+        config.http1.streaming.low_water_bytes, std::memory_order_relaxed);
+    h2_streaming_high_water_.store(
+        config.http2.streaming.high_water_bytes, std::memory_order_relaxed);
+    h2_streaming_low_water_.store(
+        config.http2.streaming.low_water_bytes, std::memory_order_relaxed);
+    h2_streaming_window_update_.store(
+        config.http2.streaming.window_update_bytes, std::memory_order_relaxed);
+
     // Store upstream configurations for pool creation in Start()
     upstream_configs_ = config.upstreams;
 
@@ -3711,6 +3724,12 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
     http_conn->SetMaxAsyncDeferredSec(
         max_async_deferred_sec_.load(std::memory_order_relaxed));
+    // Inbound H1 streaming-request watermarks. Live-reloadable via the
+    // Reload() handler-walk; setter applies to subsequent streaming
+    // requests on this connection.
+    http_conn->SetStreamingWatermarks(
+        h1_streaming_high_water_.load(std::memory_order_relaxed),
+        h1_streaming_low_water_.load(std::memory_order_relaxed));
 
     // Count every completed HTTP parse — dispatched, rejected (400/413/etc), or
     // upgraded. Fires from HandleCompleteRequest before dispatch or rejection.
@@ -4962,6 +4981,13 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     h2_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
     h2_conn->SetMaxAsyncDeferredSec(
         max_async_deferred_sec_.load(std::memory_order_relaxed));
+    // Inbound H2 streaming-request watermarks come from Http2Config::streaming.
+    // Snapshotted at construction time; reload propagation runs through the
+    // same setter via HttpServer::Reload's H2 handler-walk path.
+    h2_conn->SetStreamingWatermarks(
+        h2_streaming_high_water_.load(std::memory_order_relaxed),
+        h2_streaming_low_water_.load(std::memory_order_relaxed),
+        h2_streaming_window_update_.load(std::memory_order_relaxed));
 
     // Set request callback: dispatch through HttpRouter (same as HTTP/1.x).
     // total_requests_ is counted in stream_open_callback (below), which fires
@@ -6197,6 +6223,48 @@ bool HttpServer::Reload(ServerConfig new_config) {
         live_config_.max_connections      = new_config.max_connections;
     }
 
+    // Streaming-request watermarks: live-reloadable. Update atomics first so
+    // newly-accepted connections see the new values, then walk live H1/H2
+    // handlers via their per-dispatcher RunOnDispatcher hop.
+    {
+        h1_streaming_high_water_.store(
+            new_config.http1.streaming.high_water_bytes,
+            std::memory_order_relaxed);
+        h1_streaming_low_water_.store(
+            new_config.http1.streaming.low_water_bytes,
+            std::memory_order_relaxed);
+        h2_streaming_high_water_.store(
+            new_config.http2.streaming.high_water_bytes,
+            std::memory_order_relaxed);
+        h2_streaming_low_water_.store(
+            new_config.http2.streaming.low_water_bytes,
+            std::memory_order_relaxed);
+        h2_streaming_window_update_.store(
+            new_config.http2.streaming.window_update_bytes,
+            std::memory_order_relaxed);
+
+        auto snap = SnapshotConnections();
+        const size_t h1_high = new_config.http1.streaming.high_water_bytes;
+        const size_t h1_low  = new_config.http1.streaming.low_water_bytes;
+        const size_t h2_high = new_config.http2.streaming.high_water_bytes;
+        const size_t h2_low  = new_config.http2.streaming.low_water_bytes;
+        const size_t h2_win  = new_config.http2.streaming.window_update_bytes;
+        for (auto& hconn : snap.h1) {
+            auto conn = hconn->GetConnection();
+            if (!conn) continue;
+            conn->RunOnDispatcher([hconn, h1_high, h1_low]() {
+                hconn->SetStreamingWatermarks(h1_high, h1_low);
+            });
+        }
+        for (auto& h2conn : snap.h2) {
+            auto conn = h2conn->GetConnection();
+            if (!conn) continue;
+            conn->RunOnDispatcher([h2conn, h2_high, h2_low, h2_win]() {
+                h2conn->SetStreamingWatermarks(h2_high, h2_low, h2_win);
+            });
+        }
+    }
+
     // Update the remaining reload-safe fields
     request_timeout_sec_.store(new_config.request_timeout_sec, std::memory_order_relaxed);
     shutdown_drain_timeout_sec_.store(new_config.shutdown_drain_timeout_sec,
@@ -6308,6 +6376,8 @@ bool HttpServer::Reload(ServerConfig new_config) {
         // Persist so GetLiveConfigSnapshot() returns the applied settings.
         live_config_.http2 = new_config.http2;
     }
+    // http1 has no other fields beyond streaming today; persist for snapshot.
+    live_config_.http1 = new_config.http1;
 
     // Rate limit reload — always safe because manager is always created
     if (rate_limit_manager_) {

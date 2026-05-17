@@ -302,6 +302,15 @@ static int OnDataChunkRecvCallback(
                              stream_id, req.content_length);
         if (!stream->IsRejected() && self->Callbacks().request_count_callback)
             self->Callbacks().request_count_callback();
+        // Streaming path: abort the body_stream BEFORE marking rejected so
+        // the outbound consumer observes ABORTED rather than EOS-on-truncation.
+        // Buffered path: nothing to abort — body buffer is in-process state.
+        if (stream->route_mode() == http::RouteRequestMode::Streaming) {
+            auto* body_stream = stream->GetRequest().body_stream.get();
+            if (body_stream) {
+                body_stream->Abort("content_length_overrun");
+            }
+        }
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                            stream_id, NGHTTP2_PROTOCOL_ERROR);
@@ -586,14 +595,11 @@ static int OnFrameRecvCallback(
                     bscfg.high_water_bytes = self->StreamingHighWaterBytes();
                     bscfg.low_water_bytes  = self->StreamingLowWaterBytes();
                     // on_bytes_consumed: when the consumer frees capacity,
-                    // submit WINDOW_UPDATE for the stream AND flush it onto
-                    // the wire. The producer's flow-control window only
-                    // advances after the peer receives WINDOW_UPDATE; if we
-                    // submit to nghttp2 but never call SendPendingFrames(),
-                    // the upload deadlocks the moment the peer hits the
-                    // initial window cap. ReceiveData's tail flush only
-                    // runs when more bytes arrive — which won't happen
-                    // while the peer waits on flow control.
+                    // submit WINDOW_UPDATE for the stream. The helper
+                    // flushes the queued frame to the wire internally
+                    // (gated on !InReceiveData), so the producer's
+                    // flow-control window advances without waiting for
+                    // the next inbound DATA batch.
                     bscfg.on_bytes_consumed =
                         [owner_weak, sid](size_t n) {
                             auto handler = owner_weak.lock();
@@ -601,15 +607,6 @@ static int OnFrameRecvCallback(
                             auto s = handler->GetSession();
                             if (!s) return;
                             s->ConsumeStreamingRequestBytes(sid, n, 0);
-                            // Flush WINDOW_UPDATE to the wire. Guard against
-                            // re-entry: ConsumeStreamingRequestBytes may be
-                            // invoked from inside mem_recv2 (sub-threshold
-                            // path) and SendPendingFrames pulls mem_send2,
-                            // which is unsafe re-entrantly. The outer
-                            // OnRawData tail flushes in that case.
-                            if (!s->InReceiveData()) {
-                                s->SendPendingFrames();
-                            }
                         };
                     auto body_stream = std::make_shared<http::ChunkQueueBodyStream>(
                         std::move(bscfg));
@@ -632,6 +629,10 @@ static int OnFrameRecvCallback(
                 !stream->IsRejected()) {
                 // CL-UNDERRUN check: if a content-length was declared, verify
                 // the streamed body matched before delivering trailers.
+                // Underrun = peer-declared CL > what arrived — protocol error.
+                // Abort + RST so the outbound consumer observes ABORTED
+                // rather than EOS-on-truncation (which would forward
+                // malformed partial body as a successful response).
                 const auto& req = stream->GetRequest();
                 if (req.content_length > 0 &&
                     stream->GetRequest().pushed_body_bytes < req.content_length) {
@@ -641,7 +642,20 @@ static int OnFrameRecvCallback(
                         frame->hd.stream_id,
                         stream->GetRequest().pushed_body_bytes,
                         req.content_length);
-                    // Close the stream body with the partial data.
+                    auto* body_stream = stream->GetRequest().body_stream.get();
+                    if (body_stream) {
+                        body_stream->Abort("content_length_underrun");
+                    }
+                    stream->MarkRejected();
+                    int rv = nghttp2_submit_rst_stream(
+                        session, NGHTTP2_FLAG_NONE,
+                        frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
+                    if (rv < 0) {
+                        logging::Get()->error(
+                            "nghttp2_submit_rst_stream (CL-underrun trailer) "
+                            "failed: {}", nghttp2_strerror(rv));
+                    }
+                    break;  // Skip normal close — body_stream is aborted.
                 }
                 // Flush any sub-threshold consumed bytes before delivering EOS.
                 self->ForceFlushStreamConsume(frame->hd.stream_id);
@@ -681,7 +695,10 @@ static int OnFrameRecvCallback(
             // B.2a: Streaming path EOS — close body stream.
             if (stream->route_mode() == http::RouteRequestMode::Streaming &&
                 !stream->IsRejected()) {
-                // CL-UNDERRUN check for streaming path.
+                // CL-UNDERRUN check for streaming path: declared CL > what
+                // arrived is a protocol error. Abort + RST so the outbound
+                // consumer observes ABORTED rather than EOS-on-truncation
+                // (which would forward malformed partial body as success).
                 const auto& req = stream->GetRequest();
                 if (req.content_length > 0 &&
                     req.pushed_body_bytes < req.content_length) {
@@ -690,6 +707,20 @@ static int OnFrameRecvCallback(
                         "underrun pushed={} declared={}",
                         frame->hd.stream_id,
                         req.pushed_body_bytes, req.content_length);
+                    auto* body_stream = req.body_stream.get();
+                    if (body_stream) {
+                        body_stream->Abort("content_length_underrun");
+                    }
+                    stream->MarkRejected();
+                    int rv = nghttp2_submit_rst_stream(
+                        session, NGHTTP2_FLAG_NONE,
+                        frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
+                    if (rv < 0) {
+                        logging::Get()->error(
+                            "nghttp2_submit_rst_stream (CL-underrun DATA) "
+                            "failed: {}", nghttp2_strerror(rv));
+                    }
+                    break;
                 }
                 self->ForceFlushStreamConsume(frame->hd.stream_id);
                 auto* body_stream = req.body_stream.get();
@@ -1625,6 +1656,13 @@ bool Http2Session::ConsumeStreamingRequestBytes(
             logging::Get()->warn("nghttp2_session_consume_connection failed "
                                  "stream={} rv={}", stream_id, rv_c);
         }
+        // Flush the WINDOW_UPDATE frame nghttp2 just queued onto the wire.
+        // Skipped when called from inside a recv callback (mem_send2 from
+        // inside mem_recv2 is unsafe — HTTP_WS.md pitfall); OnRawData's
+        // tail flush handles that case.
+        if (!in_receive_data_) {
+            SendPendingFrames();
+        }
         return true;
     }
     return false;
@@ -1648,6 +1686,11 @@ void Http2Session::ForceFlushStreamConsume(int32_t stream_id) {
     if (rv_c != 0) {
         logging::Get()->warn("nghttp2_session_consume_connection (force flush) "
                              "failed stream={} rv={}", stream_id, rv_c);
+    }
+    // Flush the queued WINDOW_UPDATE — see same gate explanation in
+    // ConsumeStreamingRequestBytes.
+    if (!in_receive_data_) {
+        SendPendingFrames();
     }
 }
 

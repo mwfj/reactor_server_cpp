@@ -34,6 +34,13 @@ public:
     void SetRequestCountCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnRequestCountCallback callback);
     void SetShutdownCheckCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnShutdownCheckCallback callback);
 
+    // Configure inbound streaming-request body watermarks. Read at
+    // headers-complete time by the HeadersCompleteCallback when constructing
+    // ChunkQueueBodyStream. Live-reloadable — must be set before the next
+    // streaming request arrives. high > low > 0 (validated upstream).
+    void SetStreamingWatermarks(size_t high_water_bytes,
+                                size_t low_water_bytes);
+
     // Send an HTTP response
     void SendResponse(const HttpResponse& response);
 
@@ -358,6 +365,15 @@ private:
     // headers. The request must still block pipelined parsing until End/Abort,
     // but the generic async safety cap no longer applies after commitment.
     bool deferred_response_committed_ = false;
+
+    // Inbound streaming-request body watermarks. Snapshotted by
+    // HttpServer at construction time and refreshed via
+    // SetStreamingWatermarks on live reload. Read at headers-complete
+    // time by the streaming HeadersCompleteCallback to populate the
+    // ChunkQueueBodyStream config. 0 sentinels keep the legacy default
+    // (1 MB / 512 KB) for pre-config call paths (tests, direct ctor use).
+    size_t streaming_high_water_bytes_ = 0;  // 0 = use class default
+    size_t streaming_low_water_bytes_  = 0;  // 0 = use class default
     bool deferred_was_head_ = false;
     bool deferred_keep_alive_ = true;
     std::string deferred_pending_buf_;

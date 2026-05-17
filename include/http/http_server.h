@@ -442,6 +442,18 @@ private:
     // HTTP/2 support
     bool http2_enabled_ = true;
     Http2Session::Settings h2_settings_;
+
+    // Streaming-request watermarks (snapshot of ServerConfig::http1.streaming
+    // and ServerConfig::http2.streaming). Atomic so dispatcher threads can
+    // read live values when constructing ChunkQueueBodyStream at
+    // headers-complete time. SIGHUP-reload propagation updates these and
+    // walks live H1/H2 handlers via SetStreamingWatermarks.
+    std::atomic<size_t> h1_streaming_high_water_{262144};
+    std::atomic<size_t> h1_streaming_low_water_{65536};
+    std::atomic<size_t> h2_streaming_high_water_{262144};
+    std::atomic<size_t> h2_streaming_low_water_{65536};
+    std::atomic<size_t> h2_streaming_window_update_{32768};
+
     std::map<int, std::shared_ptr<Http2ConnectionHandler>> h2_connections_;
 
     // Connections whose protocol has not yet been determined due to insufficient

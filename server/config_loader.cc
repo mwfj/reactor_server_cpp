@@ -1021,26 +1021,14 @@ ServerConfig ConfigLoader::LoadFromString(const std::string& json_str) {
                     h2, "preconnect_watermark_pct",
                     upstream.http2.preconnect_watermark_pct,
                     up_ctx + ".http2");
-                if (h2.contains("streaming")) {
-                    if (!h2["streaming"].is_object())
-                        throw std::runtime_error(
-                            up_ctx + ".http2.streaming must be an object");
-                    auto& s = h2["streaming"];
-                    if (s.contains("high_water_bytes")) {
-                        if (!s["high_water_bytes"].is_number_unsigned())
-                            throw std::runtime_error(
-                                up_ctx + ".http2.streaming.high_water_bytes must be a non-negative integer");
-                        upstream.http2.streaming.high_water_bytes =
-                            s["high_water_bytes"].get<size_t>();
-                    }
-                    if (s.contains("low_water_bytes")) {
-                        if (!s["low_water_bytes"].is_number_unsigned())
-                            throw std::runtime_error(
-                                up_ctx + ".http2.streaming.low_water_bytes must be a non-negative integer");
-                        upstream.http2.streaming.low_water_bytes =
-                            s["low_water_bytes"].get<size_t>();
-                    }
-                }
+                // upstream.http2.streaming.* is intentionally NOT parsed: the
+                // proxy reuses the inbound ChunkQueueBodyStream end-to-end,
+                // so per-upstream OUTBOUND watermarks have no runtime
+                // consumer. Top-level http2.streaming.* (parsed above)
+                // governs the producer-side backpressure that the outbound
+                // consumer reads from. Future protocol-translation paths
+                // (e.g. a separate outbound body buffer) would re-introduce
+                // this. Until then, parsing it would be a false affordance.
             }
 
             // Per-upstream request-handling mode (restart-only). Defaults to
@@ -2099,6 +2087,34 @@ void ConfigLoader::ValidateHotReloadable(
     // rejects (which is exactly the regression this helper exists
     // to prevent).
 
+    // Top-level streaming watermarks are live-reloadable (wired into
+    // HttpServer atomics + handler-walk in HttpServer::Reload, with
+    // SetStreamingWatermarks pushing the new values into live
+    // HttpConnectionHandler / Http2ConnectionHandler instances). Mirror
+    // the startup Validate() rules so SIGHUP rejects the same shapes.
+    if (config.http2.streaming.high_water_bytes == 0) {
+        throw std::invalid_argument(
+            "http2.streaming.high_water_bytes must be > 0");
+    }
+    if (config.http2.streaming.low_water_bytes >=
+        config.http2.streaming.high_water_bytes) {
+        throw std::invalid_argument(
+            "http2.streaming.low_water_bytes must be < high_water_bytes");
+    }
+    if (config.http2.streaming.window_update_bytes == 0) {
+        throw std::invalid_argument(
+            "http2.streaming.window_update_bytes must be > 0");
+    }
+    if (config.http1.streaming.high_water_bytes == 0) {
+        throw std::invalid_argument(
+            "http1.streaming.high_water_bytes must be > 0");
+    }
+    if (config.http1.streaming.low_water_bytes >=
+        config.http1.streaming.high_water_bytes) {
+        throw std::invalid_argument(
+            "http1.streaming.low_water_bytes must be < high_water_bytes");
+    }
+
     // Reject duplicate upstream service names BEFORE the per-upstream
     // CB validation. Even for new/renamed entries, the file is
     // malformed if names collide: `CircuitBreakerManager::Reload`
@@ -2272,19 +2288,10 @@ void ConfigLoader::ValidateHotReloadable(
                     "http2.saturation_open_pct (preconnect must fire "
                     "before saturation, not at/after)");
             }
-            // Outbound streaming watermarks (live-reloadable).
-            if (h2.streaming.high_water_bytes == 0) {
-                throw std::invalid_argument(
-                    idx + " ('" + u.name +
-                    "'): http2.streaming.high_water_bytes must be > 0");
-            }
-            if (h2.streaming.low_water_bytes >=
-                h2.streaming.high_water_bytes) {
-                throw std::invalid_argument(
-                    idx + " ('" + u.name +
-                    "'): http2.streaming.low_water_bytes must be < "
-                    "high_water_bytes");
-            }
+            // h2.streaming.* intentionally not validated — not parsed
+            // from JSON and not wired to the runtime; defaults are
+            // unconditional. See ConfigLoader::LoadFromString upstream
+            // block for the rationale.
         }
 
         const auto& cb = u.circuit_breaker;
@@ -3302,19 +3309,8 @@ void ConfigLoader::Validate(const ServerConfig& config, bool reload_copy) {
                         "'): http2.preconnect_watermark_pct must be < "
                         "http2.saturation_open_pct");
                 }
-                // Outbound streaming watermarks: high > low, both > 0.
-                if (h2.streaming.high_water_bytes == 0) {
-                    throw std::invalid_argument(
-                        idx + " ('" + u.name +
-                        "'): http2.streaming.high_water_bytes must be > 0");
-                }
-                if (h2.streaming.low_water_bytes >=
-                    h2.streaming.high_water_bytes) {
-                    throw std::invalid_argument(
-                        idx + " ('" + u.name +
-                        "'): http2.streaming.low_water_bytes must be < "
-                        "high_water_bytes");
-                }
+                // h2.streaming.* intentionally not validated — see
+                // matching note in the upstream-h2 parse block.
             }
 
             // Validate method names — reject unknowns and duplicates.
@@ -4341,10 +4337,8 @@ std::string ConfigLoader::ToJson(const ServerConfig& config) {
             hj["goaway_drain_timeout_sec"] = u.http2.goaway_drain_timeout_sec;
             hj["saturation_open_pct"] = u.http2.saturation_open_pct;
             hj["preconnect_watermark_pct"] = u.http2.preconnect_watermark_pct;
-            nlohmann::json sj;
-            sj["high_water_bytes"] = u.http2.streaming.high_water_bytes;
-            sj["low_water_bytes"]  = u.http2.streaming.low_water_bytes;
-            hj["streaming"] = sj;
+            // upstream.http2.streaming.* intentionally not serialized — see
+            // matching note in the upstream-h2 parse block.
             uj["http2"] = hj;
         }
         uj["request_mode"] =

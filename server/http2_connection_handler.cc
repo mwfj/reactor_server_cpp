@@ -964,6 +964,23 @@ void Http2ConnectionHandler::SetMaxAsyncDeferredSec(int sec) {
     max_async_deferred_sec_ = sec;
 }
 
+void Http2ConnectionHandler::SetStreamingWatermarks(
+    size_t high_water_bytes, size_t low_water_bytes,
+    size_t window_update_bytes) {
+    // ConfigLoader::Validate enforces high > low > 0 + window_update > 0.
+    streaming_high_water_   = high_water_bytes;
+    streaming_low_water_    = low_water_bytes;
+    streaming_window_update_= window_update_bytes;
+    // If session is already initialized (live-reload path), push the new
+    // values into the active session. Initialize() applies them via
+    // SetStreamingConfig from these members otherwise.
+    if (session_) {
+        session_->SetStreamingConfig(
+            streaming_high_water_, streaming_low_water_,
+            streaming_window_update_);
+    }
+}
+
 void Http2ConnectionHandler::SetRequestTimeout(int seconds) {
     request_timeout_sec_ = seconds;
     // Reconcile deadline state with the new timeout value. At

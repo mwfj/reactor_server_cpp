@@ -2320,6 +2320,12 @@ void ProxyTransaction::OnRequestHeadersSubmitted() {
 void ProxyTransaction::OnRequestBodySourceConsumed(size_t bytes) {
     if (cancelled_ || IsKilledForShutdown()) return;
     body_bytes_read_from_source_ += bytes;
+    // Latch on first non-zero observation. The retry-denial gate at the
+    // top of MaybeRetry short-circuits via this flag without re-reading
+    // body_bytes_read_from_source_ — once the consumer has pulled any
+    // bytes from the source, the source's contents may have advanced
+    // past the point where a replay would resend identical bytes.
+    if (bytes > 0) source_consumed_ = true;
 }
 
 std::function<void(int, const std::string&)>
@@ -3837,6 +3843,29 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         result_code == RESULT_GOAWAY_UNPROCESSED ||
         result_code == RESULT_GOAWAY_MAYBE_PROCESSED) {
         return HttpResponse::BadGateway();
+    }
+    // Streaming-retry-denial codes: per-request semantics that prevented
+    // replay (source consumed, body-on-wire, queued-non-idempotent).
+    // All three map to 502 with a self-identifying header.
+    if (result_code == RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED) {
+        HttpResponse resp = HttpResponse::BadGateway();
+        resp.Header("X-Retry-Denied", "streaming-source-consumed");
+        return resp;
+    }
+    if (result_code == RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE) {
+        HttpResponse resp = HttpResponse::BadGateway();
+        resp.Header("X-Retry-Denied", "streaming-body-on-wire");
+        return resp;
+    }
+    if (result_code == RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED) {
+        HttpResponse resp = HttpResponse::BadGateway();
+        resp.Header("X-Retry-Denied", "non-idempotent-headers-queued");
+        return resp;
+    }
+    // Proxy-side body-size enforcement (producer aborted the body_stream
+    // with reason "body_size_limit_exceeded" mid-forward). Maps to 413.
+    if (result_code == RESULT_REQUEST_BODY_LIMIT_EXCEEDED) {
+        return HttpResponse::PayloadTooLarge();
     }
     return HttpResponse::InternalError();
 }
