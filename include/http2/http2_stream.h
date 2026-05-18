@@ -58,6 +58,7 @@ public:
 
     // Mark stream as END_STREAM received from client
     void MarkEndStream();
+    bool IsEndStreamReceived() const { return end_stream_received_; }
 
     // Check if request is ready for dispatch
     bool IsRequestComplete() const;

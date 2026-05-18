@@ -1890,6 +1890,36 @@ void Http2Session::DispatchStreamRequestStreaming(
         return;
     }
     SubmitResponse(stream_id, response);
+
+    // Sync response on a streaming route while the client may still be
+    // sending the request body. Mirrors H1's behavior at
+    // server/http_connection_handler.cc:2438 — abort the body_stream so
+    // future Push calls drop incoming DATA, then RST_STREAM so a misbehaving
+    // or stalled client can't keep the stream slot + queue alive.
+    //
+    // RST_STREAM submission MUST be deferred past the post-receive
+    // SendPendingFrames pass: nghttp2_session_add_rst_stream synchronously
+    // transitions the stream to CLOSING (see third_party/nghttp2/
+    // nghttp2_session.c:1164), after which session_predicate_response_
+    // headers_send rejects the queued response with STREAM_CLOSING. Submitting
+    // inline here would silently cancel the response we just queued. Routing
+    // through EnqueuePostReceiveTask lets the response serialize first; the
+    // task fires after OnRawData's tail flush and submits the RST cleanly.
+    if (!stream->IsEndStreamReceived()) {
+        if (auto* body_stream = req.body_stream.get()) {
+            body_stream->Abort("streaming_handler_sync_response");
+        }
+        if (auto owner = Owner()) {
+            std::weak_ptr<Http2ConnectionHandler> weak_owner = owner;
+            owner->EnqueuePostReceiveTask([weak_owner, stream_id]() {
+                auto self = weak_owner.lock();
+                if (!self) return;
+                auto* session = self->GetSession();
+                if (!session) return;
+                session->ResetStream(stream_id, NGHTTP2_NO_ERROR);
+            });
+        }
+    }
 }
 
 void Http2Session::DispatchStreamRequest(Http2Stream* stream, int32_t stream_id) {

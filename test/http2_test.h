@@ -333,7 +333,90 @@ public:
         }
     }
 
+    // Submit HEADERS without END_STREAM (deferred data provider that never
+    // emits body bytes) and poll for the server's response. Used to verify
+    // server behavior on streams where the client has not finished sending
+    // the request body — specifically, that a streaming route returning a
+    // sync response cleanly tears the stream down with RST_STREAM rather
+    // than leaving the slot + body queue alive.
+    Response SendRequestNoEnd(
+        const std::string& method,
+        const std::string& path,
+        const std::vector<std::pair<std::string,std::string>>& extra_headers = {}) {
+
+        if (!session_ || fd_ < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        std::vector<std::pair<std::string, std::string>> header_pairs;
+        header_pairs.reserve(4 + extra_headers.size());
+        header_pairs.emplace_back(":method", method);
+        header_pairs.emplace_back(":path", path);
+        header_pairs.emplace_back(":scheme", "http");
+        header_pairs.emplace_back(":authority", "localhost");
+        for (const auto& h : extra_headers) {
+            header_pairs.push_back(h);
+        }
+
+        std::vector<nghttp2_nv> nva;
+        nva.reserve(header_pairs.size());
+        for (const auto& hp : header_pairs) {
+            nva.push_back({
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.first.c_str())),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.second.c_str())),
+                hp.first.size(), hp.second.size(),
+                NGHTTP2_NV_FLAG_NONE
+            });
+        }
+
+        nghttp2_data_provider2 dp;
+        dp.source.ptr    = this;
+        dp.read_callback = DeferredDataSourceRead;
+
+        int32_t stream_id = nghttp2_submit_request2(
+            session_, nullptr, nva.data(), nva.size(), &dp, this);
+        if (stream_id < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        streams_[stream_id] = StreamState{};
+        if (!FlushOutput()) {
+            Response r; r.error = true; return r;
+        }
+
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(IO_TIMEOUT_MS);
+        while (true) {
+            // Stream done = either response complete OR server-initiated
+            // close via RST_STREAM. Both surface through OnStreamClose.
+            auto it = streams_.find(stream_id);
+            if (it != streams_.end() && it->second.done) {
+                Response r;
+                r.status   = it->second.status;
+                r.body     = it->second.body;
+                r.headers  = it->second.response_headers;
+                r.error    = false;
+                return r;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                Response r; r.error = true; return r;
+            }
+            if (!ReadAndProcess(100)) {
+                Response r; r.error = true; return r;
+            }
+        }
+    }
+
 private:
+    // Data-source callback that always defers — never returns body bytes,
+    // never signals END_STREAM. Used by SendRequestNoEnd to keep the client
+    // half-stream open while the server processes the request headers.
+    static ssize_t DeferredDataSourceRead(
+        nghttp2_session* /*session*/, int32_t /*stream_id*/,
+        uint8_t* /*buf*/, size_t /*length*/, uint32_t* /*data_flags*/,
+        nghttp2_data_source* /*source*/, void* /*user_data*/) {
+        return NGHTTP2_ERR_DEFERRED;
+    }
     int fd_ = -1;
     nghttp2_session* session_ = nullptr;
 
@@ -5067,6 +5150,99 @@ void TestH2_StreamingControlMethodsOffDispatcherThreadRejected() {
     }
 }
 
+// Regression for the H2 streaming sync-response slot-leak: a streaming
+// route that produces a synchronous response while the client is still
+// streaming the request body MUST abort the body_stream and RST_STREAM
+// the half-open stream so a misbehaving or stalled client cannot keep
+// the slot + body queue alive. Mirrors H1's behavior at
+// server/http_connection_handler.cc:2438. Without the fix the client's
+// SendRequestNoEnd would hit the 5s IO timeout waiting for stream close.
+void TestH2_StreamingSyncResponseAbortsBodyAndResetsStream() {
+    std::cout << "\n[TEST] H2 streaming: sync response on incomplete request aborts body + RSTs stream..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        // Sync middleware that fills 403 BEFORE the route handler runs.
+        // Returns false to stop the chain — response is final, deferred=false.
+        // This is the canonical "header-only rejection" path described in
+        // the docs/streaming_request.md sync-handler section.
+        auto handler_called = std::make_shared<std::atomic<int>>(0);
+        server.Use([](HttpRequest& req, HttpResponse& resp) {
+            if (req.path == "/reject") {
+                resp.Status(403).Body("denied", "text/plain");
+                return false;
+            }
+            return true;
+        });
+        // Streaming POST route — the handler should NEVER fire (middleware
+        // wins). Registered so the path is discoverable + streaming-marked.
+        server.RouteAsync("POST", "/reject",
+            [handler_called](
+                const HttpRequest&,
+                HttpRouter::InterimResponseSender /*si*/,
+                HttpRouter::ResourcePusher /*pr*/,
+                HttpRouter::StreamingResponseSender /*ss*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                ++(*handler_called);
+                HttpResponse r;
+                r.Status(500).Body("unreached", "text/plain");
+                complete(std::move(r));
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto start = std::chrono::steady_clock::now();
+            // HEADERS without END_STREAM — client half-stream stays open
+            // (deferred body provider). Without the fix the server would
+            // not RST the stream and this call would block until 5s timeout.
+            auto resp = client.SendRequestNoEnd("POST", "/reject");
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start);
+            if (resp.error) {
+                pass = false;
+                err += "client error (server failed to RST in time); ";
+            }
+            if (resp.status != 403) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) +
+                       " expected 403; ";
+            }
+            // Hard upper bound — with the fix the server RSTs immediately
+            // after queuing the response; round-trip is sub-second on every
+            // platform we test. Tighter than IO_TIMEOUT_MS so a regression
+            // surfaces as a clear failure, not a soft slowdown.
+            if (elapsed.count() > 2000) {
+                pass = false;
+                err += "response took " + std::to_string(elapsed.count()) +
+                       "ms — likely hung waiting for client END_STREAM; ";
+            }
+            if (handler_called->load() != 0) {
+                pass = false;
+                err += "route handler called " +
+                       std::to_string(handler_called->load()) +
+                       " times — middleware should have short-circuited; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: sync response on incomplete request aborts body + RSTs stream",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: sync response on incomplete request aborts body + RSTs stream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for the off-dispatcher H2 interim hop: if a worker-thread
 // continuation queues send_interim() and then immediately calls complete(),
 // the queued 103 must re-check the request-scoped completed flag on the
@@ -5739,6 +5915,7 @@ void RunAllTests() {
     TestH2_StreamingBatchedWritesPastHighWaterStayAccepted();
     TestH2_StreamingEmptyEndInlineDoesNotResetStream();
     TestH2_StreamingControlMethodsOffDispatcherThreadRejected();
+    TestH2_StreamingSyncResponseAbortsBodyAndResetsStream();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 
