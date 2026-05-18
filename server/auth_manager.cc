@@ -876,7 +876,7 @@ bool AuthManager::InvokeMiddleware(HttpRequest& req,
             // JwtVerifier::Verify intentionally does not see the forward
             // config; it runs the policy-level checks. Operator-selected
             // claims flow from forward.claims_to_headers via the overlay
-            // at the outbound hop (HeaderRewriter Phase E).
+            // at the outbound hop (HeaderRewriter).
             ctx.policy_name = policy.name;
             // Stash the raw token only when the operator explicitly asked
             // for it via forward.raw_jwt_header.

@@ -79,7 +79,7 @@ public:
     void set_route_mode(http::RouteRequestMode m) { route_mode_ = m; }
 
     // Pending request trailers accumulated during the trailer HEADERS block.
-    // Promoted to HttpRequest::request_trailers at END_STREAM (Phase D).
+    // Promoted to HttpRequest::request_trailers at END_STREAM.
     std::vector<std::pair<std::string, std::string>>& pending_trailers() {
         return pending_trailers_;
     }
@@ -220,7 +220,7 @@ private:
     http::RouteRequestMode route_mode_ = http::RouteRequestMode::Buffered;
 
     // Accumulates trailer name/value pairs from the per-header callback;
-    // promoted to HttpRequest::request_trailers at END_STREAM (Phase D).
+    // promoted to HttpRequest::request_trailers at END_STREAM.
     std::vector<std::pair<std::string, std::string>> pending_trailers_;
 
     // Bytes consumed by the consumer since the last WINDOW_UPDATE emission.

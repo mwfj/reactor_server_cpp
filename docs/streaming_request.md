@@ -137,6 +137,12 @@ The drain timeout (`server.shutdown_drain_timeout_sec`) applies. Streaming reque
 
 ---
 
+## Dispatch timing
+
+For both H1 and H2, the route handler is dispatched at **headers-complete** — as soon as the request line and all headers have been parsed, before the body is fully received. The handler reads from `BodyStream` as bytes arrive, so request-body data flows through the producer/consumer pipeline end-to-end and never accumulates fully in gateway memory.
+
+If a streaming handler responds synchronously based on headers alone (e.g., a middleware rejection), the gateway aborts the in-flight body and closes the connection — the body cannot be safely drained mid-frame.
+
 ## Backpressure end-to-end
 
 The watermark system provides a natural backpressure path:

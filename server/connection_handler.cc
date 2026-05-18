@@ -1117,8 +1117,8 @@ void ConnectionHandler::ResumeReadPump() {
     if (!read_pump_paused_.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
-    // A.5 — a non-zero counted-disable keeps the pump paused even after
-    // the binary flag is cleared. Re-arm the binary flag to preserve the
+    // A non-zero counted-disable keeps the pump paused even after the
+    // binary flag is cleared. Re-arm the binary flag to preserve the
     // invariant: pump is paused iff `paused_flag OR count>0`.
     if (read_disable_count_.load(std::memory_order_acquire) > 0) {
         read_pump_paused_.store(true, std::memory_order_release);

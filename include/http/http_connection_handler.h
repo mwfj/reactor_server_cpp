@@ -301,16 +301,17 @@ private:
     //   (e) async-resume aborted-body guard (H.3)
     bool streaming_upload_in_flight_ = false;
 
-    // Gate for the watermark callbacks: pausing the read pump before a
-    // consumer exists would deadlock multi-packet streaming uploads,
-    // since no one would call DecReadDisable. Today the handler dispatches
-    // at message-complete; max_body_size bounds growth until then. The
-    // _pump_paused_ flag pairs IncReadDisable / DecReadDisable so a
-    // low-water fire never runs without a matching prior pause.
-    // TODO: set streaming_dispatched_ at headers-complete dispatch when
-    // that path lands so the watermark callbacks become active.
+    // Watermark-callback gate: a pause without a live consumer would deadlock
+    // multi-packet streaming uploads (nobody to call DecReadDisable).
+    // _pump_paused_ pairs IncReadDisable / DecReadDisable so a low-water fire
+    // never runs without a matching prior pause.
     bool streaming_dispatched_ = false;
     bool h1_streaming_pump_paused_ = false;
+
+    // One-shot trigger set inside SetHeadersCompleteCallback (which runs
+    // synchronously from llhttp); consumed by OnRawData after Parse() returns
+    // so the dispatch runs OUTSIDE the parser callback chain.
+    bool streaming_dispatch_pending_ = false;
 
     // Close the underlying connection (send response then close)
     void CloseConnection();
@@ -321,6 +322,21 @@ private:
     // Returns true to continue pipelining loop, false to stop processing
     bool HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed);
     void HandleIncompleteRequest();
+
+    // Dispatch the streaming-route handler at headers-complete (before the
+    // body finishes arriving) so the handler can consume body_stream as the
+    // bytes arrive. Returns true if the caller should continue the OnRawData
+    // parsing loop; false if the connection has been closed or the deferred
+    // response is now in flight.
+    bool DispatchStreamingRouteFromHeaders();
+
+    // Arm the deferred-response heartbeat deadline with the configured cap
+    // safety net. Reused by the buffered-route deferred branch in
+    // HandleCompleteRequest and the streaming-route early-dispatch site —
+    // any divergence between the two re-introduces missing observability
+    // finalization or abort-hook bookkeeping on the cap-exceeded path.
+    // Sets `deferred_start_` and installs the deadline + timeout callback.
+    void ArmAsyncDeferredDeadline(int heartbeat_sec, int cap_sec);
 
     // Continue the WS upgrade handshake after any middleware has
     // resolved with PASS. Owns RFC 6455 handshake validation, 101 send,

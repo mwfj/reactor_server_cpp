@@ -258,10 +258,25 @@ static int OnDataChunkRecvCallback(
     // summing them works regardless of route_mode.
     const size_t already_seen =
         stream->AccumulatedBodySize() + stream->GetRequest().pushed_body_bytes;
+    // Refund a rejected DATA chunk to the connection window — under
+    // NO_AUTO_WINDOW_UPDATE the peer's connection credit is not auto-refunded,
+    // and repeated rejects would drain the connection (RFC 9113 §6.9.1).
+    auto refund_rejected_chunk = [&](const char* reason) {
+        if (len <= 0) return;
+        int rv_c = nghttp2_session_consume_connection(
+            session, static_cast<size_t>(len));
+        if (rv_c != 0) {
+            logging::Get()->warn(
+                "nghttp2_session_consume_connection ({} reject) failed "
+                "stream={} bytes={} rv={}",
+                reason, stream_id, len, rv_c);
+        }
+    };
     if (self->MaxBodySize() > 0 &&
         already_seen + len > self->MaxBodySize()) {
         logging::Get()->warn("HTTP/2 stream {} body exceeds max size ({})",
                              stream_id, self->MaxBodySize());
+        refund_rejected_chunk("max-body");
         // For streaming routes, signal the consumer side so the proxy
         // sees an aborted body_stream → 413 PayloadTooLarge.
         if (stream->route_mode() == http::RouteRequestMode::Streaming) {
@@ -310,6 +325,7 @@ static int OnDataChunkRecvCallback(
     if (cl_violated) {
         logging::Get()->warn("HTTP/2 stream {} DATA exceeds declared content-length {}",
                              stream_id, req.content_length);
+        refund_rejected_chunk("CL-overrun");
         // Only count if not already counted (see max-body branch above
         // for the same rationale).
         if (!stream->IsRejected() &&
@@ -616,12 +632,30 @@ static int OnFrameRecvCallback(
                     // Bind producer-side dispatcher so on_bytes_consumed /
                     // on_below_low_water fan out via EnQueue rather than firing
                     // inline on the consumer thread (which would touch nghttp2
-                    // state off-thread).
-                    if (auto owner = self->Owner()) {
-                        if (auto cc = owner->GetConnection()) {
-                            bscfg.producer_dispatcher = cc->dispatcher_ptr();
+                    // state off-thread). Defensive: unreachable today (we're
+                    // inside a live recv callback), but if the lookup ever
+                    // fails, reject the stream instead of silently falling
+                    // back to inline off-dispatcher calls.
+                    auto owner = self->Owner();
+                    auto cc = owner ? owner->GetConnection() : nullptr;
+                    if (!cc) {
+                        logging::Get()->error(
+                            "HTTP/2 stream {} streaming dispatch: producer "
+                            "dispatcher unavailable; rejecting stream",
+                            frame->hd.stream_id);
+                        stream->MarkRejected();
+                        int rv = nghttp2_submit_rst_stream(
+                            session, NGHTTP2_FLAG_NONE,
+                            frame->hd.stream_id, NGHTTP2_INTERNAL_ERROR);
+                        if (rv < 0) {
+                            logging::Get()->error(
+                                "nghttp2_submit_rst_stream (streaming-dispatch-"
+                                "no-dispatcher) failed: {}",
+                                nghttp2_strerror(rv));
                         }
+                        break;
                     }
+                    bscfg.producer_dispatcher = cc->dispatcher_ptr();
                     // on_bytes_consumed: when the consumer frees capacity,
                     // submit WINDOW_UPDATE for the stream, honoring the
                     // configured window_update_bytes threshold. The
@@ -1779,16 +1813,21 @@ void Http2Session::FinalizeAbortedStreamFlowControl(int32_t stream_id) {
     auto* stream = FindStream(stream_id);
     if (!stream) return;
 
-    const size_t accumulated_before = stream->consumed_since_last_window_update();
-    const size_t residue = stream->recv_bytes_uncredited();
-    if (accumulated_before == 0 && residue == 0) return;
+    if (stream->consumed_since_last_window_update() == 0 &&
+        stream->recv_bytes_uncredited() == 0) {
+        return;
+    }
 
-    // Defer SendPendingFrames to the trailing call so a single mem_send2
-    // covers both updates from this site. Required: FlushDeferredRemovals
-    // is called from inside SendPendingFrames, so a SendPendingFrames here
-    // would recurse infinitely for non-streaming closes.
+    // Defer SendPendingFrames to the trailing call so one mem_send2 covers
+    // both updates. Required: FlushDeferredRemovals is called from inside
+    // SendPendingFrames, so an inner flush would recurse infinitely for
+    // non-streaming closes.
     FlushStreamConsumeOnStream(stream, stream_id, /*flush_send=*/false);
 
+    // Re-read AFTER the flush — FlushStreamConsumeOnStream already
+    // decremented recv_bytes_uncredited_ by `accumulated`; using the stale
+    // pre-flush value would double-refund the overlap.
+    const size_t residue = stream->recv_bytes_uncredited();
     if (residue > 0) {
         stream->reset_recv_bytes_uncredited();
         // RST_STREAM discards the per-stream window but the peer's connection

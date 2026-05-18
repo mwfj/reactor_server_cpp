@@ -239,6 +239,7 @@ void ChunkQueueBodyStream::CloseEmpty() {
 
 void ChunkQueueBodyStream::Abort(std::string reason) {
     DataAvailableCallback fire_consumer;
+    bool fire_below_low_water = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         // Idempotent — first Abort wins; subsequent calls are dropped.
@@ -252,8 +253,25 @@ void ChunkQueueBodyStream::Abort(std::string reason) {
         front_offset_ = 0;
         bytes_queued_relaxed_.store(0, std::memory_order_relaxed);
         pending_trailers_.clear();
+        // Mirror Read()'s hysteresis: fire on_below_low_water iff the
+        // producer was previously paused via on_above_high_water. Without
+        // this, the producer-side IncReadDisable/SuspendWindowUpdate
+        // counter stays pinned past abort, wedging the connection on the
+        // next high-water-paused stream that never drains.
+        if (above_high_water_latched_) {
+            above_high_water_latched_ = false;
+            above_low_water_latched_ = false;
+            fire_below_low_water = true;
+        }
         if (pending_consumer_callback_) {
             fire_consumer.swap(pending_consumer_callback_);
+        }
+    }
+    if (fire_below_low_water && cfg_.on_below_low_water) {
+        if (auto d = producer_dispatcher_.lock()) {
+            d->EnQueue([cb = cfg_.on_below_low_water]() { cb(); });
+        } else {
+            cfg_.on_below_low_water();
         }
     }
     if (fire_consumer) {

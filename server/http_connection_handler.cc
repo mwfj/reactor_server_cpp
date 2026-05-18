@@ -688,6 +688,11 @@ HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> 
         parser_.set_streaming_body_stream(body_stream);
         parser_.GetRequest().body_stream = body_stream;
         streaming_upload_in_flight_ = true;
+        // Signal the OnRawData loop to invoke the route handler immediately
+        // after Parse() returns (outside the llhttp callback chain), so the
+        // handler starts consuming body_stream as bytes arrive rather than
+        // waiting for message-complete.
+        streaming_dispatch_pending_ = true;
     });
 
     parser_.SetStreamingBodyCompleteCallback([this]() {
@@ -1426,6 +1431,24 @@ void HttpConnectionHandler::HandleParseError() {
 }
 
 bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed) {
+    // Already dispatched at headers-complete; here we only do the bookkeeping
+    // that the dispatch site couldn't: parser reset + pipelined-next-request
+    // stash. body_stream was closed by the parser's on_message_complete.
+    if (streaming_dispatched_) {
+        streaming_dispatched_ = false;
+        buf      += consumed;
+        remaining -= consumed;
+        if (remaining > 0) {
+            StashDeferredBytes(std::string(buf, remaining));
+            buf      += remaining;
+            remaining = 0;
+        }
+        streaming_upload_in_flight_ = false;
+        parser_.Reset();
+        sent_100_continue_ = false;
+        return false;  // deferred response in flight; stop pipelining loop
+    }
+
     HttpRequest& req = parser_.GetRequest();
 
     // Propagate dispatcher index for upstream pool partition affinity
@@ -1831,143 +1854,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
             int cap_sec = (req.async_cap_sec_override >= 0)
                         ? req.async_cap_sec_override
                         : max_async_deferred_sec_;  // 0 = no cap
-            deferred_start_ = std::chrono::steady_clock::now();
-            // Arm the FIRST deadline at min(heartbeat_sec, cap_sec)
-            // when the cap is positive and smaller than the
-            // heartbeat interval. Otherwise the heartbeat callback
-            // (which is the only place the cap is checked) wouldn't
-            // fire until heartbeat_sec, and a per-request cap of e.g.
-            // 5s on a server with request_timeout_sec=30 (or the 60s
-            // fallback when timeouts are disabled) would let the
-            // request outlive its declared cap by tens of seconds.
-            int initial_sec = heartbeat_sec;
-            if (cap_sec > 0 && cap_sec < initial_sec) {
-                initial_sec = cap_sec;
-            }
-            conn_->SetDeadline(deferred_start_ +
-                               std::chrono::seconds(initial_sec));
-            std::weak_ptr<HttpConnectionHandler> weak_self =
-                shared_from_this();
-            conn_->SetDeadlineTimeoutCb(
-                [weak_self, heartbeat_sec, cap_sec]() -> bool {
-                auto self = weak_self.lock();
-                if (!self) return false;
-                if (!self->deferred_response_pending_) {
-                    // Response already delivered; let the normal close
-                    // path run (callback shouldn't normally fire here
-                    // because CompleteAsyncResponse clears the deadline,
-                    // but handle defensively).
-                    return false;
-                }
-                if (self->deferred_response_committed_) {
-                    auto now_steady = std::chrono::steady_clock::now();
-                    self->conn_->SetDeadline(
-                        now_steady + std::chrono::seconds(heartbeat_sec));
-                    return true;
-                }
-                // Absolute safety cap: if configured AND exceeded,
-                // abort the deferred state and send 504. This catches
-                // stuck handlers without overriding operator-configured
-                // timeouts — the cap is computed to be at least as
-                // large as the longest configured proxy response
-                // timeout (see HttpServer::max_async_deferred_sec_).
-                if (cap_sec > 0) {
-                    auto elapsed = std::chrono::duration_cast<
-                        std::chrono::seconds>(
-                        std::chrono::steady_clock::now() -
-                        self->deferred_start_).count();
-                    if (elapsed >= cap_sec) {
-                        logging::Get()->warn(
-                            "HTTP/1 async deferred response exceeded "
-                            "safety cap ({}s) without completion fd={}; "
-                            "aborting and sending 504",
-                            cap_sec,
-                            self->conn_ ? self->conn_->fd() : -1);
-                        // Build the synthetic 504 response.
-                        // Forcing Connection: close ensures
-                        // NormalizeOutgoingResponse returns should_close=true
-                        // so the socket is torn down (the handler may
-                        // still be running in the background and must not
-                        // see a reusable connection).
-                        HttpResponse timeout_resp =
-                            HttpResponse::GatewayTimeout();
-                        timeout_resp.Header("Connection", "close");
-                        // Pre-finalize the snapshot with the actual 504
-                        // BEFORE firing the abort hook. The hook also
-                        // calls FinalizeFromSnapshot (with a synthetic
-                        // client_disconnect placeholder), but the CAS
-                        // gate inside FinalizeFromSnapshot makes this
-                        // first call the winner — the hook's later
-                        // attempt becomes a no-op. Without this
-                        // pre-finalize, the abort hook would record
-                        // server-side timeouts as client_disconnect.
-                        //
-                        // Use the snapshot captured at BeginAsyncResponse
-                        // time, NOT parser_.GetRequest() — the parser
-                        // request slot was Reset() right after the
-                        // handler returned, so a parser-based finalize
-                        // would no-op (obs_snapshot is null) and the
-                        // abort hook's client_disconnect placeholder
-                        // would land instead.
-                        if (self->deferred_obs_snapshot_) {
-                            auto mgr =
-                                self->deferred_obs_snapshot_->manager.lock();
-                            if (mgr) {
-                                const uint64_t wire_size =
-                                    self->deferred_was_head_
-                                        ? 0u
-                                        : ComputeWireBodySize(
-                                              timeout_resp,
-                                              self->deferred_was_head_);
-                                mgr->FinalizeFromSnapshot(
-                                    *self->deferred_obs_snapshot_,
-                                    timeout_resp.GetStatusCode(),
-                                    wire_size,
-                                    "server_timeout");
-                            }
-                        }
-                        // Fire the abort hook for its bookkeeping
-                        // (active_requests--, cancel_slot, etc.). Its
-                        // FinalizeFromSnapshot is now a CAS no-op.
-                        // Move to a local first so CompleteAsyncResponse
-                        // (which clears async_abort_hook_) cannot
-                        // destroy the std::function while we're
-                        // invoking it.
-                        auto abort_hook =
-                            std::move(self->async_abort_hook_);
-                        if (abort_hook) abort_hook();
-                        // Route through CompleteAsyncResponse so HEAD
-                        // body stripping, shutdown-exempt clearing, and
-                        // pipelined-buffer handling all run. Do NOT
-                        // call CancelAsyncResponse first — that wipes
-                        // deferred_was_head_, which CompleteAsyncResponse
-                        // needs to know whether to strip the body.
-                        self->CompleteAsyncResponse(std::move(timeout_resp));
-                        return false;
-                    }
-                }
-                // Heartbeat: re-arm the deadline. When cap_sec is
-                // set, clamp the next wakeup so the FOLLOW-UP heartbeat
-                // does not overshoot the cap — otherwise a request
-                // with cap_sec < heartbeat_sec would only be checked
-                // on heartbeat boundaries, missing its cap window.
-                auto now_steady = std::chrono::steady_clock::now();
-                auto next_sec = std::chrono::seconds(heartbeat_sec);
-                if (cap_sec > 0) {
-                    auto elapsed_sec = std::chrono::duration_cast<
-                        std::chrono::seconds>(
-                        now_steady - self->deferred_start_).count();
-                    // `elapsed >= cap_sec` was already caught above,
-                    // so remaining is strictly positive here.
-                    auto remaining = static_cast<long long>(cap_sec)
-                                   - elapsed_sec;
-                    if (remaining > 0 && remaining < heartbeat_sec) {
-                        next_sec = std::chrono::seconds(remaining);
-                    }
-                }
-                self->conn_->SetDeadline(now_steady + next_sec);
-                return true;  // handled, keep connection alive
-            });
+            ArmAsyncDeferredDeadline(heartbeat_sec, cap_sec);
             buf += consumed;
             remaining -= consumed;
             if (remaining > 0) {
@@ -2311,6 +2198,217 @@ bool HttpConnectionHandler::ContinueWsUpgradeAfterAuth(
     return true;
 }
 
+void HttpConnectionHandler::ArmAsyncDeferredDeadline(int heartbeat_sec,
+                                                     int cap_sec) {
+    deferred_start_ = std::chrono::steady_clock::now();
+    // Arm the FIRST deadline at min(heartbeat_sec, cap_sec) when the cap is
+    // smaller — otherwise a tight cap would only be checked at heartbeat
+    // boundaries and the request could outlive its declared cap.
+    int initial_sec = heartbeat_sec;
+    if (cap_sec > 0 && cap_sec < initial_sec) initial_sec = cap_sec;
+    conn_->SetDeadline(deferred_start_ + std::chrono::seconds(initial_sec));
+
+    std::weak_ptr<HttpConnectionHandler> weak_self = shared_from_this();
+    conn_->SetDeadlineTimeoutCb(
+        [weak_self, heartbeat_sec, cap_sec]() -> bool {
+        auto self = weak_self.lock();
+        if (!self) return false;
+        if (!self->deferred_response_pending_) {
+            // CompleteAsyncResponse normally clears the deadline before
+            // the callback fires; handle defensively if it didn't.
+            return false;
+        }
+        if (self->deferred_response_committed_) {
+            // Streaming response is mid-body — never trip the cap.
+            auto now_steady = std::chrono::steady_clock::now();
+            self->conn_->SetDeadline(
+                now_steady + std::chrono::seconds(heartbeat_sec));
+            return true;
+        }
+        if (cap_sec > 0) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() -
+                self->deferred_start_).count();
+            if (elapsed >= cap_sec) {
+                logging::Get()->warn(
+                    "HTTP/1 async deferred response exceeded safety cap "
+                    "({}s) without completion fd={}; aborting and sending 504",
+                    cap_sec, self->conn_ ? self->conn_->fd() : -1);
+                HttpResponse timeout_resp = HttpResponse::GatewayTimeout();
+                timeout_resp.Header("Connection", "close");
+                // Pre-finalize against the snapshot captured at
+                // BeginAsyncResponse time. The parser slot may have been
+                // Reset() between dispatch and now; the abort hook's later
+                // client_disconnect attempt loses the CAS gate, so the
+                // server_timeout label here is what gets exported.
+                if (self->deferred_obs_snapshot_) {
+                    if (auto mgr = self->deferred_obs_snapshot_->manager.lock()) {
+                        const uint64_t wire_size =
+                            self->deferred_was_head_
+                                ? 0u
+                                : ComputeWireBodySize(timeout_resp,
+                                                      self->deferred_was_head_);
+                        mgr->FinalizeFromSnapshot(
+                            *self->deferred_obs_snapshot_,
+                            timeout_resp.GetStatusCode(),
+                            wire_size, "server_timeout");
+                    }
+                }
+                // Move out before invoking so CompleteAsyncResponse can't
+                // free the std::function while we're in it.
+                auto abort_hook = std::move(self->async_abort_hook_);
+                if (abort_hook) abort_hook();
+                self->CompleteAsyncResponse(std::move(timeout_resp));
+                return false;
+            }
+        }
+        // Heartbeat: re-arm, clamping next wakeup so the FOLLOW-UP
+        // doesn't overshoot a tight cap.
+        auto now_steady = std::chrono::steady_clock::now();
+        auto next_sec = std::chrono::seconds(heartbeat_sec);
+        if (cap_sec > 0) {
+            auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(
+                now_steady - self->deferred_start_).count();
+            auto remaining = static_cast<long long>(cap_sec) - elapsed_sec;
+            if (remaining > 0 && remaining < heartbeat_sec) {
+                next_sec = std::chrono::seconds(remaining);
+            }
+        }
+        self->conn_->SetDeadline(now_steady + next_sec);
+        return true;
+    });
+}
+
+bool HttpConnectionHandler::DispatchStreamingRouteFromHeaders() {
+    HttpRequest& req = parser_.GetRequest();
+
+    // Per-request fields normally populated at the top of HandleCompleteRequest.
+    const bool has_tls = conn_->HasTls();
+    req.dispatcher_index = conn_->dispatcher_index();
+    req.client_ip        = conn_->ip_addr();
+    req.client_tls       = has_tls;
+    req.client_fd        = conn_->fd();
+    req.url_scheme       = has_tls ? "https" : "http";
+    req.network_protocol_version = (req.http_minor == 0) ? "1.0" : "1.1";
+    req.owning_dispatcher = conn_->GetDispatcher();
+
+    if (callbacks_.request_count_callback) {
+        callbacks_.request_count_callback();
+    }
+
+    // Validation. Errors here predate the body and force Connection: close
+    // because the body is still streaming and we have no way to drain it.
+    if (req.http_major != 1 || (req.http_minor != 0 && req.http_minor != 1)) {
+        logging::Get()->warn("Unsupported HTTP version fd={}: {}.{}",
+                             conn_->fd(), req.http_major, req.http_minor);
+        HttpResponse resp = HttpResponse::HttpVersionNotSupported();
+        resp.Header("Connection", "close");
+        SendResponse(resp);
+        CloseConnection();
+        return false;
+    }
+    current_http_minor_.store(req.http_minor, std::memory_order_release);
+
+    if (req.http_minor >= 1 && !req.HasHeader("host")) {
+        logging::Get()->debug("Missing Host header fd={}", conn_->fd());
+        HttpResponse resp = HttpResponse::BadRequest("Missing Host header");
+        resp.Header("Connection", "close");
+        SendResponse(resp);
+        CloseConnection();
+        return false;
+    }
+
+    // Expect handling. Unlike HandleCompleteRequest (body already arrived),
+    // here the body is still streaming — if the client sent Expect: 100-continue
+    // we send 100 Continue now so the client proceeds with the upload.
+    if (req.HasHeader("expect")) {
+        std::string expect = req.GetHeader("expect");
+        std::transform(expect.begin(), expect.end(), expect.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        while (!expect.empty() && (expect.front() == ' ' || expect.front() == '\t'))
+            expect.erase(expect.begin());
+        while (!expect.empty() && (expect.back() == ' ' || expect.back() == '\t'))
+            expect.pop_back();
+        if (expect == "100-continue") {
+            if (!sent_100_continue_) {
+                static const char kCont[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                conn_->SendRaw(kCont, sizeof(kCont) - 1);
+                sent_100_continue_ = true;
+            }
+        } else {
+            logging::Get()->debug("Unsupported Expect value fd={}", conn_->fd());
+            HttpResponse err;
+            err.Status(HttpStatus::EXPECTATION_FAILED, "Expectation Failed");
+            err.Header("Connection", "close");
+            SendResponse(err);
+            CloseConnection();
+            return false;
+        }
+    }
+
+    // Mark dispatched BEFORE invoking the handler so the body_stream
+    // watermark callbacks engage for the handler's lifetime (pause/resume
+    // the read pump while body_stream queue exceeds high_water).
+    streaming_dispatched_ = true;
+
+    HttpResponse response;
+    try {
+        callbacks_.request_callback(shared_from_this(), req, response);
+    } catch (const std::exception& e) {
+        logging::Get()->error("Exception in streaming request handler: {}",
+                              e.what());
+        streaming_dispatched_ = false;
+        // Roll back any read-pump pause armed by the watermark callback
+        // before the handler threw; otherwise the connection wedges.
+        if (h1_streaming_pump_paused_) {
+            h1_streaming_pump_paused_ = false;
+            if (conn_) conn_->DecReadDisable();
+        }
+        if (auto* body_stream = req.body_stream.get()) {
+            body_stream->Abort("handler_threw");
+        }
+        response = HttpResponse::InternalError();
+        response.Header("Connection", "close");
+        HttpServer::FinalizeIfSnapshot(req, response, "handler_threw");
+        SendResponse(response);
+        CloseConnection();
+        return false;
+    }
+
+    if (response.IsDeferred()) {
+        request_in_progress_ = false;
+        static constexpr int ASYNC_HEARTBEAT_FALLBACK_SEC = 60;
+        int heartbeat_sec = request_timeout_sec_ > 0
+                          ? request_timeout_sec_
+                          : ASYNC_HEARTBEAT_FALLBACK_SEC;
+        int cap_sec = (req.async_cap_sec_override >= 0)
+                    ? req.async_cap_sec_override
+                    : max_async_deferred_sec_;
+        ArmAsyncDeferredDeadline(heartbeat_sec, cap_sec);
+        return true;
+    }
+
+    // Sync response. The handler decided based on headers alone (e.g.,
+    // middleware rejected via the router callback). Abort the body — we
+    // are not going to read it — and close after sending. Cannot continue
+    // keep-alive: the parser is mid-body and re-syncing would require
+    // discarding the remainder, which is unsafe (trailers, framing).
+    streaming_dispatched_ = false;
+    if (h1_streaming_pump_paused_) {
+        h1_streaming_pump_paused_ = false;
+        if (conn_) conn_->DecReadDisable();
+    }
+    if (auto* body_stream = req.body_stream.get()) {
+        body_stream->Abort("handler_responded_sync_mid_body");
+    }
+    response.Header("Connection", "close");
+    HttpServer::FinalizeIfSnapshot(
+        req, response, "streaming_handler_sync_response");
+    SendResponse(response);
+    CloseConnection();
+    return false;
+}
+
 void HttpConnectionHandler::HandleIncompleteRequest() {
     // Incomplete request -- need more data.
     // If the peer already closed (close_after_write_ set), no more bytes
@@ -2324,6 +2422,13 @@ void HttpConnectionHandler::HandleIncompleteRequest() {
     }
     // Perform early validation once headers are complete to avoid
     // holding connection slots for requests that can never succeed.
+    // Streaming routes already passed through the same validation inside
+    // DispatchStreamingRouteFromHeaders; skip to avoid re-checking the
+    // same headers and to keep the handler the sole owner of the deferred
+    // response.
+    if (streaming_dispatched_) {
+        return;
+    }
     if (!sent_100_continue_ && parser_.GetRequest().headers_complete) {
         const auto& partial = parser_.GetRequest();
 
@@ -2527,6 +2632,17 @@ void HttpConnectionHandler::OnRawData(std::shared_ptr<ConnectionHandler> conn, s
 
         // Safety guard: if parser consumed 0 bytes, avoid infinite loop
         if (consumed == 0) break;
+
+        // Dispatch outside the parser callback chain. Fall through so a
+        // small body that fits in one Parse — firing message-complete in
+        // the same call — still goes through HandleCompleteRequest's
+        // streaming_dispatched_ skip path for parser reset + stash.
+        if (streaming_dispatch_pending_ && !streaming_dispatched_) {
+            streaming_dispatch_pending_ = false;
+            if (!DispatchStreamingRouteFromHeaders()) {
+                return;
+            }
+        }
 
         if (parser_.GetRequest().complete) {
             if (!HandleCompleteRequest(buf, remaining, consumed)) {

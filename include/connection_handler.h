@@ -106,7 +106,7 @@ private:
     std::atomic<uint64_t> on_message_cb_epoch_{0};
     std::atomic<bool> has_on_message_callback_{false};
 
-    // Counted read-pump pause (A.5). Cooperates with the existing binary
+    // Counted read-pump pause. Cooperates with the existing binary
     // `read_pump_paused_` atomic: read pump is paused if EITHER the binary
     // flag is true OR this counter is non-zero. Used by inbound H1
     // streaming to backpressure the socket while body_stream is above its
@@ -210,8 +210,8 @@ public:
         return read_pump_paused_.load(std::memory_order_acquire);
     }
 
-    // Counted backpressure pause/resume — A.5. Inc/Dec must be balanced;
-    // a non-zero count keeps the read pump paused even if the binary
+    // Counted backpressure pause/resume. Inc/Dec must be balanced; a
+    // non-zero count keeps the read pump paused even if the binary
     // `read_pump_paused_` flag is cleared by ResumeReadPump. Used by
     // inbound H1 streaming to throttle the socket while body_stream is
     // above its high-water mark. Dispatcher-thread-only.
