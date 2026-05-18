@@ -6376,8 +6376,11 @@ bool HttpServer::Reload(ServerConfig new_config) {
         // Persist so GetLiveConfigSnapshot() returns the applied settings.
         live_config_.http2 = new_config.http2;
     }
-    // http1 has no other fields beyond streaming today; persist for snapshot.
-    live_config_.http1 = new_config.http1;
+    // Persist http1 streaming sub-fields only. Narrow scope so a future
+    // restart-only Http1Config field doesn't silently drift into the live
+    // snapshot through this reload-safe path. Mirror the same field-by-
+    // field discipline used for size limits above.
+    live_config_.http1.streaming = new_config.http1.streaming;
 
     // Rate limit reload — always safe because manager is always created
     if (rate_limit_manager_) {

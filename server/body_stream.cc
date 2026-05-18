@@ -45,9 +45,15 @@ BodyStreamResult ChunkQueueBodyStream::Read(char* buf, size_t max_len, size_t* b
             const size_t prev = bytes_queued_relaxed_.load(std::memory_order_relaxed);
             const size_t now = (prev > drained) ? (prev - drained) : 0;
             bytes_queued_relaxed_.store(now, std::memory_order_relaxed);
-            if (above_low_water_latched_ && now <= cfg_.low_water_bytes) {
-                above_low_water_latched_ = false;
-                above_high_water_latched_ = false;  // reset high-water latch on resume
+            // Hysteresis: fire on_below_low_water only when on_above_high_water
+            // previously fired. A queue that climbed between low and high (but
+            // never crossed high) must NOT fire below_low_water, since
+            // above_high_water never paused the producer — a spurious resume
+            // call would unbalance the IncReadDisable/DecReadDisable counter
+            // and over-enable reads.
+            if (above_high_water_latched_ && now <= cfg_.low_water_bytes) {
+                above_high_water_latched_ = false;
+                above_low_water_latched_ = false;  // reset both latches for next cycle
                 fire_below_low_water = true;
             }
         }

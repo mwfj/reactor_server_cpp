@@ -98,6 +98,33 @@ public:
         consumed_since_last_window_update_ = 0;
     }
 
+    // Tracks DATA bytes that have been recv'd (pushed into body_stream) but
+    // not yet credited back to nghttp2 via nghttp2_session_consume_*. Bumped
+    // on every streaming DATA chunk; decremented as the consumer drains and
+    // ConsumeStreamingRequestBytes / ForceFlushStreamConsume flushes credit
+    // to nghttp2. On abort/RST, the residue (bytes queued in body_stream that
+    // will never be drained) must be refunded to the connection-level window
+    // per RFC 9113 §6.9.1 — the stream-level window is discarded by RST but
+    // connection credit is shared across streams and would otherwise leak.
+    void AddRecvBytesUncredited(size_t n) { recv_bytes_uncredited_ += n; }
+    void SubRecvBytesUncredited(size_t n) {
+        recv_bytes_uncredited_ = (recv_bytes_uncredited_ > n)
+            ? (recv_bytes_uncredited_ - n) : 0;
+    }
+    size_t recv_bytes_uncredited() const { return recv_bytes_uncredited_; }
+    void reset_recv_bytes_uncredited() { recv_bytes_uncredited_ = 0; }
+
+    // High-/low-water hook used by streaming routes to throttle the peer
+    // via the per-stream flow-control window. When body_stream crosses
+    // the high-water mark, the on_above_high_water callback latches this
+    // flag; ConsumeStreamingRequestBytes then accumulates drained bytes
+    // but does NOT emit WINDOW_UPDATE, letting the peer's stream window
+    // drain to zero. on_below_low_water clears the flag and triggers a
+    // ForceFlushStreamConsume so the accumulated credit catches the peer
+    // back up.
+    void SetWindowUpdateSuspended(bool s) { window_update_suspended_ = s; }
+    bool IsWindowUpdateSuspended() const { return window_update_suspended_; }
+
     // Track response state
     bool IsResponseHeadersSent() const { return response_headers_sent_; }
     void MarkResponseHeadersSent() { response_headers_sent_ = true; }
@@ -209,4 +236,13 @@ private:
     // Bytes consumed by the consumer since the last WINDOW_UPDATE emission.
     // Threshold-batched to avoid per-chunk WINDOW_UPDATE floods.
     size_t consumed_since_last_window_update_ = 0;
+
+    // Bytes recv'd on streaming DATA that have not yet been credited back to
+    // nghttp2 via consume_stream/consume_connection. See AddRecvBytesUncredited.
+    size_t recv_bytes_uncredited_ = 0;
+
+    // Latched true when body_stream crosses the high-water mark; suppresses
+    // WINDOW_UPDATE emission via ConsumeStreamingRequestBytes so the peer's
+    // per-stream window drains and back-pressure flows upstream.
+    bool window_update_suspended_ = false;
 };

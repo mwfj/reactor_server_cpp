@@ -96,18 +96,17 @@ public:
     // `X-H2-Limitation: alpn-not-h2` in MakeErrorResponse so operators
     // see a distinct signal from generic checkout-failure.
     static constexpr int RESULT_H2_ALPN_NOT_NEGOTIATED = -14;
-    // v4 F5 P0 — streaming-retry-denied terminal codes. The denial reason
-    // is per-request semantics (source consumption / body-on-wire /
+    // Streaming-retry-denied terminal codes. The denial reason is
+    // per-request semantics (source consumption / body-on-wire /
     // queued-non-idempotent), distinct from RESULT_RETRY_BUDGET_EXHAUSTED
     // which is pool-level budget arithmetic. All three map to 502
     // BadGateway via MakeErrorResponse.
     static constexpr int RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED     = -15;
     static constexpr int RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE        = -16;
     static constexpr int RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED = -17;
-    // v7 F4 P1 — proxy-side request-body-size enforcement. Fires when
-    // producer (inbound body-size enforcement at B.2 / C.x) aborts the
-    // body_stream with reason "body_size_limit_exceeded" AFTER the
-    // proxy has begun forwarding. Maps to 413 PayloadTooLarge.
+    // Proxy-side request-body-size enforcement. Fires when the inbound
+    // producer aborts the body_stream with reason "body_size_limit_exceeded"
+    // AFTER the proxy has begun forwarding. Maps to 413 PayloadTooLarge.
     static constexpr int RESULT_REQUEST_BODY_LIMIT_EXCEEDED                = -18;
 
     // Constructor copies all needed fields from client_request (method, path,
@@ -232,6 +231,12 @@ public:
     // Public so test code can verify the contract directly. Leaking a
     // static-constexpr int is harmless — no ABI surface, no mutable state.
     static constexpr int SEND_STALL_FALLBACK_MS = 30000;  // 30s
+
+    // Pure static factory mapping RESULT_* codes to HttpResponse — no
+    // instance state read. Public so tests can lock the diagnostic-header
+    // contract (X-Request-Body-Limit-Exceeded, X-Proxy-Retry-Denied:
+    // <reason>) without needing a live ProxyTransaction.
+    static HttpResponse MakeErrorResponse(int result_code);
 
 private:
     // Allowlist for H2-path retries from OnError. H1 retries from
@@ -472,7 +477,7 @@ private:
     // Reset by DispatchH2 init + Cleanup.
     bool h2_request_fully_sent_ = false;
 
-    // ---- G1 streaming-request state (Phase A.8) ----
+    // ---- Streaming-request state ----
 
     // True when this transaction is forwarding a streaming-mode request.
     // Set in DispatchH1/DispatchH2's streaming branch; preserved across
@@ -759,12 +764,12 @@ private:
     void ArmResponseTimeout(int explicit_budget_ms = 0);
     void ClearResponseTimeout();
 
-    // Error response factory (maps result codes to HTTP responses).
-    // Circuit-open and retry-budget responses need richer context
-    // (Retry-After from slice_, distinguishing header), so they have
-    // dedicated factories below — MakeErrorResponse falls back to a
-    // plain 503 for those codes if called generically.
-    static HttpResponse MakeErrorResponse(int result_code);
+    // Note: MakeErrorResponse is declared public above so test code can
+    // pin the diagnostic-header contract without instantiating a full
+    // transaction. Circuit-open and retry-budget responses need richer
+    // context (Retry-After from slice_, distinguishing header), so they
+    // have dedicated factories below — the public static MakeErrorResponse
+    // falls back to a plain 503 for those codes if called generically.
 
     // Emit the circuit-open response:
     //   503 + Retry-After (seconds until slice->OpenUntil())

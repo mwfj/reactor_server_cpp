@@ -25,17 +25,16 @@ struct HttpRequest {
     int http_minor = 1;
     std::map<std::string, std::string> headers;  // Header names stored lowercase
     std::string body;
-    // G1 (Phase 5) — streaming-request handle. Non-null in
-    // RouteRequestMode::Streaming; nullptr in Buffered mode. shared_ptr
-    // preserves HttpRequest's implicit copy ctor (3 async-resume sites
-    // make_shared<HttpRequest>(req)). When non-null, `body` is empty —
-    // chunks flow through the stream instead.
+    // Streaming-request handle. Non-null in RouteRequestMode::Streaming;
+    // nullptr in Buffered mode. shared_ptr preserves HttpRequest's implicit
+    // copy ctor (async-resume sites make_shared<HttpRequest>(req)).
+    // When non-null, `body` is empty — chunks flow through the stream.
     std::shared_ptr<http::BodyStream> body_stream;
-    // G3 — request trailers populated at end-of-stream for H2 streaming
-    // routes. Empty for H1 streaming and for all buffered routes.
+    // Request trailers populated at end-of-stream for H2 streaming routes.
+    // Empty for H1 streaming and for all buffered routes.
     std::vector<std::pair<std::string, std::string>> request_trailers;
-    // §4.5 max_body_size enforcement on streaming routes (cumulative
-    // bytes pushed to body_stream).
+    // max_body_size enforcement on streaming routes (cumulative bytes
+    // pushed to body_stream).
     size_t pushed_body_bytes = 0;
     // Per-request upstream deadline override (ms). 0 → use ProxyConfig
     // default. Set by middleware (e.g. gRPC grpc-timeout decorator)
@@ -198,8 +197,8 @@ struct HttpRequest {
 
     // True if this request's framing implies a body (Transfer-Encoding
     // present OR Content-Length > 0). Framing-only — does NOT consult the
-    // method (r9 F1 P0: a streaming proxy must forward explicitly framed
-    // bodies on GET/HEAD/DELETE).
+    // method: a streaming proxy must forward explicitly framed bodies on
+    // GET/HEAD/DELETE.
     static bool ExpectsRequestBody(
         std::string_view /*method*/,
         const std::map<std::string, std::string>& headers) {

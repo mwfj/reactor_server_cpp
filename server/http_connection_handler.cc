@@ -651,13 +651,36 @@ HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> 
             ? streaming_high_water_bytes_ : DEFAULT_STREAM_HIGH_WATER_BYTES;
         cfg.low_water_bytes  = (streaming_low_water_bytes_ > 0)
             ? streaming_low_water_bytes_ : DEFAULT_STREAM_LOW_WATER_BYTES;
+        // Bind producer-side dispatcher so the watermark callbacks (which
+        // touch transport read-pump state) always fire on the dispatcher
+        // thread, even when the body stream's consumer drains from a
+        // different dispatcher (the proxy/upstream side).
+        if (conn_) {
+            cfg.producer_dispatcher = conn_->GetDispatcherShared();
+        }
         cfg.on_above_high_water = [weak_self]() {
             if (auto self = weak_self.lock()) {
-                if (self->conn_) self->conn_->IncReadDisable();
+                // Only pause the read pump once a consumer exists to drain.
+                // Today the handler dispatches at message-complete; firing
+                // IncReadDisable before then would stall the recv side mid-
+                // upload and deadlock (no one to call DecReadDisable).
+                if (!self->streaming_dispatched_) return;
+                if (self->h1_streaming_pump_paused_) return;  // idempotent
+                if (self->conn_) {
+                    self->conn_->IncReadDisable();
+                    self->h1_streaming_pump_paused_ = true;
+                }
             }
         };
         cfg.on_below_low_water = [weak_self]() {
             if (auto self = weak_self.lock()) {
+                // Pair the resume strictly with a previous pause — covers
+                // the case where streaming_dispatched_ flips true between
+                // the high-water and low-water fires (high-water observed
+                // false, low-water observes true; without the paired flag
+                // we'd over-enable the ReadDisable counter).
+                if (!self->h1_streaming_pump_paused_) return;
+                self->h1_streaming_pump_paused_ = false;
                 if (self->conn_) self->conn_->DecReadDisable();
             }
         };

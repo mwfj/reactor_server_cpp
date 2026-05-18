@@ -38,6 +38,7 @@
 #include "http/route_options.h"
 #include "http/http_callbacks.h"
 #include "upstream/retry_policy.h"
+#include "upstream/proxy_transaction.h"
 #include "config/server_config.h"
 #include "config/config_loader.h"
 
@@ -1565,6 +1566,75 @@ void TestBufferedModeBodyUnchanged() {
 }
 
 // ---------------------------------------------------------------------------
+// MakeErrorResponse contract: streaming result codes map to documented
+// status codes + self-identifying headers (X-Request-Body-Limit-Exceeded,
+// X-Proxy-Retry-Denied: <reason>) per Phase 5 design plan.
+// ---------------------------------------------------------------------------
+static std::string FindHeader(
+    const std::vector<std::pair<std::string, std::string>>& headers,
+    const std::string& name) {
+    for (const auto& [k, v] : headers) {
+        if (k == name) return v;
+    }
+    return "";
+}
+
+void TestMakeErrorResponse_StreamingDiagnosticHeaders() {
+    std::cout << "\n[TEST] MakeErrorResponse: streaming diagnostic headers..."
+              << std::endl;
+    try {
+        // RESULT_REQUEST_BODY_LIMIT_EXCEEDED → 413 + X-Request-Body-Limit-Exceeded
+        HttpResponse r1 = ProxyTransaction::MakeErrorResponse(
+            ProxyTransaction::RESULT_REQUEST_BODY_LIMIT_EXCEEDED);
+        const std::string r1_hdr =
+            FindHeader(r1.GetHeaders(), "X-Request-Body-Limit-Exceeded");
+        bool r1_ok = (r1.GetStatusCode() == 413) && (r1_hdr == "true");
+
+        // Three retry-denied codes → 502 + X-Proxy-Retry-Denied: <reason>
+        struct Case {
+            int code;
+            const char* expected_reason;
+        };
+        Case cases[] = {
+            {ProxyTransaction::RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED,
+             "streaming-source-consumed"},
+            {ProxyTransaction::RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE,
+             "streaming-body-on-wire"},
+            {ProxyTransaction::RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED,
+             "non-idempotent-headers-queued"},
+        };
+        bool cases_ok = true;
+        std::string fail_detail;
+        for (const auto& c : cases) {
+            HttpResponse resp = ProxyTransaction::MakeErrorResponse(c.code);
+            const std::string reason =
+                FindHeader(resp.GetHeaders(), "X-Proxy-Retry-Denied");
+            if (resp.GetStatusCode() != 502 || reason != c.expected_reason) {
+                cases_ok = false;
+                fail_detail += "code=" + std::to_string(c.code) +
+                    " status=" + std::to_string(resp.GetStatusCode()) +
+                    " reason='" + reason +
+                    "' want='" + c.expected_reason + "'; ";
+            }
+        }
+
+        bool pass = r1_ok && cases_ok;
+        std::string err;
+        if (!r1_ok) {
+            err += "413 case: status=" +
+                   std::to_string(r1.GetStatusCode()) +
+                   " header='" + r1_hdr + "'; ";
+        }
+        err += fail_detail;
+        TestFramework::RecordTest(
+            "MakeErrorResponse: streaming diagnostic headers", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "MakeErrorResponse: streaming diagnostic headers", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 void RunAllStreamingRequestTests() {
@@ -1620,6 +1690,9 @@ void RunAllStreamingRequestTests() {
     TestJ9f_ConsecutiveRequests();
     TestJ11_StreamingRelayChunks();
     TestBufferedModeBodyUnchanged();
+
+    // Diagnostic header contract for streaming RESULT_* codes.
+    TestMakeErrorResponse_StreamingDiagnosticHeaders();
 
     std::cout << "=== Streaming Request Body Tests complete ===" << std::endl;
 }

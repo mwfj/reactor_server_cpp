@@ -831,6 +831,17 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                     stream->streaming_abort_pending = false;
                     auto* raw_sink = stream->sink;
                     stream->sink = nullptr;
+                    // Stage the stream for erase BEFORE dispatching the
+                    // terminal error. Other error-dispatch paths in this
+                    // function set pending_erase_ + push to
+                    // pending_erase_streams_ (e.g. line ~760); without
+                    // this, active_streams_ stays elevated until the
+                    // walker actually runs and a fast retry can race the
+                    // walker, observing a still-full cap. Idempotent —
+                    // RunDeferredEraseWalk only erases entries it finds
+                    // in the deque.
+                    stream->pending_erase_ = true;
+                    pending_erase_streams_.push_back(stream_id);
                     // Reach the dispatcher via transport → ConnectionHandler.
                     auto alive = alive_token();
                     auto* uc = transport_;

@@ -75,14 +75,9 @@ Controls the backpressure thresholds for **inbound** HTTP/1.1 streaming requests
 | `http1.streaming.high_water_bytes` | `262144` (256 KB) | When `BytesQueued` crosses this, the inbound H1 layer pauses the read pump (`IncReadDisable`). |
 | `http1.streaming.low_water_bytes` | `65536` (64 KB) | When `BytesQueued` drains below this, the read pump resumes. |
 
-### `http2.streaming` on the upstream (outbound watermarks)
+### Outbound watermarks (reserved)
 
-Controls the `ChunkQueueBodyStream` thresholds on the **outbound** side of an H2 upstream connection. Governs how much of the request body can queue in the gateway while waiting for the upstream's H2 flow-control window. Live-reloadable via SIGHUP.
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `upstreams[].http2.streaming.high_water_bytes` | `262144` (256 KB) | When the outbound body queue crosses this, nghttp2's flow-control window governs further pacing. |
-| `upstreams[].http2.streaming.low_water_bytes` | `65536` (64 KB) | Drain threshold for the low-water callback. |
+There is intentionally **no** `upstreams[].http2.streaming` configuration today: the proxy reuses a single `ChunkQueueBodyStream` end-to-end, so the inbound `http2.streaming.*` watermarks govern producer-side backpressure for the entire request lifetime. A future protocol-translation path (separate outbound body buffer) would re-introduce per-upstream watermarks; the schema is held until a runtime consumer exists.
 
 ---
 
@@ -154,7 +149,7 @@ The watermark system provides a natural backpressure path:
 4. The outbound codec drains the queue, forwarding chunks to the upstream.
 5. When `BytesQueued < low_water_bytes`, reading resumes.
 
-This means a slow upstream exerts natural backpressure on the client, without unbounded gateway-side buffering. The maximum in-gateway buffering per request is bounded by `high_water_bytes` (inbound) plus `streaming.high_water_bytes` (outbound), typically ~500 KB total with default settings.
+This means a slow upstream exerts natural backpressure on the client, without unbounded gateway-side buffering. The maximum in-gateway buffering per request is bounded by `http2.streaming.high_water_bytes` (or `http1.streaming.high_water_bytes` for H1 inbound), typically ~256 KB with default settings.
 
 ---
 

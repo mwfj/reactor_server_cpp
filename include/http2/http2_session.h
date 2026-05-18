@@ -62,6 +62,24 @@ public:
     // Dispatcher-thread-only.
     void ForceFlushStreamConsume(int32_t stream_id);
 
+    // Refund the connection-level flow-control window for bytes that were
+    // recv'd into body_stream but will never be drained by the consumer
+    // (abort / RST_STREAM paths). Must be called AFTER ForceFlushStreamConsume
+    // so any drained-but-not-yet-credited bytes are flushed first; the
+    // residue tracked on the stream then represents only the queued-and-
+    // discarded bytes whose connection credit would otherwise leak.
+    // Dispatcher-thread-only.
+    void CreditConnectionForUncreditedBytes(int32_t stream_id);
+
+    // Per-stream WINDOW_UPDATE backpressure. Suspend marks the stream so
+    // ConsumeStreamingRequestBytes accumulates drained bytes without
+    // emitting WINDOW_UPDATE — the peer's per-stream window drains and
+    // upload back-pressure flows upstream. Resume clears the latch and
+    // force-flushes accumulated credit so the peer can resume sending.
+    // Dispatcher-thread-only.
+    void SuspendWindowUpdateForStream(int32_t stream_id);
+    void ResumeWindowUpdateForStream(int32_t stream_id);
+
     // Streaming watermark accessors (set from Http2Config at initialization).
     size_t StreamingHighWaterBytes() const { return streaming_high_water_; }
     size_t StreamingLowWaterBytes() const { return streaming_low_water_; }
@@ -284,8 +302,8 @@ public:
     // Streaming-route dispatch path. Same as DispatchStreamRequest but skips
     // the AccumulatedBodySize == content_length post-buffered check; streaming
     // bytes live in body_stream, not in the buffered body. CL enforcement is
-    // split: OVERRUN on each DATA chunk (B.2), UNDERRUN at DATA/trailer END_STREAM
-    // (B.2a / D.3). request_count_callback fires exactly once (same pattern as
+    // split: OVERRUN on each DATA chunk, UNDERRUN at DATA/trailer END_STREAM.
+    // request_count_callback fires exactly once (same pattern as
     // DispatchStreamRequest). Called from OnFrameRecvCallback HCAT_REQUEST branch
     // at HEADERS-complete for streaming routes.
     void DispatchStreamRequestStreaming(Http2Stream* stream, int32_t stream_id);

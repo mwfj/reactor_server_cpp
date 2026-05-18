@@ -414,6 +414,19 @@ const char* ErrorTypeForResult(int result_code) {
         case ProxyTransaction::RESULT_RESPONSE_TOO_LARGE:     return "response_too_large";
         case ProxyTransaction::RESULT_CIRCUIT_OPEN:           return "circuit_open";
         case ProxyTransaction::RESULT_RETRY_BUDGET_EXHAUSTED: return "retry_budget_exhausted";
+        case ProxyTransaction::RESULT_TRUNCATED_RESPONSE:     return "upstream_truncated";
+        case ProxyTransaction::RESULT_GOAWAY_UNPROCESSED:     return "goaway_unprocessed";
+        case ProxyTransaction::RESULT_GOAWAY_MAYBE_PROCESSED: return "goaway_maybe_processed";
+        case ProxyTransaction::RESULT_H2_METHOD_NOT_SUPPORTED:return "h2_method_not_supported";
+        case ProxyTransaction::RESULT_H2_ALPN_NOT_NEGOTIATED: return "h2_alpn_not_negotiated";
+        case ProxyTransaction::RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED:
+            return "retry_denied_streaming_source_consumed";
+        case ProxyTransaction::RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE:
+            return "retry_denied_streaming_body_on_wire";
+        case ProxyTransaction::RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED:
+            return "retry_denied_non_idempotent_headers_queued";
+        case ProxyTransaction::RESULT_REQUEST_BODY_LIMIT_EXCEEDED:
+            return "request_body_limit_exceeded";
         default:                                              return "upstream_error";
     }
 }
@@ -1145,7 +1158,7 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase E — Outbound H1 streaming
+// Outbound H1 streaming
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::string ProxyTransaction::BuildH1StreamingRequestHead_() const {
@@ -1540,7 +1553,7 @@ void ProxyTransaction::DispatchH2() {
         // Wire consumer dispatcher BEFORE SubmitStreamingRequest's first
         // WaitForData/Read — body_stream_ was constructed on the inbound
         // dispatcher; the real consumer is the outbound dispatcher that owns
-        // this lease (v8 F4 P1).
+        // this lease.
         if (auto* uc_raw = h2->transport()) {
             if (auto t = uc_raw->GetTransport()) {
                 body_stream_->SetConsumerDispatcher(
@@ -3177,6 +3190,15 @@ void ProxyTransaction::ResetForRetryAttempt() {
     paused_parse_bytes_.clear();
     InvalidateStreamTimers();
     sse_stream_ = false;
+    // Per-attempt request-send progress flags. Without resetting, the
+    // retry's first OnUpstreamWriteComplete (headers ack) sees a stale
+    // h1_streaming_send_complete_=true and transitions to
+    // AWAITING_RESPONSE before the body has been sent — arming the
+    // response timeout prematurely. The H2 parallel flag is reset in
+    // DispatchH2 / Cleanup; H1 needs explicit reset here.
+    h1_streaming_send_complete_ = false;
+    h1_request_fully_sent_ = false;
+    request_headers_submitted_ = false;
 }
 
 void ProxyTransaction::ClearPendingRetryable5xxResponse() {
@@ -3846,26 +3868,29 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
     }
     // Streaming-retry-denial codes: per-request semantics that prevented
     // replay (source consumed, body-on-wire, queued-non-idempotent).
-    // All three map to 502 with a self-identifying header.
+    // All three map to 502 with `X-Proxy-Retry-Denied: <reason>`.
     if (result_code == RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED) {
         HttpResponse resp = HttpResponse::BadGateway();
-        resp.Header("X-Retry-Denied", "streaming-source-consumed");
+        resp.Header("X-Proxy-Retry-Denied", "streaming-source-consumed");
         return resp;
     }
     if (result_code == RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE) {
         HttpResponse resp = HttpResponse::BadGateway();
-        resp.Header("X-Retry-Denied", "streaming-body-on-wire");
+        resp.Header("X-Proxy-Retry-Denied", "streaming-body-on-wire");
         return resp;
     }
     if (result_code == RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED) {
         HttpResponse resp = HttpResponse::BadGateway();
-        resp.Header("X-Retry-Denied", "non-idempotent-headers-queued");
+        resp.Header("X-Proxy-Retry-Denied", "non-idempotent-headers-queued");
         return resp;
     }
     // Proxy-side body-size enforcement (producer aborted the body_stream
-    // with reason "body_size_limit_exceeded" mid-forward). Maps to 413.
+    // with reason "body_size_limit_exceeded" mid-forward). Maps to 413
+    // + `X-Request-Body-Limit-Exceeded: true`.
     if (result_code == RESULT_REQUEST_BODY_LIMIT_EXCEEDED) {
-        return HttpResponse::PayloadTooLarge();
+        HttpResponse resp = HttpResponse::PayloadTooLarge();
+        resp.Header("X-Request-Body-Limit-Exceeded", "true");
+        return resp;
     }
     return HttpResponse::InternalError();
 }
@@ -4192,6 +4217,24 @@ void ProxyTransaction::ReportBreakerOutcome(int result_code) {
             // clear admission_generation_ before delivering), but the
             // defensive branch keeps the class-wide invariant: these
             // outcomes are invisible to the breaker.
+            return;
+
+        case RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED:
+        case RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE:
+        case RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED:
+            // Retry-denial outcomes are local policy decisions — the
+            // underlying transport failure (CONNECT_FAILURE /
+            // UPSTREAM_DISCONNECT / RESPONSE_TIMEOUT) was already reported
+            // through the prior attempt's ReportBreakerOutcome call. The
+            // denial itself is breaker-neutral so we don't double-count
+            // the same failure when MaybeRetry surfaces it as terminal.
+            slice_->ReportNeutral(probe, gen);
+            return;
+
+        case RESULT_REQUEST_BODY_LIMIT_EXCEEDED:
+            // Producer-side limit (inbound body cap exceeded) — not an
+            // upstream health signal. Operator policy decision.
+            slice_->ReportNeutral(probe, gen);
             return;
 
         default:

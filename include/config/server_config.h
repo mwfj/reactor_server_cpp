@@ -89,14 +89,13 @@ struct Http2UpstreamConfig {
     // (the prediction must fire BEFORE saturation actually trips).
     int preconnect_watermark_pct = 0;
 
-    // Outbound H2 streaming-request body watermarks. Live-reloadable;
-    // not part of LiveEqual. nghttp2 auto-manages WINDOW_UPDATE so no
-    // window_update_bytes here (unlike inbound Http2Config::StreamingConfig).
-    struct StreamingOutboundConfig {
-        size_t high_water_bytes = 262144;
-        size_t low_water_bytes  = 65536;
-    };
-    StreamingOutboundConfig streaming;
+    // (Per-upstream outbound streaming watermarks intentionally absent:
+    // the proxy reuses the inbound ChunkQueueBodyStream end-to-end, so
+    // a separate per-upstream watermark has no runtime consumer. Top-
+    // level http2.streaming.* governs producer-side backpressure. If a
+    // future protocol-translation path introduces a separate outbound
+    // body buffer, re-add the sub-struct + loader + runtime wiring
+    // together — never as schema-without-runtime.)
 
     // Full equality: every field. Used by tests + serialization round-trips.
     bool operator==(const Http2UpstreamConfig& o) const {
@@ -110,9 +109,7 @@ struct Http2UpstreamConfig {
                ping_timeout_sec == o.ping_timeout_sec &&
                goaway_drain_timeout_sec == o.goaway_drain_timeout_sec &&
                saturation_open_pct == o.saturation_open_pct &&
-               preconnect_watermark_pct == o.preconnect_watermark_pct &&
-               streaming.high_water_bytes == o.streaming.high_water_bytes &&
-               streaming.low_water_bytes  == o.streaming.low_water_bytes;
+               preconnect_watermark_pct == o.preconnect_watermark_pct;
     }
     bool operator!=(const Http2UpstreamConfig& o) const { return !(*this == o); }
 
