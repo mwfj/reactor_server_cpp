@@ -98,14 +98,9 @@ public:
         consumed_since_last_window_update_ = 0;
     }
 
-    // Tracks DATA bytes that have been recv'd (pushed into body_stream) but
-    // not yet credited back to nghttp2 via nghttp2_session_consume_*. Bumped
-    // on every streaming DATA chunk; decremented as the consumer drains and
-    // ConsumeStreamingRequestBytes / ForceFlushStreamConsume flushes credit
-    // to nghttp2. On abort/RST, the residue (bytes queued in body_stream that
-    // will never be drained) must be refunded to the connection-level window
-    // per RFC 9113 §6.9.1 — the stream-level window is discarded by RST but
-    // connection credit is shared across streams and would otherwise leak.
+    // Bytes recv'd-and-queued minus bytes credited back to nghttp2.
+    // Residue is refunded to the connection window on abort/RST per
+    // RFC 9113 §6.9.1.
     void AddRecvBytesUncredited(size_t n) { recv_bytes_uncredited_ += n; }
     void SubRecvBytesUncredited(size_t n) {
         recv_bytes_uncredited_ = (recv_bytes_uncredited_ > n)
@@ -114,14 +109,9 @@ public:
     size_t recv_bytes_uncredited() const { return recv_bytes_uncredited_; }
     void reset_recv_bytes_uncredited() { recv_bytes_uncredited_ = 0; }
 
-    // High-/low-water hook used by streaming routes to throttle the peer
-    // via the per-stream flow-control window. When body_stream crosses
-    // the high-water mark, the on_above_high_water callback latches this
-    // flag; ConsumeStreamingRequestBytes then accumulates drained bytes
-    // but does NOT emit WINDOW_UPDATE, letting the peer's stream window
-    // drain to zero. on_below_low_water clears the flag and triggers a
-    // ForceFlushStreamConsume so the accumulated credit catches the peer
-    // back up.
+    // Latched by the body_stream high-water callback; suppresses
+    // WINDOW_UPDATE emission until low-water clears it, so the peer's
+    // per-stream window drains.
     void SetWindowUpdateSuspended(bool s) { window_update_suspended_ = s; }
     bool IsWindowUpdateSuspended() const { return window_update_suspended_; }
 

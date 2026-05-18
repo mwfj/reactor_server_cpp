@@ -278,14 +278,8 @@ static int OnDataChunkRecvCallback(
             self->Callbacks().request_count_callback) {
             self->Callbacks().request_count_callback();
         }
-        // Force-flush accumulated sub-threshold consume credit BEFORE
-        // RST so the connection-level window doesn't leak. Stream-level
-        // WINDOW_UPDATE is vestigial after RST but harmless. Then refund
-        // the connection-window credit for bytes queued in body_stream that
-        // will never be drained (RFC 9113 §6.9.1).
         if (stream->route_mode() == http::RouteRequestMode::Streaming) {
-            self->ForceFlushStreamConsume(stream_id);
-            self->CreditConnectionForUncreditedBytes(stream_id);
+            self->FinalizeAbortedStreamFlowControl(stream_id);
         }
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
@@ -331,11 +325,7 @@ static int OnDataChunkRecvCallback(
             if (body_stream) {
                 body_stream->Abort("content_length_overrun");
             }
-            // Force-flush sub-threshold consume credit (see max-body
-            // branch for the connection-window-leak rationale) and refund
-            // queued-but-not-drained residue to the connection window.
-            self->ForceFlushStreamConsume(stream_id);
-            self->CreditConnectionForUncreditedBytes(stream_id);
+            self->FinalizeAbortedStreamFlowControl(stream_id);
         }
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
@@ -360,10 +350,8 @@ static int OnDataChunkRecvCallback(
             body_stream->Push(std::string(reinterpret_cast<const char*>(data), len));
         }
         stream->GetRequest().pushed_body_bytes += len;
-        // Track bytes outstanding against nghttp2's flow-control accounting.
-        // Decremented when ConsumeStreamingRequestBytes / ForceFlushStreamConsume
-        // credit the bytes back; the residue at abort time is refunded to the
-        // connection window via CreditConnectionForUncreditedBytes.
+        // Residue is refunded to the connection window at abort/RST via
+        // FinalizeAbortedStreamFlowControl.
         stream->AddRecvBytesUncredited(static_cast<size_t>(len));
     } else {
         // Buffered path: accumulate body and manually consume the bytes so
@@ -631,7 +619,7 @@ static int OnFrameRecvCallback(
                     // state off-thread).
                     if (auto owner = self->Owner()) {
                         if (auto cc = owner->GetConnection()) {
-                            bscfg.producer_dispatcher = cc->GetDispatcherShared();
+                            bscfg.producer_dispatcher = cc->dispatcher_ptr();
                         }
                     }
                     // on_bytes_consumed: when the consumer frees capacity,
@@ -709,11 +697,7 @@ static int OnFrameRecvCallback(
                     if (body_stream) {
                         body_stream->Abort("content_length_underrun");
                     }
-                    // Force-flush sub-threshold consume credit BEFORE RST so
-                    // the connection-level window doesn't leak, then refund
-                    // queued-but-not-drained residue.
-                    self->ForceFlushStreamConsume(frame->hd.stream_id);
-                    self->CreditConnectionForUncreditedBytes(frame->hd.stream_id);
+                    self->FinalizeAbortedStreamFlowControl(frame->hd.stream_id);
                     stream->MarkRejected();
                     int rv = nghttp2_submit_rst_stream(
                         session, NGHTTP2_FLAG_NONE,
@@ -779,11 +763,7 @@ static int OnFrameRecvCallback(
                     if (body_stream) {
                         body_stream->Abort("content_length_underrun");
                     }
-                    // Force-flush sub-threshold consume credit BEFORE RST so
-                    // the connection-level window doesn't leak, then refund
-                    // queued-but-not-drained residue.
-                    self->ForceFlushStreamConsume(frame->hd.stream_id);
-                    self->CreditConnectionForUncreditedBytes(frame->hd.stream_id);
+                    self->FinalizeAbortedStreamFlowControl(frame->hd.stream_id);
                     stream->MarkRejected();
                     int rv = nghttp2_submit_rst_stream(
                         session, NGHTTP2_FLAG_NONE,
@@ -1755,7 +1735,11 @@ bool Http2Session::ConsumeStreamingRequestBytes(
 void Http2Session::ForceFlushStreamConsume(int32_t stream_id) {
     auto* stream = FindStream(stream_id);
     if (!stream) return;
+    FlushStreamConsumeOnStream(stream, stream_id, /*flush_send=*/true);
+}
 
+void Http2Session::FlushStreamConsumeOnStream(
+    Http2Stream* stream, int32_t stream_id, bool flush_send) {
     size_t accumulated = stream->consumed_since_last_window_update();
     if (accumulated == 0) return;
 
@@ -1772,9 +1756,7 @@ void Http2Session::ForceFlushStreamConsume(int32_t stream_id) {
                              "failed stream={} rv={}", stream_id, rv_c);
     }
     stream->SubRecvBytesUncredited(accumulated);
-    // Flush the queued WINDOW_UPDATE — see same gate explanation in
-    // ConsumeStreamingRequestBytes.
-    if (!in_receive_data_) {
+    if (flush_send && !in_receive_data_) {
         SendPendingFrames();
     }
 }
@@ -1789,30 +1771,34 @@ void Http2Session::ResumeWindowUpdateForStream(int32_t stream_id) {
     auto* stream = FindStream(stream_id);
     if (!stream) return;
     stream->SetWindowUpdateSuspended(false);
-    // The body_stream just dropped below low-water — catch the peer up
-    // with all accumulated credit so it can resume sending DATA.
-    ForceFlushStreamConsume(stream_id);
+    // Catch the peer up with all accumulated credit so it can resume DATA.
+    FlushStreamConsumeOnStream(stream, stream_id, /*flush_send=*/true);
 }
 
-void Http2Session::CreditConnectionForUncreditedBytes(int32_t stream_id) {
+void Http2Session::FinalizeAbortedStreamFlowControl(int32_t stream_id) {
     auto* stream = FindStream(stream_id);
     if (!stream) return;
 
-    size_t residue = stream->recv_bytes_uncredited();
-    if (residue == 0) return;
+    const size_t accumulated_before = stream->consumed_since_last_window_update();
+    const size_t residue = stream->recv_bytes_uncredited();
+    if (accumulated_before == 0 && residue == 0) return;
 
-    stream->reset_recv_bytes_uncredited();
+    // Defer SendPendingFrames to the trailing call so a single mem_send2
+    // covers both updates from this site. Required: FlushDeferredRemovals
+    // is called from inside SendPendingFrames, so a SendPendingFrames here
+    // would recurse infinitely for non-streaming closes.
+    FlushStreamConsumeOnStream(stream, stream_id, /*flush_send=*/false);
 
-    // RST_STREAM will discard the per-stream window, but the peer's
-    // connection-level window stays consumed until we WINDOW_UPDATE.
-    // Per RFC 9113 §6.9.1, refunding the connection-level credit prevents
-    // a slow leak that would eventually stall every other stream on this
-    // connection.
-    int rv = nghttp2_session_consume_connection(impl_->session, residue);
-    if (rv != 0) {
-        logging::Get()->warn(
-            "nghttp2_session_consume_connection (abort refund) failed "
-            "stream={} bytes={} rv={}", stream_id, residue, rv);
+    if (residue > 0) {
+        stream->reset_recv_bytes_uncredited();
+        // RST_STREAM discards the per-stream window but the peer's connection
+        // window stays consumed until we WINDOW_UPDATE (RFC 9113 §6.9.1).
+        int rv = nghttp2_session_consume_connection(impl_->session, residue);
+        if (rv != 0) {
+            logging::Get()->warn(
+                "nghttp2_session_consume_connection (abort refund) failed "
+                "stream={} bytes={} rv={}", stream_id, residue, rv);
+        }
     }
     if (!in_receive_data_) {
         SendPendingFrames();
@@ -2072,14 +2058,9 @@ void Http2Session::MarkStreamForRemoval(int32_t stream_id) {
 
 void Http2Session::FlushDeferredRemovals() {
     for (int32_t id : streams_to_remove_) {
-        // Flush any sub-threshold consumed bytes before erasing. This covers
-        // abort paths and error paths where the EOS branch didn't run.
-        ForceFlushStreamConsume(id);
-        // Refund the connection-window credit for bytes that were recv'd
-        // into body_stream but never drained (peer RST, abort, or any other
-        // path where consumer drain stopped short of pushed_body_bytes).
-        // Idempotent at abort sites that already refunded — residue is reset.
-        CreditConnectionForUncreditedBytes(id);
+        // Catches peer-RST and error paths where the EOS branch didn't run;
+        // idempotent at abort sites that already refunded.
+        FinalizeAbortedStreamFlowControl(id);
         streams_.erase(id);
     }
     streams_to_remove_.clear();

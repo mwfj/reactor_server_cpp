@@ -301,18 +301,14 @@ private:
     //   (e) async-resume aborted-body guard (H.3)
     bool streaming_upload_in_flight_ = false;
 
-    // True once the H1 streaming route handler has been dispatched (which
-    // today happens at message-complete time, alongside non-streaming
-    // routes). Until then, on_above_high_water must NOT pause the read
-    // pump — no consumer exists to drain body_stream, so a pause would
-    // deadlock multi-packet uploads. Memory growth is bounded by
-    // max_body_size, which the parser enforces on every body chunk.
-    // h1_streaming_pump_paused_ pairs IncReadDisable / DecReadDisable so
-    // a low-water fire never runs without a matching prior pause —
-    // crucial when streaming_dispatched_ flips between the two
-    // callbacks. TODO: when handler dispatch moves to headers-complete
-    // (proper inbound back-pressure), set streaming_dispatched_ at that
-    // earlier site so the watermark callbacks become active.
+    // Gate for the watermark callbacks: pausing the read pump before a
+    // consumer exists would deadlock multi-packet streaming uploads,
+    // since no one would call DecReadDisable. Today the handler dispatches
+    // at message-complete; max_body_size bounds growth until then. The
+    // _pump_paused_ flag pairs IncReadDisable / DecReadDisable so a
+    // low-water fire never runs without a matching prior pause.
+    // TODO: set streaming_dispatched_ at headers-complete dispatch when
+    // that path lands so the watermark callbacks become active.
     bool streaming_dispatched_ = false;
     bool h1_streaming_pump_paused_ = false;
 

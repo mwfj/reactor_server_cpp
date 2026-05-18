@@ -656,7 +656,7 @@ HttpConnectionHandler::HttpConnectionHandler(std::shared_ptr<ConnectionHandler> 
         // thread, even when the body stream's consumer drains from a
         // different dispatcher (the proxy/upstream side).
         if (conn_) {
-            cfg.producer_dispatcher = conn_->GetDispatcherShared();
+            cfg.producer_dispatcher = conn_->dispatcher_ptr();
         }
         cfg.on_above_high_water = [weak_self]() {
             if (auto self = weak_self.lock()) {

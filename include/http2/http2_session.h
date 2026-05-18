@@ -62,14 +62,13 @@ public:
     // Dispatcher-thread-only.
     void ForceFlushStreamConsume(int32_t stream_id);
 
-    // Refund the connection-level flow-control window for bytes that were
-    // recv'd into body_stream but will never be drained by the consumer
-    // (abort / RST_STREAM paths). Must be called AFTER ForceFlushStreamConsume
-    // so any drained-but-not-yet-credited bytes are flushed first; the
-    // residue tracked on the stream then represents only the queued-and-
-    // discarded bytes whose connection credit would otherwise leak.
-    // Dispatcher-thread-only.
-    void CreditConnectionForUncreditedBytes(int32_t stream_id);
+    // Abort/RST cleanup: flush drained-but-not-yet-credited bytes AND refund
+    // the connection-level credit for residue queued in body_stream that
+    // the consumer will never read. Single FindStream + single
+    // SendPendingFrames pass — preferred over ForceFlushStreamConsume at
+    // abort sites because it covers both the drained-credit-flush and the
+    // discarded-residue-refund concerns. Dispatcher-thread-only.
+    void FinalizeAbortedStreamFlowControl(int32_t stream_id);
 
     // Per-stream WINDOW_UPDATE backpressure. Suspend marks the stream so
     // ConsumeStreamingRequestBytes accumulates drained bytes without
@@ -309,6 +308,12 @@ public:
     void DispatchStreamRequestStreaming(Http2Stream* stream, int32_t stream_id);
 
 private:
+    // Shared body of ForceFlushStreamConsume and FinalizeAbortedStreamFlowControl.
+    // `flush_send=false` lets the caller batch a single trailing
+    // SendPendingFrames when multiple flow-control updates feed the same wire.
+    void FlushStreamConsumeOnStream(Http2Stream* stream, int32_t stream_id,
+                                     bool flush_send);
+
     // Helper: submit a GOAWAY frame and only latch goaway_sent_ on
     // successful submit. Used by SendGoaway + every flood-protection
     // branch in OnFrameRecvCallback. Centralizing avoids the "set flag,

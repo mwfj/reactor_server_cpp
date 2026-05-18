@@ -199,7 +199,7 @@ public:
     size_t InputBufferSize() const { return input_bf_.Size(); }
     size_t OutputBufferSize() const { return output_bf_.Size(); }
     Dispatcher* GetDispatcher() const { return event_dispatcher_.get(); }
-    std::shared_ptr<Dispatcher> GetDispatcherShared() const { return event_dispatcher_; }
+    std::shared_ptr<Dispatcher> dispatcher_ptr() const { return event_dispatcher_; }
 
     void EnableReadMode();
     void DisableReadMode();
