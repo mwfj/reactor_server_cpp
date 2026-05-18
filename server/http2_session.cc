@@ -23,6 +23,63 @@ struct Http2Session::Impl {
     }
 };
 
+// Construct and wire a ChunkQueueBodyStream for an inbound H2 streaming
+// route. Captures the producer-side dispatcher and installs the
+// session-level callbacks (on_bytes_consumed → ConsumeStreamingRequestBytes;
+// on_above_high_water / on_below_low_water → Suspend/Resume per-stream
+// WINDOW_UPDATE batching). Returns nullptr when the connection or its
+// dispatcher is unavailable — caller must reject the stream rather than
+// fall back to inline off-dispatcher calls. Used by both the normal
+// HEADERS-complete streaming dispatch and the pre-dispatch CL-overflow
+// 413 path (docs/streaming_request.md §body-size enforcement).
+static std::shared_ptr<http::ChunkQueueBodyStream>
+CreateStreamingBodyStreamForRecv(Http2Session* self, int32_t stream_id) {
+    auto owner = self->Owner();
+    auto cc = owner ? owner->GetConnection() : nullptr;
+    if (!cc) return nullptr;
+    auto owner_weak = self->WeakOwner();
+
+    http::ChunkQueueBodyStream::Config bscfg;
+    bscfg.high_water_bytes = self->StreamingHighWaterBytes();
+    bscfg.low_water_bytes  = self->StreamingLowWaterBytes();
+    bscfg.producer_dispatcher = cc->dispatcher_ptr();
+    // on_bytes_consumed: drain-time WINDOW_UPDATE emission. The helper
+    // batches sub-threshold drains and flushes the queued frame to the
+    // wire internally (gated on !InReceiveData). Sub-threshold accumulated
+    // bytes are force-flushed at stream EOS/abort sites so the
+    // connection-level window never permanently leaks.
+    auto thr = self->StreamingWindowUpdateBytes();
+    bscfg.on_bytes_consumed =
+        [owner_weak, stream_id, thr](size_t n) {
+            auto handler = owner_weak.lock();
+            if (!handler) return;
+            auto s = handler->GetSession();
+            if (!s) return;
+            s->ConsumeStreamingRequestBytes(stream_id, n, thr);
+        };
+    // Cross high-water: latch WINDOW_UPDATE suppression on the session so
+    // the peer's per-stream window drains.
+    bscfg.on_above_high_water =
+        [owner_weak, stream_id]() {
+            auto handler = owner_weak.lock();
+            if (!handler) return;
+            auto s = handler->GetSession();
+            if (!s) return;
+            s->SuspendWindowUpdateForStream(stream_id);
+        };
+    // Cross low-water: clear suspension and catch peer up with
+    // accumulated credit.
+    bscfg.on_below_low_water =
+        [owner_weak, stream_id]() {
+            auto handler = owner_weak.lock();
+            if (!handler) return;
+            auto s = handler->GetSession();
+            if (!s) return;
+            s->ResumeWindowUpdateForStream(stream_id);
+        };
+    return std::make_shared<http::ChunkQueueBodyStream>(std::move(bscfg));
+}
+
 // Data source read callback: nghttp2 calls this to pull response body chunks.
 static ssize_t DataSourceReadCallback(
     nghttp2_session* /*session*/, int32_t /*stream_id*/,
@@ -174,34 +231,27 @@ static int OnHeaderCallback(
         return 0;
     };
 
-    // RFC 9113 Section 8.1: trailers MUST NOT contain pseudo-headers.
-    // Forbidden connection-level headers are still invalid in trailers.
+    // RFC 9113 Section 8.1 / RFC 9110 Section 6.5.1: trailers MUST NOT
+    // contain pseudo-headers or fields used for message framing, routing,
+    // authentication, or representation metadata that must precede the
+    // body. Route every trailer field through the shared sanitizer so the
+    // forbidden set stays in one place (include/http/http2_trailer_sanitizer.h);
+    // diverging local lists are how `trailer` ended up silently accepted
+    // on the streaming path before this gate ran the sanitizer.
     if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
-        if (!hdr_name.empty() && hdr_name[0] == ':') {
-            logging::Get()->warn("HTTP/2 stream {} pseudo-header in trailers: {}",
-                                 frame->hd.stream_id, hdr_name);
+        auto result = http::SanitizeHttp2TrailerField(hdr_name, hdr_value);
+        if (result.classification == http::H2TrailerClassification::Forbidden) {
+            logging::Get()->warn(
+                "HTTP/2 stream {} forbidden field in trailers: {}",
+                frame->hd.stream_id, hdr_name);
             return reject_protocol_error();
         }
-        // RFC 9110 Section 6.5.1: trailers MUST NOT include fields used for
-        // message framing, routing, request modifiers, authentication, or
-        // representation metadata that must be received before the body.
-        if (hdr_name == "connection" || hdr_name == "keep-alive" ||
-            hdr_name == "proxy-connection" || hdr_name == "transfer-encoding" ||
-            hdr_name == "upgrade" || hdr_name == "te" ||
-            hdr_name == "content-length" || hdr_name == "host" ||
-            hdr_name == "authorization" || hdr_name == "content-type" ||
-            hdr_name == "content-encoding" || hdr_name == "content-range") {
-            logging::Get()->warn("HTTP/2 stream {} forbidden header in trailers: {}",
-                                 frame->hd.stream_id, hdr_name);
-            return reject_protocol_error();
-        }
-        // Valid trailer field — accumulate for streaming routes; discard otherwise.
+        // Valid trailer — accumulate for streaming routes; buffered routes
+        // do not forward request trailers to handlers, so the field is
+        // discarded after classification.
         if (stream->route_mode() == http::RouteRequestMode::Streaming) {
-            auto result = http::SanitizeHttp2TrailerField(hdr_name, hdr_value);
-            if (result.classification == http::H2TrailerClassification::Accept) {
-                stream->pending_trailers().emplace_back(
-                    std::move(result.lower_name), hdr_value);
-            }
+            stream->pending_trailers().emplace_back(
+                std::move(result.lower_name), hdr_value);
         }
         return 0;
     }
@@ -325,8 +375,34 @@ static int OnDataChunkRecvCallback(
         return 0;
     }
 
-    // Skip body accumulation on rejected streams (RST_STREAM already sent)
-    if (stream->IsRejected()) return 0;
+    // Skip body accumulation on rejected streams (RST_STREAM already sent
+    // or pending). Refund the connection-level window: with
+    // NO_AUTO_WINDOW_UPDATE enabled, post-rejection DATA chunks would
+    // otherwise drain the connection window without ever being credited
+    // back (the per-stream refund is irrelevant once the stream is on the
+    // way out, but the connection-level credit is shared across siblings
+    // and is critical under RFC 9113 §6.9.1). This matters most for the
+    // streaming deferred-RST path — the rejection window stays open until
+    // SubmitStreamResponse flushes the 413 — and is still meaningful in
+    // the buffered inline-RST path because additional DATA frames can be
+    // processed within the same nghttp2_session_mem_recv2 call before the
+    // queued RST is serialized.
+    // Skip body accumulation on rejected streams (RST_STREAM already sent
+    // or pending). Refund the connection-level window: with
+    // NO_AUTO_WINDOW_UPDATE enabled, post-rejection DATA chunks would
+    // otherwise drain the connection window without ever being credited
+    // back (the per-stream refund is irrelevant once the stream is on the
+    // way out, but the connection-level credit is shared across siblings
+    // and is critical under RFC 9113 §6.9.1). This matters most for the
+    // streaming deferred-RST path — the rejection window stays open until
+    // SubmitStreamResponse flushes the 413 — and is still meaningful in
+    // the buffered inline-RST path because additional DATA frames can be
+    // processed within the same nghttp2_session_mem_recv2 call before the
+    // queued RST is serialized.
+    if (stream->IsRejected()) {
+        refund_rejected_chunk("post-rejection");
+        return 0;
+    }
 
     // Reject DATA that exceeds the declared Content-Length, or any DATA
     // when content-length: 0 was declared. Without this, a malformed peer
@@ -468,14 +544,56 @@ static int OnFrameRecvCallback(
             // Early reject: if content-length exceeds body size limit, RST now
             // instead of waiting for DATA frames that will be rejected anyway.
             // Prevents stream slot exhaustion from impossible uploads.
+            //
+            // Streaming routes follow a different path: per
+            // docs/streaming_request.md §body-size enforcement, the handler
+            // must produce 413 and the RST is deferred until after the
+            // response is on the wire. Resolve the route mode inline so a
+            // CL-overflow on a streaming route reaches the documented 413
+            // path rather than a raw RST_STREAM(CANCEL) the client cannot
+            // distinguish from a generic protocol failure.
             if (self->MaxBodySize() > 0 && req.content_length > self->MaxBodySize()) {
                 logging::Get()->warn("HTTP/2 stream {} content-length {} exceeds max body size {}",
                                      frame->hd.stream_id, req.content_length, self->MaxBodySize());
-                if (self->Callbacks().request_count_callback)
-                    self->Callbacks().request_count_callback();
-                nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                          frame->hd.stream_id, NGHTTP2_CANCEL);
-                stream->MarkRejected();
+                bool routed_to_streaming_413 = false;
+                if (self->Callbacks().resolve_route_options_callback &&
+                    !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+                    auto opts = self->Callbacks().resolve_route_options_callback(
+                        req.method, req.path);
+                    if (opts.request_mode == http::RouteRequestMode::Streaming) {
+                        // Construct a streaming body_stream, pre-abort it,
+                        // and dispatch. Handler reads body_stream → ABORTED
+                        // (reason "body_size_limit_exceeded"), produces 413.
+                        // SubmitStreamResponse drains MarkRstPendingAfterResponse
+                        // so the RST follows the 413 onto the wire. The
+                        // request count is bumped inside
+                        // DispatchStreamRequestStreaming so we MUST NOT
+                        // also call request_count_callback here.
+                        auto body_stream = CreateStreamingBodyStreamForRecv(
+                            self, frame->hd.stream_id);
+                        if (body_stream) {
+                            stream->set_route_mode(http::RouteRequestMode::Streaming);
+                            body_stream->Abort("body_size_limit_exceeded");
+                            stream->GetRequest().body_stream = body_stream;
+                            stream->MarkRstPendingAfterResponse();
+                            self->DispatchStreamRequestStreaming(
+                                stream, frame->hd.stream_id);
+                            // Mark rejected AFTER dispatch so racing DATA
+                            // chunks hit the post-rejection refund path in
+                            // OnDataChunkRecvCallback rather than being
+                            // pushed into the aborted body_stream.
+                            stream->MarkRejected();
+                            routed_to_streaming_413 = true;
+                        }
+                    }
+                }
+                if (!routed_to_streaming_413) {
+                    if (self->Callbacks().request_count_callback)
+                        self->Callbacks().request_count_callback();
+                    nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                              frame->hd.stream_id, NGHTTP2_CANCEL);
+                    stream->MarkRejected();
+                }
                 break;
             }
 
@@ -642,22 +760,14 @@ static int OnFrameRecvCallback(
                 if (opts.request_mode == http::RouteRequestMode::Streaming &&
                     !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
                     stream->set_route_mode(http::RouteRequestMode::Streaming);
-                    // Construct streaming body pipeline.
-                    auto owner_weak = self->WeakOwner();
-                    const int32_t sid = frame->hd.stream_id;
-                    http::ChunkQueueBodyStream::Config bscfg;
-                    bscfg.high_water_bytes = self->StreamingHighWaterBytes();
-                    bscfg.low_water_bytes  = self->StreamingLowWaterBytes();
-                    // Bind producer-side dispatcher so on_bytes_consumed /
-                    // on_below_low_water fan out via EnQueue rather than firing
-                    // inline on the consumer thread (which would touch nghttp2
-                    // state off-thread). Defensive: unreachable today (we're
-                    // inside a live recv callback), but if the lookup ever
-                    // fails, reject the stream instead of silently falling
-                    // back to inline off-dispatcher calls.
-                    auto owner = self->Owner();
-                    auto cc = owner ? owner->GetConnection() : nullptr;
-                    if (!cc) {
+                    // Producer-dispatcher lookup is defensive: unreachable
+                    // today (we're inside a live recv callback) but if the
+                    // helper ever returns nullptr, reject the stream
+                    // instead of silently falling back to inline
+                    // off-dispatcher calls.
+                    auto body_stream = CreateStreamingBodyStreamForRecv(
+                        self, frame->hd.stream_id);
+                    if (!body_stream) {
                         logging::Get()->error(
                             "HTTP/2 stream {} streaming dispatch: producer "
                             "dispatcher unavailable; rejecting stream",
@@ -674,46 +784,6 @@ static int OnFrameRecvCallback(
                         }
                         break;
                     }
-                    bscfg.producer_dispatcher = cc->dispatcher_ptr();
-                    // on_bytes_consumed: when the consumer frees capacity,
-                    // submit WINDOW_UPDATE for the stream, honoring the
-                    // configured window_update_bytes threshold. The
-                    // helper batches sub-threshold drains and flushes
-                    // the queued frame to the wire internally (gated on
-                    // !InReceiveData). Sub-threshold accumulated bytes
-                    // are force-flushed at stream EOS/abort sites so the
-                    // connection-level window never permanently leaks.
-                    auto thr = self->StreamingWindowUpdateBytes();
-                    bscfg.on_bytes_consumed =
-                        [owner_weak, sid, thr](size_t n) {
-                            auto handler = owner_weak.lock();
-                            if (!handler) return;
-                            auto s = handler->GetSession();
-                            if (!s) return;
-                            s->ConsumeStreamingRequestBytes(sid, n, thr);
-                        };
-                    // Cross high-water: latch WINDOW_UPDATE suppression on the
-                    // session so the peer's per-stream window drains.
-                    bscfg.on_above_high_water =
-                        [owner_weak, sid]() {
-                            auto handler = owner_weak.lock();
-                            if (!handler) return;
-                            auto s = handler->GetSession();
-                            if (!s) return;
-                            s->SuspendWindowUpdateForStream(sid);
-                        };
-                    // Cross low-water: clear suspension and catch peer up
-                    // with accumulated credit.
-                    bscfg.on_below_low_water =
-                        [owner_weak, sid]() {
-                            auto handler = owner_weak.lock();
-                            if (!handler) return;
-                            auto s = handler->GetSession();
-                            if (!s) return;
-                            s->ResumeWindowUpdateForStream(sid);
-                        };
-                    auto body_stream = std::make_shared<http::ChunkQueueBodyStream>(
-                        std::move(bscfg));
                     stream->GetRequest().body_stream = body_stream;
                     self->DispatchStreamRequestStreaming(stream, frame->hd.stream_id);
                     break;
@@ -724,9 +794,38 @@ static int OnFrameRecvCallback(
         // NGHTTP2_HCAT_HEADERS (trailing headers): check END_STREAM and
         // dispatch the trailer notification to streaming routes.
         if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
-            if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-                stream->MarkEndStream();
+            // RFC 9113 §8.1: trailing HEADERS MUST carry END_STREAM. Without
+            // it, the stream is not yet ending — pushing trailers into the
+            // BodyStream now would prematurely signal end-of-body to the
+            // outbound consumer and the upstream would see a truncated
+            // request as if it were complete. Reject with PROTOCOL_ERROR,
+            // abort the BodyStream so the handler observes ABORTED, and
+            // clear any trailers we'd already accumulated under the
+            // assumption END_STREAM was coming.
+            if (!(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+                logging::Get()->warn(
+                    "HTTP/2 stream {} trailer HEADERS without END_STREAM",
+                    frame->hd.stream_id);
+                stream->pending_trailers().clear();
+                if (stream->route_mode() == http::RouteRequestMode::Streaming) {
+                    auto* body_stream = stream->GetRequest().body_stream.get();
+                    if (body_stream) {
+                        body_stream->Abort("trailer_without_end_stream");
+                    }
+                    self->FinalizeAbortedStreamFlowControl(frame->hd.stream_id);
+                }
+                stream->MarkRejected();
+                int rv = nghttp2_submit_rst_stream(
+                    session, NGHTTP2_FLAG_NONE,
+                    frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
+                if (rv < 0) {
+                    logging::Get()->error(
+                        "nghttp2_submit_rst_stream (trailer-no-end-stream) "
+                        "failed: {}", nghttp2_strerror(rv));
+                }
+                break;
             }
+            stream->MarkEndStream();
 
             // Streaming trailer dispatch.
             if (stream->route_mode() == http::RouteRequestMode::Streaming &&

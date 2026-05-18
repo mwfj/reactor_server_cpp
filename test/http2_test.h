@@ -5367,6 +5367,204 @@ void TestH2_StreamingBodyOverflowDelivers413BeforeRst() {
     }
 }
 
+// Regression covering two related fixes:
+//
+//   (a) #137: streaming route + declared Content-Length > max_body_size
+//       MUST be routed through the deferred-413 path (per
+//       docs/streaming_request.md §body-size enforcement) rather than
+//       an inline RST_STREAM(CANCEL) at HEADERS-receipt. Pre-fix the
+//       client saw a raw RST it could not distinguish from any other
+//       protocol failure.
+//
+//   (b) #135: post-rejection DATA chunks (the client keeps streaming
+//       the body while the 413+RST race onto the wire) MUST refund
+//       the connection-level flow-control window. Pre-fix the
+//       IsRejected() early-return in OnDataChunkRecvCallback dropped
+//       the bytes without calling nghttp2_session_consume_connection,
+//       and under NO_AUTO_WINDOW_UPDATE a large enough rejected upload
+//       could drain the default 65535-byte connection window — leaving
+//       sibling streams on the same connection unable to make progress.
+//
+// The 70 KiB body is chosen so the post-rejection drain (everything
+// except the first chunk, which is refunded inline at the max-body
+// detect site) exceeds the default connection window without #135.
+// A follow-up GET on the same connection must complete normally;
+// without #135 it stalls until the test client's IO_TIMEOUT_MS.
+void TestH2_StreamingDeclaredCLOverflowDelivers413AndConnWindowRefunded() {
+    std::cout << "\n[TEST] H2 streaming: declared CL > max_body_size → 413 + conn window refunded..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        // max_body_size MUST be larger than the H2 default DATA frame size
+        // (~16 KiB) so that post-rejection DATA chunks fall through the
+        // max-body branch (which has its own refund) and reach the
+        // IsRejected() refund path under test. With max_body_size below
+        // the chunk size, each chunk would self-trip max-body and the
+        // post-rejection refund is never exercised.
+        cfg.max_body_size = 64 * 1024;  // 64 KiB
+        HttpServer server(cfg);
+        auto handler_dispatched = std::make_shared<std::atomic<bool>>(false);
+        server.RouteAsync("POST", "/upload",
+            [handler_dispatched](
+                const HttpRequest& req,
+                HttpRouter::InterimResponseSender /*si*/,
+                HttpRouter::ResourcePusher /*pr*/,
+                HttpRouter::StreamingResponseSender /*ss*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                handler_dispatched->store(true, std::memory_order_release);
+                if (!req.body_stream) {
+                    HttpResponse r;
+                    r.Status(200).Body("ok", "text/plain");
+                    complete(std::move(r));
+                    return;
+                }
+                auto shared_complete =
+                    std::make_shared<HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                auto body = req.body_stream;
+                auto pump = std::make_shared<std::function<void()>>();
+                std::weak_ptr<std::function<void()>> pump_weak = pump;
+                *pump = [body, shared_complete, pump_weak]() {
+                    char buf[256];
+                    while (true) {
+                        size_t n = 0;
+                        auto r = body->Read(buf, sizeof(buf), &n);
+                        if (r == http::BodyStreamResult::END_OF_STREAM) {
+                            HttpResponse resp;
+                            resp.Status(200).Body("ok", "text/plain");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::ABORTED) {
+                            HttpResponse resp = HttpResponse::PayloadTooLarge();
+                            resp.Header("X-Request-Body-Limit-Exceeded", "true");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::WOULD_BLOCK) {
+                            if (auto p = pump_weak.lock()) {
+                                body->WaitForData([p]() {
+                                    if (*p) (*p)();
+                                });
+                            }
+                            return;
+                        }
+                    }
+                };
+                (*pump)();
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        // Second route: a small POST with body. The conn-level flow-control
+        // window is consumed by client→server DATA frames; if #135 fails to
+        // refund the rejected upload's bytes, the client's remote-conn-
+        // window stays at zero and this second POST stalls inside the test
+        // client's data_provider until IO_TIMEOUT_MS. A GET would not
+        // exercise the same window (HEADERS frames are not flow-controlled).
+        server.Post("/echo", [](const HttpRequest& req, HttpResponse& res) {
+            res.Status(HttpStatus::OK).Body(req.body, "text/plain");
+        });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            // Body just above max_body_size. Each chunk sits below
+            // max_body_size so the max-body branch (which has its own
+            // refund) does NOT fire — every post-rejection chunk falls
+            // through to the IsRejected() early-return whose refund is
+            // the path under test. On localhost the server's 413+RST
+            // arrives back so fast the client only manages to send one
+            // ~16 KiB chunk per rejected stream before its data_provider
+            // is cancelled — so the test loops a handful of rejected
+            // uploads to accumulate enough unrefunded bytes to drain the
+            // default 65535-byte connection window if #135 is broken.
+            const size_t kBodySize = 80 * 1024;
+            std::string big_body(kBodySize, 'X');
+            std::vector<std::pair<std::string, std::string>> extra = {
+                {"content-length", std::to_string(kBodySize)}
+            };
+            constexpr int kRejectedIterations = 6;
+            for (int i = 0; i < kRejectedIterations && pass; ++i) {
+                auto rj = client.Post("/upload", big_body, extra);
+                if (rj.error) {
+                    pass = false;
+                    err += "rejected req[" + std::to_string(i) +
+                           "]: client error; ";
+                    break;
+                }
+                if (rj.status != HttpStatus::PAYLOAD_TOO_LARGE) {
+                    pass = false;
+                    err += "rejected req[" + std::to_string(i) +
+                           "]: status=" + std::to_string(rj.status) +
+                           " expected 413 — declared CL > max_body_size "
+                           "should route through streaming 413 path, not RST; ";
+                    break;
+                }
+                if (i == 0) {
+                    // First iteration also checks streaming-dispatch + marker
+                    // header — these are constant across loop iterations.
+                    if (!handler_dispatched->load(std::memory_order_acquire)) {
+                        pass = false;
+                        err += "streaming handler never dispatched — pre-"
+                               "dispatch path did not engage the 413 codepath; ";
+                    }
+                    bool saw_marker = false;
+                    for (const auto& [k, v] : rj.headers) {
+                        if (k == "x-request-body-limit-exceeded" && v == "true") {
+                            saw_marker = true;
+                            break;
+                        }
+                    }
+                    if (!saw_marker) {
+                        pass = false;
+                        err += "first req: missing X-Request-Body-Limit-"
+                               "Exceeded marker — 413 came from a different "
+                               "path; ";
+                    }
+                }
+            }
+
+            // Final request on the same connection. Must be a POST so the
+            // client→server DATA path is exercised — if the conn window
+            // was drained by accumulated post-rejection DATA chunks across
+            // the rejected-upload loop above (without #135 refund), the
+            // test client stalls inside its data_provider until
+            // IO_TIMEOUT_MS expires.
+            const std::string echo_body = "hello";
+            auto resp2 = client.Post("/echo", echo_body);
+            if (resp2.error) {
+                pass = false;
+                err += "final req: client error (likely conn window drained); ";
+            }
+            if (resp2.status != HttpStatus::OK) {
+                pass = false;
+                err += "final req: status=" + std::to_string(resp2.status) +
+                       " expected 200 — conn window may not have been "
+                       "refunded after the rejected uploads; ";
+            }
+            if (resp2.body != echo_body) {
+                pass = false;
+                err += "final req: body mismatch — got '" + resp2.body +
+                       "' expected '" + echo_body + "'; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: declared CL > max_body_size → 413 + conn window refunded",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: declared CL > max_body_size → 413 + conn window refunded",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for the off-dispatcher H2 interim hop: if a worker-thread
 // continuation queues send_interim() and then immediately calls complete(),
 // the queued 103 must re-check the request-scoped completed flag on the
@@ -6041,6 +6239,7 @@ void RunAllTests() {
     TestH2_StreamingControlMethodsOffDispatcherThreadRejected();
     TestH2_StreamingSyncResponseAbortsBodyAndResetsStream();
     TestH2_StreamingBodyOverflowDelivers413BeforeRst();
+    TestH2_StreamingDeclaredCLOverflowDelivers413AndConnWindowRefunded();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 
