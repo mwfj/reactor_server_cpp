@@ -277,12 +277,6 @@ static int OnDataChunkRecvCallback(
         logging::Get()->warn("HTTP/2 stream {} body exceeds max size ({})",
                              stream_id, self->MaxBodySize());
         refund_rejected_chunk("max-body");
-        // For streaming routes, signal the consumer side so the proxy
-        // sees an aborted body_stream → 413 PayloadTooLarge.
-        if (stream->route_mode() == http::RouteRequestMode::Streaming) {
-            auto* body_stream = stream->GetRequest().body_stream.get();
-            if (body_stream) body_stream->Abort("body_size_limit_exceeded");
-        }
         // Only count if not already counted: streaming dispatch (HEADERS-
         // complete in streaming mode) bumps the counter early via
         // MarkCounterDecremented; buffered routes only count at dispatch
@@ -293,9 +287,34 @@ static int OnDataChunkRecvCallback(
             self->Callbacks().request_count_callback) {
             self->Callbacks().request_count_callback();
         }
+        // Streaming path: defer the RST_STREAM. The handler reads body_stream;
+        // when Read returns ABORTED it dispatches a terminal 413 back through
+        // SubmitResponse. A synchronous RST here would transition the stream
+        // to NGHTTP2_STREAM_CLOSING in nghttp2 (third_party/nghttp2/
+        // nghttp2_session.c:1164), and the subsequent 413 SubmitResponse
+        // would be rejected by session_predicate_response_headers_send with
+        // STREAM_CLOSING — client never sees the documented 413
+        // (docs/streaming_request.md:86, ProxyTransaction's
+        // RESULT_REQUEST_BODY_LIMIT_EXCEEDED mapping).
+        //
+        // Mark RstPendingAfterResponse on the stream; abort body_stream so
+        // the handler observes the limit and produces the terminal response.
+        // Http2ConnectionHandler::SubmitStreamResponse drains the flag after
+        // SendPendingFrames has serialized the response, guaranteeing the
+        // 413 reaches the wire before the RST closes the slot.
         if (stream->route_mode() == http::RouteRequestMode::Streaming) {
-            self->FinalizeAbortedStreamFlowControl(stream_id);
+            auto* body_stream = stream->GetRequest().body_stream.get();
+            if (body_stream) body_stream->Abort("body_size_limit_exceeded");
+            stream->MarkRejected();
+            stream->MarkRstPendingAfterResponse();
+            // DO NOT FinalizeAbortedStreamFlowControl here — that path is
+            // for streams about to RST inline; we'll refund flow control
+            // when the deferred RST fires.
+            return 0;
         }
+        // Buffered route: no handler is running yet (dispatch is at
+        // message-complete), no 413-via-SubmitResponse path. Stream is
+        // rejected outright — peer sees RST_STREAM immediately.
         stream->MarkRejected();
         int rv = nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                            stream_id, NGHTTP2_CANCEL);

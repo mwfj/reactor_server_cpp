@@ -1367,6 +1367,22 @@ int Http2ConnectionHandler::SubmitStreamResponse(int32_t stream_id,
     session_->SendPendingFrames();
     RecheckShutdownDrainAfterFlush();
 
+    // Deferred RST_STREAM for body-size overflow on streaming routes.
+    // OnDataChunkRecvCallback marks RstPendingAfterResponse when the
+    // inbound body exceeds max_body_size; the handler then delivers a
+    // terminal 413 (or other terminal status) here. The response is now
+    // serialized — the RST closes the stream slot without racing the
+    // response frames on the wire. nghttp2_session_add_rst_stream
+    // transitions the stream to CLOSING immediately, so this MUST run
+    // AFTER SubmitResponse + SendPendingFrames above.
+    if (submit_rv == 0) {
+        auto* stream = session_->FindStream(stream_id);
+        if (stream && stream->RstPendingAfterResponse()) {
+            session_->ResetStream(stream_id, NGHTTP2_NO_ERROR);
+            session_->SendPendingFrames();
+        }
+    }
+
     // Fire the per-stream post-write notifier: response frames are
     // committed to nghttp2's output buffer. Lookup-and-erase keeps
     // the operation idempotent across stream-id reuse.

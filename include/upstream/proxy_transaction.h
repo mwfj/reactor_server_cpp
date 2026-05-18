@@ -701,7 +701,11 @@ private:
     // Pulls chunks until WOULD_BLOCK/EOS/ABORTED.
     void PumpH1StreamingBody_();
 
-    // Emit the chunked terminator block (final chunk marker + trailers + CRLF).
+    // Emit the chunked terminator block (final chunk marker + CRLF).
+    // H1 upstreams silently discard inbound request trailers per the
+    // streaming contract (docs/streaming_request.md §H2 request trailers);
+    // the `trailers` parameter is accepted for call-site symmetry with
+    // H2 but the entries are NOT written on the wire.
     // Sets h1_streaming_send_complete_ = true BEFORE the final SendRaw so
     // OnUpstreamWriteComplete's guard permits the AWAITING_RESPONSE transition.
     void EmitH1ChunkedTrailers_(

@@ -132,6 +132,19 @@ public:
     bool FinalResponseSubmitted() const { return final_response_submitted_; }
     void MarkFinalResponseSubmitted() { final_response_submitted_ = true; }
 
+    // Streaming-route body-size enforcement: set in OnDataChunkRecvCallback
+    // when the inbound body exceeds max_body_size. The handler will deliver
+    // a 413 response via the normal async path; SubmitResponse must then
+    // queue a RST_STREAM AFTER the response has been serialized so the
+    // peer can't keep streaming bytes into a half-closed stream slot. A
+    // direct RST_STREAM submission at chunk-recv time would transition the
+    // stream to CLOSING in nghttp2 (third_party/nghttp2/nghttp2_session.c:1164)
+    // and cancel the pending 413 — see the analogous fix at
+    // server/http2_session.cc::DispatchStreamRequestStreaming for the
+    // deferred-RST pattern. Dispatcher-thread-only.
+    bool RstPendingAfterResponse() const { return rst_pending_after_response_; }
+    void MarkRstPendingAfterResponse() { rst_pending_after_response_ = true; }
+
     // Body size tracking for limit enforcement
     size_t AccumulatedBodySize() const { return accumulated_body_size_; }
 
@@ -196,6 +209,7 @@ private:
     bool response_headers_sent_ = false;
     bool response_complete_ = false;
     bool final_response_submitted_ = false;
+    bool rst_pending_after_response_ = false;
     size_t accumulated_body_size_ = 0;
     size_t accumulated_header_size_ = 0;
     bool rejected_ = false;

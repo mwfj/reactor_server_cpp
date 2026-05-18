@@ -5243,6 +5243,130 @@ void TestH2_StreamingSyncResponseAbortsBodyAndResetsStream() {
     }
 }
 
+// Regression: streaming route + body-size overflow MUST deliver the
+// documented 413 to the client before the inbound stream is reset. The
+// pre-fix code submitted RST_STREAM synchronously in OnDataChunkRecv,
+// transitioning the stream to CLOSING in nghttp2; the subsequent 413
+// SubmitResponse from the handler's terminal-error path was then
+// rejected (session_predicate_response_headers_send → STREAM_CLOSING),
+// silently dropping the client-visible 413.
+void TestH2_StreamingBodyOverflowDelivers413BeforeRst() {
+    std::cout << "\n[TEST] H2 streaming: body overflow delivers 413 before RST_STREAM..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.max_body_size = 256;  // tiny — easy to exceed
+        HttpServer server(cfg);
+        // Streaming POST route. The handler drains body_stream and
+        // responds 413 when Read returns ABORTED — mirrors the proxy's
+        // RESULT_REQUEST_BODY_LIMIT_EXCEEDED → 413 mapping.
+        auto handler_dispatched = std::make_shared<std::atomic<bool>>(false);
+        server.RouteAsync("POST", "/upload",
+            [handler_dispatched](
+                const HttpRequest& req,
+                HttpRouter::InterimResponseSender /*si*/,
+                HttpRouter::ResourcePusher /*pr*/,
+                HttpRouter::StreamingResponseSender /*ss*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                handler_dispatched->store(true, std::memory_order_release);
+                if (!req.body_stream) {
+                    HttpResponse r;
+                    r.Status(200).Body("ok", "text/plain");
+                    complete(std::move(r));
+                    return;
+                }
+                // Drain via self-owning pump (weak_ptr capture breaks the
+                // shared_ptr self-cycle; see streaming_request_test.h
+                // TestH1Streaming_BodyOverflow for the canonical pattern).
+                auto shared_complete =
+                    std::make_shared<HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                auto body = req.body_stream;
+                auto pump = std::make_shared<std::function<void()>>();
+                std::weak_ptr<std::function<void()>> pump_weak = pump;
+                *pump = [body, shared_complete, pump_weak]() {
+                    char buf[256];
+                    while (true) {
+                        size_t n = 0;
+                        auto r = body->Read(buf, sizeof(buf), &n);
+                        if (r == http::BodyStreamResult::END_OF_STREAM) {
+                            HttpResponse resp;
+                            resp.Status(200).Body("ok", "text/plain");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::ABORTED) {
+                            HttpResponse resp = HttpResponse::PayloadTooLarge();
+                            resp.Header("X-Request-Body-Limit-Exceeded", "true");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::WOULD_BLOCK) {
+                            if (auto p = pump_weak.lock()) {
+                                body->WaitForData([p]() {
+                                    if (*p) (*p)();
+                                });
+                            }
+                            return;
+                        }
+                    }
+                };
+                (*pump)();
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            // 4 KiB body — well above the 256-byte limit.
+            std::string big_body(4 * 1024, 'X');
+            auto resp = client.Post("/upload", big_body);
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.status != HttpStatus::PAYLOAD_TOO_LARGE) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) +
+                       " expected 413 — RST may have raced response; ";
+            }
+            // Header from the handler's ABORTED branch confirms the 413
+            // came from the streaming-route abort path (not, say, an
+            // early-rejection middleware fallback).
+            bool saw_marker = false;
+            for (const auto& [k, v] : resp.headers) {
+                if (k == "x-request-body-limit-exceeded" && v == "true") {
+                    saw_marker = true;
+                    break;
+                }
+            }
+            if (!saw_marker) {
+                pass = false;
+                err += "missing X-Request-Body-Limit-Exceeded marker — "
+                       "413 came from a different path; ";
+            }
+            if (!handler_dispatched->load()) {
+                pass = false;
+                err += "streaming handler never dispatched; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: body overflow delivers 413 before RST_STREAM",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: body overflow delivers 413 before RST_STREAM",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for the off-dispatcher H2 interim hop: if a worker-thread
 // continuation queues send_interim() and then immediately calls complete(),
 // the queued 103 must re-check the request-scoped completed flag on the
@@ -5916,6 +6040,7 @@ void RunAllTests() {
     TestH2_StreamingEmptyEndInlineDoesNotResetStream();
     TestH2_StreamingControlMethodsOffDispatcherThreadRejected();
     TestH2_StreamingSyncResponseAbortsBodyAndResetsStream();
+    TestH2_StreamingBodyOverflowDelivers413BeforeRst();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 

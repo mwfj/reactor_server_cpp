@@ -1405,29 +1405,26 @@ namespace {
 // te / transfer-encoding / upgrade / trailer / proxy-authenticate /
 // proxy-authorization). Also strips Host because the H2 wire conveys
 // it via :authority.
-bool IsForbiddenH2RequestHeader(const std::string& lower_name) {
-    // HeaderRewriter::IsHopByHopHeader covers the RFC 7230 §6.1 set
-    // (connection, keep-alive, proxy-*, te, transfer-encoding, trailer,
-    // upgrade); host is conveyed via :authority on the H2 wire; expect
-    // is illegal on H2 per RFC 9113 §8.2.2.
-    //
-    // content-length is NOT hop-by-hop (it is end-to-end per RFC 9110
-    // §8.6) and HeaderRewriter does not strip it, but on the H2 wire CL
-    // is at best informational — END_STREAM signals end-of-body and
-    // nghttp2's HTTP messaging enforcement validates emitted DATA bytes
-    // against the data-source provider, not against a header value.
-    // Worse, on the streaming path (chunked-style upload via
-    // SubmitStreamingRequest) keeping a stale CL from the inbound side
-    // would advertise an N that may not match what we actually emit if
-    // the body is aborted/truncated mid-stream — a peer-visible framing
-    // inconsistency. Strip unconditionally for defense-in-depth across
-    // both the buffered SubmitRequest path AND the streaming
-    // SubmitStreamingRequest path; H1 SendH1StreamingRequest_ already
-    // does the erase on its own caller-stripped list.
-    return HeaderRewriter::IsHopByHopHeader(lower_name) ||
-           lower_name == "host" ||
-           lower_name == "expect" ||
-           lower_name == "content-length";
+//
+// content-length is NOT hop-by-hop (it is end-to-end per RFC 9110 §8.6).
+// For BUFFERED submission, the body size is known at submit time and
+// inbound CL invariably equals the captured body's size (the inbound
+// layer would not have produced a buffered body of N bytes if CL said
+// M); RFC 9113 §8.1.2.6 explicitly permits content-length on H2 requests
+// for this case. Preserve it so upstreams that key admission on CL
+// (e.g. early-reject on Content-Length > limit) get the information.
+// For STREAMING submission, the inbound CL is unreliable — the actual
+// emitted-body length is not known until END_STREAM and a mid-stream
+// abort/truncation would leave a framing inconsistency. Strip in that
+// path; END_STREAM is the only authoritative end-of-body signal.
+bool IsForbiddenH2RequestHeader(const std::string& lower_name, bool streaming) {
+    if (HeaderRewriter::IsHopByHopHeader(lower_name) ||
+        lower_name == "host" ||
+        lower_name == "expect") {
+        return true;
+    }
+    if (streaming && lower_name == "content-length") return true;
+    return false;
 }
 
 }  // namespace
@@ -1510,7 +1507,7 @@ int32_t UpstreamH2Connection::SubmitRequest(
     size_t i = 0;
     for (const auto& kv : headers) {
         const std::string& lower = lower_names[i++];
-        if (IsForbiddenH2RequestHeader(lower)) continue;
+        if (IsForbiddenH2RequestHeader(lower, /*streaming=*/false)) continue;
         push_nv(lower.data(), lower.size(),
                 kv.second.data(), kv.second.size());
     }
@@ -1637,14 +1634,17 @@ int32_t UpstreamH2Connection::SubmitStreamingRequest(
     size_t i = 0;
     for (const auto& kv : rewritten_headers) {
         const std::string& lower = lower_names[i++];
-        // IsForbiddenH2RequestHeader covers hop-by-hop (TE, transfer-
-        // encoding, trailer, upgrade, etc.) plus host, expect, and
-        // content-length. The H1 SendH1StreamingRequest_ path
-        // additionally erases content-length / transfer-encoding /
-        // trailer from rewritten_headers_ upstream of the codec; this
-        // gate enforces the same invariant for the H2 streaming path
-        // without relying on caller bookkeeping.
-        if (IsForbiddenH2RequestHeader(lower)) continue;
+        // IsForbiddenH2RequestHeader (streaming=true) covers hop-by-hop
+        // (TE, transfer-encoding, trailer, upgrade, etc.) plus host,
+        // expect, and content-length. CL is stripped on the streaming
+        // path because the emitted body length is not known at submit
+        // time and a mid-stream abort/truncation would leave a framing
+        // inconsistency. The H1 SendH1StreamingRequest_ path additionally
+        // erases content-length / transfer-encoding / trailer from
+        // rewritten_headers_ upstream of the codec; this gate enforces
+        // the same invariant for the H2 streaming path without relying
+        // on caller bookkeeping.
+        if (IsForbiddenH2RequestHeader(lower, /*streaming=*/true)) continue;
         push_nv(lower.data(), lower.size(),
                 kv.second.data(), kv.second.size());
     }

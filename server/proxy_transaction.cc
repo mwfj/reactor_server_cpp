@@ -1398,31 +1398,23 @@ void ProxyTransaction::EmitH1ChunkedTrailers_(
     auto transport = uc->GetTransport();
     if (!transport) return;
 
-    // Serialize the entire terminator block (last-chunk marker + trailer
-    // lines + final CRLF) into a single string BEFORE SendRaw. Two reasons:
-    //
-    // 1. Synchronous OnUpstreamWriteComplete race: SendRaw's fast-path
-    //    direct-write fires the completion callback synchronously per call.
-    //    If we set h1_streaming_send_complete_=true before the first of
-    //    multiple SendRaws, OnUpstreamWriteComplete on the FIRST partial
-    //    drain would observe the gate open and transition state to
-    //    AWAITING_RESPONSE before the trailer + final CRLF are on the wire.
-    //
-    // 2. Atomic terminator: peers must see "0\r\n...trailers...\r\n" as a
-    //    single framing unit. A partial transport write that leaves the
-    //    block mid-emit forces the peer's parser to wait for more bytes;
-    //    a single SendRaw lets the transport's drain logic handle the
-    //    partial-write internally without any framing ambiguity.
+    // H1 upstreams silently discard inbound request trailers per the
+    // streaming contract (docs/streaming_request.md §H2 request trailers,
+    // "H1 upstreams do not receive trailers"). Many H1 origin servers
+    // mishandle chunked trailers, and the existing rewritten-headers pass
+    // already strips the inbound `Trailer` header so the upstream is not
+    // told to expect any. Emitting fields here would silently violate the
+    // contract clients negotiated. Single atomic terminator avoids the
+    // synchronous-OnUpstreamWriteComplete race that splitting SendRaw
+    // calls would expose.
+    if (!trailers.empty()) {
+        logging::Get()->debug(
+            "H1 upstream streaming: discarding {} request trailer field(s) per contract",
+            trailers.size());
+    }
     std::string terminator;
     if (!omit_last_chunk_marker) {
         terminator.append("0\r\n");
-    }
-    auto filtered = http::SanitizeHttp2TrailerFieldsForOutboundEmit(trailers);
-    for (const auto& [name, value] : filtered) {
-        terminator.append(name);
-        terminator.append(": ");
-        terminator.append(value);
-        terminator.append("\r\n");
     }
     terminator.append("\r\n");
 
@@ -2086,9 +2078,20 @@ bool ProxyTransaction::OnHeaders(
             // Invalidate the send-stall closure. Otherwise it fires
             // after the budget elapses with state in AWAITING_RESPONSE /
             // RECEIVING_BODY and spuriously surfaces RESPONSE_TIMEOUT
-            // against a stream whose headers are already in hand.
+            // against a stream whose headers are already in hand. The
+            // generation bump alone suffices: the closure consults
+            // h2_send_stall_generation_ on fire and no-ops on mismatch.
+            //
+            // Do NOT flip h2_request_fully_sent_ here — the inbound H2
+            // body producer may still be alive (peer responded BEFORE
+            // client END_STREAM). Cleanup's body_stream-abort gate
+            // (request_fully_sent_at_cleanup) reads this flag to decide
+            // whether to abort the inbound BodyStream; setting true here
+            // would let an early 413/404 leak the producer with no
+            // consumer → wedged inbound dispatcher. The true setter is
+            // OnRequestSubmitted, fired only when we actually emit
+            // END_STREAM on the outbound stream.
             ++h2_send_stall_generation_;
-            h2_request_fully_sent_ = true;
         }
         // Header phase done; body phase is governed by stream timers.
         ClearResponseTimeout();
