@@ -1407,6 +1407,22 @@ void HttpConnectionHandler::HandleUpgradedData(const std::string& data) {
 void HttpConnectionHandler::HandleParseError() {
     streaming_upload_in_flight_ = false;
     logging::Get()->warn("HTTP parse error fd={}: {}", conn_->fd(), parser_.GetError());
+
+    // Streaming early-dispatch path: a deferred handler is still running
+    // and owns the response. The parser error (typically BODY_TOO_LARGE)
+    // already aborted body_stream, which the handler will observe and use
+    // to deliver the terminal 413 via CompleteAsyncResponse. Sending a
+    // second direct 413 here would put two responses on the wire and
+    // double-count the request (counted once at the dispatch site).
+    // Force Connection: close on the eventual deferred response (parser
+    // is unrecoverable) by clearing deferred_keep_alive_.
+    // Gate on BOTH flags: if the handler already completed (deferred not
+    // pending), no async response is coming — fall through to direct send.
+    if (streaming_dispatched_ && deferred_response_pending_) {
+        deferred_keep_alive_ = false;
+        return;
+    }
+
     // Count parse errors as requests for stats consistency with HTTP/2
     if (callbacks_.request_count_callback) {
         callbacks_.request_count_callback();
@@ -2314,6 +2330,26 @@ bool HttpConnectionHandler::DispatchStreamingRouteFromHeaders() {
         HttpResponse resp = HttpResponse::BadRequest("Missing Host header");
         resp.Header("Connection", "close");
         SendResponse(resp);
+        CloseConnection();
+        return false;
+    }
+
+    // Early Content-Length cap reject. Must run BEFORE Expect handling so
+    // we don't send 100 Continue right before rejecting (which would have
+    // the client start uploading a body we've already decided to reject)
+    // AND before handler dispatch so the route never commits to an upstream.
+    // Mirrors HandleIncompleteRequest's buffered-path check and
+    // OnDataChunkRecvCallback's H2 check.
+    if (max_body_size_ > 0 && req.content_length > max_body_size_) {
+        logging::Get()->warn(
+            "Early reject: Content-Length ({}) exceeds limit ({}) fd={}",
+            req.content_length, max_body_size_, conn_->fd());
+        if (auto* body_stream = req.body_stream.get()) {
+            body_stream->Abort("content_length_exceeds_limit");
+        }
+        HttpResponse err = HttpResponse::PayloadTooLarge();
+        err.Header("Connection", "close");
+        SendResponse(err);
         CloseConnection();
         return false;
     }

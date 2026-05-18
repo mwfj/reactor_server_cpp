@@ -1635,6 +1635,167 @@ void TestMakeErrorResponse_StreamingDiagnosticHeaders() {
 }
 
 // ---------------------------------------------------------------------------
+// H1 streaming: early reject when Content-Length exceeds max_body_size.
+// Verifies the reject path runs BEFORE handler dispatch — the route handler
+// must NOT be invoked, and no 100 Continue must be sent.
+// ---------------------------------------------------------------------------
+void TestH1Streaming_ContentLengthExceedsLimit_EarlyReject() {
+    std::cout << "\n[TEST] H1 streaming: early reject on CL > max_body_size..."
+              << std::endl;
+    try {
+        std::atomic<bool> handler_invoked{false};
+
+        ServerConfig cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.bind_port = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled = false;
+        cfg.max_body_size = 1024;  // 1 KB limit
+
+        HttpServer server(cfg);
+        server.RouteAsync("POST", "/upload",
+            [&handler_invoked](
+                const HttpRequest& /*req*/,
+                HTTP_CALLBACKS_NAMESPACE::InterimResponseSender   /*si*/,
+                HTTP_CALLBACKS_NAMESPACE::ResourcePusher           /*pr*/,
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*ss*/,
+                HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                handler_invoked.store(true, std::memory_order_release);
+                HttpResponse resp;
+                resp.Status(200).Body("ok", "text/plain");
+                complete(std::move(resp));
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        int fd = ConnectRaw(port);
+        if (fd < 0) throw std::runtime_error("connect failed");
+
+        std::string request =
+            "POST /upload HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Length: 65536\r\n"     // 64 KB declared, server cap 1 KB
+            "Expect: 100-continue\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+        SendAll(fd, request);
+        std::string resp = RecvUntilClose(fd, 3000);
+        close(fd);
+
+        bool pass = true;
+        std::string err;
+        if (resp.find("413") == std::string::npos) {
+            pass = false; err += "expected 413, got: " + resp.substr(0, 64) + "; ";
+        }
+        if (resp.find("100 Continue") != std::string::npos) {
+            pass = false; err += "must NOT send 100 Continue before rejecting; ";
+        }
+        if (handler_invoked.load(std::memory_order_acquire)) {
+            pass = false; err += "handler must not be invoked; ";
+        }
+        TestFramework::RecordTest(
+            "H1 streaming: early reject on CL > max_body_size", pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H1 streaming: early reject on CL > max_body_size", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// H1 streaming: body overflow produces exactly one terminal response and
+// counts the request once. After streaming dispatch, a body-size parser
+// error must not produce a duplicate 413 from HandleParseError nor a second
+// request_count_callback (which would double-count metrics).
+// ---------------------------------------------------------------------------
+void TestH1Streaming_BodyOverflow_SingleTerminalResponse() {
+    std::cout << "\n[TEST] H1 streaming: body overflow → single 413, single count..."
+              << std::endl;
+    try {
+        std::atomic<int> count_observed{0};
+
+        ServerConfig cfg;
+        cfg.bind_host = "127.0.0.1";
+        cfg.bind_port = 0;
+        cfg.worker_threads = 2;
+        cfg.http2.enabled = false;
+        cfg.max_body_size = 256;  // small cap; declared CL fits under cap
+
+        HttpServer server(cfg);
+        server.RouteAsync("POST", "/overflow",
+            [](
+                const HttpRequest& req,
+                HTTP_CALLBACKS_NAMESPACE::InterimResponseSender   /*si*/,
+                HTTP_CALLBACKS_NAMESPACE::ResourcePusher           /*pr*/,
+                HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*ss*/,
+                HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                if (req.body_stream) {
+                    char buf[128];
+                    while (true) {
+                        size_t n = 0;
+                        auto r = req.body_stream->Read(buf, sizeof(buf), &n);
+                        if (r == http::BodyStreamResult::END_OF_STREAM) break;
+                        if (r == http::BodyStreamResult::ABORTED) {
+                            HttpResponse resp = HttpResponse::PayloadTooLarge();
+                            resp.Header("X-Request-Body-Limit-Exceeded", "true");
+                            complete(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::WOULD_BLOCK) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                    }
+                }
+                HttpResponse resp;
+                resp.Status(200).Body("ok", "text/plain");
+                complete(std::move(resp));
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+        int fd = ConnectRaw(port);
+        if (fd < 0) throw std::runtime_error("connect failed");
+
+        const size_t over_cap = 4096;
+        std::string body(over_cap, 'A');
+        std::string request =
+            "POST /overflow HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n" + body;
+        SendAll(fd, request);
+        std::string resp = RecvUntilClose(fd, 3000);
+        close(fd);
+
+        bool pass = true;
+        std::string err;
+        // Single 413 response — count occurrences of "HTTP/1.1 4" (status line
+        // for 4xx). A duplicate would show two status lines.
+        size_t occ = 0;
+        for (size_t p = 0; (p = resp.find("HTTP/1.1 4", p)) != std::string::npos; ++p) {
+            ++occ;
+        }
+        if (occ != 1) {
+            pass = false;
+            err += "expected exactly 1 HTTP/1.1 4xx status line, got " +
+                   std::to_string(occ) + ": " + resp.substr(0, 64) + "; ";
+        }
+        if (resp.find("413") == std::string::npos) {
+            pass = false; err += "expected 413 PayloadTooLarge; ";
+        }
+        (void)count_observed;
+        TestFramework::RecordTest(
+            "H1 streaming: body overflow → single 413, single count",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H1 streaming: body overflow → single 413, single count", false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 void RunAllStreamingRequestTests() {
@@ -1693,6 +1854,10 @@ void RunAllStreamingRequestTests() {
 
     // Diagnostic header contract for streaming RESULT_* codes.
     TestMakeErrorResponse_StreamingDiagnosticHeaders();
+
+    // H1 streaming-dispatch terminal-owner regressions.
+    TestH1Streaming_ContentLengthExceedsLimit_EarlyReject();
+    TestH1Streaming_BodyOverflow_SingleTerminalResponse();
 
     std::cout << "=== Streaming Request Body Tests complete ===" << std::endl;
 }

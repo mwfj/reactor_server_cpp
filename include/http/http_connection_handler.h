@@ -235,11 +235,10 @@ public:
     void StashDeferredBytes(const std::string& data);
 
     // Clear the streaming-upload-in-flight flag. Called from the async-resume
-    // aborted-body guard (H.3) when the guard fires on the dispatcher thread.
-    // Mirrors the flag clear at the other four terminal sites enumerated at
-    // the field declaration above. H2's no-op counterpart on
-    // Http2ConnectionHandler keeps the generic MakeAsyncResumeCallback
-    // template clean.
+    // aborted-body guard when it fires on the dispatcher thread. Mirrors the
+    // flag clear at the other terminal sites enumerated at the field
+    // declaration. H2's no-op counterpart on Http2ConnectionHandler keeps the
+    // generic MakeAsyncResumeCallback template clean.
     void ClearStreamingUploadInFlight() { streaming_upload_in_flight_ = false; }
 
     // True if an async response is currently pending delivery.
@@ -298,7 +297,7 @@ private:
     //   (b) HandleParseError at function entry
     //   (c) CloseConnection at function entry
     //   (d) parser_.Reset() site (symmetric with sent_100_continue_)
-    //   (e) async-resume aborted-body guard (H.3)
+    //   (e) async-resume aborted-body guard
     bool streaming_upload_in_flight_ = false;
 
     // Watermark-callback gate: a pause without a live consumer would deadlock

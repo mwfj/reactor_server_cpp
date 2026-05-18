@@ -284,6 +284,19 @@ jobs:
         # semantics and Apple-specific threading scheduling that can mask
         # races not caught by Linux alone.
         run: ./test_runner h2_upstream
+      - name: Test - streaming_request (real-socket H1/H2 streaming + watermark backpressure)
+        # Boots HttpServer + upstream + ChunkQueueBodyStream pipeline.
+        # Exercises producer/consumer dispatcher crossings, read-pump
+        # IncReadDisable/DecReadDisable, and H2 WINDOW_UPDATE suspend/resume —
+        # all on the dispatcher-driven socket path so kqueue vs epoll edge
+        # differences (especially around partial reads + EAGAIN) can surface.
+        run: ./test_runner streaming_request
+      - name: Test - h2_trailer (H2 request trailer dispatch + sanitization)
+        # Boots a real HttpServer and exercises the NGHTTP2 trailer block
+        # callback path against live sockets; trailer parsing is socket-bound
+        # and the END_STREAM-on-HEADERS framing classifier interacts with
+        # platform-specific I/O readiness boundaries.
+        run: ./test_runner h2_trailer
       - name: Test - obs_e2e (real-socket observability end-to-end)
         # Boots a real HttpServer and verifies SERVER spans / finalize
         # counters / 404 finalize. Socket-bound; the rest of the obs_*
