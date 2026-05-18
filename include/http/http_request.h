@@ -30,15 +30,13 @@ struct HttpRequest {
     // copy ctor (async-resume sites make_shared<HttpRequest>(req)).
     // When non-null, `body` is empty — chunks flow through the stream.
     std::shared_ptr<http::BodyStream> body_stream;
-    // Request trailers populated at end-of-stream for H2 streaming routes.
-    // Empty for H1 streaming and for all buffered routes.
-    std::vector<std::pair<std::string, std::string>> request_trailers;
     // max_body_size enforcement on streaming routes (cumulative bytes
     // pushed to body_stream).
     size_t pushed_body_bytes = 0;
-    // Per-request upstream deadline override (ms). 0 → use ProxyConfig
-    // default. Set by middleware (e.g. gRPC grpc-timeout decorator)
-    // BEFORE ProxyHandler::Handle runs.
+    // RESERVED: per-request upstream deadline override (ms). 0 → use
+    // ProxyConfig default. Intended for the gRPC grpc-timeout decorator
+    // path; no middleware writes this today, and ProxyTransaction does
+    // not read it. Kept as the API surface for the eventual gRPC wiring.
     int upstream_deadline_override_ms = 0;
     bool keep_alive = true;
     bool upgrade = false;         // Connection: Upgrade (for WebSocket)
@@ -226,7 +224,6 @@ struct HttpRequest {
         headers.clear();
         body.clear();
         body_stream.reset();
-        request_trailers.clear();
         pushed_body_bytes = 0;
         upstream_deadline_override_ms = 0;
         keep_alive = true;

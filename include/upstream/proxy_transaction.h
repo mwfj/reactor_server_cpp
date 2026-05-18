@@ -487,16 +487,22 @@ private:
 
     // Cumulative DATA bytes whose transport-drain has been observed
     // (OnRequestBodyProgress). Drives the body-on-wire retry-denial
-    // check (RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE).
+    // check (RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE). Latches for
+    // the transaction lifetime — NEVER reset by ResetForRetryAttempt
+    // because the retry-denial gate must remain truthful across the
+    // attempt boundary (a future replayable body source would still
+    // honor the latch; this one represents irrevocable wire progress).
     size_t body_bytes_written_to_upstream_ = 0;
 
     // Cumulative bytes read from the body_stream source (consumer-side
     // BodyStream::Read). Drives the source-consumed retry-denial check
     // (RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED). Bumped via
-    // OnRequestBodySourceConsumed virtual.
+    // OnRequestBodySourceConsumed virtual. Latches for the transaction
+    // lifetime — see body_bytes_written_to_upstream_ above; same rule.
     size_t body_bytes_read_from_source_ = 0;
     // Latched once Read drains any bytes — short-circuit for retry
-    // policy checks that don't need exact count.
+    // policy checks that don't need exact count. Latches for the
+    // transaction lifetime; NEVER reset across retries.
     bool source_consumed_ = false;
 
     // True after request HEADERS hit the wire. Drives the headers-on-
@@ -504,9 +510,11 @@ private:
     // (RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED).
     bool request_headers_submitted_ = false;
 
-    // Per-request upstream-deadline override (ms). 0 = use ProxyConfig
-    // default. Plumbed in by middleware (e.g., gRPC `grpc-timeout`
-    // decorator) BEFORE Start(). Read once at DispatchH1/DispatchH2.
+    // RESERVED: per-request upstream-deadline override (ms). 0 = use
+    // ProxyConfig default. API surface for the future gRPC
+    // `grpc-timeout` decorator; no middleware writes this today and
+    // neither DispatchH1 nor DispatchH2 reads it. Kept as the wiring
+    // point for the eventual gRPC plumbing.
     int upstream_deadline_override_ms_ = 0;
 
     // H1-side parallel to h2_request_fully_sent_. Set when the H1

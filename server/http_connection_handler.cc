@@ -1424,6 +1424,12 @@ void HttpConnectionHandler::HandleParseError() {
     // direct-send when no deferred handler exists.
     if (streaming_dispatched_ && deferred_response_pending_) {
         streaming_dispatched_ = false;
+        // Also clear the pipelined-stash gate so the post-replay parser
+        // reset path (OnRawData @ ~L2681) doesn't misfire against state
+        // left over from this aborted request. No concrete trigger today
+        // because subsequent on_headers_complete resets the gate, but
+        // defensive — keeps the two streaming-dispatch flags in lockstep.
+        streaming_dispatch_pending_ = false;
         deferred_keep_alive_ = false;
         return;
     }

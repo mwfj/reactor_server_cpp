@@ -2493,6 +2493,11 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             logging::Get()->debug(
                 "streaming retry blocked: source consumed drained={}",
                 body_bytes_written_to_upstream_);
+            // Connection hygiene: H1 Cleanup only poisons on
+            // poison_connection_; without it the half-sent chunked
+            // request returns to the idle pool and corrupts reuse.
+            // H2 ignores the flag (Cleanup unconditionally RST_STREAMs).
+            poison_connection_ = true;
             DeliverTerminalError(RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED,
                                  "streaming source consumed before failure");
             return;
@@ -2501,6 +2506,7 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             logging::Get()->debug(
                 "streaming retry blocked: body bytes on wire count={}",
                 body_bytes_written_to_upstream_);
+            poison_connection_ = true;
             DeliverTerminalError(RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE,
                                  "streaming body bytes already on wire");
             return;
@@ -2509,6 +2515,7 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             logging::Get()->debug(
                 "streaming retry blocked: non-idempotent with HEADERS queued method={}",
                 method_);
+            poison_connection_ = true;
             DeliverTerminalError(RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED,
                                  "non-idempotent method with HEADERS already queued");
             return;
@@ -2717,6 +2724,18 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             }
         }
         return;
+    }
+
+    // Streaming request reached this point with HEADERS already on the wire
+    // but ShouldRetry refused the retry (budget exhausted, non-retryable
+    // condition). H1 Cleanup only poisons the connection when
+    // poison_connection_=true; without it, the half-sent chunked request
+    // returns to the idle pool and corrupts the next reuse. H2 Cleanup
+    // already issues RST_STREAM unconditionally, so poison_connection_ is
+    // a no-op there but harmless. The streaming_tombstone_pending check
+    // (computed in the streaming block above) captures exactly this case.
+    if (streaming_tombstone_pending) {
+        poison_connection_ = true;
     }
 
     // Retry not allowed -- map condition to appropriate error response

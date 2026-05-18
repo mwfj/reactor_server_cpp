@@ -50,6 +50,7 @@
 #include "upstream/retry_policy.h"
 #include "http/http_request.h"
 #include "http/streaming_response_sender.h"
+#include "http/body_stream_impl.h"
 #include <fstream>
 #include <iterator>
 #include "upstream/upstream_connection.h"
@@ -2882,6 +2883,283 @@ void TestC6ResetStreamSinkDetachSurvivesDtor() {
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
             "H2Upstream C6: ResetStream detaches sink — dtor's FailAllStreams skips it",
+            false, e.what());
+    }
+}
+
+// Probe sink for the SR-series streaming-request lifetime tests below.
+// Overrides MakeDeferredErrorCallback so the streaming submit path populates
+// streaming_abort_callback with a function we can observe through invocation
+// flags. Lifetime constraint: declare BEFORE the UpstreamH2Connection that
+// uses it so dtor order tears the connection down first.
+struct DeferredCallbackProbeSink :
+    public UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink {
+    int factory_calls = 0;
+    int deferred_fired = 0;
+    int onerror_calls = 0;
+    int last_code = 0;
+    std::string last_msg;
+
+    bool OnHeaders(const UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseHead&) override { return true; }
+    bool OnBodyChunk(const char*, size_t) override { return true; }
+    void OnTrailers(const std::vector<std::pair<std::string, std::string>>&) override {}
+    void OnComplete() override {}
+    void OnError(int code, const std::string& msg) override {
+        ++onerror_calls;
+        last_code = code;
+        last_msg = msg;
+    }
+    std::function<void(int, const std::string&)> MakeDeferredErrorCallback() override {
+        ++factory_calls;
+        return [this](int code, const std::string& msg) {
+            ++deferred_fired;
+            last_code = code;
+            last_msg = msg;
+        };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// SR1 — streaming_abort_callback is populated at SubmitStreamingRequest time
+// (NOT lazily inside the data-source ABORTED branch). The submit-time
+// construction is mandatory for the WOULD_BLOCK-then-resume path where the
+// ABORTED branch can fire after DispatchH2 returns and no strong owner is
+// on the stack to safely call sink->MakeDeferredErrorCallback().
+// ---------------------------------------------------------------------------
+void TestSR1_StreamingAbortCallbackPopulatedAtSubmit() {
+    std::cout << "\n[TEST] H2Upstream SR1: streaming_abort_callback populated at submit time..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec   = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 0;
+
+        DeferredCallbackProbeSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream SR1: streaming_abort_callback populated at submit time",
+                false, "Init failed");
+            return;
+        }
+
+        // Empty body_stream (no chunks, not closed, not aborted) — first
+        // read returns WOULD_BLOCK so the stream stays in flight after submit.
+        http::ChunkQueueBodyStream::Config bs_cfg;
+        auto body = std::make_shared<http::ChunkQueueBodyStream>(bs_cfg);
+
+        int32_t sid = conn.SubmitStreamingRequest(
+            &sink, "POST", "http", "example.com", "/", {}, false, body);
+
+        bool pass = true;
+        std::string err;
+        if (sid < 1) {
+            pass = false; err += "SubmitStreamingRequest failed sid=" +
+                                 std::to_string(sid) + "; ";
+        } else {
+            if (sink.factory_calls != 1) {
+                pass = false;
+                err += "MakeDeferredErrorCallback factory_calls=" +
+                       std::to_string(sink.factory_calls) + " expected 1; ";
+            }
+            auto* stream = conn.GetStream(sid);
+            if (!stream) {
+                pass = false; err += "GetStream returned null; ";
+            } else if (!stream->streaming_abort_callback) {
+                pass = false;
+                err += "streaming_abort_callback is empty after submit; ";
+            }
+        }
+        // Drain: abort the body so the WaitForData callback that the read
+        // path armed does not fire after `body` is destroyed below.
+        body->Abort("test cleanup");
+        TestFramework::RecordTest(
+            "H2Upstream SR1: streaming_abort_callback populated at submit time",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream SR1: streaming_abort_callback populated at submit time",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SR2 — Submit-time abort: when the body_stream is already aborted at
+// SubmitStreamingRequest time, the data-source ABORTED branch must (a)
+// classify the abort (body_size_limit_exceeded → REQUEST_BODY_LIMIT_EXCEEDED),
+// (b) defer terminal delivery via OnStreamClose, (c) detach the sink, and (d)
+// stage the stream for the deferred-erase walker. Synchronous-fallback path
+// (no dispatcher) verifies the sink receives the terminal OnError exactly once.
+// ---------------------------------------------------------------------------
+void TestSR2_StreamingSubmitTimeAbortDeliversTerminalError() {
+    std::cout << "\n[TEST] H2Upstream SR2: submit-time abort dispatches terminal OnError via OnStreamClose..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec   = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 0;
+
+        RecordingSink sink;  // empty MakeDeferredErrorCallback → sync fallback
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream SR2: submit-time abort dispatches terminal OnError via OnStreamClose",
+                false, "Init failed");
+            return;
+        }
+
+        // Pre-aborted body — the very first read_callback inside FlushSend's
+        // mem_send2 pass will hit the ABORTED branch.
+        http::ChunkQueueBodyStream::Config bs_cfg;
+        auto body = std::make_shared<http::ChunkQueueBodyStream>(bs_cfg);
+        body->Abort("body_size_limit_exceeded");
+
+        int32_t sid = conn.SubmitStreamingRequest(
+            &sink, "POST", "http", "example.com", "/", {}, false, body);
+
+        bool pass = true;
+        std::string err;
+        if (sid < 1) {
+            pass = false; err += "SubmitStreamingRequest failed sid=" +
+                                 std::to_string(sid) + "; ";
+        }
+        // Sync fallback fires sink.OnError exactly once from inside
+        // SubmitStreamingRequest's FlushSend.
+        if (sink.error_calls != 1) {
+            pass = false;
+            err += "sink.error_calls=" + std::to_string(sink.error_calls) +
+                   " expected 1; ";
+        }
+        if (sink.last_error_code !=
+            ProxyTransaction::RESULT_REQUEST_BODY_LIMIT_EXCEEDED) {
+            pass = false;
+            err += "sink.last_error_code=" +
+                   std::to_string(sink.last_error_code) +
+                   " expected RESULT_REQUEST_BODY_LIMIT_EXCEEDED(" +
+                   std::to_string(
+                       ProxyTransaction::RESULT_REQUEST_BODY_LIMIT_EXCEEDED) +
+                   "); ";
+        }
+        if (sid >= 1) {
+            auto* stream = conn.GetStream(sid);
+            if (stream) {
+                if (stream->sink != nullptr) {
+                    pass = false;
+                    err += "stream->sink not cleared after terminal dispatch; ";
+                }
+                if (stream->streaming_abort_pending) {
+                    pass = false;
+                    err += "streaming_abort_pending not reset after dispatch; ";
+                }
+                if (!stream->pending_erase_) {
+                    pass = false;
+                    err += "stream not staged for erase walker; ";
+                }
+            }
+        }
+        TestFramework::RecordTest(
+            "H2Upstream SR2: submit-time abort dispatches terminal OnError via OnStreamClose",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream SR2: submit-time abort dispatches terminal OnError via OnStreamClose",
+            false, e.what());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SR3 — DetachSink symmetric clear: both the raw sink pointer AND the
+// streaming_abort_callback must drop together. Without the callback clear,
+// the per-stream txn keepalive would leak (transaction kept alive until the
+// erase walker eventually runs); with mid-callback re-entry it could UAF on
+// return. Verifies the round-5 round-fix pattern.
+// ---------------------------------------------------------------------------
+void TestSR3_DetachSinkClearsStreamingAbortCallback() {
+    std::cout << "\n[TEST] H2Upstream SR3: DetachSink clears both sink and streaming_abort_callback..." << std::endl;
+    try {
+        auto cfg = std::make_shared<Http2UpstreamConfig>();
+        cfg->enabled = true;
+        cfg->max_concurrent_streams_pref = 10;
+        cfg->ping_idle_sec   = 0;
+        cfg->ping_timeout_sec = 0;
+        cfg->goaway_drain_timeout_sec = 0;
+
+        DeferredCallbackProbeSink sink;
+        UpstreamH2Connection conn(nullptr, cfg);
+        if (!conn.Init()) {
+            TestFramework::RecordTest(
+                "H2Upstream SR3: DetachSink clears both sink and streaming_abort_callback",
+                false, "Init failed");
+            return;
+        }
+
+        // Non-aborted body — stream stays in flight after submit. We never
+        // close or drain it; DetachSink is the explicit teardown vehicle.
+        http::ChunkQueueBodyStream::Config bs_cfg;
+        auto body = std::make_shared<http::ChunkQueueBodyStream>(bs_cfg);
+
+        int32_t sid = conn.SubmitStreamingRequest(
+            &sink, "POST", "http", "example.com", "/", {}, false, body);
+
+        bool pass = true;
+        std::string err;
+        if (sid < 1) {
+            pass = false; err += "SubmitStreamingRequest failed sid=" +
+                                 std::to_string(sid) + "; ";
+        } else {
+            auto* stream_before = conn.GetStream(sid);
+            if (!stream_before) {
+                pass = false; err += "GetStream returned null before detach; ";
+            } else {
+                if (!stream_before->streaming_abort_callback) {
+                    pass = false;
+                    err += "streaming_abort_callback empty before DetachSink; ";
+                }
+                if (stream_before->sink != &sink) {
+                    pass = false;
+                    err += "stream->sink not bound to test sink before DetachSink; ";
+                }
+            }
+            conn.DetachSink(sid);
+            auto* stream_after = conn.GetStream(sid);
+            if (!stream_after) {
+                // DetachSink does NOT erase the stream; entry must persist.
+                pass = false; err += "stream entry vanished after DetachSink; ";
+            } else {
+                if (stream_after->sink != nullptr) {
+                    pass = false;
+                    err += "stream->sink not cleared by DetachSink; ";
+                }
+                if (stream_after->streaming_abort_callback) {
+                    pass = false;
+                    err += "streaming_abort_callback not cleared by DetachSink; ";
+                }
+            }
+            // sink.OnError MUST NOT have fired — DetachSink is silent teardown.
+            if (sink.onerror_calls != 0) {
+                pass = false;
+                err += "sink.onerror_calls=" + std::to_string(sink.onerror_calls) +
+                       " expected 0; ";
+            }
+            if (sink.deferred_fired != 0) {
+                pass = false;
+                err += "deferred callback fired unexpectedly count=" +
+                       std::to_string(sink.deferred_fired) + "; ";
+            }
+        }
+        // Drain: abort body so the WaitForData callback armed during
+        // SubmitStreamingRequest's first read does not fire post-cleanup.
+        body->Abort("test cleanup");
+        TestFramework::RecordTest(
+            "H2Upstream SR3: DetachSink clears both sink and streaming_abort_callback",
+            pass, err);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2Upstream SR3: DetachSink clears both sink and streaming_abort_callback",
             false, e.what());
     }
 }
@@ -10040,6 +10318,12 @@ void RunAllH2UpstreamTests() {
     TestC4bMarkDeadDisablesUsable();
     TestC5AcquireReleaseNoTornRead();
     TestC6ResetStreamSinkDetachSurvivesDtor();
+
+    // SR-series — direct H2 streaming-request lifetime coverage
+    // (SubmitStreamingRequest / streaming_abort_callback / DetachSink)
+    TestSR1_StreamingAbortCallbackPopulatedAtSubmit();
+    TestSR2_StreamingSubmitTimeAbortDeliversTerminalError();
+    TestSR3_DetachSinkClearsStreamingAbortCallback();
 
     // TestN-series — correctness / negative tests
     TestN1TruncationCLShortRead();

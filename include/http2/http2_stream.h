@@ -79,7 +79,8 @@ public:
     void set_route_mode(http::RouteRequestMode m) { route_mode_ = m; }
 
     // Pending request trailers accumulated during the trailer HEADERS block.
-    // Promoted to HttpRequest::request_trailers at END_STREAM.
+    // At END_STREAM the session moves these into body_stream via
+    // PushTrailersAndClose; handlers read them through BodyStream::Trailers().
     std::vector<std::pair<std::string, std::string>>& pending_trailers() {
         return pending_trailers_;
     }
@@ -219,8 +220,10 @@ private:
     // existing code paths are unaffected when streaming is not configured.
     http::RouteRequestMode route_mode_ = http::RouteRequestMode::Buffered;
 
-    // Accumulates trailer name/value pairs from the per-header callback;
-    // promoted to HttpRequest::request_trailers at END_STREAM.
+    // Accumulates trailer name/value pairs from the per-header callback.
+    // At END_STREAM these are moved into the body_stream via
+    // PushTrailersAndClose; handlers access them through
+    // BodyStream::Trailers() once END_OF_STREAM is observed.
     std::vector<std::pair<std::string, std::string>> pending_trailers_;
 
     // Bytes consumed by the consumer since the last WINDOW_UPDATE emission.

@@ -1720,13 +1720,19 @@ void TestH1Streaming_BodyOverflow_SingleTerminalResponse() {
         cfg.max_body_size = 256;
 
         HttpServer server(cfg);
+        // Synchronization: the route handler sets this flag when invoked.
+        // The client polls it before sending the second (over-cap) chunk
+        // so the test deterministically exercises the post-dispatch
+        // HandleParseError gate rather than racing the dispatcher.
+        auto handler_dispatched = std::make_shared<std::atomic<bool>>(false);
         server.RouteAsync("POST", "/overflow",
-            [](
+            [handler_dispatched](
                 const HttpRequest& req,
                 HTTP_CALLBACKS_NAMESPACE::InterimResponseSender   /*si*/,
                 HTTP_CALLBACKS_NAMESPACE::ResourcePusher           /*pr*/,
                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*ss*/,
                 HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
+                handler_dispatched->store(true, std::memory_order_release);
                 if (!req.body_stream) {
                     HttpResponse resp;
                     resp.Status(200).Body("ok", "text/plain");
@@ -1734,15 +1740,20 @@ void TestH1Streaming_BodyOverflow_SingleTerminalResponse() {
                     return;
                 }
                 // Drain via WaitForData so the handler doesn't busy-spin.
-                // Pump is a self-owning shared_ptr — its closures hold the
-                // shared_ptr by value, keeping it alive across WaitForData
-                // re-arms until the body terminates.
+                // The pump lambda captures itself by weak_ptr to avoid a
+                // self-cycle (lambda holding a strong ref to its own
+                // owner). Each WaitForData closure takes a fresh strong
+                // ref via .lock() so the pump survives the deferred wakeup;
+                // when the body terminates, no new WaitForData is armed
+                // and the last strong ref drops with the closure that
+                // fired this iteration. Valgrind clean.
                 auto shared_complete =
                     std::make_shared<HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback>(
                         std::move(complete));
                 auto body = req.body_stream;
                 auto pump = std::make_shared<std::function<void()>>();
-                *pump = [body, shared_complete, pump]() {
+                std::weak_ptr<std::function<void()>> pump_weak = pump;
+                *pump = [body, shared_complete, pump_weak]() {
                     char buf[128];
                     while (true) {
                         size_t n = 0;
@@ -1760,9 +1771,11 @@ void TestH1Streaming_BodyOverflow_SingleTerminalResponse() {
                             return;
                         }
                         if (r == http::BodyStreamResult::WOULD_BLOCK) {
-                            auto pump_ref = pump;
-                            body->WaitForData(
-                                [pump_ref]() { (*pump_ref)(); });
+                            if (auto pump_strong = pump_weak.lock()) {
+                                body->WaitForData([pump_strong]() {
+                                    if (*pump_strong) (*pump_strong)();
+                                });
+                            }
                             return;
                         }
                     }
@@ -1795,10 +1808,15 @@ void TestH1Streaming_BodyOverflow_SingleTerminalResponse() {
             + std::string(64, 'X') + "\r\n";
         SendAll(fd, headers);
 
-        // Give the dispatcher time to run headers-complete + early dispatch
-        // before the next chunk arrives. 100 ms is generous; on a healthy
-        // machine the dispatcher runs in microseconds.
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Wait for the handler to actually dispatch before sending the
+        // over-cap chunk. Deterministic — no race under TSan slowdown
+        // or noisy CI runners. 3 s upper bound is generous; a healthy
+        // dispatcher fires in microseconds.
+        if (!WaitFor([&]{ return handler_dispatched->load(std::memory_order_acquire); },
+                     std::chrono::milliseconds{3000})) {
+            close(fd);
+            throw std::runtime_error("handler did not dispatch within 3s");
+        }
 
         // Over-cap chunk: 64 bytes already pushed + 1024 = 1088 > 256.
         std::string huge = std::string(1024, 'A');

@@ -128,6 +128,11 @@ const std::string& ChunkQueueBodyStream::AbortReason() const {
 void ChunkQueueBodyStream::WaitForData(DataAvailableCallback callback) {
     if (!callback) return;
     DataAvailableCallback fire_immediately;
+    // Snapshot consumer_dispatcher_ under the lock — SetConsumerDispatcher
+    // writes the weak_ptr under mtx_, and weak_ptr assignment vs lock() is
+    // not safe under concurrent access. Copy into a local while we hold
+    // the mutex, then use the local for .lock() outside.
+    std::weak_ptr<Dispatcher> consumer_d_snapshot;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         const bool has_data = !queue_.empty();
@@ -138,12 +143,13 @@ void ChunkQueueBodyStream::WaitForData(DataAvailableCallback callback) {
             // dispatcher so ordering with future Push notifications stays
             // consistent).
             fire_immediately = std::move(callback);
+            consumer_d_snapshot = consumer_dispatcher_;
         } else {
             pending_consumer_callback_ = std::move(callback);
         }
     }
     if (fire_immediately) {
-        if (auto d = consumer_dispatcher_.lock()) {
+        if (auto d = consumer_d_snapshot.lock()) {
             d->EnQueue([cb = std::move(fire_immediately)]() mutable { cb(); });
         } else {
             fire_immediately();
@@ -161,6 +167,7 @@ void ChunkQueueBodyStream::Push(std::string chunk) {
     if (chunk.empty()) return;
     DataAvailableCallback fire_consumer;
     bool fire_above_high_water = false;
+    std::weak_ptr<Dispatcher> consumer_d_snapshot;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (eos_.load(std::memory_order_relaxed) ||
@@ -183,6 +190,7 @@ void ChunkQueueBodyStream::Push(std::string chunk) {
         }
         if (pending_consumer_callback_) {
             fire_consumer.swap(pending_consumer_callback_);
+            consumer_d_snapshot = consumer_dispatcher_;
         }
     }
     if (fire_above_high_water && cfg_.on_above_high_water) {
@@ -193,7 +201,7 @@ void ChunkQueueBodyStream::Push(std::string chunk) {
         }
     }
     if (fire_consumer) {
-        if (auto d = consumer_dispatcher_.lock()) {
+        if (auto d = consumer_d_snapshot.lock()) {
             d->EnQueue([cb = std::move(fire_consumer)]() mutable { cb(); });
         } else {
             fire_consumer();
@@ -204,6 +212,7 @@ void ChunkQueueBodyStream::Push(std::string chunk) {
 void ChunkQueueBodyStream::PushTrailersAndClose(
     std::vector<std::pair<std::string, std::string>> trailers) {
     DataAvailableCallback fire_consumer;
+    std::weak_ptr<Dispatcher> consumer_d_snapshot;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (eos_.load(std::memory_order_relaxed) ||
@@ -216,10 +225,11 @@ void ChunkQueueBodyStream::PushTrailersAndClose(
         eos_.store(true, std::memory_order_release);
         if (pending_consumer_callback_) {
             fire_consumer.swap(pending_consumer_callback_);
+            consumer_d_snapshot = consumer_dispatcher_;
         }
     }
     if (fire_consumer) {
-        if (auto d = consumer_dispatcher_.lock()) {
+        if (auto d = consumer_d_snapshot.lock()) {
             d->EnQueue([cb = std::move(fire_consumer)]() mutable { cb(); });
         } else {
             fire_consumer();
@@ -229,6 +239,7 @@ void ChunkQueueBodyStream::PushTrailersAndClose(
 
 void ChunkQueueBodyStream::CloseEmpty() {
     DataAvailableCallback fire_consumer;
+    std::weak_ptr<Dispatcher> consumer_d_snapshot;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         // Idempotent — second call observes eos and returns silently.
@@ -239,10 +250,11 @@ void ChunkQueueBodyStream::CloseEmpty() {
         eos_.store(true, std::memory_order_release);
         if (pending_consumer_callback_) {
             fire_consumer.swap(pending_consumer_callback_);
+            consumer_d_snapshot = consumer_dispatcher_;
         }
     }
     if (fire_consumer) {
-        if (auto d = consumer_dispatcher_.lock()) {
+        if (auto d = consumer_d_snapshot.lock()) {
             d->EnQueue([cb = std::move(fire_consumer)]() mutable { cb(); });
         } else {
             fire_consumer();
@@ -253,6 +265,7 @@ void ChunkQueueBodyStream::CloseEmpty() {
 void ChunkQueueBodyStream::Abort(std::string reason) {
     DataAvailableCallback fire_consumer;
     bool fire_below_low_water = false;
+    std::weak_ptr<Dispatcher> consumer_d_snapshot;
     {
         std::lock_guard<std::mutex> lk(mtx_);
         // Idempotent — first Abort wins; subsequent calls are dropped.
@@ -284,6 +297,7 @@ void ChunkQueueBodyStream::Abort(std::string reason) {
         }
         if (pending_consumer_callback_) {
             fire_consumer.swap(pending_consumer_callback_);
+            consumer_d_snapshot = consumer_dispatcher_;
         }
     }
     if (fire_below_low_water && cfg_.on_below_low_water) {
@@ -294,7 +308,7 @@ void ChunkQueueBodyStream::Abort(std::string reason) {
         }
     }
     if (fire_consumer) {
-        if (auto d = consumer_dispatcher_.lock()) {
+        if (auto d = consumer_d_snapshot.lock()) {
             d->EnQueue([cb = std::move(fire_consumer)]() mutable { cb(); });
         } else {
             fire_consumer();
