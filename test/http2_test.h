@@ -407,6 +407,104 @@ public:
         }
     }
 
+    // Submit HEADERS (no END_STREAM, no body bytes) followed immediately by
+    // a trailing HEADERS frame with caller-supplied fields and END_STREAM.
+    // Used by trailer-rejection regression tests. nghttp2's data-source
+    // protocol for the "trailer-after-no-body" shape is: data_provider
+    // returns 0 bytes with NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM
+    // on the first call (signaling "body is done, trailer follows"); the
+    // matching nghttp2_submit_trailer call then queues the trailing
+    // HEADERS frame with END_STREAM. Polls a short deadline for stream
+    // completion (response OR server RST) so the test can verify
+    // handler-side behavior afterwards regardless of what reaches the wire.
+    Response SendHeadersAndTrailers(
+        const std::string& method,
+        const std::string& path,
+        const std::vector<std::pair<std::string,std::string>>& trailer_fields) {
+
+        if (!session_ || fd_ < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        std::vector<std::pair<std::string, std::string>> header_pairs;
+        header_pairs.reserve(4);
+        header_pairs.emplace_back(":method", method);
+        header_pairs.emplace_back(":path", path);
+        header_pairs.emplace_back(":scheme", "http");
+        header_pairs.emplace_back(":authority", "localhost");
+
+        std::vector<nghttp2_nv> nva;
+        nva.reserve(header_pairs.size());
+        for (const auto& hp : header_pairs) {
+            nva.push_back({
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.first.c_str())),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.second.c_str())),
+                hp.first.size(), hp.second.size(),
+                NGHTTP2_NV_FLAG_NONE
+            });
+        }
+
+        nghttp2_data_provider2 dp;
+        dp.source.ptr    = this;
+        dp.read_callback = NoBodyTrailerDataSourceRead;
+
+        int32_t stream_id = nghttp2_submit_request2(
+            session_, nullptr, nva.data(), nva.size(), &dp, this);
+        if (stream_id < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        streams_[stream_id] = StreamState{};
+        // First flush: emit HEADERS + DATA(1 byte, NO_END_STREAM).
+        if (!FlushOutput()) {
+            Response r; r.error = true; return r;
+        }
+        // Submit trailer AFTER initial flush — nghttp2_submit_trailer
+        // requires the stream to have an outstanding deferred-data state,
+        // which is established by the data_provider returning
+        // EOF | NO_END_STREAM. Submitting before the data_provider has
+        // been pumped at least once can leave the trailer queued behind a
+        // stream the framer considers "not yet open for trailers".
+        std::vector<nghttp2_nv> trailer_nva;
+        trailer_nva.reserve(trailer_fields.size());
+        for (const auto& hp : trailer_fields) {
+            trailer_nva.push_back({
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.first.c_str())),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.second.c_str())),
+                hp.first.size(), hp.second.size(),
+                NGHTTP2_NV_FLAG_NONE
+            });
+        }
+        int trv = nghttp2_submit_trailer(
+            session_, stream_id, trailer_nva.data(), trailer_nva.size());
+        if (trv != 0) {
+            Response r; r.error = true; return r;
+        }
+        if (!FlushOutput()) {
+            Response r; r.error = true; return r;
+        }
+
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(IO_TIMEOUT_MS);
+        while (true) {
+            auto it = streams_.find(stream_id);
+            if (it != streams_.end() && it->second.done) {
+                Response r;
+                r.status   = it->second.status;
+                r.body     = it->second.body;
+                r.headers  = it->second.response_headers;
+                r.error    = false;
+                return r;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                Response r; r.error = true; return r;
+            }
+            if (!ReadAndProcess(100)) {
+                Response r; r.error = true; return r;
+            }
+        }
+    }
+
 private:
     // Data-source callback that always defers — never returns body bytes,
     // never signals END_STREAM. Used by SendRequestNoEnd to keep the client
@@ -416,6 +514,23 @@ private:
         uint8_t* /*buf*/, size_t /*length*/, uint32_t* /*data_flags*/,
         nghttp2_data_source* /*source*/, void* /*user_data*/) {
         return NGHTTP2_ERR_DEFERRED;
+    }
+
+    // Data-source callback for the "tiny body, trailer follows" shape:
+    // emits a single byte on the first call with EOF + NO_END_STREAM,
+    // telling nghttp2 the data half is done and the application will queue
+    // a trailer HEADERS frame (which then carries END_STREAM). Some
+    // nghttp2 versions skip the trailer if the data_provider never emits
+    // a DATA frame, so a 1-byte payload guarantees the DATA frame exists
+    // and the trailer is serialized afterwards.
+    static ssize_t NoBodyTrailerDataSourceRead(
+        nghttp2_session* /*session*/, int32_t /*stream_id*/,
+        uint8_t* buf, size_t length, uint32_t* data_flags,
+        nghttp2_data_source* /*source*/, void* /*user_data*/) {
+        if (length < 1) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        buf[0] = ' ';  // single space byte
+        *data_flags = NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
+        return 1;
     }
     int fd_ = -1;
     nghttp2_session* session_ = nullptr;
@@ -5367,6 +5482,132 @@ void TestH2_StreamingBodyOverflowDelivers413BeforeRst() {
     }
 }
 
+// Regression for #138: when the inbound H2 trailer block contains a
+// forbidden field (sanitizer Forbidden — e.g., content-length per RFC
+// 9110 §6.5.1), the rejection path MUST abort the streaming route's
+// BodyStream so a handler parked in Read()/WaitForData() unblocks. The
+// generic reject_protocol_error helper (which fires for forbidden
+// request-header values too) does not touch body_stream; only the
+// trailer-context helper (reject_trailer_block) walks through Abort +
+// pending_trailers.clear() + FinalizeAbortedStreamFlowControl. Pre-fix
+// the OnFrameRecv trailer branch saw IsRejected and silently skipped its
+// PushTrailersAndClose / CloseEmpty path, leaving the BodyStream
+// consumer parked indefinitely.
+void TestH2_ForbiddenTrailerFieldAbortsStreamingBodyStream() {
+    std::cout << "\n[TEST] H2 streaming: forbidden trailer field aborts BodyStream..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        HttpServer server(cfg);
+
+        auto result_promise = std::make_shared<std::promise<std::string>>();
+        auto result_future = result_promise->get_future().share();
+        auto promise_set = std::make_shared<std::atomic<bool>>(false);
+
+        server.RouteAsync("POST", "/upload",
+            [result_promise, promise_set](
+                const HttpRequest& req,
+                HttpRouter::InterimResponseSender /*si*/,
+                HttpRouter::ResourcePusher /*pr*/,
+                HttpRouter::StreamingResponseSender /*ss*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                if (!req.body_stream) {
+                    HttpResponse r;
+                    r.Status(200).Body("ok", "text/plain");
+                    complete(std::move(r));
+                    return;
+                }
+                auto shared_complete =
+                    std::make_shared<HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                auto body = req.body_stream;
+                auto pump = std::make_shared<std::function<void()>>();
+                std::weak_ptr<std::function<void()>> pump_weak = pump;
+                *pump = [body, shared_complete, pump_weak,
+                         result_promise, promise_set]() {
+                    char buf[256];
+                    while (true) {
+                        size_t n = 0;
+                        auto r = body->Read(buf, sizeof(buf), &n);
+                        if (r == http::BodyStreamResult::END_OF_STREAM) {
+                            if (!promise_set->exchange(true)) {
+                                result_promise->set_value("end_of_stream");
+                            }
+                            HttpResponse resp;
+                            resp.Status(200).Body("ok", "text/plain");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::ABORTED) {
+                            std::string reason = body->AbortReason();
+                            if (!promise_set->exchange(true)) {
+                                result_promise->set_value("aborted:" + reason);
+                            }
+                            HttpResponse resp;
+                            resp.Status(500).Body("aborted", "text/plain");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::WOULD_BLOCK) {
+                            if (auto p = pump_weak.lock()) {
+                                body->WaitForData([p]() {
+                                    if (*p) (*p)();
+                                });
+                            }
+                            return;
+                        }
+                    }
+                };
+                (*pump)();
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            // HEADERS (no END_STREAM, no body) + trailer with `content-length`
+            // which the shared sanitizer marks Forbidden.
+            auto resp = client.SendHeadersAndTrailers("POST", "/upload", {
+                {"content-length", "0"}
+            });
+            // Server may RST and may or may not deliver a response — we
+            // do not care which; the diagnostic is the handler-side promise.
+            (void)resp;
+            // The handler MUST observe BodyStream::Read() returning
+            // ABORTED (with reason "forbidden_trailer_field"). Without
+            // #138, the handler stays parked in WaitForData and the
+            // promise is never set.
+            auto status = result_future.wait_for(std::chrono::seconds(3));
+            if (status != std::future_status::ready) {
+                pass = false;
+                err += "handler did not unblock — BodyStream not aborted "
+                       "(forbidden trailer rejection failed to wake consumer); ";
+            } else {
+                std::string result = result_future.get();
+                if (result != "aborted:forbidden_trailer_field") {
+                    pass = false;
+                    err += "expected 'aborted:forbidden_trailer_field' got '" +
+                           result + "'; ";
+                }
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: forbidden trailer field aborts BodyStream",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: forbidden trailer field aborts BodyStream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression covering two related fixes:
 //
 //   (a) #137: streaming route + declared Content-Length > max_body_size
@@ -6240,6 +6481,7 @@ void RunAllTests() {
     TestH2_StreamingSyncResponseAbortsBodyAndResetsStream();
     TestH2_StreamingBodyOverflowDelivers413BeforeRst();
     TestH2_StreamingDeclaredCLOverflowDelivers413AndConnWindowRefunded();
+    TestH2_ForbiddenTrailerFieldAbortsStreamingBodyStream();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 

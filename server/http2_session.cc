@@ -191,27 +191,6 @@ static int OnHeaderCallback(
         return 0;
     }
 
-    // Enforce max_header_list_size on ALL header frames (request + trailers).
-    // RFC 7541 Section 4.1: entry size = name + value + 32.
-    // nghttp2 advertises this in SETTINGS but does NOT enforce it on the receive side.
-    stream->AddHeaderBytes(namelen, valuelen);
-    if (self->MaxHeaderListSize() > 0 &&
-        stream->AccumulatedHeaderSize() > self->MaxHeaderListSize()) {
-        logging::Get()->warn("HTTP/2 stream {} header list size ({}) exceeds limit ({})",
-                             frame->hd.stream_id, stream->AccumulatedHeaderSize(),
-                             self->MaxHeaderListSize());
-        // Only count as a request if this is the initial header block, not
-        // trailers. Trailers arrive after MarkHeadersComplete, so the stream
-        // was already counted/dispatched.
-        if (!stream->IsRejected() && !stream->GetRequest().headers_complete
-            && self->Callbacks().request_count_callback)
-            self->Callbacks().request_count_callback();
-        stream->MarkRejected();
-        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
-                                  frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
-        return 0;
-    }
-
     std::string hdr_name(reinterpret_cast<const char*>(name), namelen);
     std::string hdr_value(reinterpret_cast<const char*>(value), valuelen);
 
@@ -231,6 +210,58 @@ static int OnHeaderCallback(
         return 0;
     };
 
+    // Helper: when a trailer-context rejection fires (forbidden field,
+    // header-list overflow during HCAT_HEADERS), the streaming handler is
+    // already dispatched and may be parked in BodyStream::Read() /
+    // WaitForData(). The OnFrameRecv trailer branch is gated on
+    // !IsRejected so once we MarkRejected here it silently skips its
+    // PushTrailersAndClose / CloseEmpty path — leaving the handler hung.
+    // Abort the body_stream so the handler unblocks with ABORTED, clear
+    // any partial trailers we'd accumulated under the assumption the
+    // block would complete cleanly, and refund the per-stream flow
+    // control residue before RST. Caller MUST ensure frame->headers.cat
+    // != NGHTTP2_HCAT_REQUEST — request-header rejection paths have no
+    // body_stream to abort.
+    auto reject_trailer_block = [&](uint32_t error_code,
+                                    const char* abort_reason) -> int {
+        if (stream->route_mode() == http::RouteRequestMode::Streaming) {
+            auto* body_stream = stream->GetRequest().body_stream.get();
+            if (body_stream) body_stream->Abort(abort_reason);
+            self->FinalizeAbortedStreamFlowControl(frame->hd.stream_id);
+        }
+        stream->pending_trailers().clear();
+        stream->MarkRejected();
+        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                  frame->hd.stream_id, error_code);
+        return 0;
+    };
+
+    // Enforce max_header_list_size on ALL header frames (request + trailers).
+    // RFC 7541 Section 4.1: entry size = name + value + 32.
+    // nghttp2 advertises this in SETTINGS but does NOT enforce it on the receive side.
+    stream->AddHeaderBytes(namelen, valuelen);
+    if (self->MaxHeaderListSize() > 0 &&
+        stream->AccumulatedHeaderSize() > self->MaxHeaderListSize()) {
+        logging::Get()->warn("HTTP/2 stream {} header list size ({}) exceeds limit ({})",
+                             frame->hd.stream_id, stream->AccumulatedHeaderSize(),
+                             self->MaxHeaderListSize());
+        // Trailer-context overflow: streaming handler may be parked on
+        // body_stream — route through the trailer-cleanup helper.
+        if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+            return reject_trailer_block(NGHTTP2_ENHANCE_YOUR_CALM,
+                                        "trailer_header_list_overflow");
+        }
+        // Request-context overflow: body_stream doesn't exist yet (streaming
+        // dispatch happens in OnFrameRecv after all headers parse).
+        if (!stream->IsRejected() && !stream->GetRequest().headers_complete
+            && self->Callbacks().request_count_callback)
+            self->Callbacks().request_count_callback();
+        stream->MarkRejected();
+        nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                  frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
+        return 0;
+    }
+
     // RFC 9113 Section 8.1 / RFC 9110 Section 6.5.1: trailers MUST NOT
     // contain pseudo-headers or fields used for message framing, routing,
     // authentication, or representation metadata that must precede the
@@ -244,7 +275,8 @@ static int OnHeaderCallback(
             logging::Get()->warn(
                 "HTTP/2 stream {} forbidden field in trailers: {}",
                 frame->hd.stream_id, hdr_name);
-            return reject_protocol_error();
+            return reject_trailer_block(NGHTTP2_PROTOCOL_ERROR,
+                                        "forbidden_trailer_field");
         }
         // Valid trailer — accumulate for streaming routes; buffered routes
         // do not forward request trailers to handlers, so the field is

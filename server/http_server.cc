@@ -2268,6 +2268,11 @@ void HttpServer::Proxy(const std::string& route_pattern,
             // don't destroy this handler while this route is still live.
             // RouteProxyAsync (NOT RouteAsync) so ResolveRouteMatch can
             // demux this entry as RouteKind::Proxy at step (2).
+            // Pass explicit RouteOptions so the inbound dispatcher
+            // activates the streaming body-source path when the upstream
+            // config requests it. Mirrors the config-auto-register branch
+            // — both manual Proxy() and config_loader-driven proxy routes
+            // must honor UpstreamConfig::request_mode identically.
             router_.RouteProxyAsync(mr.method, pattern,
                 [handler](HttpRequest& request,
                           HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
@@ -2276,7 +2281,8 @@ void HttpServer::Proxy(const std::string& route_pattern,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                     handler->Handle(request, std::move(stream_sender),
                                     std::move(complete));
-                });
+                },
+                http::RouteOptions{found->request_mode});
             // Mark the derived bare-prefix companion only for the
             // methods this proxy actually registers on it. A method
             // not in the proxy's method list should NOT yield — a
