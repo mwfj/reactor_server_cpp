@@ -105,10 +105,23 @@ bool ChunkQueueBodyStream::Aborted() const {
 }
 
 const std::vector<std::pair<std::string, std::string>>& ChunkQueueBodyStream::Trailers() const {
+    // trailers_ is written exactly once inside Read() under mtx_ (when EOS is
+    // first observed and pending_trailers_ is moved over). Lock here so the
+    // initial publication is visible to the caller's thread even when it
+    // differs from the consumer that ran Read(); after publication the
+    // container is immutable, so the returned reference outlives the lock.
+    std::lock_guard<std::mutex> lk(mtx_);
     return trailers_;
 }
 
 const std::string& ChunkQueueBodyStream::AbortReason() const {
+    // abort_reason_ is written under mtx_ inside Abort() before aborted_.store.
+    // The release-store + matching acquire-load on aborted_ would normally
+    // cover the read, but TSan tracks the access independently — lock here
+    // to satisfy the formal memory model and silence the race report.
+    // The field is written at most once (Abort() is idempotent), so the
+    // reference is valid past the lock release.
+    std::lock_guard<std::mutex> lk(mtx_);
     return abort_reason_;
 }
 
@@ -246,8 +259,14 @@ void ChunkQueueBodyStream::Abort(std::string reason) {
         if (aborted_.load(std::memory_order_relaxed)) {
             return;
         }
-        aborted_.store(true, std::memory_order_release);
+        // Write abort_reason_ BEFORE the release-store on aborted_ so a
+        // lockless consumer that observes aborted_=true via acquire-load
+        // is guaranteed to see the published reason. Lockless AbortReason()
+        // accessors still take the mutex defensively (Trailers() / a future
+        // accessor that runs off the consumer dispatcher), but the
+        // happens-before chain here covers the common in-flight check.
         abort_reason_ = std::move(reason);
+        aborted_.store(true, std::memory_order_release);
         // Drop queued bytes — they will never be drained.
         queue_.clear();
         front_offset_ = 0;

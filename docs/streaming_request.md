@@ -2,7 +2,7 @@
 
 Lets the proxy engine forward an inbound request body to the upstream **chunk-by-chunk** instead of buffering the entire body before dispatching. This is essential for large uploads, long-lived ingest streams, and any path where the client sends more than a few hundred KB before the upstream needs to start processing.
 
-If your routes receive bodies under ~1 MB and you don't need reduced first-byte latency, the default buffered mode is simpler. Streaming is opt-in per upstream.
+Proxy routes default to `request_mode: "streaming"` — the gateway sets this automatically for routes registered via `RegisterProxyRoutes`. If your routes receive bodies under ~1 MB, don't need reduced first-byte latency, and want retry-on-failure semantics, opt into buffered mode by setting `request_mode: "buffered"` on the upstream.
 
 ---
 
@@ -83,7 +83,7 @@ There is intentionally **no** `upstreams[].http2.streaming` configuration today:
 
 ## Request body size limits
 
-The gateway enforces body-size limits from the inbound protocol layer **before** forwarding. If the client sends more than `max_request_body_bytes` (HTTP/2, configurable per-protocol), the inbound layer aborts the `BodyStream` with reason `"body_size_limit_exceeded"`. The proxy detects this abort and returns **413 Payload Too Large** to the client.
+The gateway enforces body-size limits from the inbound protocol layer **before** forwarding. If the client sends more than `max_body_size` (top-level server config, default 1 MB), the inbound layer aborts the `BodyStream` with reason `"body_size_limit_exceeded"`. The proxy detects this abort and returns **413 Payload Too Large** to the client.
 
 The abort can happen mid-stream — after some chunks have already been forwarded. In that case the upstream receives a partial body (the upstream connection is force-closed or RST_STREAMed). Upstream-side handling of an aborted partial body is the upstream's responsibility.
 

@@ -1709,17 +1709,15 @@ void TestH1Streaming_ContentLengthExceedsLimit_EarlyReject() {
 // request_count_callback (which would double-count metrics).
 // ---------------------------------------------------------------------------
 void TestH1Streaming_BodyOverflow_SingleTerminalResponse() {
-    std::cout << "\n[TEST] H1 streaming: body overflow → single 413, single count..."
+    std::cout << "\n[TEST] H1 streaming: body overflow after dispatch → single 413, single count..."
               << std::endl;
     try {
-        std::atomic<int> count_observed{0};
-
         ServerConfig cfg;
         cfg.bind_host = "127.0.0.1";
         cfg.bind_port = 0;
         cfg.worker_threads = 2;
         cfg.http2.enabled = false;
-        cfg.max_body_size = 256;  // small cap; declared CL fits under cap
+        cfg.max_body_size = 256;
 
         HttpServer server(cfg);
         server.RouteAsync("POST", "/overflow",
@@ -1729,26 +1727,47 @@ void TestH1Streaming_BodyOverflow_SingleTerminalResponse() {
                 HTTP_CALLBACKS_NAMESPACE::ResourcePusher           /*pr*/,
                 HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender /*ss*/,
                 HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
-                if (req.body_stream) {
+                if (!req.body_stream) {
+                    HttpResponse resp;
+                    resp.Status(200).Body("ok", "text/plain");
+                    complete(std::move(resp));
+                    return;
+                }
+                // Drain via WaitForData so the handler doesn't busy-spin.
+                // Pump is a self-owning shared_ptr — its closures hold the
+                // shared_ptr by value, keeping it alive across WaitForData
+                // re-arms until the body terminates.
+                auto shared_complete =
+                    std::make_shared<HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback>(
+                        std::move(complete));
+                auto body = req.body_stream;
+                auto pump = std::make_shared<std::function<void()>>();
+                *pump = [body, shared_complete, pump]() {
                     char buf[128];
                     while (true) {
                         size_t n = 0;
-                        auto r = req.body_stream->Read(buf, sizeof(buf), &n);
-                        if (r == http::BodyStreamResult::END_OF_STREAM) break;
+                        auto r = body->Read(buf, sizeof(buf), &n);
+                        if (r == http::BodyStreamResult::END_OF_STREAM) {
+                            HttpResponse resp;
+                            resp.Status(200).Body("ok", "text/plain");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
                         if (r == http::BodyStreamResult::ABORTED) {
                             HttpResponse resp = HttpResponse::PayloadTooLarge();
                             resp.Header("X-Request-Body-Limit-Exceeded", "true");
-                            complete(std::move(resp));
+                            (*shared_complete)(std::move(resp));
                             return;
                         }
                         if (r == http::BodyStreamResult::WOULD_BLOCK) {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            auto pump_ref = pump;
+                            body->WaitForData(
+                                [pump_ref]() { (*pump_ref)(); });
+                            return;
                         }
                     }
-                }
-                HttpResponse resp;
-                resp.Status(200).Body("ok", "text/plain");
-                complete(std::move(resp));
+                };
+                (*pump)();
             },
             http::RouteOptions{http::RouteRequestMode::Streaming});
 
@@ -1757,41 +1776,74 @@ void TestH1Streaming_BodyOverflow_SingleTerminalResponse() {
         int fd = ConnectRaw(port);
         if (fd < 0) throw std::runtime_error("connect failed");
 
-        const size_t over_cap = 4096;
-        std::string body(over_cap, 'A');
-        std::string request =
+        // Stats snapshot BEFORE the request — `total_requests` is monotonic.
+        auto stats_before = server.GetStats();
+
+        // Two-write send with a brief delay: the first write reaches the
+        // server's parser in one OnRawData call (headers + a small chunk),
+        // letting headers-complete fire and the streaming handler dispatch
+        // BEFORE the over-cap chunk arrives in a second OnRawData call.
+        // Chunked encoding bypasses the early-CL reject; we want to exercise
+        // the post-dispatch parser-error path (HandleParseError gate).
+        std::string headers =
             "POST /overflow HTTP/1.1\r\n"
             "Host: 127.0.0.1\r\n"
-            "Content-Length: " + std::to_string(body.size()) + "\r\n"
+            "Transfer-Encoding: chunked\r\n"
             "Connection: close\r\n"
-            "\r\n" + body;
-        SendAll(fd, request);
+            "\r\n"
+            "40\r\n"                                     // 0x40 = 64 bytes
+            + std::string(64, 'X') + "\r\n";
+        SendAll(fd, headers);
+
+        // Give the dispatcher time to run headers-complete + early dispatch
+        // before the next chunk arrives. 100 ms is generous; on a healthy
+        // machine the dispatcher runs in microseconds.
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        // Over-cap chunk: 64 bytes already pushed + 1024 = 1088 > 256.
+        std::string huge = std::string(1024, 'A');
+        char szbuf[16];
+        std::snprintf(szbuf, sizeof(szbuf), "%zx\r\n",
+                      static_cast<size_t>(huge.size()));
+        std::string overflow_chunk = std::string(szbuf) + huge + "\r\n";
+        SendAll(fd, overflow_chunk);
+
         std::string resp = RecvUntilClose(fd, 3000);
         close(fd);
 
         bool pass = true;
         std::string err;
-        // Single 413 response — count occurrences of "HTTP/1.1 4" (status line
-        // for 4xx). A duplicate would show two status lines.
-        size_t occ = 0;
-        for (size_t p = 0; (p = resp.find("HTTP/1.1 4", p)) != std::string::npos; ++p) {
-            ++occ;
+        // Single response — count "HTTP/1.1 " status lines. The bug we're
+        // guarding against would produce TWO (one from HandleParseError's
+        // direct send, one from the handler's CompleteAsyncResponse).
+        size_t status_count = 0;
+        for (size_t p = 0; (p = resp.find("HTTP/1.1 ", p)) != std::string::npos; ++p) {
+            ++status_count;
         }
-        if (occ != 1) {
+        if (status_count != 1) {
             pass = false;
-            err += "expected exactly 1 HTTP/1.1 4xx status line, got " +
-                   std::to_string(occ) + ": " + resp.substr(0, 64) + "; ";
+            err += "expected exactly 1 HTTP/1.1 status line, got " +
+                   std::to_string(status_count) + ": " + resp.substr(0, 96) + "; ";
         }
         if (resp.find("413") == std::string::npos) {
-            pass = false; err += "expected 413 PayloadTooLarge; ";
+            pass = false; err += "expected 413 in response; ";
         }
-        (void)count_observed;
+        // Request must be counted exactly once. Compares the live
+        // total_requests counter snapshot delta against expectation.
+        auto stats_after = server.GetStats();
+        int64_t delta = stats_after.total_requests - stats_before.total_requests;
+        if (delta != 1) {
+            pass = false;
+            err += "expected total_requests delta=1, got " +
+                   std::to_string(delta) + "; ";
+        }
         TestFramework::RecordTest(
-            "H1 streaming: body overflow → single 413, single count",
+            "H1 streaming: body overflow after dispatch → single 413, single count",
             pass, err);
     } catch (const std::exception& e) {
         TestFramework::RecordTest(
-            "H1 streaming: body overflow → single 413, single count", false, e.what());
+            "H1 streaming: body overflow after dispatch → single 413, single count",
+            false, e.what());
     }
 }
 

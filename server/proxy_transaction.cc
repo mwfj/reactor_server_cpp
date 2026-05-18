@@ -2476,6 +2476,12 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
     // disconnected client.
     if (cancelled_) return;
 
+    // Streaming-only intent: fire TombstonePreBodyHeadersForRetry_() only
+    // if both (a) the streaming preconditions hold AND (b) ShouldRetry
+    // approves the retry. Computed in the streaming block, consumed in
+    // the ShouldRetry-true branch below.
+    bool streaming_tombstone_pending = false;
+
     if (is_streaming_request_) {
         // Streaming retries are gated on whether body bytes reached the
         // upstream. The three cases produce distinct result codes so
@@ -2507,15 +2513,17 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
                                  "non-idempotent method with HEADERS already queued");
             return;
         }
-        if (headers_queued) {
-            // Idempotent with HEADERS queued but no body on wire —
-            // tombstone the in-flight stream/transport and fall through
-            // to the normal retry classification below.
-            TombstonePreBodyHeadersForRetry_();
-        }
+        // Defer the tombstone (RST_STREAM on H2 / MarkClosing on H1) until
+        // we know a retry is actually going to follow. ShouldRetry may
+        // refuse (budget exhausted, condition disallowed); poisoning the
+        // connection BEFORE that check needlessly burns a pool slot.
+        streaming_tombstone_pending = headers_queued && replay_safe;
     }
 
     if (retry_policy_.ShouldRetry(attempt_, method_, condition, response_committed_)) {
+        if (streaming_tombstone_pending) {
+            TombstonePreBodyHeadersForRetry_();
+        }
         if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
             auto snapshot = SnapshotRetryable5xxBody(
                 response_head_, response_body_, paused_parse_bytes_);
@@ -2984,6 +2992,16 @@ void ProxyTransaction::Cleanup() {
     // (empty) guard decrements the old counter immediately.
     inflight_guard_ = CIRCUIT_BREAKER_NAMESPACE::RetryBudget::InFlightGuard{};
 
+    // Capture the protocol-specific "request fully sent" state BEFORE the
+    // H2 cleanup block mutates h2_path_ / h2_request_fully_sent_. The
+    // body_stream cleanup at the end of this function reads these to decide
+    // whether to abort the body stream; reading h2_path_ post-mutation
+    // would silently fall through to h1_request_fully_sent_ on H2 streams,
+    // spuriously aborting body streams whose request was already fully on
+    // the wire.
+    const bool request_fully_sent_at_cleanup =
+        h2_path_ ? h2_request_fully_sent_ : h1_request_fully_sent_;
+
     // H2 path: two leases are in flight.
     //   (1) Transport lease — donated to the UpstreamH2Connection for its
     //       full lifetime at dispatch time; its callbacks are bound to the
@@ -3078,14 +3096,10 @@ void ProxyTransaction::Cleanup() {
         // Abort if the REQUEST side hasn't reached terminal sent state.
         // Only fires on terminal Cleanup (FAILED/COMPLETE), not on mid-
         // retry Cleanup where body_stream_ must survive for the next
-        // attempt. Request fully-sent flag is path-specific (h1 vs h2)
-        // and is set only when the final framing has been handed to the
-        // transport or nghttp2 data-source. After that point an abort
-        // here would be a no-op against producers but a misleading
-        // signal to upstream peers — skip it.
-        const bool request_fully_sent =
-            (h2_path_ ? h2_request_fully_sent_ : h1_request_fully_sent_);
-        if (!request_fully_sent) {
+        // attempt. Uses the pre-mutation snapshot — the H2 reset block
+        // above already cleared h2_path_ / h2_request_fully_sent_, so
+        // reading them here would always fall through to the H1 flag.
+        if (!request_fully_sent_at_cleanup) {
             body_stream_->Abort("proxy_transaction_cleanup");
         }
         body_stream_.reset();

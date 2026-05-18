@@ -1418,7 +1418,12 @@ void HttpConnectionHandler::HandleParseError() {
     // is unrecoverable) by clearing deferred_keep_alive_.
     // Gate on BOTH flags: if the handler already completed (deferred not
     // pending), no async response is coming — fall through to direct send.
+    // Clear streaming_dispatched_ on the same return so a SECOND parse
+    // error (after CompleteAsyncResponse replays buffered pipelined bytes
+    // through OnRawData) doesn't see the stale flag and skip the count +
+    // direct-send when no deferred handler exists.
     if (streaming_dispatched_ && deferred_response_pending_) {
+        streaming_dispatched_ = false;
         deferred_keep_alive_ = false;
         return;
     }
