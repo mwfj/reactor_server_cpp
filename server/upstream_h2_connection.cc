@@ -871,6 +871,18 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                     } else if (raw_sink) {
                         // Synchronous fallback for legacy/test sinks.
                         raw_sink->OnError(code, msg);
+                    } else {
+                        // Both channels empty: DetachSink's preserve-callback
+                        // gate should have prevented this. If it ever fires
+                        // (future contributor bypassing the gate), surface
+                        // the silent drop instead of leaking the txn until
+                        // response timeout — operators can correlate with
+                        // the txn's pending state via the stream_id.
+                        logging::Get()->error(
+                            "H2 streaming abort terminal error dropped: "
+                            "stream={} code={} msg={} — both deferred_cb "
+                            "and raw_sink cleared before OnStreamClose ran",
+                            stream_id, code, msg);
                     }
                     // Enqueue a RunDeferredEraseWalk to drain the
                     // pending_erase entry promptly so active_streams_
@@ -1217,7 +1229,19 @@ void UpstreamH2Connection::DetachSink(int32_t stream_id) {
     // keepalive (streaming_abort_callback). The mid-callback UAF this would
     // otherwise cause is prevented by the local-keepalive guard at every
     // raw-sink dispatch site.
-    it->second->streaming_abort_callback = {};
+    //
+    // EXCEPTION: when StreamingDataSourceReadCallback's ABORTED branch has
+    // already stored a terminal classification (streaming_abort_pending),
+    // the callback is the ONLY surviving channel that delivers OnError to
+    // the txn. A concurrent peer DATA frame whose sink->OnBodyChunk returns
+    // false will call ResetStream → DetachSink in the same recv batch; if we
+    // cleared the callback here, OnStreamClose's streaming_abort branch
+    // would find both deferred_cb and raw_sink null and silently drop the
+    // terminal error — txn hangs until response timeout. Preserve the
+    // callback so OnStreamClose can still dispatch.
+    if (!it->second->streaming_abort_pending) {
+        it->second->streaming_abort_callback = {};
+    }
     if (it->second->peer_already_closed_ && !it->second->pending_erase_) {
         it->second->pending_erase_ = true;
         pending_erase_streams_.push_back(stream_id);

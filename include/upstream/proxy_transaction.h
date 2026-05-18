@@ -529,6 +529,26 @@ private:
     // transition path.
     bool h1_streaming_send_complete_ = false;
 
+    // Re-entry + transport-drain backpressure flags for PumpH1StreamingBody_.
+    // h1_pump_active_: SendRaw can fire the SetWriteProgressCb callback
+    //   synchronously when a direct-write succeeds. The callback re-enters
+    //   PumpH1StreamingBody_, which would recurse arbitrarily deep on a
+    //   fast upstream. The flag short-circuits the re-entry — the outer
+    //   loop picks up additional progress on its next iteration.
+    // h1_pump_paused_for_drain_: set when Pump returns because the transport
+    //   output buffer crossed the high-water mark. Cleared (and Pump resumed)
+    //   when SetWriteProgressCb observes the buffer back below low-water.
+    //   Without this, body_stream_->Read() would keep releasing inbound
+    //   producer backpressure into output_bf_, defeating the streaming
+    //   memory bound on a slow/stalled upstream.
+    bool h1_pump_active_ = false;
+    bool h1_pump_paused_for_drain_ = false;
+
+    // Cached send-stall budget for the H1 streaming send phase. Parallel to
+    // h2_stall_budget_ms_ — computed once at the start of SendH1Streaming
+    // Request_ so the SetWriteProgressCb refresh path uses a stable value.
+    int h1_stall_budget_ms_ = 0;
+
     // Active BodyStream for the current streaming request attempt.
     // Non-null when is_streaming_request_=true and the send phase is active.
     std::shared_ptr<http::BodyStream> body_stream_;

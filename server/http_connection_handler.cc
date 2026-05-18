@@ -2325,9 +2325,18 @@ bool HttpConnectionHandler::DispatchStreamingRouteFromHeaders() {
 
     // Validation. Errors here predate the body and force Connection: close
     // because the body is still streaming and we have no way to drain it.
+    // Abort body_stream on every early-reject path: the parser will keep
+    // pushing bytes into body_stream (on_body fires regardless of route
+    // disposition), and on_above_high_water would call IncReadDisable
+    // against a connection we just told to close — leaving a pinned
+    // read-disable count without a matching DecReadDisable. Mirrors the
+    // Content-Length cap reject below.
     if (req.http_major != 1 || (req.http_minor != 0 && req.http_minor != 1)) {
         logging::Get()->warn("Unsupported HTTP version fd={}: {}.{}",
                              conn_->fd(), req.http_major, req.http_minor);
+        if (auto* body_stream = req.body_stream.get()) {
+            body_stream->Abort("unsupported_http_version");
+        }
         HttpResponse resp = HttpResponse::HttpVersionNotSupported();
         resp.Header("Connection", "close");
         SendResponse(resp);
@@ -2338,6 +2347,9 @@ bool HttpConnectionHandler::DispatchStreamingRouteFromHeaders() {
 
     if (req.http_minor >= 1 && !req.HasHeader("host")) {
         logging::Get()->debug("Missing Host header fd={}", conn_->fd());
+        if (auto* body_stream = req.body_stream.get()) {
+            body_stream->Abort("missing_host_header");
+        }
         HttpResponse resp = HttpResponse::BadRequest("Missing Host header");
         resp.Header("Connection", "close");
         SendResponse(resp);
@@ -2384,6 +2396,9 @@ bool HttpConnectionHandler::DispatchStreamingRouteFromHeaders() {
             }
         } else {
             logging::Get()->debug("Unsupported Expect value fd={}", conn_->fd());
+            if (auto* body_stream = req.body_stream.get()) {
+                body_stream->Abort("unsupported_expect_value");
+            }
             HttpResponse err;
             err.Status(HttpStatus::EXPECTATION_FAILED, "Expectation Failed");
             err.Header("Connection", "close");
@@ -2397,6 +2412,29 @@ bool HttpConnectionHandler::DispatchStreamingRouteFromHeaders() {
     // watermark callbacks engage for the handler's lifetime (pause/resume
     // the read pump while body_stream queue exceeds high_water).
     streaming_dispatched_ = true;
+
+    // Catch-up pause: the parser callback chain (on_body) may have pushed
+    // body bytes that crossed high_water BEFORE this dispatch ran. The
+    // on_above_high_water callback returned early because
+    // streaming_dispatched_ was still false (see Setup), and the latch
+    // (above_high_water_latched_) in body_stream prevents the callback
+    // from firing again until the queue drains below low_water. Without
+    // a catch-up pause here, a large headers+body in a single TCP segment
+    // can buffer up to the connection input cap before the handler starts
+    // consuming. Pause now if we're already above water; the matching
+    // on_below_low_water resume will fire naturally when the consumer
+    // drains the queue.
+    if (auto* body_stream = parser_.GetRequest().body_stream.get()) {
+        const size_t hw = (streaming_high_water_bytes_ > 0)
+            ? streaming_high_water_bytes_
+            : 262144;  // matches DEFAULT_STREAM_HIGH_WATER_BYTES
+        if (!h1_streaming_pump_paused_ &&
+            body_stream->BytesQueued() >= hw &&
+            conn_) {
+            conn_->IncReadDisable();
+            h1_streaming_pump_paused_ = true;
+        }
+    }
 
     HttpResponse response;
     try {

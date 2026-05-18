@@ -1217,6 +1217,44 @@ void ProxyTransaction::SendH1StreamingRequest_(
         return;
     }
     auto transport = uc->GetTransport();
+    if (!transport) {
+        OnError(RESULT_CHECKOUT_FAILED,
+                "h1 streaming: upstream transport unavailable");
+        return;
+    }
+
+    // Arm the send-phase stall deadline AND install the write-progress
+    // refresh, matching the buffered H1 path at SendH1Request_ (~L1813).
+    // Without these, a wedged upstream that stops reading our chunked-body
+    // writes would pin both the client and the pool connection indefinitely
+    // — OnUpstreamWriteComplete only fires under back-pressure when the
+    // socket actually drains, and the pool's far-future checkout deadline
+    // never trips. SetWriteProgressCb also resumes the pump when the
+    // transport buffer drains below low-water (see PumpH1StreamingBody_).
+    h1_stall_budget_ms_ = ComputeH2StallBudgetMs(config_.response_timeout_ms);
+    ArmResponseTimeout(h1_stall_budget_ms_);
+    {
+        std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+        transport->SetWriteProgressCb(
+            [weak_self](std::shared_ptr<ConnectionHandler>, size_t) {
+                auto self = weak_self.lock();
+                if (!self) return;
+                // Refresh the send-stall deadline while still writing.
+                if (self->state_ == State::SENDING_REQUEST) {
+                    self->ArmResponseTimeout(self->h1_stall_budget_ms_);
+                }
+                // Resume the body pump if it was paused for transport drain.
+                // Re-entry guard inside PumpH1StreamingBody_ handles the
+                // synchronous-direct-write case where SendRaw fires this
+                // callback from inside the pump itself.
+                if (self->h1_pump_paused_for_drain_ &&
+                    !self->cancelled_ &&
+                    !self->IsKilledForShutdown()) {
+                    self->h1_pump_paused_for_drain_ = false;
+                    self->PumpH1StreamingBody_();
+                }
+            });
+    }
 
     // For pure_bodyless: set completion-gate flags BEFORE SendRaw. The head
     // write is the entire request (CL:0); SendRaw's fast-path direct-write can
@@ -1252,13 +1290,59 @@ void ProxyTransaction::SendH1StreamingRequest_(
 
 void ProxyTransaction::PumpH1StreamingBody_() {
     static constexpr size_t MAX_CHUNK_BYTES = 16 * 1024;
-    char buf[MAX_CHUNK_BYTES];
+    // Hysteresis on transport output buffer: pause the pump when the
+    // outbound buffer climbs above HIGH_WATER, resume from
+    // SetWriteProgressCb when it drains below LOW_WATER. Without this,
+    // body_stream_->Read() releases inbound producer backpressure
+    // (on_bytes_consumed → inbound DecReadDisable / WINDOW_UPDATE),
+    // but SendRaw may only append to output_bf_ on EAGAIN — a slow
+    // upstream lets the gateway move the entire body from inbound queue
+    // to outbound buffer, defeating the streaming memory bound.
+    static constexpr size_t TRANSPORT_HIGH_WATER = 262144;  // 256 KB
+
+    // Re-entry guard: SendRaw fires SetWriteProgressCb synchronously when a
+    // direct-write succeeds. That callback may call PumpH1StreamingBody_
+    // again (when paused-for-drain). The outer pump's loop picks up the
+    // extra progress on its next iteration — recursion would just stack.
+    if (h1_pump_active_) {
+        return;
+    }
+    h1_pump_active_ = true;
+    struct ActiveGuard {
+        ProxyTransaction& self;
+        ~ActiveGuard() { self.h1_pump_active_ = false; }
+    };
+    ActiveGuard guard{*this};
+
+    // body_stream_ can be reset by Cleanup() (terminal teardown after
+    // response-timeout, retry path, or shutdown) between a WOULD_BLOCK
+    // return and the deferred WaitForData fire. cancelled_ /
+    // IsKilledForShutdown() don't cover the natural Cleanup() path on a
+    // failed transaction. Null-check defensively.
+    if (!body_stream_) {
+        return;
+    }
     auto* uc = lease_.Get();
     if (!uc) {
         return;
     }
     auto transport = uc->GetTransport();
+    if (!transport) {
+        // Transport torn down (pool teardown / lease released). Treat as
+        // benign — Cleanup or the caller's terminal-error path owns the
+        // disposition; nothing for us to do.
+        return;
+    }
+    char buf[MAX_CHUNK_BYTES];
     while (true) {
+        // Pause on transport backpressure BEFORE pulling more from the
+        // body_stream — the Read() call would release inbound producer
+        // backpressure, causing the inbound queue to grow even though
+        // we can't push to upstream yet.
+        if (transport->OutputBufferSize() >= TRANSPORT_HIGH_WATER) {
+            h1_pump_paused_for_drain_ = true;
+            return;
+        }
         size_t bytes_read = 0;
         auto rc = body_stream_->Read(buf, MAX_CHUNK_BYTES, &bytes_read);
         switch (rc) {
@@ -1312,21 +1396,44 @@ void ProxyTransaction::EmitH1ChunkedTrailers_(
     auto* uc = lease_.Get();
     if (!uc) return;
     auto transport = uc->GetTransport();
+    if (!transport) return;
 
-    // Pre-flip the gate before the final SendRaw sequence so the eventual
-    // OnUpstreamWriteComplete is permitted to transition state.
-    h1_streaming_send_complete_ = true;
-    h1_request_fully_sent_ = true;
-
+    // Serialize the entire terminator block (last-chunk marker + trailer
+    // lines + final CRLF) into a single string BEFORE SendRaw. Two reasons:
+    //
+    // 1. Synchronous OnUpstreamWriteComplete race: SendRaw's fast-path
+    //    direct-write fires the completion callback synchronously per call.
+    //    If we set h1_streaming_send_complete_=true before the first of
+    //    multiple SendRaws, OnUpstreamWriteComplete on the FIRST partial
+    //    drain would observe the gate open and transition state to
+    //    AWAITING_RESPONSE before the trailer + final CRLF are on the wire.
+    //
+    // 2. Atomic terminator: peers must see "0\r\n...trailers...\r\n" as a
+    //    single framing unit. A partial transport write that leaves the
+    //    block mid-emit forces the peer's parser to wait for more bytes;
+    //    a single SendRaw lets the transport's drain logic handle the
+    //    partial-write internally without any framing ambiguity.
+    std::string terminator;
     if (!omit_last_chunk_marker) {
-        transport->SendRaw("0\r\n", 3);
+        terminator.append("0\r\n");
     }
     auto filtered = http::SanitizeHttp2TrailerFieldsForOutboundEmit(trailers);
     for (const auto& [name, value] : filtered) {
-        std::string line = name + ": " + value + "\r\n";
-        transport->SendRaw(line.data(), line.size());
+        terminator.append(name);
+        terminator.append(": ");
+        terminator.append(value);
+        terminator.append("\r\n");
     }
-    transport->SendRaw("\r\n", 2);
+    terminator.append("\r\n");
+
+    // Set the completion gate AFTER assembling but BEFORE the single
+    // SendRaw — the sole post-final-write OnUpstreamWriteComplete (which
+    // may fire synchronously on direct-write) needs the gate open to take
+    // the normal AWAITING_RESPONSE transition path.
+    h1_streaming_send_complete_ = true;
+    h1_request_fully_sent_ = true;
+
+    transport->SendRaw(terminator.data(), terminator.size());
 }
 
 void ProxyTransaction::DispatchH1() {
