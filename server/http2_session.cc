@@ -905,6 +905,15 @@ static int OnFrameRecvCallback(
                     }
                 }
             }
+            // Buffered routes do not forward request trailers, but the
+            // trailing HEADERS frame still completes the request and must
+            // dispatch the accumulated body. This branch breaks before the
+            // generic complete-then-dispatch path below.
+            if (stream->route_mode() != http::RouteRequestMode::Streaming &&
+                stream->IsRequestComplete() && !stream->IsRejected() &&
+                self->Callbacks().request_callback) {
+                self->DispatchStreamRequest(stream, frame->hd.stream_id);
+            }
             break;
         }
 

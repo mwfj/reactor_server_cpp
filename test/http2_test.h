@@ -5608,6 +5608,83 @@ void TestH2_ForbiddenTrailerFieldAbortsStreamingBodyStream() {
     }
 }
 
+// Regression: buffered H2 requests that end with a valid trailer HEADERS
+// frame must still dispatch after the DATA body is complete. Phase 5 added
+// a dedicated trailer branch for streaming routes; without an explicit
+// buffered dispatch there, this request timed out because the branch broke
+// before the generic complete-then-dispatch block.
+void TestH2_BufferedRequestWithValidTrailerDispatches() {
+    std::cout << "\n[TEST] H2 buffered: valid request trailer dispatches..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        HttpServer server(cfg);
+
+        auto handler_dispatched = std::make_shared<std::atomic<bool>>(false);
+        auto saw_expected_body = std::make_shared<std::atomic<bool>>(false);
+        auto saw_body_stream = std::make_shared<std::atomic<bool>>(false);
+
+        server.Post("/upload",
+            [handler_dispatched, saw_expected_body, saw_body_stream](
+                const HttpRequest& req, HttpResponse& res) {
+                handler_dispatched->store(true, std::memory_order_release);
+                saw_expected_body->store(req.body == " ",
+                                         std::memory_order_release);
+                saw_body_stream->store(static_cast<bool>(req.body_stream),
+                                       std::memory_order_release);
+                res.Status(HttpStatus::OK).Body(req.body, "text/plain");
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.SendHeadersAndTrailers("POST", "/upload", {
+                {"x-upload-checksum", "ok"}
+            });
+            if (resp.error) {
+                pass = false;
+                err += "client error or timeout; ";
+            }
+            if (resp.status != HttpStatus::OK) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) +
+                       " expected 200; ";
+            }
+            if (resp.body != " ") {
+                pass = false;
+                err += "body='" + resp.body + "' expected single space; ";
+            }
+            if (!handler_dispatched->load(std::memory_order_acquire)) {
+                pass = false;
+                err += "buffered handler was not dispatched; ";
+            }
+            if (!saw_expected_body->load(std::memory_order_acquire)) {
+                pass = false;
+                err += "handler did not receive DATA body; ";
+            }
+            if (saw_body_stream->load(std::memory_order_acquire)) {
+                pass = false;
+                err += "buffered handler unexpectedly received body_stream; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 buffered: valid request trailer dispatches",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 buffered: valid request trailer dispatches",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression covering two related fixes:
 //
 //   (a) #137: streaming route + declared Content-Length > max_body_size
@@ -6482,6 +6559,7 @@ void RunAllTests() {
     TestH2_StreamingBodyOverflowDelivers413BeforeRst();
     TestH2_StreamingDeclaredCLOverflowDelivers413AndConnWindowRefunded();
     TestH2_ForbiddenTrailerFieldAbortsStreamingBodyStream();
+    TestH2_BufferedRequestWithValidTrailerDispatches();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 

@@ -8,7 +8,8 @@ enum class H2TrailerClassification {
     Forbidden
 };
 
-// Caller must lowercase the name before calling.
+// Expects a lowercase name. Use SanitizeHttp2TrailerField when accepting
+// caller-owned field names that may need normalization.
 inline bool IsForbiddenH2TrailerName(std::string_view lower_name) {
     if (lower_name.empty() || lower_name[0] == ':') return true;
     return lower_name == "connection" ||

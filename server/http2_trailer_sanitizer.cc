@@ -5,11 +5,12 @@ namespace http {
 H2TrailerFieldResult SanitizeHttp2TrailerField(
     std::string_view name, std::string_view value) {
 
-    // Caller must already have lowercased `name`. We still defensively check
-    // the canonical forbidden set so a future caller that forgets is caught.
     H2TrailerFieldResult result;
     result.lower_name = std::string(name);
-    if (IsForbiddenH2TrailerName(name)) {
+    for (char& c : result.lower_name) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c | 0x20);
+    }
+    if (IsForbiddenH2TrailerName(result.lower_name)) {
         result.classification = H2TrailerClassification::Forbidden;
     } else {
         result.classification = H2TrailerClassification::Accept;

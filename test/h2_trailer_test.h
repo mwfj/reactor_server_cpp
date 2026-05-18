@@ -550,8 +550,7 @@ void TestT2_IsForbiddenH2TrailerName() {
 
 // ---------------------------------------------------------------------------
 // T3: SanitizeHttp2TrailerField per-field classification
-//     Contract: caller lowercases the name before passing it. The function
-//     stores the name as-is in lower_name and classifies via IsForbiddenH2TrailerName.
+//     Normalizes names to lowercase before classification.
 // ---------------------------------------------------------------------------
 void TestT3_SanitizeHttp2TrailerField() {
     std::cout << "\n[TEST] T3: SanitizeHttp2TrailerField per-field classification..."
@@ -560,7 +559,7 @@ void TestT3_SanitizeHttp2TrailerField() {
         bool pass = true;
         std::string err;
 
-        // Forbidden field (caller lowercases first — that is the documented contract)
+        // Forbidden field.
         auto r1 = http::SanitizeHttp2TrailerField("content-length", "42");
         if (r1.classification != http::H2TrailerClassification::Forbidden) {
             pass = false; err += "content-length not Forbidden; ";
@@ -615,6 +614,16 @@ void TestT3_SanitizeHttp2TrailerField() {
         auto r8 = http::SanitizeHttp2TrailerField("host", "example.com");
         if (r8.classification != http::H2TrailerClassification::Forbidden) {
             pass = false; err += "host not Forbidden; ";
+        }
+
+        // Mixed-case direct callers are normalized before classification.
+        auto r9 = http::SanitizeHttp2TrailerField("Content-Length", "42");
+        if (r9.classification != http::H2TrailerClassification::Forbidden) {
+            pass = false; err += "Content-Length not Forbidden; ";
+        }
+        if (r9.lower_name != "content-length") {
+            pass = false; err += "Content-Length lower_name wrong: " +
+                                 r9.lower_name + "; ";
         }
 
         TestFramework::RecordTest(
