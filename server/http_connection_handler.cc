@@ -2424,10 +2424,17 @@ bool HttpConnectionHandler::DispatchStreamingRouteFromHeaders() {
     // consuming. Pause now if we're already above water; the matching
     // on_below_low_water resume will fire naturally when the consumer
     // drains the queue.
+    //
+    // MUST use the SAME high_water threshold that the body_stream was
+    // constructed with at headers-complete (see Setup ~L650-653). The
+    // body_stream's own above_high_water_latched_ is set only when its
+    // BytesQueued crosses ITS threshold; if we paused at a smaller
+    // threshold than the body_stream uses, on_below_low_water would
+    // never fire and DecReadDisable never runs → permanent wedge.
     if (auto* body_stream = parser_.GetRequest().body_stream.get()) {
         const size_t hw = (streaming_high_water_bytes_ > 0)
             ? streaming_high_water_bytes_
-            : 262144;  // matches DEFAULT_STREAM_HIGH_WATER_BYTES
+            : DEFAULT_STREAM_HIGH_WATER_BYTES;
         if (!h1_streaming_pump_paused_ &&
             body_stream->BytesQueued() >= hw &&
             conn_) {

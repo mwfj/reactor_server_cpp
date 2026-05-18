@@ -9,7 +9,54 @@ ChunkQueueBodyStream::ChunkQueueBodyStream(Config cfg)
       producer_dispatcher_(cfg_.producer_dispatcher),
       consumer_dispatcher_(cfg_.consumer_dispatcher) {}
 
-ChunkQueueBodyStream::~ChunkQueueBodyStream() = default;
+ChunkQueueBodyStream::~ChunkQueueBodyStream() {
+    // Defensive backstop: mirror Abort()'s above_high_water_latched_
+    // release block. If the stream is destroyed while latched (no Abort,
+    // no natural drain below low-water), the producer-side IncReadDisable
+    // / WINDOW_UPDATE suspension never gets a matching DecReadDisable /
+    // resume — wedging the inbound dispatcher on that connection.
+    // Normally Abort() / Read() drain below low-water reliably fire the
+    // resume, but consumer paths that drop the shared_ptr without aborting
+    // (e.g. a future caller that lets the lease destruct without going
+    // through ProxyTransaction::Cancel) would leak the latch.
+    bool fire_below_low_water = false;
+    BodyStream::BelowLowWaterCallback resume_cb;
+    std::weak_ptr<Dispatcher> producer_d_snapshot;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (above_high_water_latched_ && cfg_.on_below_low_water) {
+            above_high_water_latched_ = false;
+            above_low_water_latched_ = false;
+            fire_below_low_water = true;
+            resume_cb = cfg_.on_below_low_water;
+            producer_d_snapshot = producer_dispatcher_;
+        }
+    }
+    if (fire_below_low_water) {
+        // Marshal through producer_dispatcher_ like the other call sites.
+        // Inline fire is the fallback when the dispatcher is gone (best-
+        // effort — the producer connection is probably also gone). The
+        // callback runs after the dtor body completes; capturing the
+        // weak_ptr by value extends nothing — but the user-provided
+        // resume_cb itself captures whatever it needs (typically a
+        // weak_ptr to the connection handler).
+        if (auto d = producer_d_snapshot.lock()) {
+            d->EnQueue([cb = std::move(resume_cb)]() { cb(); });
+        } else {
+            try {
+                resume_cb();
+            } catch (const std::exception& e) {
+                logging::Get()->error(
+                    "~ChunkQueueBodyStream inline on_below_low_water threw: {}",
+                    e.what());
+            } catch (...) {
+                logging::Get()->error(
+                    "~ChunkQueueBodyStream inline on_below_low_water threw "
+                    "(unknown exception)");
+            }
+        }
+    }
+}
 
 // ---------- Consumer side ----------
 

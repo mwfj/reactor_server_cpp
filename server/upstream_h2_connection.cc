@@ -1406,14 +1406,28 @@ namespace {
 // proxy-authorization). Also strips Host because the H2 wire conveys
 // it via :authority.
 bool IsForbiddenH2RequestHeader(const std::string& lower_name) {
-    // HeaderRewriter::IsHopByHopHeader covers the RFC 7230 §6.1 set;
-    // host is conveyed via :authority on the H2 wire; expect is illegal
-    // on H2 per RFC 9113 §8.2.2 and HeaderRewriter strips it upstream,
-    // but list it explicitly as defense-in-depth so this gate stays
-    // self-contained.
+    // HeaderRewriter::IsHopByHopHeader covers the RFC 7230 §6.1 set
+    // (connection, keep-alive, proxy-*, te, transfer-encoding, trailer,
+    // upgrade); host is conveyed via :authority on the H2 wire; expect
+    // is illegal on H2 per RFC 9113 §8.2.2.
+    //
+    // content-length is NOT hop-by-hop (it is end-to-end per RFC 9110
+    // §8.6) and HeaderRewriter does not strip it, but on the H2 wire CL
+    // is at best informational — END_STREAM signals end-of-body and
+    // nghttp2's HTTP messaging enforcement validates emitted DATA bytes
+    // against the data-source provider, not against a header value.
+    // Worse, on the streaming path (chunked-style upload via
+    // SubmitStreamingRequest) keeping a stale CL from the inbound side
+    // would advertise an N that may not match what we actually emit if
+    // the body is aborted/truncated mid-stream — a peer-visible framing
+    // inconsistency. Strip unconditionally for defense-in-depth across
+    // both the buffered SubmitRequest path AND the streaming
+    // SubmitStreamingRequest path; H1 SendH1StreamingRequest_ already
+    // does the erase on its own caller-stripped list.
     return HeaderRewriter::IsHopByHopHeader(lower_name) ||
            lower_name == "host" ||
-           lower_name == "expect";
+           lower_name == "expect" ||
+           lower_name == "content-length";
 }
 
 }  // namespace
@@ -1623,9 +1637,13 @@ int32_t UpstreamH2Connection::SubmitStreamingRequest(
     size_t i = 0;
     for (const auto& kv : rewritten_headers) {
         const std::string& lower = lower_names[i++];
-        // IsForbiddenH2RequestHeader covers hop-by-hop + host + expect.
-        // Caller (DispatchH2 streaming branch) pre-strips content-length,
-        // transfer-encoding, and trailer; this gate is the defense-in-depth.
+        // IsForbiddenH2RequestHeader covers hop-by-hop (TE, transfer-
+        // encoding, trailer, upgrade, etc.) plus host, expect, and
+        // content-length. The H1 SendH1StreamingRequest_ path
+        // additionally erases content-length / transfer-encoding /
+        // trailer from rewritten_headers_ upstream of the codec; this
+        // gate enforces the same invariant for the H2 streaming path
+        // without relying on caller bookkeeping.
         if (IsForbiddenH2RequestHeader(lower)) continue;
         push_nv(lower.data(), lower.size(),
                 kv.second.data(), kv.second.size());

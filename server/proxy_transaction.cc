@@ -2246,24 +2246,33 @@ void ProxyTransaction::OnComplete() {
 void ProxyTransaction::OnUpstreamWriteComplete(
     std::shared_ptr<ConnectionHandler> conn) {
     if (cancelled_ || IsKilledForShutdown()) return;
-    // Clear the send-phase write-progress callback installed in
-    // SendUpstreamRequest. The response-wait phase uses a hard
-    // (unrefreshed) deadline. Done regardless of state so an early
-    // response path that already transitioned past SENDING_REQUEST
-    // also stops refreshing.
-    if (auto* upstream_conn = lease_.Get()) {
-        if (auto transport = upstream_conn->GetTransport()) {
-            transport->SetWriteProgressCb(nullptr);
-        }
-    }
 
     // Streaming H1: intermediate chunk drains (between the first headers
     // SendRaw and the final EmitH1ChunkedTrailers_ SendRaw) must NOT
     // transition state to AWAITING_RESPONSE. EmitH1ChunkedTrailers_ sets
     // h1_streaming_send_complete_ = true BEFORE its final SendRaw so the
     // sole post-final-write fire takes the normal transition path below.
+    //
+    // CRITICAL: do NOT clear SetWriteProgressCb on this intermediate path.
+    // The streaming pump's transport-drain backpressure relies on the
+    // callback to resume after the output buffer drops below high-water.
+    // Clearing the callback here on a sync write completion (header /
+    // early-chunk) would leave the pump permanently paused on a slow-but-
+    // draining upstream — false-stall + body queue grows. The clear
+    // happens on the post-final-write path below + in Cleanup.
     if (is_streaming_request_ && !h1_streaming_send_complete_) {
         return;
+    }
+
+    // Clear the send-phase write-progress callback installed in
+    // SendUpstreamRequest / SendH1StreamingRequest_. The response-wait
+    // phase uses a hard (unrefreshed) deadline. Done regardless of state
+    // so an early response path that already transitioned past
+    // SENDING_REQUEST also stops refreshing.
+    if (auto* upstream_conn = lease_.Get()) {
+        if (auto transport = upstream_conn->GetTransport()) {
+            transport->SetWriteProgressCb(nullptr);
+        }
     }
 
     // If state already advanced past SENDING_REQUEST (due to early response),
@@ -3066,6 +3075,20 @@ void ProxyTransaction::Cancel() {
         stream_sender_.Abort(
             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::
                 CLIENT_DISCONNECT);
+    }
+    // Abort the request body_stream BEFORE Cleanup. Cleanup's body_stream
+    // abort gate fires only when state_ ∈ {FAILED, COMPLETE} — Cancel()
+    // does NOT transition state, so on a mid-flight cancel (SENDING_REQUEST
+    // / AWAITING_RESPONSE / RECEIVING_BODY) Cleanup's gate skips the abort.
+    // The inbound HTTP/1.1 keep-alive connection may still hold a reference
+    // to body_stream (so ~ChunkQueueBodyStream doesn't run on lease.reset);
+    // the inbound producer keeps pushing chunks into a queue with no
+    // consumer, and the producer-side IncReadDisable stays applied —
+    // wedging the read pump on that connection. Explicit abort here is
+    // independent of Cleanup's state-keyed gate.
+    if (body_stream_) {
+        body_stream_->Abort("proxy_transaction_cancel");
+        body_stream_.reset();
     }
     // Release the upstream lease back to the pool (or destroy it if
     // poisoned) and clear transport callbacks so any in-flight upstream
