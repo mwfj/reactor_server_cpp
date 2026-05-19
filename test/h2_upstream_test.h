@@ -2909,7 +2909,7 @@ struct DeferredCallbackProbeSink :
         last_code = code;
         last_msg = msg;
     }
-    std::function<void(int, const std::string&)> MakeDeferredErrorCallback() override {
+    UPSTREAM_CALLBACKS_NAMESPACE::H2StreamingAbortCallback MakeDeferredErrorCallback() override {
         ++factory_calls;
         return [this](int code, const std::string& msg) {
             ++deferred_fired;

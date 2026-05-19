@@ -20,6 +20,20 @@ namespace CALLBACKS_NAMESPACE {
     // waiting for the buffer to fully drain.
     using ConnWriteProgressCallback = std::function<void(std::shared_ptr<ConnectionHandler>, size_t)>;
 
+    // Outbound connect lifecycle (upstream/proxy use). Fires once when the
+    // socket transitions from CONNECTING to CONNECTED. Consumed-on-fire.
+    using ConnConnectCompleteCallback = std::function<void(std::shared_ptr<ConnectionHandler>)>;
+
+    // Fires once when the TLS handshake transitions to READY (consume-on-fire).
+    // Wired by the H2 upstream codec so it can inspect ALPN immediately on
+    // completion.
+    using ConnHandshakeCompleteCallback = std::function<void()>;
+
+    // Deadline timer fired. Returns true if the timeout was handled (e.g.
+    // HTTP/2 RST'd expired streams and re-armed) — connection stays alive.
+    // Returns false to proceed with the default close behavior.
+    using ConnDeadlineTimeoutCallback = std::function<bool()>;
+
     struct ConnCallbacks {
         ConnOnMsgCallback        on_message_callback      = nullptr;
         ConnCompleteCallback     complete_callback        = nullptr;

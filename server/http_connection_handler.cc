@@ -1463,7 +1463,7 @@ bool HttpConnectionHandler::HandleCompleteRequest(const char*& buf, size_t& rema
     // stash. body_stream was closed by the parser's on_message_complete.
     if (streaming_dispatched_) {
         streaming_dispatched_ = false;
-        buf      += consumed;
+        buf       += consumed;
         remaining -= consumed;
         if (remaining > 0) {
             StashDeferredBytes(std::string(buf, remaining));
@@ -2310,7 +2310,7 @@ bool HttpConnectionHandler::DispatchStreamingRouteFromHeaders() {
     HttpRequest& req = parser_.GetRequest();
 
     // Per-request fields normally populated at the top of HandleCompleteRequest.
-    const bool has_tls = conn_->HasTls();
+    const bool has_tls   = conn_->HasTls();
     req.dispatcher_index = conn_->dispatcher_index();
     req.client_ip        = conn_->ip_addr();
     req.client_tls       = has_tls;
@@ -2436,8 +2436,8 @@ bool HttpConnectionHandler::DispatchStreamingRouteFromHeaders() {
             ? streaming_high_water_bytes_
             : DEFAULT_STREAM_HIGH_WATER_BYTES;
         if (!h1_streaming_pump_paused_ &&
-            body_stream->BytesQueued() >= hw &&
-            conn_) {
+            body_stream->BytesQueued() >= hw && conn_) {
+                
             conn_->IncReadDisable();
             h1_streaming_pump_paused_ = true;
         }

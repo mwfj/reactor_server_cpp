@@ -310,6 +310,8 @@ server.Start();
 
 `Proxy()` calls must happen before `Start()`. Calling it afterwards — or naming an upstream that is not in the config — raises `std::invalid_argument`.
 
+Manually-registered routes honor every applicable field on `config.upstreams[name]`, including `request_mode`: if the upstream is configured with `request_mode: "streaming"`, the route is dispatched at headers-complete with a `BodyStream` for the request body, identical to a config-auto-registered proxy route. See [docs/streaming_request.md](streaming_request.md) for the streaming semantics.
+
 ### HEAD precedence and companion methods
 
 Proxy registrations interact with the HEAD-fallback rule from [Route Matching](#route-matching) as follows:

@@ -13,8 +13,37 @@ class Dispatcher;
 struct HttpRequest;
 class HttpResponse;
 class AsyncPendingState;   // defined in http/http_router.h
+namespace http {
+    class BodyStream;
+    class HttpParser;
+}
 
 namespace HTTP_CALLBACKS_NAMESPACE {
+
+    // ---- BodyStream callbacks (streaming inbound request body) -------------
+    // One-shot resume callback fired when Read returns WOULD_BLOCK and the
+    // producer pushes data / EOS / abort. Set via BodyStream::WaitForData.
+    using BodyStreamDataAvailableCallback = std::function<void()>;
+    // Producer-side hook: fires after the consumer drains N bytes from the
+    // queue, with N as the argument. Used by the inbound H2 layer to emit
+    // WINDOW_UPDATE for the stream.
+    using BodyStreamBytesConsumedCallback = std::function<void(size_t)>;
+    // Producer-side hook: fires when queue depth drops below the configured
+    // low-water mark. Used by the inbound layer to clear WINDOW_UPDATE
+    // suppression (H2) or resume the read pump (H1).
+    using BodyStreamBelowLowWaterCallback = std::function<void()>;
+
+    // ---- HttpParser callbacks -----------------------------------------------
+    // Fires from llhttp's on_headers_complete. The connection handler uses
+    // this to perform per-request actions (route resolution, streaming
+    // setup) while the parser is still mid-parse — synchronous, before
+    // on_body runs.
+    using HttpParserHeadersCompleteCallback = std::function<void()>;
+    // Fires from on_message_complete when a streaming body stream is
+    // installed. Lets the connection handler clear streaming-upload state
+    // on the happy-path EOS signal.
+    using HttpParserStreamingBodyCompleteCallback = std::function<void()>;
+
 
     // ---- HttpConnectionHandler callbacks ------------------------------------
     using HttpConnRequestCallback = std::function<void(

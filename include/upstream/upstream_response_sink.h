@@ -1,6 +1,7 @@
 #pragma once
 
 #include "upstream/upstream_response_head.h"
+#include "upstream/upstream_callbacks.h"
 
 namespace UPSTREAM_CALLBACKS_NAMESPACE {
 
@@ -49,10 +50,10 @@ public:
     // deferred dispatcher task to deliver a terminal OnError. The returned
     // function MUST capture a STRONG owner so it is safe to invoke after
     // every other ref to the sink has been released. Default returns an
-    // empty std::function — caller falls through to synchronous in-place
-    // dispatch.
-    virtual std::function<void(int, const std::string&)>
-    MakeDeferredErrorCallback() {
+    // empty callable — caller falls through to synchronous in-place
+    // dispatch. Canonical alias lives in upstream_callbacks.h per
+    // CODE_CONVENTIONS.md §Callbacks.
+    virtual H2StreamingAbortCallback MakeDeferredErrorCallback() {
         return {};
     }
 };

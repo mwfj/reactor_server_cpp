@@ -224,8 +224,7 @@ public:
     // within this callback — doing so is reentrant into nghttp2 and unsafe.
     void SetStreamOpenCallback(HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback cb);
     void SetRequestCountCallback(HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback cb);
-    void SetResolveRouteOptionsCallback(
-        HTTP2_CALLBACKS_NAMESPACE::ResolveRouteOptionsCallback cb);
+    void SetResolveRouteOptionsCallback(HTTP2_CALLBACKS_NAMESPACE::ResolveRouteOptionsCallback cb);
 
     // --- Flood protection ---
 

@@ -1043,8 +1043,7 @@ void Http2ConnectionHandler::Initialize(const std::string& initial_data) {
     }
 
     // Push streaming watermark config into the session.
-    session_->SetStreamingConfig(
-        streaming_high_water_, streaming_low_water_, streaming_window_update_);
+    session_->SetStreamingConfig(streaming_high_water_, streaming_low_water_, streaming_window_update_);
 
     // Apply body size limit. Header list size comes from h2_settings_
     // (passed to Http2Session constructor) and is advertised in SETTINGS.

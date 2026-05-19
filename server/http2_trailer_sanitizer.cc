@@ -2,8 +2,8 @@
 
 namespace http {
 
-H2TrailerFieldResult SanitizeHttp2TrailerField(
-    std::string_view name, std::string_view value) {
+H2TrailerFieldResult SanitizeHttp2TrailerField(std::string_view name, 
+                                               std::string_view value) {
 
     H2TrailerFieldResult result;
     result.lower_name = std::string(name);

@@ -63,7 +63,10 @@ public:
 
     // Callback invoked (once) when the connection finishes draining all
     // active streams during graceful shutdown. Called on dispatcher thread.
-    using DrainCompleteCallback = std::function<void()>;
+    // Re-exported from HTTP2_CALLBACKS_NAMESPACE; canonical alias lives
+    // there per CODE_CONVENTIONS.md §Callbacks & Callback Registries.
+    using DrainCompleteCallback =
+        HTTP2_CALLBACKS_NAMESPACE::Http2DrainCompleteCallback;
     void SetDrainCompleteCallback(DrainCompleteCallback cb);
 
     // Access the underlying connection

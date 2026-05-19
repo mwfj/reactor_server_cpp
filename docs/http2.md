@@ -186,10 +186,10 @@ Per RFC 9113 Section 8.2.2:
 - **Required pseudo-headers (non-CONNECT)**: `:method`, `:path`, and `:scheme` must be present
 - **CONNECT pseudo-headers**: `:method` + `:authority` required; `:path` and `:scheme` must NOT be present (checked by presence, not value — an explicit empty `:path` is rejected)
 - **`:authority` vs `host`**: case-insensitive hostname comparison (RFC 3986 Section 3.2.2), exact port match, IPv6 bracket-aware
-- **Trailer validation**: pseudo-headers forbidden; `content-length`, `host`, `authorization`, `content-type`, `content-encoding`, `content-range`, and connection-specific headers rejected per RFC 9110 Section 6.5.1
+- **Trailer validation**: pseudo-headers forbidden; `content-length`, `host`, `authorization`, `content-type`, `content-encoding`, `content-range`, and connection-specific headers rejected per RFC 9110 Section 6.5.1. Trailer HEADERS without `END_STREAM` are rejected with PROTOCOL_ERROR (RFC 9113 §8.1).
 - **1xx responses**: all `status < 200` rejected from app-facing `SubmitResponse()` with RST_STREAM(INTERNAL_ERROR); internal 100-continue uses `nghttp2_submit_headers` directly
 - **Unsupported Expect**: rejected with 417 response + RST_STREAM(NO_ERROR) when client side is still open (no END_STREAM on request); clean 417 without RST when request already ended
-- **Body size limits** enforced per-stream via RST_STREAM(CANCEL)
+- **Body size limits**: buffered routes (`request_mode: "buffered"`) reject with RST_STREAM(CANCEL); streaming routes (`request_mode: "streaming"`) deliver a 413 response first and defer the RST until after `SubmitResponse + SendPendingFrames` so the client receives the status line. Pre-dispatch declared `content-length > max_body_size` also delivers a streaming 413. See [docs/streaming_request.md](streaming_request.md) for the full streaming-mode contract.
 
 ### TLS Requirements
 

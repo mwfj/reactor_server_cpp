@@ -2460,7 +2460,7 @@ void ProxyTransaction::OnRequestBodySourceConsumed(size_t bytes) {
     if (bytes > 0) source_consumed_ = true;
 }
 
-std::function<void(int, const std::string&)>
+UPSTREAM_CALLBACKS_NAMESPACE::H2StreamingAbortCallback
 ProxyTransaction::MakeDeferredErrorCallback() {
     // INVARIANT: invoked via virtual dispatch on `sink` from inside
     // SubmitStreamingRequest, which runs on the OnCheckoutReady strong-self

@@ -601,15 +601,13 @@ static int OnFrameRecvCallback(
                         // request count is bumped inside
                         // DispatchStreamRequestStreaming so we MUST NOT
                         // also call request_count_callback here.
-                        auto body_stream = CreateStreamingBodyStreamForRecv(
-                            self, frame->hd.stream_id);
+                        auto body_stream = CreateStreamingBodyStreamForRecv(self, frame->hd.stream_id);
                         if (body_stream) {
                             stream->set_route_mode(http::RouteRequestMode::Streaming);
                             body_stream->Abort("body_size_limit_exceeded");
                             stream->GetRequest().body_stream = body_stream;
                             stream->MarkRstPendingAfterResponse();
-                            self->DispatchStreamRequestStreaming(
-                                stream, frame->hd.stream_id);
+                            self->DispatchStreamRequestStreaming(stream, frame->hd.stream_id);
                             // Mark rejected AFTER dispatch so racing DATA
                             // chunks hit the post-rejection refund path in
                             // OnDataChunkRecvCallback rather than being
@@ -787,8 +785,7 @@ static int OnFrameRecvCallback(
         if (frame->headers.cat == NGHTTP2_HCAT_REQUEST && !stream->IsRejected()) {
             if (self->Callbacks().resolve_route_options_callback) {
                 const auto& req = stream->GetRequest();
-                auto opts = self->Callbacks().resolve_route_options_callback(
-                    req.method, req.path);
+                auto opts = self->Callbacks().resolve_route_options_callback(req.method, req.path);
                 if (opts.request_mode == http::RouteRequestMode::Streaming &&
                     !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
                     stream->set_route_mode(http::RouteRequestMode::Streaming);
@@ -1898,14 +1895,13 @@ bool Http2Session::ConsumeStreamingRequestBytes(
         stream->reset_consumed_since_last_window_update();
         if (accumulated == 0) return true;
 
-        int rv_s = nghttp2_session_consume_stream(
-            impl_->session, stream_id, accumulated);
+        int rv_s = nghttp2_session_consume_stream(impl_->session, stream_id, accumulated);
         if (rv_s != 0) {
             logging::Get()->warn("nghttp2_session_consume_stream failed "
                                  "stream={} rv={}", stream_id, rv_s);
         }
-        int rv_c = nghttp2_session_consume_connection(
-            impl_->session, accumulated);
+
+        int rv_c = nghttp2_session_consume_connection(impl_->session, accumulated);
         if (rv_c != 0) {
             logging::Get()->warn("nghttp2_session_consume_connection failed "
                                  "stream={} rv={}", stream_id, rv_c);
@@ -1937,12 +1933,12 @@ void Http2Session::FlushStreamConsumeOnStream(
     if (accumulated == 0) return;
 
     stream->reset_consumed_since_last_window_update();
-    int rv_s = nghttp2_session_consume_stream(
-        impl_->session, stream_id, accumulated);
+    int rv_s = nghttp2_session_consume_stream(impl_->session, stream_id, accumulated);
     if (rv_s != 0) {
         logging::Get()->warn("nghttp2_session_consume_stream (force flush) "
                              "failed stream={} rv={}", stream_id, rv_s);
     }
+    
     int rv_c = nghttp2_session_consume_connection(impl_->session, accumulated);
     if (rv_c != 0) {
         logging::Get()->warn("nghttp2_session_consume_connection (force flush) "

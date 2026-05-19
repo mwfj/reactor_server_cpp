@@ -271,6 +271,15 @@ Upstream connection pools are configured via the `upstreams` array in the JSON c
 
 **Validator constraint:** `verify_peer: true` with an IP-literal `host` and no `sni_hostname` override is rejected at config load with an error. Use `sni_hostname` to supply the certificate name when connecting to an upstream by IP address with peer verification enabled.
 
+**Top-level upstream fields** (siblings of `pool` / `tls` / `http2` / `proxy`):
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | (required) | Identifier referenced by `proxy.route_prefix` auto-registration and `HttpServer::Proxy()` API. |
+| `host` | (required) | Hostname or IPv4/IPv6 literal of the upstream. |
+| `port` | (required) | TCP port. |
+| `request_mode` | `"streaming"` (proxy routes) / `"buffered"` (non-proxy) | Per-route forwarding mode. Streaming dispatches at headers-complete with a `BodyStream`; buffered captures the full body before dispatch. Restart-only — SIGHUP cannot toggle the mode for an already-registered route. See [docs/streaming_request.md](streaming_request.md). |
+
 **Note:** Upstream configuration changes require a server restart — pools are built once during `Start()` and cannot be rebuilt at runtime. The `upstreams[].http2.*` block is the exception: most fields are live-reloadable via SIGHUP. See **Upstream HTTP/2** below.
 
 ### Upstream HTTP/2

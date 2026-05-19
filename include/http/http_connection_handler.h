@@ -23,8 +23,7 @@ public:
     void SetRequestCallback(RequestCallback callback);
     void SetRouteCheckCallback(RouteCheckCallback callback);
     void SetMiddlewareCallback(MiddlewareCallback callback);
-    void SetResolveRouteOptionsCallback(
-        HTTP_CALLBACKS_NAMESPACE::HttpConnResolveRouteOptionsCallback callback);
+    void SetResolveRouteOptionsCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnResolveRouteOptionsCallback callback);
     // Install the async middleware callback for WS upgrades. Optional;
     // when not installed the WS upgrade path skips the async phase and
     // runs the sync path only.

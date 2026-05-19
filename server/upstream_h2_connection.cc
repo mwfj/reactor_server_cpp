@@ -826,8 +826,7 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                 if (stream->streaming_abort_pending) {
                     const int code = stream->streaming_abort_code;
                     std::string msg = std::move(stream->streaming_abort_message);
-                    auto deferred_cb =
-                        std::move(stream->streaming_abort_callback);
+                    auto deferred_cb = std::move(stream->streaming_abort_callback);
                     stream->streaming_abort_pending = false;
                     auto* raw_sink = stream->sink;
                     stream->sink = nullptr;
@@ -1677,8 +1676,7 @@ int32_t UpstreamH2Connection::SubmitStreamingRequest(
     nghttp2_data_provider2* data_prd = nullptr;
     if (!pure_bodyless) {
         provider.source.ptr = stream.get();
-        provider.read_callback =
-            &UpstreamH2Connection::StreamingDataSourceReadCallback;
+        provider.read_callback = &UpstreamH2Connection::StreamingDataSourceReadCallback;
         data_prd = &provider;
     }
     // pure_bodyless: data_prd stays nullptr → END_STREAM rides HEADERS frame.

@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include "http/http_callbacks.h"
 
 class Dispatcher;
 
@@ -17,9 +18,16 @@ enum class BodyStreamResult {
 // registers a one-shot resume callback when Read returns WOULD_BLOCK.
 class BodyStream {
 public:
-    using DataAvailableCallback = std::function<void()>;
-    using BytesConsumedCallback = std::function<void(size_t)>;
-    using BelowLowWaterCallback = std::function<void()>;
+    // Re-export from HTTP_CALLBACKS_NAMESPACE so callers can keep using
+    // the short `BodyStream::DataAvailableCallback` form while the canonical
+    // alias lives with the rest of the HTTP-layer callbacks
+    // (CODE_CONVENTIONS.md §Callbacks & Callback Registries).
+    using DataAvailableCallback =
+        HTTP_CALLBACKS_NAMESPACE::BodyStreamDataAvailableCallback;
+    using BytesConsumedCallback =
+        HTTP_CALLBACKS_NAMESPACE::BodyStreamBytesConsumedCallback;
+    using BelowLowWaterCallback =
+        HTTP_CALLBACKS_NAMESPACE::BodyStreamBelowLowWaterCallback;
 
     virtual ~BodyStream() = default;
 

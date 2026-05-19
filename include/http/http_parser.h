@@ -2,6 +2,7 @@
 
 #include "http/http_request.h"
 #include "http/body_stream.h"
+#include "http/http_callbacks.h"
 #include <string>
 #include <cstddef>
 #include <functional>
@@ -49,7 +50,10 @@ public:
     // Callback fired from on_headers_complete. Allows the connection handler
     // to perform per-request actions (route resolution, streaming setup)
     // while the parser is still mid-parse — synchronous, before on_body runs.
-    using HeadersCompleteCallback = std::function<void()>;
+    // Re-exported from HTTP_CALLBACKS_NAMESPACE; canonical alias lives there
+    // per CODE_CONVENTIONS.md §Callbacks & Callback Registries.
+    using HeadersCompleteCallback =
+        HTTP_CALLBACKS_NAMESPACE::HttpParserHeadersCompleteCallback;
     void SetHeadersCompleteCallback(HeadersCompleteCallback cb) {
         headers_complete_callback_ = std::move(cb);
     }
@@ -57,7 +61,8 @@ public:
     // Callback fired from on_message_complete when streaming_body_stream_ is
     // set. Lets the connection handler clear streaming_upload_in_flight_ on
     // the happy-path EOS signal. Only fires when streaming is active.
-    using StreamingBodyCompleteCallback = std::function<void()>;
+    using StreamingBodyCompleteCallback =
+        HTTP_CALLBACKS_NAMESPACE::HttpParserStreamingBodyCompleteCallback;
     void SetStreamingBodyCompleteCallback(StreamingBodyCompleteCallback cb) {
         streaming_body_complete_callback_ = std::move(cb);
     }

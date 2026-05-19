@@ -218,7 +218,7 @@ public:
     void OnRequestHeadersSubmitted() override;
     void OnRequestBodyProgress(size_t bytes_drained) override;
     void OnRequestBodySourceConsumed(size_t bytes) override;
-    std::function<void(int, const std::string&)>
+    UPSTREAM_CALLBACKS_NAMESPACE::H2StreamingAbortCallback
     MakeDeferredErrorCallback() override;
 
     // Send-phase stall fallback budget when config_.response_timeout_ms == 0.

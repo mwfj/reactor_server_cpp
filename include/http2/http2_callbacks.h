@@ -39,6 +39,11 @@ namespace HTTP2_CALLBACKS_NAMESPACE {
     // including those rejected by the session (consistent with HTTP/1).
     using Http2RequestCountCallback = std::function<void()>;
 
+    // Invoked once when an Http2ConnectionHandler finishes draining all
+    // active streams during graceful shutdown. Called on the dispatcher
+    // thread that owns the connection.
+    using Http2DrainCompleteCallback = std::function<void()>;
+
     // Called at HEADERS-complete to resolve per-route options (e.g. request
     // mode) without a full router dispatch. Returns default RouteOptions
     // when no matching route exists (Buffered mode — preserves old behavior).

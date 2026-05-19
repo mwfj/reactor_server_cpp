@@ -37,7 +37,7 @@ private:
     TimeStamp ts_; // Each connection owns a timestamp to manage
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
-    std::function<bool()> deadline_timeout_cb_;
+    CALLBACKS_NAMESPACE::ConnDeadlineTimeoutCallback deadline_timeout_cb_;
     // Generation counter for deadline callback. Incremented by
     // SetDeadlineTimeoutCb(). Used by CallDeadlineTimeoutCb() to detect
     // whether the callback explicitly re-installed or cleared itself
@@ -54,13 +54,16 @@ private:
     // Outbound connect support (for upstream/proxy connections)
     enum class ConnectState { NONE, CONNECTING, CONNECTED };
     ConnectState connect_state_ = ConnectState::NONE;
-    using ConnectCompleteCallback = std::function<void(std::shared_ptr<ConnectionHandler>)>;
+    // Re-exported from CALLBACKS_NAMESPACE so callers keep using the short
+    // class-scope name while the canonical alias lives with the rest of the
+    // reactor-core callbacks (CODE_CONVENTIONS.md §Callbacks).
+    using ConnectCompleteCallback = CALLBACKS_NAMESPACE::ConnConnectCompleteCallback;
     ConnectCompleteCallback connect_complete_callback_ = nullptr;
 
     // Fires once when TLS handshake transitions to READY (consume-on-fire).
     // Wired by the H2 upstream codec so it can inspect ALPN immediately on
     // completion. Cleared after invocation. See SetHandshakeCompleteCallback.
-    using HandshakeCompleteCallback = std::function<void()>;
+    using HandshakeCompleteCallback = CALLBACKS_NAMESPACE::ConnHandshakeCompleteCallback;
     HandshakeCompleteCallback handshake_complete_callback_ = nullptr;
 
     // TLS support
@@ -266,7 +269,8 @@ public:
     // Deadline timeout callback. Returns true if the timeout was handled
     // (e.g., HTTP/2 RST'd expired streams and re-armed) — connection stays alive.
     // Returns false to proceed with the default close behavior.
-    using DeadlineTimeoutCb = std::function<bool()>;
+    // Re-exported from CALLBACKS_NAMESPACE per CODE_CONVENTIONS.md §Callbacks.
+    using DeadlineTimeoutCb = CALLBACKS_NAMESPACE::ConnDeadlineTimeoutCallback;
     void SetDeadlineTimeoutCb(DeadlineTimeoutCb cb);
     bool CallDeadlineTimeoutCb();  // returns true if handled (keep alive)
 

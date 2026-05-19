@@ -69,8 +69,9 @@ struct UpstreamH2Stream {
     // ProxyTransaction alive for the entire H2 stream lifetime so the raw
     // `sink` pointer cannot dangle; (b) deferred terminal-error callback
     // consumed by OnStreamClose's streaming-abort branch.
-    // Empty std::function = no keepalive (legacy/test sinks).
-    std::function<void(int, const std::string&)> streaming_abort_callback;
+    // Empty = no keepalive (legacy/test sinks). Canonical type alias lives
+    // in upstream_callbacks.h per CODE_CONVENTIONS.md §Callbacks.
+    UPSTREAM_CALLBACKS_NAMESPACE::H2StreamingAbortCallback streaming_abort_callback;
 
     // Set at submit time so frame callbacks can detect HEAD-on-NO_BODY
     // (RFC 9110 §9.3.2) without reaching back into the codec or proxy
