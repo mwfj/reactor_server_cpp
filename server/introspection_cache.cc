@@ -114,9 +114,6 @@ void IntrospectionCache::Insert(const std::string& key,
 }
 
 void IntrospectionCache::ApplyReload(const IntrospectionConfig& new_cfg) {
-    cache_sec_.store(new_cfg.cache_sec, std::memory_order_relaxed);
-    negative_cache_sec_.store(new_cfg.negative_cache_sec,
-                              std::memory_order_relaxed);
     stale_grace_sec_.store(new_cfg.stale_grace_sec,
                            std::memory_order_relaxed);
     if (new_cfg.max_entries > 0) {

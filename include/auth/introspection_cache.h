@@ -16,10 +16,13 @@ namespace AUTH_NAMESPACE {
 // Stale-grace is honored ONLY for positive (active=true) entries — negative
 // entries are never stale-served.
 //
-// The reloadable TTL fields (cache_sec, negative_cache_sec, stale_grace_sec)
-// are atomic and consulted on every Insert/Lookup; ApplyReload mutates them
-// without taking any shard lock. shard_count is fixed at construction
-// (restart-required); changing it would require rehashing every entry.
+// stale_grace_sec_ is atomic so LookupStale can read it under each shard's
+// lock without contending on a shared config mutex; ApplyReload updates it
+// (and the cache's per-shard cap) without taking any shard lock. shard_count
+// is fixed at construction (restart-required); changing it would require
+// rehashing every entry. TTL clamp values (cache_sec, negative_cache_sec)
+// live on the AuthManager-side IntrospectionConfig snapshot — callers clamp
+// before invoking Insert.
 class IntrospectionCache {
  public:
     enum class LookupState { Miss, Fresh, Stale };
@@ -140,8 +143,6 @@ class IntrospectionCache {
     std::atomic<uint64_t> negative_hit_{0};
     std::atomic<uint64_t> stale_served_{0};
 
-    std::atomic<int> cache_sec_{60};
-    std::atomic<int> negative_cache_sec_{10};
     std::atomic<int> stale_grace_sec_{30};
 };
 

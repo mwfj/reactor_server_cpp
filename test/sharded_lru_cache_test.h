@@ -239,13 +239,13 @@ static void Test_Handle_MoveConstruct() {
         bool h1_valid = bool(h1);
 
         auto h2 = std::move(h1);
-        // h1 must be empty; h2 must be valid and hold the value.
+        // h1 must be empty (operator bool returns false); h2 must be valid
+        // and hold the value. operator* / operator-> on an empty handle is
+        // UB by contract — do not dereference h1 here.
         bool h1_empty = !h1;
         bool h2_valid = bool(h2) && *h2 == 77;
-        // operator-> on moved-from h1 must return nullptr (not crash).
-        bool ptr_null = (h1.operator->() == nullptr);
 
-        bool ok = h1_valid && h1_empty && h2_valid && ptr_null;
+        bool ok = h1_valid && h1_empty && h2_valid;
         Record("ShardedLruCache: Handle_MoveConstruct",
                ok, "Move-construct: source empty, dest valid");
     } catch (const std::exception& e) {

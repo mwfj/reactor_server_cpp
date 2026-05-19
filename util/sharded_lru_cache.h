@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include <cassert>
 // <atomic>, <functional>, <memory>, <mutex>, <stdexcept>, <unordered_map>,
 // <utility>, <vector>, <cstddef> all provided by common.h.
 
@@ -25,7 +26,19 @@ namespace UTIL_NAMESPACE {
 // initializer-list and never reassigned.
 //
 // shard_count must be a power of two in [1, 64]; per_shard_cap must be > 0.
-template <typename Key, typename Value, typename Hash = std::hash<Key>>
+// Hash:    used for shard selection (low bits → mask).
+// MapHash: used for the per-shard unordered_map's bucket placement.
+//
+// Splitting these matters when Hash deliberately consumes only part of the
+// key (e.g. IntrospectionCache's HexPrefixHash takes the first 4 hex chars
+// for shard derivation). Threading the same constrained hash through the
+// per-shard map would limit per-bucket entropy to whatever bits Hash kept
+// after the shard mask. Keep MapHash as the default std::hash<Key> unless
+// you need a custom one.
+template <typename Key,
+          typename Value,
+          typename Hash = std::hash<Key>,
+          typename MapHash = std::hash<Key>>
 class ShardedLruCache {
  private:
     // Forward-declared so Handle (public section, below) can hold Node*
@@ -94,10 +107,26 @@ class ShardedLruCache {
             return lock_.owns_lock() && node_ != nullptr;
         }
 
-        Value& operator*() noexcept { return node_->value; }
-        Value* operator->() noexcept { return node_ ? &node_->value : nullptr; }
-        const Value& operator*() const noexcept { return node_->value; }
-        const Value* operator->() const noexcept { return node_ ? &node_->value : nullptr; }
+        // Dereference is UB when the Handle is empty (i.e., when operator bool
+        // returns false). Callers MUST check operator bool first. Debug builds
+        // catch the violation via assert; release builds get the same UB as
+        // std::unique_ptr / std::optional dereference.
+        Value& operator*() noexcept {
+            assert(node_ != nullptr && "Handle::operator*: empty handle");
+            return node_->value;
+        }
+        Value* operator->() noexcept {
+            assert(node_ != nullptr && "Handle::operator->: empty handle");
+            return &node_->value;
+        }
+        const Value& operator*() const noexcept {
+            assert(node_ != nullptr && "Handle::operator*: empty handle");
+            return node_->value;
+        }
+        const Value* operator->() const noexcept {
+            assert(node_ != nullptr && "Handle::operator->: empty handle");
+            return &node_->value;
+        }
 
      private:
         friend class ShardedLruCache;
@@ -302,7 +331,7 @@ class ShardedLruCache {
 
     struct Shard {
         mutable std::mutex mu;
-        std::unordered_map<Key, std::unique_ptr<Node>, Hash> index;
+        std::unordered_map<Key, std::unique_ptr<Node>, MapHash> index;
         Node* lru_head = nullptr;  // MRU
         Node* lru_tail = nullptr;  // LRU
         std::size_t size = 0;
