@@ -514,7 +514,10 @@ private:
     std::mutex& drain_mtx_;
     std::condition_variable& drain_cv_;
 
-    // Idle connections (front = most recently used, LRU eviction from back)
+    // Idle connections (front = most recently used, eviction from back).
+    // Deliberately not UTIL_NAMESPACE::ShardedLruCache: timer-driven (not
+    // capacity-driven) eviction, unique_ptr move-out ownership to borrowers,
+    // mid-container endpoint-mismatch walker, and dispatcher-bound (no mutex).
     std::deque<std::unique_ptr<UpstreamConnection>> idle_conns_;
 
     // Connections currently checked out (pool retains ownership)

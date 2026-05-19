@@ -64,6 +64,7 @@ jobs:
           # timing makes them flake under valgrind).
           for suite in \
             basic \
+            lru_cache \
             http \
             http2 \
             ws \

@@ -52,41 +52,20 @@ RateLimitZone::KeyExtractor MakeKeyExtractor(const std::string& key_type) {
 }
 
 // ---------------------------------------------------------------------------
-// Shard LRU helpers (all called under shard lock)
+// Per-shard cap rounding helper
 // ---------------------------------------------------------------------------
+//
+// Floor with min-1: enforces a hard RAM cap while never producing a
+// zero-capacity shard (which the cache constructor rejects).
 
-void RateLimitZone::Shard::TouchLru(Entry* e) {
-    if (e == lru_head) return;  // Already most-recent
-    RemoveLru(e);
-    PushFrontLru(e);
+namespace {
+
+size_t ComputeRateLimitPerShardCap(int max_entries) {
+    size_t cap = static_cast<size_t>(max_entries) / RateLimitZone::SHARD_COUNT;
+    return cap == 0 ? 1u : cap;
 }
 
-void RateLimitZone::Shard::RemoveLru(Entry* e) {
-    if (e->lru_prev) {
-        e->lru_prev->lru_next = e->lru_next;
-    } else {
-        lru_head = e->lru_next;
-    }
-    if (e->lru_next) {
-        e->lru_next->lru_prev = e->lru_prev;
-    } else {
-        lru_tail = e->lru_prev;
-    }
-    e->lru_prev = nullptr;
-    e->lru_next = nullptr;
-}
-
-void RateLimitZone::Shard::PushFrontLru(Entry* e) {
-    e->lru_prev = nullptr;
-    e->lru_next = lru_head;
-    if (lru_head) {
-        lru_head->lru_prev = e;
-    }
-    lru_head = e;
-    if (!lru_tail) {
-        lru_tail = e;
-    }
-}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Constructor / Destructor
@@ -98,7 +77,7 @@ RateLimitZone::RateLimitZone(const std::string& name,
     : name_(name),
       key_type_(config.key_type),
       key_extractor_(std::move(extractor)),
-      shards_(SHARD_COUNT)
+      cache_(SHARD_COUNT, ComputeRateLimitPerShardCap(config.max_entries))
 {
     auto policy = std::make_shared<ZonePolicy>();
     policy->rate = config.rate;
@@ -118,70 +97,15 @@ RateLimitZone::~RateLimitZone() {
 }
 
 // ---------------------------------------------------------------------------
-// ShardIndex
-// ---------------------------------------------------------------------------
-
-size_t RateLimitZone::ShardIndex(const std::string& key) const {
-    return std::hash<std::string>{}(key) % shards_.size();
-}
-
-// ---------------------------------------------------------------------------
-// FindOrCreate (called under shard lock)
-// ---------------------------------------------------------------------------
-
-RateLimitZone::Entry* RateLimitZone::FindOrCreate(Shard& shard,
-                                                   const std::string& key,
-                                                   const ZonePolicy& policy) {
-    auto it = shard.buckets.find(key);
-    if (it != shard.buckets.end()) {
-        return it->second.get();
-    }
-
-    // Enforce max_entries synchronously on insert. Relying on the periodic
-    // timer sweep alone lets high-cardinality bursts (many unique keys per
-    // interval) grow the shard far beyond the configured cap, which makes
-    // max_entries useless as a RAM guard under adversarial traffic.
-    //
-    // max_per_shard: floor(max_entries / SHARD_COUNT), minimum 1 so we
-    // never produce a zero-capacity shard. Matches the EvictExpired math.
-    //
-    // Tradeoff: drastic reductions via Reload() (e.g., 100k → 16) will
-    // cause the first insert into an over-capacity shard to evict many
-    // entries under the shard lock. Extreme reductions are rare and the
-    // memory guarantee is considered worth the one-time latency spike.
-    size_t max_per_shard = static_cast<size_t>(policy.max_entries) / shards_.size();
-    if (max_per_shard == 0) max_per_shard = 1;
-    // Evict LRU tail until there's room for the new entry.
-    while (shard.count >= max_per_shard && shard.lru_tail != nullptr) {
-        Entry* victim = shard.lru_tail;
-        std::string victim_key = std::move(victim->key);
-        shard.RemoveLru(victim);
-        shard.buckets.erase(victim_key);
-        shard.count--;
-    }
-
-    // Create new entry
-    auto entry = std::make_unique<Entry>(policy.rate, policy.capacity);
-    entry->key = key;
-    Entry* raw = entry.get();
-    shard.buckets.emplace(key, std::move(entry));
-    shard.PushFrontLru(raw);
-    shard.count++;
-    return raw;
-}
-
-// ---------------------------------------------------------------------------
 // Check
 // ---------------------------------------------------------------------------
 
 RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
-    // 1. Load immutable policy snapshot
     auto policy = LoadPolicy();
 
-    // "Not applicable" result — zone didn't apply to this request.
-    // applicable=false tells the manager to skip this zone when building
-    // response headers (so RateLimit-* headers reflect the actual zones
-    // that governed the request, not skipped zones).
+    // applicable=false skips this zone when building RateLimit-* response
+    // headers so client-facing headers reflect only zones that governed
+    // the request.
     Result not_applicable{
         /*allowed=*/true,
         /*applicable=*/false,
@@ -191,17 +115,13 @@ RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
         /*rate=*/policy->rate
     };
 
-    // 2. Check applies_to filter: if non-empty, request path must match
-    //    at least one prefix on a segment boundary. "/api" matches
-    //    "/api", "/api/", "/api/users" but NOT "/apis" or "/api2".
     if (!policy->applies_to.empty()) {
         bool matched = false;
         for (const auto& prefix : policy->applies_to) {
             if (request.path.size() >= prefix.size() &&
                 request.path.compare(0, prefix.size(), prefix) == 0) {
-                // Ensure the match ends at a segment boundary:
-                // prefix already ends with '/', OR path matches exactly,
-                // OR the next character is '/'.
+                // Segment-boundary match: "/api" matches "/api", "/api/",
+                // "/api/users" but NOT "/apis" or "/api2".
                 if (prefix.back() == '/' ||
                     request.path.size() == prefix.size() ||
                     request.path[prefix.size()] == '/') {
@@ -215,43 +135,30 @@ RateLimitZone::Result RateLimitZone::Check(const HttpRequest& request) {
         }
     }
 
-    // 3. Extract key from request
     std::string key = key_extractor_(request);
     if (key.empty()) {
-        // No key extracted (e.g., missing header) — zone doesn't apply.
         return not_applicable;
     }
 
-    // 4. Hash to shard and lock
-    size_t idx = ShardIndex(key);
-    Shard& shard = shards_[idx];
-    std::lock_guard<std::mutex> lk(shard.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    auto handle = cache_.FindOrCreate(key, [&]() -> RateLimitZone::RateLimitEntry {
+        return RateLimitZone::RateLimitEntry{TokenBucket(policy->rate, policy->capacity), now};
+    });
+    handle->last_access = now;
 
-    // 5. Find or create entry
-    Entry* entry = FindOrCreate(shard, key, *policy);
-
-    // 6. Update access time and LRU position
-    entry->last_access = std::chrono::steady_clock::now();
-    shard.TouchLru(entry);
-
-    // 7. Lazy config update: sync bucket with current policy if rate or
-    //    capacity changed. UpdateConfig calls Refill() first to materialize
-    //    tokens accrued under the old rate before switching.
-    //
-    //    Compare rate as millitokens (integer) to avoid spurious mismatches
-    //    from floating-point round-trip (e.g., rate=0.3 stored as 299 mt
-    //    reads back as 0.299, which != 0.3 and would trigger UpdateConfig
-    //    on every request on the hot path).
+    // Compare rate as millitokens (integer) to avoid spurious mismatches
+    // from floating-point round-trip (rate=0.3 stored as 299 mt reads
+    // back as 0.299, which != 0.3 and would trigger UpdateConfig on every
+    // request on the hot path).
     int64_t policy_rate_mt = static_cast<int64_t>(policy->rate * 1000);
-    if (entry->bucket.Capacity() != policy->capacity ||
-        entry->bucket.RateMillitokens() != policy_rate_mt) {
-        entry->bucket.UpdateConfig(policy->rate, policy->capacity);
+    if (handle->bucket.Capacity() != policy->capacity ||
+        handle->bucket.RateMillitokens() != policy_rate_mt) {
+        handle->bucket.UpdateConfig(policy->rate, policy->capacity);
     }
 
-    // 8. Attempt to consume a token
-    bool allowed = entry->bucket.TryConsume();
-    int64_t remaining = entry->bucket.AvailableTokens();
-    double retry_after = entry->bucket.SecondsUntilAvailable();
+    bool allowed = handle->bucket.TryConsume();
+    int64_t remaining = handle->bucket.AvailableTokens();
+    double retry_after = handle->bucket.SecondsUntilAvailable();
 
     return {allowed, /*applicable=*/true, policy->capacity, remaining,
             retry_after, policy->rate};
@@ -265,11 +172,7 @@ void RateLimitZone::EvictExpired(size_t dispatcher_index, size_t dispatcher_coun
     if (dispatcher_count == 0) return;
 
     auto policy = LoadPolicy();
-
-    // Compute per-shard capacity limit (minimum 1 to avoid zero-cap)
-    size_t shard_count = shards_.size();
-    size_t max_per_shard = static_cast<size_t>(policy->max_entries) / shard_count;
-    if (max_per_shard == 0) max_per_shard = 1;
+    const size_t max_per_shard = ComputeRateLimitPerShardCap(policy->max_entries);
 
     // Compute idle cutoff: 4 full refill cycles (capacity / rate * 4 seconds).
     // An entry idle for this long has fully refilled and is wasting memory.
@@ -293,21 +196,15 @@ void RateLimitZone::EvictExpired(size_t dispatcher_index, size_t dispatcher_coun
         }
     }
 
-    // Stride across shards assigned to this dispatcher
+    // Stride across shards assigned to this dispatcher. Predicate combines
+    // over-cap and idle-cutoff into one tail walk; the cache stops at the
+    // first entry that satisfies neither.
+    const size_t shard_count = cache_.ShardCount();
     for (size_t i = dispatcher_index; i < shard_count; i += dispatcher_count) {
-        Shard& shard = shards_[i];
-        std::lock_guard<std::mutex> lk(shard.mutex);
-
-        // Evict from tail (LRU = least recently used)
-        while (shard.lru_tail != nullptr &&
-               (shard.count > max_per_shard ||
-                shard.lru_tail->last_access < cutoff)) {
-            Entry* victim = shard.lru_tail;
-            std::string victim_key = std::move(victim->key);
-            shard.RemoveLru(victim);
-            shard.buckets.erase(victim_key);
-            shard.count--;
-        }
+        cache_.EvictFromTailWhile(i,
+            [cutoff, max_per_shard](const RateLimitZone::RateLimitEntry& entry, std::size_t size) {
+                return size > max_per_shard || entry.last_access < cutoff;
+            });
     }
 }
 
@@ -323,6 +220,11 @@ void RateLimitZone::UpdateConfig(const RateLimitZoneConfig& config) {
     policy->applies_to = config.applies_to;
     StorePolicy(std::move(policy));
 
+    // Propagate the new per-shard cap to the cache. Existing entries are
+    // NOT proactively shed — the next EvictExpired tick or the first
+    // over-cap insert evicts down to the new cap.
+    cache_.ResizePerShardCap(ComputeRateLimitPerShardCap(config.max_entries));
+
     logging::Get()->debug("RateLimitZone '{}' config updated: rate={} capacity={} max_entries={}",
                           name_, config.rate, config.capacity, config.max_entries);
 }
@@ -332,10 +234,5 @@ void RateLimitZone::UpdateConfig(const RateLimitZoneConfig& config) {
 // ---------------------------------------------------------------------------
 
 size_t RateLimitZone::EntryCount() const {
-    size_t total = 0;
-    for (const auto& shard : shards_) {
-        std::lock_guard<std::mutex> lk(shard.mutex);
-        total += shard.count;
-    }
-    return total;
+    return cache_.Size();
 }

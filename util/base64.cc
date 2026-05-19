@@ -4,7 +4,7 @@
 #include <openssl/buffer.h>
 #include <openssl/evp.h>
 
-namespace base64_util {
+namespace UTIL_NAMESPACE {
 
 std::string EncodeNoNewline(const void* data, size_t size) {
     if (size == 0 || data == nullptr) return std::string();
@@ -36,4 +36,4 @@ std::string EncodeNoNewline(const void* data, size_t size) {
     return out;
 }
 
-}  // namespace base64_util
+}  // namespace UTIL_NAMESPACE

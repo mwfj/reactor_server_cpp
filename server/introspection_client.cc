@@ -135,7 +135,7 @@ std::string IntrospectionClient::BuildAuthorizationHeaderBasic(
     credentials.append(encoded_id);
     credentials.push_back(':');
     credentials.append(encoded_secret);
-    std::string b64 = base64_util::EncodeNoNewline(credentials);
+    std::string b64 = UTIL_NAMESPACE::EncodeNoNewline(credentials);
     if (b64.empty()) {
         return std::string();
     }
