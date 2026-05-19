@@ -34,7 +34,7 @@ private:
     // race a stale snapshot.
     std::atomic<bool> shutdown_exempt_{false};
 
-    TimeStamp ts_; // Each connection owns a timestamp to manage
+    UTIL_NAMESPACE::TimeStamp ts_; // Each connection owns a timestamp to manage
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
     CALLBACKS_NAMESPACE::ConnDeadlineTimeoutCallback deadline_timeout_cb_;

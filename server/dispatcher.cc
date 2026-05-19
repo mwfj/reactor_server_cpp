@@ -4,6 +4,8 @@
 #include "log/logger.h"
 #include "log/log_utils.h"
 
+using UTIL_NAMESPACE::TimeStamp;
+
 Dispatcher::Dispatcher() :
     ep_(std::unique_ptr<EventHandler>(new EventHandler())),
     is_sock_dispatcher_(false),

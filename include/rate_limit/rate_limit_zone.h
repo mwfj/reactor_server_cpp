@@ -3,6 +3,7 @@
 #include "rate_limit/token_bucket.h"
 #include "http/http_request.h"
 #include "config/server_config.h"
+#include "sharded_lru_cache.h"
 // <string>, <vector>, <functional>, <memory>, <mutex>, <unordered_map>
 // provided by common.h (via http_request.h)
 
@@ -41,7 +42,7 @@ public:
     RateLimitZone& operator=(const RateLimitZone&) = delete;
 
     // Check whether a request is allowed under this zone's rate limit.
-    // Thread-safe: acquires the target shard lock internally.
+    // Thread-safe: acquires the target shard lock internally (via cache_).
     Result Check(const HttpRequest& request);
 
     // Evict expired entries from shards assigned to this dispatcher.
@@ -50,7 +51,10 @@ public:
     void EvictExpired(size_t dispatcher_index, size_t dispatcher_count);
 
     // Hot-reload: update the zone policy from new config.
-    // Thread-safe: swaps the policy snapshot atomically.
+    // Thread-safe: swaps the policy snapshot atomically and propagates the
+    // new per-shard cap to the cache. Existing entries are NOT proactively
+    // shed — the next EvictExpired tick or first over-cap insert evicts down
+    // to the new cap.
     void UpdateConfig(const RateLimitZoneConfig& config);
 
     // Return total entry count across all shards (diagnostic/stats).
@@ -59,7 +63,20 @@ public:
     const std::string& name() const { return name_; }
     const std::string& key_type() const { return key_type_; }
 
+    // Shard count — exposed publicly so config_loader can validate
+    // max_entries against it (enforcing max_entries >= SHARD_COUNT keeps
+    // the documented cap meaningful). Changing this value requires updating
+    // the memory-cap documentation too.
+    static constexpr size_t SHARD_COUNT = 16;
+
 private:
+    // Per-key entry stored in the sharded LRU cache. `last_access` feeds
+    // EvictExpired's idle predicate; the cache itself drives LRU promotion.
+    struct RateLimitEntry {
+        TokenBucket bucket;
+        std::chrono::steady_clock::time_point last_access;
+    };
+
     // --- Policy snapshot (atomic swap via shared_ptr) ---
     std::shared_ptr<const ZonePolicy> policy_;
     mutable std::mutex policy_mtx_;
@@ -73,59 +90,11 @@ private:
         policy_ = std::move(p);
     }
 
-    // --- Per-key entry with intrusive LRU pointers ---
-    struct Entry {
-        TokenBucket bucket;
-        std::chrono::steady_clock::time_point last_access;
-        Entry* lru_prev = nullptr;
-        Entry* lru_next = nullptr;
-        std::string key;  // Stored for eviction (need to erase from map by key)
-
-        Entry(double rate, int64_t capacity)
-            : bucket(rate, capacity),
-              last_access(std::chrono::steady_clock::now()) {}
-    };
-
-    // --- Sharded hash map with per-shard LRU list ---
-    struct Shard {
-        mutable std::mutex mutex;
-        std::unordered_map<std::string, std::unique_ptr<Entry>> buckets;
-        Entry* lru_head = nullptr;  // Most recently accessed
-        Entry* lru_tail = nullptr;  // Least recently accessed
-        size_t count = 0;
-
-        // Move entry to front of LRU (called under lock).
-        void TouchLru(Entry* e);
-        // Unlink entry from LRU list (called under lock).
-        void RemoveLru(Entry* e);
-        // Insert entry at head of LRU list (called under lock).
-        void PushFrontLru(Entry* e);
-    };
-
-public:
-    // Shard count — exposed publicly so config_loader can validate
-    // max_entries against it (enforcing max_entries >= SHARD_COUNT keeps
-    // the documented cap meaningful). Changing this value requires updating
-    // the memory-cap documentation too.
-    static constexpr size_t SHARD_COUNT = 16;
-
-private:
     std::string name_;
     std::string key_type_;
     KeyExtractor key_extractor_;
-    std::vector<Shard> shards_;
 
-    // Hash key to shard index.
-    size_t ShardIndex(const std::string& key) const;
-
-    // Find existing entry or create a new one (called under shard lock).
-    Entry* FindOrCreate(Shard& shard, const std::string& key,
-                        const ZonePolicy& policy);
-
-    // Shards are sized at construction and never resized. std::vector<Shard>
-    // works because Shard contains std::mutex (non-movable), but any future
-    // push_back / resize would fail to compile. This is intentional — shard
-    // count is a compile-time constant (DEFAULT_SHARD_COUNT).
+    UTIL_NAMESPACE::ShardedLruCache<std::string, RateLimitEntry> cache_;
 };
 
 // Factory: build a KeyExtractor from a key_type string.

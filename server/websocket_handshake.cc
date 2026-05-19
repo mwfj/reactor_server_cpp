@@ -157,5 +157,5 @@ std::string WebSocketHandshake::ComputeAcceptKey(const std::string& client_key) 
     unsigned char hash[SHA_DIGEST_LENGTH];
     SHA1(reinterpret_cast<const unsigned char*>(input.data()), input.size(), hash);
 
-    return base64_util::EncodeNoNewline(hash, SHA_DIGEST_LENGTH);
+    return UTIL_NAMESPACE::EncodeNoNewline(hash, SHA_DIGEST_LENGTH);
 }

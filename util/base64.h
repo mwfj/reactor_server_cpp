@@ -2,7 +2,7 @@
 
 #include "common.h"
 
-namespace base64_util {
+namespace UTIL_NAMESPACE {
 
 // Base64-encodes the input bytes using OpenSSL with no embedded newline
 // (BIO_FLAGS_BASE64_NO_NL). Returns "" on any allocation / encode failure.
@@ -13,4 +13,4 @@ inline std::string EncodeNoNewline(const std::string& in) {
     return EncodeNoNewline(in.data(), in.size());
 }
 
-}  // namespace base64_util
+}  // namespace UTIL_NAMESPACE

@@ -178,6 +178,7 @@ jobs:
             basic \
             timeout \
             config \
+            lru_cache \
             http \
             ws \
             tls \

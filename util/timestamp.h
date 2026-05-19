@@ -3,6 +3,8 @@
 #include "common.h"
 #include <time.h>
 
+namespace UTIL_NAMESPACE {
+
 class TimeStamp{
 private:
     // Use steady_clock for idle timeout tracking — immune to NTP/wall-clock
@@ -18,3 +20,5 @@ public:
 
     bool IsTimeOut(std::chrono::seconds duration) const;
 };
+
+}  // namespace UTIL_NAMESPACE

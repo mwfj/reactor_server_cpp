@@ -7,6 +7,8 @@
 #include "observability/metrics_catalog.h"
 #include "observability/observability_manager.h"
 
+using UTIL_NAMESPACE::TimeStamp;
+
 ConnectionHandler::ConnectionHandler(std::shared_ptr<Dispatcher> _dispatcher, std::unique_ptr<SocketHandler> _sock)
     : event_dispatcher_(_dispatcher), sock_(std::move(_sock))
 {

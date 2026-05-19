@@ -1,5 +1,7 @@
 #include "timestamp.h"
 
+namespace UTIL_NAMESPACE {
+
 TimeStamp::TimeStamp() : time_(std::chrono::steady_clock::now()) {}
 
 TimeStamp TimeStamp::Now(){
@@ -59,3 +61,5 @@ bool TimeStamp::IsTimeOut(std::chrono::seconds duration) const {
     // require 301s elapsed (truncation of 300.9s → 300s, 300 > 300 is false).
     return elapsed >= duration;
 }
+
+}  // namespace UTIL_NAMESPACE

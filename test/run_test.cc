@@ -40,6 +40,7 @@
 #include "h2_upstream_test.h"
 #include "router_async_middleware_test.h"
 #include "introspection_cache_test.h"
+#include "sharded_lru_cache_test.h"
 #include "introspection_client_test.h"
 #include "auth_introspection_integration_test.h"
 #include "auth_observability_test.h"
@@ -163,6 +164,9 @@ void RunAllTest(){
 
     // Run config tests
     ConfigTests::RunAllTests();
+
+    // Run ShardedLruCache utility tests
+    ShardedLruCacheTests::RunAllTests();
 
     // Run focused internal HTTP/1 streaming regressions
     HttpInternalTests::RunAllTests();
@@ -386,6 +390,7 @@ void PrintUsage(const char* program_name) {
     std::cout << "  auth_race,   -Q    Auth race condition tests" << std::endl;
     std::cout << "  router_async,-N    Router async-middleware tests" << std::endl;
     std::cout << "  introspection_cache, -Y  Introspection cache unit tests" << std::endl;
+    std::cout << "  lru_cache          ShardedLruCache utility tests" << std::endl;
     std::cout << "  intro_client, -y   Introspection client static-helper + AsyncPendingState tests" << std::endl;
     std::cout << "  auth_intro,  -Z    Introspection integration tests" << std::endl;
     std::cout << "  auth_observability, -o    Auth observability tests" << std::endl;
@@ -579,6 +584,9 @@ int main(int argc, char* argv[]) {
         // Run introspection cache unit tests
         }else if(mode == "introspection_cache" || mode == "-Y"){
             IntrospectionCacheTests::RunAllTests();
+        // Run ShardedLruCache utility tests
+        }else if(mode == "lru_cache"){
+            ShardedLruCacheTests::RunAllTests();
         // Run introspection client static-helper + AsyncPendingState unit tests
         }else if(mode == "intro_client" || mode == "-y"){
             IntrospectionClientTests::RunAllTests();
