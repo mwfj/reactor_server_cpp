@@ -333,7 +333,205 @@ public:
         }
     }
 
+    // Submit HEADERS without END_STREAM (deferred data provider that never
+    // emits body bytes) and poll for the server's response. Used to verify
+    // server behavior on streams where the client has not finished sending
+    // the request body — specifically, that a streaming route returning a
+    // sync response cleanly tears the stream down with RST_STREAM rather
+    // than leaving the slot + body queue alive.
+    Response SendRequestNoEnd(
+        const std::string& method,
+        const std::string& path,
+        const std::vector<std::pair<std::string,std::string>>& extra_headers = {}) {
+
+        if (!session_ || fd_ < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        std::vector<std::pair<std::string, std::string>> header_pairs;
+        header_pairs.reserve(4 + extra_headers.size());
+        header_pairs.emplace_back(":method", method);
+        header_pairs.emplace_back(":path", path);
+        header_pairs.emplace_back(":scheme", "http");
+        header_pairs.emplace_back(":authority", "localhost");
+        for (const auto& h : extra_headers) {
+            header_pairs.push_back(h);
+        }
+
+        std::vector<nghttp2_nv> nva;
+        nva.reserve(header_pairs.size());
+        for (const auto& hp : header_pairs) {
+            nva.push_back({
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.first.c_str())),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.second.c_str())),
+                hp.first.size(), hp.second.size(),
+                NGHTTP2_NV_FLAG_NONE
+            });
+        }
+
+        nghttp2_data_provider2 dp;
+        dp.source.ptr    = this;
+        dp.read_callback = DeferredDataSourceRead;
+
+        int32_t stream_id = nghttp2_submit_request2(
+            session_, nullptr, nva.data(), nva.size(), &dp, this);
+        if (stream_id < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        streams_[stream_id] = StreamState{};
+        if (!FlushOutput()) {
+            Response r; r.error = true; return r;
+        }
+
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(IO_TIMEOUT_MS);
+        while (true) {
+            // Stream done = either response complete OR server-initiated
+            // close via RST_STREAM. Both surface through OnStreamClose.
+            auto it = streams_.find(stream_id);
+            if (it != streams_.end() && it->second.done) {
+                Response r;
+                r.status   = it->second.status;
+                r.body     = it->second.body;
+                r.headers  = it->second.response_headers;
+                r.error    = false;
+                return r;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                Response r; r.error = true; return r;
+            }
+            if (!ReadAndProcess(100)) {
+                Response r; r.error = true; return r;
+            }
+        }
+    }
+
+    // Submit HEADERS (no END_STREAM, no body bytes) followed immediately by
+    // a trailing HEADERS frame with caller-supplied fields and END_STREAM.
+    // Used by trailer-rejection regression tests. nghttp2's data-source
+    // protocol for the "trailer-after-no-body" shape is: data_provider
+    // returns 0 bytes with NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM
+    // on the first call (signaling "body is done, trailer follows"); the
+    // matching nghttp2_submit_trailer call then queues the trailing
+    // HEADERS frame with END_STREAM. Polls a short deadline for stream
+    // completion (response OR server RST) so the test can verify
+    // handler-side behavior afterwards regardless of what reaches the wire.
+    Response SendHeadersAndTrailers(
+        const std::string& method,
+        const std::string& path,
+        const std::vector<std::pair<std::string,std::string>>& trailer_fields) {
+
+        if (!session_ || fd_ < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        std::vector<std::pair<std::string, std::string>> header_pairs;
+        header_pairs.reserve(4);
+        header_pairs.emplace_back(":method", method);
+        header_pairs.emplace_back(":path", path);
+        header_pairs.emplace_back(":scheme", "http");
+        header_pairs.emplace_back(":authority", "localhost");
+
+        std::vector<nghttp2_nv> nva;
+        nva.reserve(header_pairs.size());
+        for (const auto& hp : header_pairs) {
+            nva.push_back({
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.first.c_str())),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.second.c_str())),
+                hp.first.size(), hp.second.size(),
+                NGHTTP2_NV_FLAG_NONE
+            });
+        }
+
+        nghttp2_data_provider2 dp;
+        dp.source.ptr    = this;
+        dp.read_callback = NoBodyTrailerDataSourceRead;
+
+        int32_t stream_id = nghttp2_submit_request2(
+            session_, nullptr, nva.data(), nva.size(), &dp, this);
+        if (stream_id < 0) {
+            Response r; r.error = true; return r;
+        }
+
+        streams_[stream_id] = StreamState{};
+        // First flush: emit HEADERS + DATA(1 byte, NO_END_STREAM).
+        if (!FlushOutput()) {
+            Response r; r.error = true; return r;
+        }
+        // Submit trailer AFTER initial flush — nghttp2_submit_trailer
+        // requires the stream to have an outstanding deferred-data state,
+        // which is established by the data_provider returning
+        // EOF | NO_END_STREAM. Submitting before the data_provider has
+        // been pumped at least once can leave the trailer queued behind a
+        // stream the framer considers "not yet open for trailers".
+        std::vector<nghttp2_nv> trailer_nva;
+        trailer_nva.reserve(trailer_fields.size());
+        for (const auto& hp : trailer_fields) {
+            trailer_nva.push_back({
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.first.c_str())),
+                const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(hp.second.c_str())),
+                hp.first.size(), hp.second.size(),
+                NGHTTP2_NV_FLAG_NONE
+            });
+        }
+        int trv = nghttp2_submit_trailer(
+            session_, stream_id, trailer_nva.data(), trailer_nva.size());
+        if (trv != 0) {
+            Response r; r.error = true; return r;
+        }
+        if (!FlushOutput()) {
+            Response r; r.error = true; return r;
+        }
+
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(IO_TIMEOUT_MS);
+        while (true) {
+            auto it = streams_.find(stream_id);
+            if (it != streams_.end() && it->second.done) {
+                Response r;
+                r.status   = it->second.status;
+                r.body     = it->second.body;
+                r.headers  = it->second.response_headers;
+                r.error    = false;
+                return r;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                Response r; r.error = true; return r;
+            }
+            if (!ReadAndProcess(100)) {
+                Response r; r.error = true; return r;
+            }
+        }
+    }
+
 private:
+    // Data-source callback that always defers — never returns body bytes,
+    // never signals END_STREAM. Used by SendRequestNoEnd to keep the client
+    // half-stream open while the server processes the request headers.
+    static ssize_t DeferredDataSourceRead(
+        nghttp2_session* /*session*/, int32_t /*stream_id*/,
+        uint8_t* /*buf*/, size_t /*length*/, uint32_t* /*data_flags*/,
+        nghttp2_data_source* /*source*/, void* /*user_data*/) {
+        return NGHTTP2_ERR_DEFERRED;
+    }
+
+    // Data-source callback for the "tiny body, trailer follows" shape:
+    // emits a single byte on the first call with EOF + NO_END_STREAM,
+    // telling nghttp2 the data half is done and the application will queue
+    // a trailer HEADERS frame (which then carries END_STREAM). Some
+    // nghttp2 versions skip the trailer if the data_provider never emits
+    // a DATA frame, so a 1-byte payload guarantees the DATA frame exists
+    // and the trailer is serialized afterwards.
+    static ssize_t NoBodyTrailerDataSourceRead(
+        nghttp2_session* /*session*/, int32_t /*stream_id*/,
+        uint8_t* buf, size_t length, uint32_t* data_flags,
+        nghttp2_data_source* /*source*/, void* /*user_data*/) {
+        if (length < 1) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        buf[0] = ' ';  // single space byte
+        *data_flags = NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
+        return 1;
+    }
     int fd_ = -1;
     nghttp2_session* session_ = nullptr;
 
@@ -5067,6 +5265,624 @@ void TestH2_StreamingControlMethodsOffDispatcherThreadRejected() {
     }
 }
 
+// Regression for the H2 streaming sync-response slot-leak: a streaming
+// route that produces a synchronous response while the client is still
+// streaming the request body MUST abort the body_stream and RST_STREAM
+// the half-open stream so a misbehaving or stalled client cannot keep
+// the slot + body queue alive. Mirrors H1's behavior at
+// server/http_connection_handler.cc:2438. Without the fix the client's
+// SendRequestNoEnd would hit the 5s IO timeout waiting for stream close.
+void TestH2_StreamingSyncResponseAbortsBodyAndResetsStream() {
+    std::cout << "\n[TEST] H2 streaming: sync response on incomplete request aborts body + RSTs stream..."
+              << std::endl;
+    try {
+        HttpServer server(MakeH2Config(0));
+        // Sync middleware that fills 403 BEFORE the route handler runs.
+        // Returns false to stop the chain — response is final, deferred=false.
+        // This is the canonical "header-only rejection" path described in
+        // the docs/streaming_request.md sync-handler section.
+        auto handler_called = std::make_shared<std::atomic<int>>(0);
+        server.Use([](HttpRequest& req, HttpResponse& resp) {
+            if (req.path == "/reject") {
+                resp.Status(403).Body("denied", "text/plain");
+                return false;
+            }
+            return true;
+        });
+        // Streaming POST route — the handler should NEVER fire (middleware
+        // wins). Registered so the path is discoverable + streaming-marked.
+        server.RouteAsync("POST", "/reject",
+            [handler_called](
+                const HttpRequest&,
+                HttpRouter::InterimResponseSender /*si*/,
+                HttpRouter::ResourcePusher /*pr*/,
+                HttpRouter::StreamingResponseSender /*ss*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                ++(*handler_called);
+                HttpResponse r;
+                r.Status(500).Body("unreached", "text/plain");
+                complete(std::move(r));
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto start = std::chrono::steady_clock::now();
+            // HEADERS without END_STREAM — client half-stream stays open
+            // (deferred body provider). Without the fix the server would
+            // not RST the stream and this call would block until 5s timeout.
+            auto resp = client.SendRequestNoEnd("POST", "/reject");
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start);
+            if (resp.error) {
+                pass = false;
+                err += "client error (server failed to RST in time); ";
+            }
+            if (resp.status != 403) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) +
+                       " expected 403; ";
+            }
+            // Hard upper bound — with the fix the server RSTs immediately
+            // after queuing the response; round-trip is sub-second on every
+            // platform we test. Tighter than IO_TIMEOUT_MS so a regression
+            // surfaces as a clear failure, not a soft slowdown.
+            if (elapsed.count() > 2000) {
+                pass = false;
+                err += "response took " + std::to_string(elapsed.count()) +
+                       "ms — likely hung waiting for client END_STREAM; ";
+            }
+            if (handler_called->load() != 0) {
+                pass = false;
+                err += "route handler called " +
+                       std::to_string(handler_called->load()) +
+                       " times — middleware should have short-circuited; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: sync response on incomplete request aborts body + RSTs stream",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: sync response on incomplete request aborts body + RSTs stream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression: streaming route + body-size overflow MUST deliver the
+// documented 413 to the client before the inbound stream is reset. The
+// pre-fix code submitted RST_STREAM synchronously in OnDataChunkRecv,
+// transitioning the stream to CLOSING in nghttp2; the subsequent 413
+// SubmitResponse from the handler's terminal-error path was then
+// rejected (session_predicate_response_headers_send → STREAM_CLOSING),
+// silently dropping the client-visible 413.
+void TestH2_StreamingBodyOverflowDelivers413BeforeRst() {
+    std::cout << "\n[TEST] H2 streaming: body overflow delivers 413 before RST_STREAM..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        cfg.max_body_size = 256;  // tiny — easy to exceed
+        HttpServer server(cfg);
+        // Streaming POST route. The handler drains body_stream and
+        // responds 413 when Read returns ABORTED — mirrors the proxy's
+        // RESULT_REQUEST_BODY_LIMIT_EXCEEDED → 413 mapping.
+        auto handler_dispatched = std::make_shared<std::atomic<bool>>(false);
+        server.RouteAsync("POST", "/upload",
+            [handler_dispatched](
+                const HttpRequest& req,
+                HttpRouter::InterimResponseSender /*si*/,
+                HttpRouter::ResourcePusher /*pr*/,
+                HttpRouter::StreamingResponseSender /*ss*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                handler_dispatched->store(true, std::memory_order_release);
+                if (!req.body_stream) {
+                    HttpResponse r;
+                    r.Status(200).Body("ok", "text/plain");
+                    complete(std::move(r));
+                    return;
+                }
+                // Drain via self-owning pump (weak_ptr capture breaks the
+                // shared_ptr self-cycle; see streaming_request_test.h
+                // TestH1Streaming_BodyOverflow for the canonical pattern).
+                auto shared_complete =
+                    std::make_shared<HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                auto body = req.body_stream;
+                auto pump = std::make_shared<std::function<void()>>();
+                std::weak_ptr<std::function<void()>> pump_weak = pump;
+                *pump = [body, shared_complete, pump_weak]() {
+                    char buf[256];
+                    while (true) {
+                        size_t n = 0;
+                        auto r = body->Read(buf, sizeof(buf), &n);
+                        if (r == http::BodyStreamResult::END_OF_STREAM) {
+                            HttpResponse resp;
+                            resp.Status(200).Body("ok", "text/plain");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::ABORTED) {
+                            HttpResponse resp = HttpResponse::PayloadTooLarge();
+                            resp.Header("X-Request-Body-Limit-Exceeded", "true");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::WOULD_BLOCK) {
+                            if (auto p = pump_weak.lock()) {
+                                body->WaitForData([p]() {
+                                    if (*p) (*p)();
+                                });
+                            }
+                            return;
+                        }
+                    }
+                };
+                (*pump)();
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            // 4 KiB body — well above the 256-byte limit.
+            std::string big_body(4 * 1024, 'X');
+            auto resp = client.Post("/upload", big_body);
+            if (resp.error) {
+                pass = false;
+                err += "client error; ";
+            }
+            if (resp.status != HttpStatus::PAYLOAD_TOO_LARGE) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) +
+                       " expected 413 — RST may have raced response; ";
+            }
+            // Header from the handler's ABORTED branch confirms the 413
+            // came from the streaming-route abort path (not, say, an
+            // early-rejection middleware fallback).
+            bool saw_marker = false;
+            for (const auto& [k, v] : resp.headers) {
+                if (k == "x-request-body-limit-exceeded" && v == "true") {
+                    saw_marker = true;
+                    break;
+                }
+            }
+            if (!saw_marker) {
+                pass = false;
+                err += "missing X-Request-Body-Limit-Exceeded marker — "
+                       "413 came from a different path; ";
+            }
+            if (!handler_dispatched->load()) {
+                pass = false;
+                err += "streaming handler never dispatched; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: body overflow delivers 413 before RST_STREAM",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: body overflow delivers 413 before RST_STREAM",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression for #138: when the inbound H2 trailer block contains a
+// forbidden field (sanitizer Forbidden — e.g., content-length per RFC
+// 9110 §6.5.1), the rejection path MUST abort the streaming route's
+// BodyStream so a handler parked in Read()/WaitForData() unblocks. The
+// generic reject_protocol_error helper (which fires for forbidden
+// request-header values too) does not touch body_stream; only the
+// trailer-context helper (reject_trailer_block) walks through Abort +
+// pending_trailers.clear() + FinalizeAbortedStreamFlowControl. Pre-fix
+// the OnFrameRecv trailer branch saw IsRejected and silently skipped its
+// PushTrailersAndClose / CloseEmpty path, leaving the BodyStream
+// consumer parked indefinitely.
+void TestH2_ForbiddenTrailerFieldAbortsStreamingBodyStream() {
+    std::cout << "\n[TEST] H2 streaming: forbidden trailer field aborts BodyStream..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        HttpServer server(cfg);
+
+        auto result_promise = std::make_shared<std::promise<std::string>>();
+        auto result_future = result_promise->get_future().share();
+        auto promise_set = std::make_shared<std::atomic<bool>>(false);
+
+        server.RouteAsync("POST", "/upload",
+            [result_promise, promise_set](
+                const HttpRequest& req,
+                HttpRouter::InterimResponseSender /*si*/,
+                HttpRouter::ResourcePusher /*pr*/,
+                HttpRouter::StreamingResponseSender /*ss*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                if (!req.body_stream) {
+                    HttpResponse r;
+                    r.Status(200).Body("ok", "text/plain");
+                    complete(std::move(r));
+                    return;
+                }
+                auto shared_complete =
+                    std::make_shared<HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                auto body = req.body_stream;
+                auto pump = std::make_shared<std::function<void()>>();
+                std::weak_ptr<std::function<void()>> pump_weak = pump;
+                *pump = [body, shared_complete, pump_weak,
+                         result_promise, promise_set]() {
+                    char buf[256];
+                    while (true) {
+                        size_t n = 0;
+                        auto r = body->Read(buf, sizeof(buf), &n);
+                        if (r == http::BodyStreamResult::END_OF_STREAM) {
+                            if (!promise_set->exchange(true)) {
+                                result_promise->set_value("end_of_stream");
+                            }
+                            HttpResponse resp;
+                            resp.Status(200).Body("ok", "text/plain");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::ABORTED) {
+                            std::string reason = body->AbortReason();
+                            if (!promise_set->exchange(true)) {
+                                result_promise->set_value("aborted:" + reason);
+                            }
+                            HttpResponse resp;
+                            resp.Status(500).Body("aborted", "text/plain");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::WOULD_BLOCK) {
+                            if (auto p = pump_weak.lock()) {
+                                body->WaitForData([p]() {
+                                    if (*p) (*p)();
+                                });
+                            }
+                            return;
+                        }
+                    }
+                };
+                (*pump)();
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            // HEADERS (no END_STREAM, no body) + trailer with `content-length`
+            // which the shared sanitizer marks Forbidden.
+            auto resp = client.SendHeadersAndTrailers("POST", "/upload", {
+                {"content-length", "0"}
+            });
+            // Server may RST and may or may not deliver a response — we
+            // do not care which; the diagnostic is the handler-side promise.
+            (void)resp;
+            // The handler MUST observe BodyStream::Read() returning
+            // ABORTED (with reason "forbidden_trailer_field"). Without
+            // #138, the handler stays parked in WaitForData and the
+            // promise is never set.
+            auto status = result_future.wait_for(std::chrono::seconds(3));
+            if (status != std::future_status::ready) {
+                pass = false;
+                err += "handler did not unblock — BodyStream not aborted "
+                       "(forbidden trailer rejection failed to wake consumer); ";
+            } else {
+                std::string result = result_future.get();
+                if (result != "aborted:forbidden_trailer_field") {
+                    pass = false;
+                    err += "expected 'aborted:forbidden_trailer_field' got '" +
+                           result + "'; ";
+                }
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: forbidden trailer field aborts BodyStream",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: forbidden trailer field aborts BodyStream",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression: buffered H2 requests that end with a valid trailer HEADERS
+// frame must still dispatch after the DATA body is complete. Phase 5 added
+// a dedicated trailer branch for streaming routes; without an explicit
+// buffered dispatch there, this request timed out because the branch broke
+// before the generic complete-then-dispatch block.
+void TestH2_BufferedRequestWithValidTrailerDispatches() {
+    std::cout << "\n[TEST] H2 buffered: valid request trailer dispatches..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        HttpServer server(cfg);
+
+        auto handler_dispatched = std::make_shared<std::atomic<bool>>(false);
+        auto saw_expected_body = std::make_shared<std::atomic<bool>>(false);
+        auto saw_body_stream = std::make_shared<std::atomic<bool>>(false);
+
+        server.Post("/upload",
+            [handler_dispatched, saw_expected_body, saw_body_stream](
+                const HttpRequest& req, HttpResponse& res) {
+                handler_dispatched->store(true, std::memory_order_release);
+                saw_expected_body->store(req.body == " ",
+                                         std::memory_order_release);
+                saw_body_stream->store(static_cast<bool>(req.body_stream),
+                                       std::memory_order_release);
+                res.Status(HttpStatus::OK).Body(req.body, "text/plain");
+            });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            auto resp = client.SendHeadersAndTrailers("POST", "/upload", {
+                {"x-upload-checksum", "ok"}
+            });
+            if (resp.error) {
+                pass = false;
+                err += "client error or timeout; ";
+            }
+            if (resp.status != HttpStatus::OK) {
+                pass = false;
+                err += "status=" + std::to_string(resp.status) +
+                       " expected 200; ";
+            }
+            if (resp.body != " ") {
+                pass = false;
+                err += "body='" + resp.body + "' expected single space; ";
+            }
+            if (!handler_dispatched->load(std::memory_order_acquire)) {
+                pass = false;
+                err += "buffered handler was not dispatched; ";
+            }
+            if (!saw_expected_body->load(std::memory_order_acquire)) {
+                pass = false;
+                err += "handler did not receive DATA body; ";
+            }
+            if (saw_body_stream->load(std::memory_order_acquire)) {
+                pass = false;
+                err += "buffered handler unexpectedly received body_stream; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 buffered: valid request trailer dispatches",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 buffered: valid request trailer dispatches",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
+// Regression covering two related fixes:
+//
+//   (a) #137: streaming route + declared Content-Length > max_body_size
+//       MUST be routed through the deferred-413 path (per
+//       docs/streaming_request.md §body-size enforcement) rather than
+//       an inline RST_STREAM(CANCEL) at HEADERS-receipt. Pre-fix the
+//       client saw a raw RST it could not distinguish from any other
+//       protocol failure.
+//
+//   (b) #135: post-rejection DATA chunks (the client keeps streaming
+//       the body while the 413+RST race onto the wire) MUST refund
+//       the connection-level flow-control window. Pre-fix the
+//       IsRejected() early-return in OnDataChunkRecvCallback dropped
+//       the bytes without calling nghttp2_session_consume_connection,
+//       and under NO_AUTO_WINDOW_UPDATE a large enough rejected upload
+//       could drain the default 65535-byte connection window — leaving
+//       sibling streams on the same connection unable to make progress.
+//
+// The 70 KiB body is chosen so the post-rejection drain (everything
+// except the first chunk, which is refunded inline at the max-body
+// detect site) exceeds the default connection window without #135.
+// A follow-up GET on the same connection must complete normally;
+// without #135 it stalls until the test client's IO_TIMEOUT_MS.
+void TestH2_StreamingDeclaredCLOverflowDelivers413AndConnWindowRefunded() {
+    std::cout << "\n[TEST] H2 streaming: declared CL > max_body_size → 413 + conn window refunded..."
+              << std::endl;
+    try {
+        ServerConfig cfg = MakeH2Config(0);
+        // max_body_size MUST be larger than the H2 default DATA frame size
+        // (~16 KiB) so that post-rejection DATA chunks fall through the
+        // max-body branch (which has its own refund) and reach the
+        // IsRejected() refund path under test. With max_body_size below
+        // the chunk size, each chunk would self-trip max-body and the
+        // post-rejection refund is never exercised.
+        cfg.max_body_size = 64 * 1024;  // 64 KiB
+        HttpServer server(cfg);
+        auto handler_dispatched = std::make_shared<std::atomic<bool>>(false);
+        server.RouteAsync("POST", "/upload",
+            [handler_dispatched](
+                const HttpRequest& req,
+                HttpRouter::InterimResponseSender /*si*/,
+                HttpRouter::ResourcePusher /*pr*/,
+                HttpRouter::StreamingResponseSender /*ss*/,
+                HttpRouter::AsyncCompletionCallback complete) {
+                handler_dispatched->store(true, std::memory_order_release);
+                if (!req.body_stream) {
+                    HttpResponse r;
+                    r.Status(200).Body("ok", "text/plain");
+                    complete(std::move(r));
+                    return;
+                }
+                auto shared_complete =
+                    std::make_shared<HttpRouter::AsyncCompletionCallback>(std::move(complete));
+                auto body = req.body_stream;
+                auto pump = std::make_shared<std::function<void()>>();
+                std::weak_ptr<std::function<void()>> pump_weak = pump;
+                *pump = [body, shared_complete, pump_weak]() {
+                    char buf[256];
+                    while (true) {
+                        size_t n = 0;
+                        auto r = body->Read(buf, sizeof(buf), &n);
+                        if (r == http::BodyStreamResult::END_OF_STREAM) {
+                            HttpResponse resp;
+                            resp.Status(200).Body("ok", "text/plain");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::ABORTED) {
+                            HttpResponse resp = HttpResponse::PayloadTooLarge();
+                            resp.Header("X-Request-Body-Limit-Exceeded", "true");
+                            (*shared_complete)(std::move(resp));
+                            return;
+                        }
+                        if (r == http::BodyStreamResult::WOULD_BLOCK) {
+                            if (auto p = pump_weak.lock()) {
+                                body->WaitForData([p]() {
+                                    if (*p) (*p)();
+                                });
+                            }
+                            return;
+                        }
+                    }
+                };
+                (*pump)();
+            },
+            http::RouteOptions{http::RouteRequestMode::Streaming});
+
+        // Second route: a small POST with body. The conn-level flow-control
+        // window is consumed by client→server DATA frames; if #135 fails to
+        // refund the rejected upload's bytes, the client's remote-conn-
+        // window stays at zero and this second POST stalls inside the test
+        // client's data_provider until IO_TIMEOUT_MS. A GET would not
+        // exercise the same window (HEADERS frames are not flow-controlled).
+        server.Post("/echo", [](const HttpRequest& req, HttpResponse& res) {
+            res.Status(HttpStatus::OK).Body(req.body, "text/plain");
+        });
+
+        TestServerRunner<HttpServer> runner(server);
+        int port = runner.GetPort();
+
+        Http2TestClient client;
+        bool pass = true;
+        std::string err;
+        if (!client.Connect("127.0.0.1", port)) {
+            pass = false;
+            err += "connect failed; ";
+        } else {
+            // Body just above max_body_size. Each chunk sits below
+            // max_body_size so the max-body branch (which has its own
+            // refund) does NOT fire — every post-rejection chunk falls
+            // through to the IsRejected() early-return whose refund is
+            // the path under test. On localhost the server's 413+RST
+            // arrives back so fast the client only manages to send one
+            // ~16 KiB chunk per rejected stream before its data_provider
+            // is cancelled — so the test loops a handful of rejected
+            // uploads to accumulate enough unrefunded bytes to drain the
+            // default 65535-byte connection window if #135 is broken.
+            const size_t kBodySize = 80 * 1024;
+            std::string big_body(kBodySize, 'X');
+            std::vector<std::pair<std::string, std::string>> extra = {
+                {"content-length", std::to_string(kBodySize)}
+            };
+            constexpr int kRejectedIterations = 6;
+            for (int i = 0; i < kRejectedIterations && pass; ++i) {
+                auto rj = client.Post("/upload", big_body, extra);
+                if (rj.error) {
+                    pass = false;
+                    err += "rejected req[" + std::to_string(i) +
+                           "]: client error; ";
+                    break;
+                }
+                if (rj.status != HttpStatus::PAYLOAD_TOO_LARGE) {
+                    pass = false;
+                    err += "rejected req[" + std::to_string(i) +
+                           "]: status=" + std::to_string(rj.status) +
+                           " expected 413 — declared CL > max_body_size "
+                           "should route through streaming 413 path, not RST; ";
+                    break;
+                }
+                if (i == 0) {
+                    // First iteration also checks streaming-dispatch + marker
+                    // header — these are constant across loop iterations.
+                    if (!handler_dispatched->load(std::memory_order_acquire)) {
+                        pass = false;
+                        err += "streaming handler never dispatched — pre-"
+                               "dispatch path did not engage the 413 codepath; ";
+                    }
+                    bool saw_marker = false;
+                    for (const auto& [k, v] : rj.headers) {
+                        if (k == "x-request-body-limit-exceeded" && v == "true") {
+                            saw_marker = true;
+                            break;
+                        }
+                    }
+                    if (!saw_marker) {
+                        pass = false;
+                        err += "first req: missing X-Request-Body-Limit-"
+                               "Exceeded marker — 413 came from a different "
+                               "path; ";
+                    }
+                }
+            }
+
+            // Final request on the same connection. Must be a POST so the
+            // client→server DATA path is exercised — if the conn window
+            // was drained by accumulated post-rejection DATA chunks across
+            // the rejected-upload loop above (without #135 refund), the
+            // test client stalls inside its data_provider until
+            // IO_TIMEOUT_MS expires.
+            const std::string echo_body = "hello";
+            auto resp2 = client.Post("/echo", echo_body);
+            if (resp2.error) {
+                pass = false;
+                err += "final req: client error (likely conn window drained); ";
+            }
+            if (resp2.status != HttpStatus::OK) {
+                pass = false;
+                err += "final req: status=" + std::to_string(resp2.status) +
+                       " expected 200 — conn window may not have been "
+                       "refunded after the rejected uploads; ";
+            }
+            if (resp2.body != echo_body) {
+                pass = false;
+                err += "final req: body mismatch — got '" + resp2.body +
+                       "' expected '" + echo_body + "'; ";
+            }
+        }
+        client.Disconnect();
+        TestFramework::RecordTest(
+            "H2 streaming: declared CL > max_body_size → 413 + conn window refunded",
+            pass, err, TestFramework::TestCategory::OTHER);
+    } catch (const std::exception& e) {
+        TestFramework::RecordTest(
+            "H2 streaming: declared CL > max_body_size → 413 + conn window refunded",
+            false, e.what(), TestFramework::TestCategory::OTHER);
+    }
+}
+
 // Regression for the off-dispatcher H2 interim hop: if a worker-thread
 // continuation queues send_interim() and then immediately calls complete(),
 // the queued 103 must re-check the request-scoped completed flag on the
@@ -5739,6 +6555,11 @@ void RunAllTests() {
     TestH2_StreamingBatchedWritesPastHighWaterStayAccepted();
     TestH2_StreamingEmptyEndInlineDoesNotResetStream();
     TestH2_StreamingControlMethodsOffDispatcherThreadRejected();
+    TestH2_StreamingSyncResponseAbortsBodyAndResetsStream();
+    TestH2_StreamingBodyOverflowDelivers413BeforeRst();
+    TestH2_StreamingDeclaredCLOverflowDelivers413AndConnWindowRefunded();
+    TestH2_ForbiddenTrailerFieldAbortsStreamingBodyStream();
+    TestH2_BufferedRequestWithValidTrailerDispatches();
     TestH2_ProxyStreamingLargeContentLength();
     TestH2_ProxyTransientHighWaterFlushDoesNotStall();
 

@@ -3,6 +3,7 @@
 #include "http/http_request.h"
 #include "http/http_response.h"
 #include "http/http_callbacks.h"
+#include "http/route_options.h"
 #include "http/route_trie.h"
 #include "observability/trace_context.h"   // IssueTraceContext (optional<>)
 // <string>, <vector>, <functional>, <memory>, <unordered_map>, <atomic>
@@ -205,11 +206,19 @@ public:
     void Delete(const std::string& path, Handler handler);
     void Route(const std::string& method, const std::string& path, Handler handler);
 
+    // 4-arg overload — explicit per-route options.
+    void Route(const std::string& method, const std::string& path,
+                Handler handler, http::RouteOptions options);
+
     // Route registration (async). Async routes take precedence over sync
     // routes for the same method+path pair — if both are registered, the
     // async handler is used.
     void RouteAsync(const std::string& method, const std::string& path,
                     AsyncHandler handler);
+
+    // 4-arg overload — explicit per-route options.
+    void RouteAsync(const std::string& method, const std::string& path,
+                    AsyncHandler handler, http::RouteOptions options);
 
     // Route registration (proxy async). Same per-method async-trie
     // insertion path as RouteAsync, but tags the (method, pattern) pair
@@ -227,6 +236,20 @@ public:
     // unmarked path so existing user routes are unaffected.
     void RouteProxyAsync(const std::string& method, const std::string& path,
                           AsyncHandler handler);
+
+    // 4-arg overload — explicit per-route options.
+    void RouteProxyAsync(const std::string& method, const std::string& path,
+                          AsyncHandler handler, http::RouteOptions options);
+
+    // Pre-dispatch hook: resolves RouteOptions at headers-complete BEFORE
+    // async middleware runs. Walks the same precedence chain as
+    // ResolveRouteMatch (async-trie → sync-trie with HEAD→GET fallback)
+    // but does NOT populate req.params and does NOT mutate any request
+    // state. Returns RouteOptions{} (Buffered) for: (a) no route match,
+    // (b) WS-upgrade candidates, (c) routes registered with the 3-arg
+    // form (no explicit options).
+    http::RouteOptions ResolveOptionsAtHeaders(const std::string& method,
+                                                const std::string& path) const;
 
     // Returns true iff (method, pattern) was registered via
     // RouteProxyAsync. ResolveRouteMatch consults this at step (2) to
@@ -506,6 +529,14 @@ private:
     // companions go in proxy_companion_patterns_.
     std::unordered_map<std::string, std::unordered_set<std::string>>
         proxy_async_patterns_;
+
+    // Per-route options keyed (method, pattern). Inserted alongside trie
+    // node insertion in RouteInternal_; looked up by ResolveOptionsAtHeaders
+    // after a precedence-walk pattern match. Routes registered via the
+    // 3-arg overloads do NOT insert here (default RouteOptions{} returned
+    // on miss).
+    std::unordered_map<std::string,
+        std::unordered_map<std::string, http::RouteOptions>> route_options_;
 
     // Normalized-pattern keys for async routes, tracked per method.
     // Each registered pattern is reduced to a "semantic shape" key

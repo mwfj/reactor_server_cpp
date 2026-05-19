@@ -7,6 +7,8 @@
 #include "upstream/pool_partition.h"
 #include "connection_handler.h"
 #include "dispatcher.h"
+#include "http/body_stream.h"
+#include "http/http2_trailer_sanitizer.h"
 #include "http/http_status.h"
 #include "log/logger.h"
 #include <charconv>
@@ -223,12 +225,20 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
     // CL); RESULT_TRUNCATED_RESPONSE is reserved for under-read at
     // OnStreamClose's CL short-read backstop.
     auto reject_overrun = [&](const char* msg) {
+        // Local keepalive — holds the captured strong
+        // shared_ptr<ProxyTransaction> through the dispatch + ResetStream
+        // chain (ResetStream → DetachSink clears streaming_abort_callback,
+        // but this local keeps a separate strong ref alive until lambda exit).
+        auto keepalive = stream->streaming_abort_callback;  // NOLINT
         auto* sink = stream->sink;
         stream->sink = nullptr;
         if (sink) {
             sink->OnError(ProxyTransaction::RESULT_PARSE_ERROR, msg);
         }
         self->ResetStream(stream_id);
+        // keepalive destructs at end of lambda — ~ProxyTransaction runs
+        // cleanly OUTSIDE the OnDataChunkRecvCallback frame if no other
+        // strong ref exists.
     };
     if (stream->response_head.framing == Framing::NO_BODY && len > 0) {
         reject_overrun("body bytes on NO_BODY response");
@@ -245,6 +255,11 @@ int OnDataChunkRecvCallback(nghttp2_session* /*session*/, uint8_t /*flags*/,
 
     stream->body_bytes_received += static_cast<int64_t>(len);
 
+    // Local keepalive — holds the captured strong
+    // shared_ptr<ProxyTransaction> through OnBodyChunk; if mid-call
+    // Cleanup → ResetStream → DetachSink clears streaming_abort_callback,
+    // this local keeps the strong ref alive until the enclosing scope exits.
+    auto keepalive = stream->streaming_abort_callback;  // NOLINT
     const bool keep = stream->sink->OnBodyChunk(
         reinterpret_cast<const char*>(data), len);
     if (!keep) {
@@ -296,6 +311,23 @@ int OnFrameSendCallback(nghttp2_session* /*session*/,
         const bool eos = (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
         self->EnqueueFrameForDrain(frame->hd.stream_id, frame_bytes,
                                     is_data, eos, /*is_control=*/false);
+        // Fire OnRequestHeadersSubmitted exactly once per stream (streaming
+        // requests). The deferred-drain path fires OnRequestSubmitted from
+        // FireSinkForDrainEntry at END_STREAM drain; this hook is the earlier
+        // "HEADERS frame has been serialized into the transport buffer" signal
+        // consumed by ProxyTransaction to arm the send-stall watchdog before
+        // the first DATA frame bytes leave. The fire-once flag prevents
+        // re-dispatch on a retransmit (which nghttp2 does not do) and is
+        // harmless for buffered requests (which ignore the virtual).
+        if (frame->hd.type == NGHTTP2_HEADERS &&
+            frame->headers.cat == NGHTTP2_HCAT_REQUEST &&
+            !stream->headers_submitted_callback_fired_) {
+            stream->headers_submitted_callback_fired_ = true;
+            // Local keepalive — guards the OnRequestHeadersSubmitted
+            // call in case it re-enters Cleanup → ResetStream → DetachSink.
+            auto keepalive = stream->streaming_abort_callback;  // NOLINT
+            stream->sink->OnRequestHeadersSubmitted();
+        }
         return 0;
     }
     // Control frame: track bytes but never dispatch sink virtuals.
@@ -668,11 +700,17 @@ void UpstreamH2Connection::OnGoawayReceived(int32_t last_stream_id) {
         if (stream && stream->sink) {
             // Detach before OnError — see UPSTREAM_PROXY.md "Sink ptr
             // stale across RST_STREAM → OnStreamClose race".
+            // Local keepalive — the destruction-chain via
+            // pending_erase_=true → walker → ~UpstreamH2Stream releases
+            // streaming_abort_callback eventually; this local holds a
+            // separate strong ref through the synchronous OnError call.
+            auto keepalive = stream->streaming_abort_callback;  // NOLINT
             auto* sink = stream->sink;
             stream->sink = nullptr;
             sink->OnError(
                 ProxyTransaction::RESULT_GOAWAY_UNPROCESSED,
                 "h2 stream above GOAWAY last_stream_id — peer did not process");
+            // keepalive destructs at end of for-loop iteration.
         }
     }
 
@@ -742,6 +780,11 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                 // but lies about Content-Length — neither nghttp2 nor
                 // Step 1.5 can detect that until the clean END_STREAM
                 // arrives short.
+                // Local keepalive — guards both OnError and
+                // OnComplete; if mid-call Cleanup → ResetStream → DetachSink
+                // clears streaming_abort_callback, this local keeps the
+                // strong ref alive until the enclosing scope exits.
+                auto keepalive = stream->streaming_abort_callback;  // NOLINT
                 if (stream->response_head.framing == Framing::CONTENT_LENGTH &&
                     stream->response_head.expected_length >= 0 &&
                     stream->body_bytes_received <
@@ -769,12 +812,93 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                 //      budget would burn looping against an H2 session
                 //      that fundamentally rejects this request shape.
                 MarkDead();
+                // Local keepalive — guards the OnError call.
+                auto keepalive = stream->streaming_abort_callback;  // NOLINT
                 stream->sink->OnError(
                     ProxyTransaction::RESULT_PARSE_ERROR,
                     "h2 peer sent HTTP_1_1_REQUIRED — set "
                     "upstream http2.prefer=never or reconfigure "
                     "upstream H2 routing");
             } else {
+                // Streaming-side abort takes precedence over peer-error
+                // classification. StoredAbort was set by
+                // StreamingDataSourceReadCallback's ABORTED branch.
+                if (stream->streaming_abort_pending) {
+                    const int code = stream->streaming_abort_code;
+                    std::string msg = std::move(stream->streaming_abort_message);
+                    auto deferred_cb = std::move(stream->streaming_abort_callback);
+                    stream->streaming_abort_pending = false;
+                    auto* raw_sink = stream->sink;
+                    stream->sink = nullptr;
+                    // Stage the stream for erase BEFORE dispatching the
+                    // terminal error. Other error-dispatch paths in this
+                    // function set pending_erase_ + push to
+                    // pending_erase_streams_ (e.g. line ~760); without
+                    // this, active_streams_ stays elevated until the
+                    // walker actually runs and a fast retry can race the
+                    // walker, observing a still-full cap. Idempotent —
+                    // RunDeferredEraseWalk only erases entries it finds
+                    // in the deque.
+                    stream->pending_erase_ = true;
+                    pending_erase_streams_.push_back(stream_id);
+                    // Reach the dispatcher via transport → ConnectionHandler.
+                    auto alive = alive_token();
+                    auto* uc = transport_;
+                    Dispatcher* d = nullptr;
+                    if (uc) {
+                        if (auto t = uc->GetTransport()) {
+                            d = t->GetDispatcher();
+                        }
+                    }
+                    // Defer when we have a self-contained callback AND a live
+                    // dispatcher. deferred_cb is non-empty iff the sink
+                    // overrode MakeDeferredErrorCallback (ProxyTransaction
+                    // does); it captures a strong shared_ptr<ProxyTransaction>
+                    // internally so no alive-token gate is needed inside the
+                    // lambda. Empty deferred_cb (legacy/test sinks) falls
+                    // through to synchronous dispatch — safe because those
+                    // sinks are typically stack-owned for the entire stream
+                    // lifetime.
+                    if (deferred_cb && d) {
+                        d->EnQueue(
+                            [cb = std::move(deferred_cb),
+                             code, msg = std::move(msg)]() mutable {
+                                cb(code, msg);
+                                // cb destructs here, releasing the captured
+                                // strong shared_ptr<ProxyTransaction>.
+                            });
+                    } else if (raw_sink) {
+                        // Synchronous fallback for legacy/test sinks.
+                        raw_sink->OnError(code, msg);
+                    } else {
+                        // Both channels empty: DetachSink's preserve-callback
+                        // gate should have prevented this. If it ever fires
+                        // (future contributor bypassing the gate), surface
+                        // the silent drop instead of leaking the txn until
+                        // response timeout — operators can correlate with
+                        // the txn's pending state via the stream_id.
+                        logging::Get()->error(
+                            "H2 streaming abort terminal error dropped: "
+                            "stream={} code={} msg={} — both deferred_cb "
+                            "and raw_sink cleared before OnStreamClose ran",
+                            stream_id, code, msg);
+                    }
+                    // Enqueue a RunDeferredEraseWalk to drain the
+                    // pending_erase entry promptly so active_streams_
+                    // returns to 0 quickly (avoids ~1s slot-hold under
+                    // tight pool.max_connections=1).
+                    if (d) {
+                        d->EnQueue(
+                            [self = this, alive]() {
+                                if (!alive ||
+                                    !alive->load(std::memory_order_acquire))
+                                    return;
+                                self->RunDeferredEraseWalk();
+                            });
+                    }
+                    last_activity_at_ = std::chrono::steady_clock::now();
+                    return;
+                }
                 // Translate the H2 stream error to a proxy RESULT_* code.
                 // Without this translation the raw nghttp2 code (positive
                 // int) falls through ProxyTransaction::MakeErrorResponse's
@@ -816,6 +940,10 @@ void UpstreamH2Connection::OnStreamClose(int32_t stream_id,
                     "goaway_seen={} goaway_last={}",
                     classification_label, stream_id, error_code,
                     goaway_seen_, goaway_last_stream_id_);
+                // Local keepalive — holds the captured strong
+                // shared_ptr<ProxyTransaction> through OnError; prevents
+                // mid-call ~ProxyTransaction from UAF on return.
+                auto keepalive = stream->streaming_abort_callback;  // NOLINT
                 stream->sink->OnError(
                     classified,
                     std::string(reason_label) + " code=" +
@@ -911,6 +1039,10 @@ void UpstreamH2Connection::OnHeadersComplete(int32_t stream_id,
         stream->response_head.framing = Framing::CHUNKED;
     }
 
+    // Local keepalive — holds strong ref through OnHeaders call;
+    // if mid-call Cleanup → ResetStream → DetachSink clears the callback
+    // field, this local prevents ~ProxyTransaction inside the call.
+    auto keepalive = stream->streaming_abort_callback;  // NOLINT
     if (!stream->sink->OnHeaders(stream->response_head)) {
         // Sink rejected the response head (e.g. client disconnect during
         // commit). Cancel the stream — same semantic as H1 returning
@@ -929,6 +1061,8 @@ void UpstreamH2Connection::OnTrailersComplete(int32_t stream_id) {
     // OnStreamClose), so dispatching a zero-pair OnTrailers here would
     // be a no-op for every existing sink.
     if (stream->trailers.empty()) return;
+    // Local keepalive — holds strong ref through OnTrailers call.
+    auto keepalive = stream->streaming_abort_callback;  // NOLINT
     stream->sink->OnTrailers(stream->trailers);
 }
 
@@ -1038,6 +1172,13 @@ void UpstreamH2Connection::FailAllStreams(int error_code,
     pending_erase_streams_.clear();
     for (auto& kv : streams) {
         if (kv.second && kv.second->sink) {
+            // Local keepalive — holds strong ref through OnError;
+            // the local `streams` map destructs at scope-exit, releasing each
+            // UpstreamH2Stream (and its streaming_abort_callback) AFTER the
+            // loop — redundant for the ~UpstreamH2Stream release path but
+            // necessary for the mid-OnError Cleanup → ResetStream reentrant
+            // path (which calls DetachSink → clears the field synchronously).
+            auto keepalive = kv.second->streaming_abort_callback;  // NOLINT
             kv.second->sink->OnError(error_code, reason);
         }
     }
@@ -1083,6 +1224,23 @@ void UpstreamH2Connection::DetachSink(int32_t stream_id) {
     auto it = streams_.find(stream_id);
     if (it == streams_.end() || !it->second) return;
     it->second->sink = nullptr;
+    // Symmetric clear: detaching the sink also releases the per-stream txn
+    // keepalive (streaming_abort_callback). The mid-callback UAF this would
+    // otherwise cause is prevented by the local-keepalive guard at every
+    // raw-sink dispatch site.
+    //
+    // EXCEPTION: when StreamingDataSourceReadCallback's ABORTED branch has
+    // already stored a terminal classification (streaming_abort_pending),
+    // the callback is the ONLY surviving channel that delivers OnError to
+    // the txn. A concurrent peer DATA frame whose sink->OnBodyChunk returns
+    // false will call ResetStream → DetachSink in the same recv batch; if we
+    // cleared the callback here, OnStreamClose's streaming_abort branch
+    // would find both deferred_cb and raw_sink null and silently drop the
+    // terminal error — txn hangs until response timeout. Preserve the
+    // callback so OnStreamClose can still dispatch.
+    if (!it->second->streaming_abort_pending) {
+        it->second->streaming_abort_callback = {};
+    }
     if (it->second->peer_already_closed_ && !it->second->pending_erase_) {
         it->second->pending_erase_ = true;
         pending_erase_streams_.push_back(stream_id);
@@ -1140,10 +1298,14 @@ void UpstreamH2Connection::FireSinkForDrainEntry(const PendingFrameDrain& entry)
     // a stale lookup short-circuits here.
     auto it = streams_.find(entry.stream_id);
     if (it == streams_.end() || !it->second || !it->second->sink) return;
+    // Local keepalive — holds strong ref through the sink virtual call;
+    // if mid-call Cleanup → ResetStream → DetachSink clears
+    // streaming_abort_callback, this local prevents ~ProxyTransaction inside.
+    auto keepalive = it->second->streaming_abort_callback;  // NOLINT
     if (entry.is_end_stream) {
         it->second->sink->OnRequestSubmitted();
     } else if (entry.is_data_frame) {
-        it->second->sink->OnRequestBodyProgress();
+        it->second->sink->OnRequestBodyProgress(entry.bytes);
     }
 }
 
@@ -1206,11 +1368,12 @@ void UpstreamH2Connection::OnTransportWriteProgress(size_t remaining) {
             // FULL-drain branch above, so firing progress here cannot
             // race the submitted dispatch. Control-frame entries
             // (is_control=true) skip dispatch via FireSinkForDrainEntry.
+            const size_t partial_drained = drained;
             front.bytes -= drained;
             drained = 0;
             if (front.is_data_frame && !front.is_control) {
                 PendingFrameDrain partial_entry{
-                    front.stream_id, 0, /*is_data=*/true,
+                    front.stream_id, partial_drained, /*is_data=*/true,
                     /*is_end_stream=*/false, /*is_control=*/false};
                 FireSinkForDrainEntry(partial_entry);
             }
@@ -1241,15 +1404,26 @@ namespace {
 // te / transfer-encoding / upgrade / trailer / proxy-authenticate /
 // proxy-authorization). Also strips Host because the H2 wire conveys
 // it via :authority.
-bool IsForbiddenH2RequestHeader(const std::string& lower_name) {
-    // HeaderRewriter::IsHopByHopHeader covers the RFC 7230 §6.1 set;
-    // host is conveyed via :authority on the H2 wire; expect is illegal
-    // on H2 per RFC 9113 §8.2.2 and HeaderRewriter strips it upstream,
-    // but list it explicitly as defense-in-depth so this gate stays
-    // self-contained.
-    return HeaderRewriter::IsHopByHopHeader(lower_name) ||
-           lower_name == "host" ||
-           lower_name == "expect";
+//
+// content-length is NOT hop-by-hop (it is end-to-end per RFC 9110 §8.6).
+// For BUFFERED submission, the body size is known at submit time and
+// inbound CL invariably equals the captured body's size (the inbound
+// layer would not have produced a buffered body of N bytes if CL said
+// M); RFC 9113 §8.1.2.6 explicitly permits content-length on H2 requests
+// for this case. Preserve it so upstreams that key admission on CL
+// (e.g. early-reject on Content-Length > limit) get the information.
+// For STREAMING submission, the inbound CL is unreliable — the actual
+// emitted-body length is not known until END_STREAM and a mid-stream
+// abort/truncation would leave a framing inconsistency. Strip in that
+// path; END_STREAM is the only authoritative end-of-body signal.
+bool IsForbiddenH2RequestHeader(const std::string& lower_name, bool streaming) {
+    if (HeaderRewriter::IsHopByHopHeader(lower_name) ||
+        lower_name == "host" ||
+        lower_name == "expect") {
+        return true;
+    }
+    if (streaming && lower_name == "content-length") return true;
+    return false;
 }
 
 }  // namespace
@@ -1332,7 +1506,7 @@ int32_t UpstreamH2Connection::SubmitRequest(
     size_t i = 0;
     for (const auto& kv : headers) {
         const std::string& lower = lower_names[i++];
-        if (IsForbiddenH2RequestHeader(lower)) continue;
+        if (IsForbiddenH2RequestHeader(lower, /*streaming=*/false)) continue;
         push_nv(lower.data(), lower.size(),
                 kv.second.data(), kv.second.size());
     }
@@ -1413,4 +1587,321 @@ int32_t UpstreamH2Connection::SubmitRequest(
         }
     }
     return stream_id;
+}
+
+int32_t UpstreamH2Connection::SubmitStreamingRequest(
+    UPSTREAM_CALLBACKS_NAMESPACE::UpstreamResponseSink* sink,
+    const std::string& method,
+    const std::string& scheme,
+    const std::string& authority,
+    const std::string& path_with_query,
+    const std::map<std::string, std::string>& rewritten_headers,
+    bool client_te_trailers,
+    std::shared_ptr<http::BodyStream> body_stream)
+{
+    if (!IsUsable()) return -1;
+
+    // Build lowercased header-name backing store — must stay alive until
+    // nghttp2_submit_request2 copies the bytes synchronously. ASCII-only
+    // bitwise lowercasing (RFC 9113 §8.2); std::tolower is locale-dependent.
+    std::vector<std::string> lower_names;
+    lower_names.reserve(rewritten_headers.size());
+    for (const auto& kv : rewritten_headers) {
+        std::string lower = kv.first;
+        for (char& c : lower) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c | 0x20);
+        }
+        lower_names.push_back(std::move(lower));
+    }
+
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(4 + rewritten_headers.size() + (client_te_trailers ? 1 : 0));
+    auto push_nv = [&nva](const char* name, size_t namelen,
+                          const char* value, size_t valuelen) {
+        nghttp2_nv nv;
+        nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(name));
+        nv.namelen = namelen;
+        nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(value));
+        nv.valuelen = valuelen;
+        nv.flags = NGHTTP2_NV_FLAG_NONE;
+        nva.push_back(nv);
+    };
+    push_nv(":method", 7, method.data(), method.size());
+    push_nv(":scheme", 7, scheme.data(), scheme.size());
+    push_nv(":authority", 10, authority.data(), authority.size());
+    push_nv(":path", 5, path_with_query.data(), path_with_query.size());
+    size_t i = 0;
+    for (const auto& kv : rewritten_headers) {
+        const std::string& lower = lower_names[i++];
+        // IsForbiddenH2RequestHeader (streaming=true) covers hop-by-hop
+        // (TE, transfer-encoding, trailer, upgrade, etc.) plus host,
+        // expect, and content-length. CL is stripped on the streaming
+        // path because the emitted body length is not known at submit
+        // time and a mid-stream abort/truncation would leave a framing
+        // inconsistency. The H1 SendH1StreamingRequest_ path additionally
+        // erases content-length / transfer-encoding / trailer from
+        // rewritten_headers_ upstream of the codec; this gate enforces
+        // the same invariant for the H2 streaming path without relying
+        // on caller bookkeeping.
+        if (IsForbiddenH2RequestHeader(lower, /*streaming=*/true)) continue;
+        push_nv(lower.data(), lower.size(),
+                kv.second.data(), kv.second.size());
+    }
+    if (client_te_trailers) {
+        push_nv("te", 2, "trailers", 8);
+    }
+
+    // Three-shape decision from a single atomic snapshot. PureBodyless:
+    // EOS already set + no trailers + no bytes queued — END_STREAM rides
+    // the HEADERS frame. EmptyBodyWithTrailers and Bodied both use the
+    // non-null-provider path (StreamingDataSourceReadCallback).
+    const auto snap = body_stream->SnapshotForSubmit();
+    const bool pure_bodyless =
+        snap.eos && !snap.has_trailers && snap.bytes_queued == 0;
+
+    auto stream = std::make_shared<UpstreamH2Stream>();
+    stream->sink = sink;
+    // CRITICAL: construct the per-stream txn keepalive + deferred terminal
+    // callback at submit time while OnCheckoutReady's strong-self capture is
+    // on the stack so sink->MakeDeferredErrorCallback() reaches
+    // shared_from_this() safely. The WOULD_BLOCK-then-resume path re-enters
+    // the ABORTED branch AFTER DispatchH2 returns — lazy construction there
+    // would UAF on the raw sink pointer before shared_from_this() is reached.
+    stream->streaming_abort_callback = sink->MakeDeferredErrorCallback();
+    stream->request_method = method;
+    stream->body_stream = std::move(body_stream);
+    stream->headers_submitted_callback_fired_ = false;
+
+    nghttp2_data_provider2 provider = {};
+    nghttp2_data_provider2* data_prd = nullptr;
+    if (!pure_bodyless) {
+        provider.source.ptr = stream.get();
+        provider.read_callback = &UpstreamH2Connection::StreamingDataSourceReadCallback;
+        data_prd = &provider;
+    }
+    // pure_bodyless: data_prd stays nullptr → END_STREAM rides HEADERS frame.
+
+    int32_t stream_id = nghttp2_submit_request2(
+        session_, /*priority=*/nullptr,
+        nva.data(), nva.size(),
+        data_prd,
+        /*stream_user_data=*/stream.get());
+    if (stream_id < 0) {
+        logging::Get()->warn(
+            "UpstreamH2Connection: submit_request2 (streaming) failed rv={}",
+            stream_id);
+        return -1;
+    }
+
+    stream->stream_id = stream_id;
+    if (pure_bodyless && stream->body_stream) {
+        // Pure-bodyless: EOS already on the wire; close the BodyStream to
+        // satisfy the sink contract (downstream OnResponseComplete chain).
+        stream->body_stream->CloseEmpty();
+    }
+
+    streams_[stream_id] = std::move(stream);
+    ++active_streams_;
+    last_activity_at_ = std::chrono::steady_clock::now();
+
+    if (!in_receive_data_) {
+        if (!FlushSend()) {
+            auto it = streams_.find(stream_id);
+            if (it != streams_.end() && it->second) {
+                it->second->sink = nullptr;
+                // Clear the keepalive alongside the raw sink detach.
+                // Without this, the txn would live until RunDeferredEraseWalk
+                // erases the stream entry.
+                it->second->streaming_abort_callback = {};
+                it->second->peer_already_closed_ = true;
+                if (!it->second->pending_erase_) {
+                    it->second->pending_erase_ = true;
+                    pending_erase_streams_.push_back(stream_id);
+                }
+            }
+            MarkDead();
+            RunDeferredEraseWalk();
+            return -1;
+        }
+    }
+    return stream_id;
+}
+
+ssize_t UpstreamH2Connection::StreamingDataSourceReadCallback(
+    nghttp2_session* /*session*/, int32_t stream_id,
+    uint8_t* buf, size_t length, uint32_t* data_flags,
+    nghttp2_data_source* /*source*/, void* user_data)
+{
+    // user_data carries UpstreamH2Connection* (set by nghttp2 session
+    // callbacks). Use streams_.find — NEVER operator[] (default-constructs
+    // a phantom entry on stale-stream access, masking UAF as silent no-op).
+    auto* self = static_cast<UpstreamH2Connection*>(user_data);
+    auto it = self->streams_.find(stream_id);
+    if (it == self->streams_.end() || !it->second) {
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
+    auto& s = *it->second;
+    if (!s.body_stream || !s.sink) {
+        // Race: sink detached or body_stream cleared between submit and
+        // callback fire (FlushSend-failure rollback, Cleanup, abort).
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
+
+    size_t bytes_read = 0;
+    auto rc = s.body_stream->Read(
+        reinterpret_cast<char*>(buf), length, &bytes_read);
+    switch (rc) {
+        case http::BodyStreamResult::OK: {
+            if (bytes_read > 0) {
+                // Local keepalive — guards the OnRequestBodySourceConsumed
+                // call in case it re-enters Cleanup → ResetStream → DetachSink.
+                auto keepalive = s.streaming_abort_callback;  // NOLINT
+                s.sink->OnRequestBodySourceConsumed(bytes_read);
+            }
+            return static_cast<ssize_t>(bytes_read);
+        }
+
+        case http::BodyStreamResult::WOULD_BLOCK: {
+            // WaitForData is one-shot — re-arm on every WOULD_BLOCK.
+            // The SubmitStreamingRequest path does not install it; the
+            // FIRST gap arms it HERE; each subsequent gap re-arms it.
+            // Without re-arm, the SECOND gap in a streaming upload stalls
+            // forever (producer Push wakes nobody).
+            auto alive = self->alive_token();
+            s.body_stream->WaitForData(
+                [self, alive, stream_id]() {
+                    if (!alive || !alive->load(std::memory_order_acquire))
+                        return;
+                    nghttp2_session_resume_data(self->session_, stream_id);
+                    // Gate on in_receive_data_ so we never call FlushSend
+                    // from inside a receive callback (HTTP_WS.md pitfall).
+                    if (!self->in_receive_data_) self->FlushSend();
+                });
+            return NGHTTP2_ERR_DEFERRED;
+        }
+
+        case http::BodyStreamResult::END_OF_STREAM: {
+            if (bytes_read > 0) {
+                // Local keepalive — guards the OnRequestBodySourceConsumed
+                // call in case it re-enters Cleanup → ResetStream → DetachSink.
+                auto keepalive = s.streaming_abort_callback;  // NOLINT
+                s.sink->OnRequestBodySourceConsumed(bytes_read);
+            }
+            const auto& trailers = s.body_stream->Trailers();
+            if (trailers.empty()) {
+                *data_flags = NGHTTP2_DATA_FLAG_EOF;
+                return static_cast<ssize_t>(bytes_read);
+            }
+            // Submit trailers INSIDE the callback. SubmitTrailer MUST NOT
+            // call FlushSend — the outer mem_send2 pass serializes the
+            // trailer HEADERS frame naturally.
+            auto status = self->SubmitTrailer(stream_id, trailers);
+            switch (status) {
+                case SubmitTrailerResult::OK:
+                    *data_flags = NGHTTP2_DATA_FLAG_EOF |
+                                  NGHTTP2_DATA_FLAG_NO_END_STREAM;
+                    break;
+                case SubmitTrailerResult::NoTrailersSubmitted:
+                    *data_flags = NGHTTP2_DATA_FLAG_EOF;
+                    break;
+                case SubmitTrailerResult::NoSuchStream:
+                case SubmitTrailerResult::InvalidTrailer:
+                case SubmitTrailerResult::SubmitFailed:
+                default:
+                    logging::Get()->warn(
+                        "H2 SubmitTrailer failed stream={} status={}",
+                        stream_id, static_cast<int>(status));
+                    *data_flags = NGHTTP2_DATA_FLAG_EOF;
+                    break;
+            }
+            return static_cast<ssize_t>(bytes_read);
+        }
+
+        case http::BodyStreamResult::ABORTED: {
+            // Store the abort classification; do NOT call sink->OnError
+            // inline. The read callback runs inside nghttp2's serialization
+            // pass (nghttp2_session_mem_send2); a synchronous OnError →
+            // DeliverTerminalError → Cleanup → ResetStream → FlushSend
+            // would re-enter mem_send2 from inside its own callback —
+            // forbidden by nghttp2 (corrupts the outgoing frame serializer).
+            //
+            // Correct shape: store here + TEMPORAL_CALLBACK_FAILURE.
+            // nghttp2 issues RST_STREAM internally; OnStreamClose then
+            // dispatches the terminal sink->OnError on a clean call stack
+            // via the deferred EnQueue path.
+            const std::string& reason = s.body_stream->AbortReason();
+            const int result_code =
+                (reason == "body_size_limit_exceeded" ||
+                 reason == "content_length_overrun"  ||
+                 reason == "content_length_underrun")
+                    ? ProxyTransaction::RESULT_REQUEST_BODY_LIMIT_EXCEEDED
+                    : ProxyTransaction::RESULT_SEND_FAILED;
+            logging::Get()->warn(
+                "H2 streaming body_stream aborted stream={} reason={} "
+                "code={} (deferring sink dispatch to OnStreamClose)",
+                stream_id, reason, result_code);
+            s.streaming_abort_pending = true;
+            s.streaming_abort_code = result_code;
+            s.streaming_abort_message = "streaming body aborted: " + reason;
+            // streaming_abort_callback was already populated at submit time.
+            // Do NOT construct it lazily here: on the WOULD_BLOCK-then-resume
+            // path this branch can fire AFTER DispatchH2 returns, when no
+            // strong ref to the ProxyTransaction exists on the stack.
+            // Constructing the callback here would UAF on the raw sink pointer
+            // before shared_from_this() is reached.
+            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        }
+    }
+    // Defensive fallthrough (enum exhausted above; reachable only on future
+    // enum addition). Per-stream, not session-fatal.
+    return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+}
+
+UpstreamH2Connection::SubmitTrailerResult UpstreamH2Connection::SubmitTrailer(
+    int32_t stream_id,
+    const std::vector<std::pair<std::string, std::string>>& trailers)
+{
+    if (dead_ || !session_) {
+        return SubmitTrailerResult::SubmitFailed;
+    }
+    auto* nghttp2_stream = nghttp2_session_find_stream(session_, stream_id);
+    if (!nghttp2_stream) {
+        return SubmitTrailerResult::NoSuchStream;
+    }
+
+    auto filtered = http::SanitizeHttp2TrailerFieldsForOutboundEmit(trailers);
+    if (filtered.empty()) {
+        return SubmitTrailerResult::NoTrailersSubmitted;
+    }
+
+    // NGHTTP2_NV_FLAG_NONE so nghttp2 copies the bytes. `filtered` is a
+    // local that dies on function return; NO_COPY flags would require backing
+    // memory to live until the matching on_frame_send. Live response-trailer
+    // code at server/http2_session.cc:825 documents this same decision.
+    std::vector<nghttp2_nv> nva;
+    nva.reserve(filtered.size());
+    for (const auto& [name, value] : filtered) {
+        nghttp2_nv nv;
+        nv.name = reinterpret_cast<uint8_t*>(const_cast<char*>(name.data()));
+        nv.value = reinterpret_cast<uint8_t*>(const_cast<char*>(value.data()));
+        nv.namelen = name.size();
+        nv.valuelen = value.size();
+        nv.flags = NGHTTP2_NV_FLAG_NONE;
+        nva.push_back(nv);
+    }
+
+    int rv = nghttp2_submit_trailer(session_, stream_id,
+                                    nva.data(), nva.size());
+    if (rv < 0) {
+        logging::Get()->warn(
+            "nghttp2_submit_trailer failed stream={} rv={}",
+            stream_id, nghttp2_strerror(rv));
+        return rv == NGHTTP2_ERR_INVALID_ARGUMENT
+                ? SubmitTrailerResult::InvalidTrailer
+                : SubmitTrailerResult::SubmitFailed;
+    }
+    return SubmitTrailerResult::OK;
+    // NO FlushSend here — caller's data-source callback is inside
+    // mem_send2's outer pass; the trailer HEADERS frame is serialized
+    // naturally as part of that same pass.
 }

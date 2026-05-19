@@ -47,6 +47,48 @@ public:
     // MUST be called after every operation that may produce output.
     bool SendPendingFrames();
 
+    // Streaming-request consumer batching. Accumulates bytes against a
+    // per-stream counter; when the threshold is reached, emits WINDOW_UPDATE
+    // for both stream and connection windows via the canonical send path
+    // (deferred flush when InReceiveData(), else inline SendPendingFrames).
+    // Returns true if a window update was emitted; false if the stream
+    // is gone or the threshold is not yet reached. Dispatcher-thread-only.
+    bool ConsumeStreamingRequestBytes(int32_t stream_id, size_t consumed,
+                                       size_t threshold);
+
+    // Force-flush sub-threshold WINDOW_UPDATE residue at terminal paths
+    // (inbound END_STREAM on DATA, stream cleanup before erase, every
+    // abort path). Idempotent: no-op when pending == 0 or stream is gone.
+    // Dispatcher-thread-only.
+    void ForceFlushStreamConsume(int32_t stream_id);
+
+    // Abort/RST cleanup: flush drained-but-not-yet-credited bytes AND refund
+    // the connection-level credit for residue queued in body_stream that
+    // the consumer will never read. Single FindStream + single
+    // SendPendingFrames pass — preferred over ForceFlushStreamConsume at
+    // abort sites because it covers both the drained-credit-flush and the
+    // discarded-residue-refund concerns. Dispatcher-thread-only.
+    void FinalizeAbortedStreamFlowControl(int32_t stream_id);
+
+    // Per-stream WINDOW_UPDATE backpressure. Suspend marks the stream so
+    // ConsumeStreamingRequestBytes accumulates drained bytes without
+    // emitting WINDOW_UPDATE — the peer's per-stream window drains and
+    // upload back-pressure flows upstream. Resume clears the latch and
+    // force-flushes accumulated credit so the peer can resume sending.
+    // Dispatcher-thread-only.
+    void SuspendWindowUpdateForStream(int32_t stream_id);
+    void ResumeWindowUpdateForStream(int32_t stream_id);
+
+    // Streaming watermark accessors (set from Http2Config at initialization).
+    size_t StreamingHighWaterBytes() const { return streaming_high_water_; }
+    size_t StreamingLowWaterBytes() const { return streaming_low_water_; }
+    size_t StreamingWindowUpdateBytes() const { return streaming_window_update_; }
+    void SetStreamingConfig(size_t high, size_t low, size_t window_update) {
+        streaming_high_water_ = high;
+        streaming_low_water_ = low;
+        streaming_window_update_ = window_update;
+    }
+
     // Check if nghttp2 has pending output bytes.
     bool WantWrite() const;
 
@@ -57,6 +99,26 @@ public:
     void SendServerPreface();
 
     // --- Response submission ---
+
+    // Result codes for SubmitTrailers.
+    enum class SubmitTrailersResult {
+        OK,                  // Trailers queued successfully
+        NoTrailersSubmitted, // Post-sanitize set was empty; caller must emit EOF alone
+        NoSuchStream,        // Stream not found in nghttp2 (handler or session gone)
+        InvalidTrailer,      // nghttp2 rejected a trailer field name/value
+        SubmitFailed         // nghttp2 returned a fatal error
+    };
+
+    // Submit response trailers on a stream. Sanitizes via
+    // SanitizeHttp2TrailerFieldsForOutboundEmit before forwarding to nghttp2.
+    // On NoTrailersSubmitted the caller MUST emit NGHTTP2_DATA_FLAG_EOF alone
+    // (never EOF|NO_END_STREAM when no trailer HEADERS frame was queued).
+    // MUST be called from inside the data-source read callback (inside
+    // nghttp2_session_mem_send2); the caller owns the flush on the way out.
+    // Dispatcher-thread-only.
+    SubmitTrailersResult SubmitTrailers(
+        int32_t stream_id,
+        const std::vector<std::pair<std::string, std::string>>& trailers);
 
     // Submit HTTP response for a stream. Returns 0 on success.
     int SubmitResponse(int32_t stream_id, const HttpResponse& response);
@@ -162,6 +224,7 @@ public:
     // within this callback — doing so is reentrant into nghttp2 and unsafe.
     void SetStreamOpenCallback(HTTP2_CALLBACKS_NAMESPACE::Http2StreamOpenCallback cb);
     void SetRequestCountCallback(HTTP2_CALLBACKS_NAMESPACE::Http2RequestCountCallback cb);
+    void SetResolveRouteOptionsCallback(HTTP2_CALLBACKS_NAMESPACE::ResolveRouteOptionsCallback cb);
 
     // --- Flood protection ---
 
@@ -225,6 +288,7 @@ public:
         owner_ = std::move(owner);
     }
     std::shared_ptr<Http2ConnectionHandler> Owner() const { return owner_.lock(); }
+    std::weak_ptr<Http2ConnectionHandler> WeakOwner() const { return owner_; }
 
     // Access callbacks (used by static nghttp2 callback functions)
     HTTP2_CALLBACKS_NAMESPACE::Http2SessionCallbacks& Callbacks() { return callbacks_; }
@@ -233,7 +297,22 @@ public:
     // Called from OnFrameRecvCallback (static) for both HEADERS and DATA END_STREAM.
     void DispatchStreamRequest(Http2Stream* stream, int32_t stream_id);
 
+    // Streaming-route dispatch path. Same as DispatchStreamRequest but skips
+    // the AccumulatedBodySize == content_length post-buffered check; streaming
+    // bytes live in body_stream, not in the buffered body. CL enforcement is
+    // split: OVERRUN on each DATA chunk, UNDERRUN at DATA/trailer END_STREAM.
+    // request_count_callback fires exactly once (same pattern as
+    // DispatchStreamRequest). Called from OnFrameRecvCallback HCAT_REQUEST branch
+    // at HEADERS-complete for streaming routes.
+    void DispatchStreamRequestStreaming(Http2Stream* stream, int32_t stream_id);
+
 private:
+    // Shared body of ForceFlushStreamConsume and FinalizeAbortedStreamFlowControl.
+    // `flush_send=false` lets the caller batch a single trailing
+    // SendPendingFrames when multiple flow-control updates feed the same wire.
+    void FlushStreamConsumeOnStream(Http2Stream* stream, int32_t stream_id,
+                                     bool flush_send);
+
     // Helper: submit a GOAWAY frame and only latch goaway_sent_ on
     // successful submit. Used by SendGoaway + every flood-protection
     // branch in OnFrameRecvCallback. Centralizing avoids the "set flag,
@@ -276,6 +355,11 @@ private:
     size_t max_body_size_ = 0;
     size_t incomplete_stream_count_ = 0;
     size_t max_header_list_size_ = 0;
+
+    // Streaming watermark config (set from Http2Config::streaming at init).
+    size_t streaming_high_water_ = 262144;    // 256 KB
+    size_t streaming_low_water_  = 65536;     // 64 KB
+    size_t streaming_window_update_ = 32768;  // 32 KB
 
     // Flood protection counters (sliding window)
     int settings_count_ = 0;

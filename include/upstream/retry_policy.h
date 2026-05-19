@@ -41,6 +41,12 @@ public:
 
     int MaxRetries() const { return config_.max_retries; }
 
+    // True when the HTTP method is safe to replay for a streaming request
+    // retry. Uses the same RFC 7231 §4.2.2 idempotent set as IsIdempotent;
+    // streaming retries must not replay non-idempotent methods because body
+    // bytes may have already reached the upstream.
+    bool IsMethodRetryableForReplay(const std::string& method) const;
+
 private:
     Config config_;
 

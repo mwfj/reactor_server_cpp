@@ -648,8 +648,8 @@ private:
     // capture ensures DNS swaps automatically invalidate the cache
     // (the endpoint pointer in the entry differs from the current one).
     // Invalidation: explicit on reload-push (CloseIdleMatchingEndpoint…)
-    // AND on DNS-swap detected mid-probe (1.B.4 in the plan); LRU
-    // eviction at `kH2NegotiationCacheCap`. Dispatcher-thread-only.
+    // AND on DNS-swap detected mid-probe; LRU eviction at
+    // `kH2NegotiationCacheCap`. Dispatcher-thread-only.
     enum class H2NegotiationOutcome { H1Only, H2Negotiated };
     struct H2NegotiationCacheEntry {
         H2NegotiationOutcome outcome;

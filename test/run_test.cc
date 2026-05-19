@@ -67,6 +67,8 @@
 #include "observability_self_metrics_test.h"
 #include "observability_connection_metrics_test.h"
 #include "observability_pool_gauges_test.h"
+#include "streaming_request_test.h"
+#include "h2_trailer_test.h"
 #include "test_framework.h"
 #include <algorithm>
 #include <sys/resource.h>
@@ -330,6 +332,16 @@ void RunAllTest(){
     // null-manager safety.
     ObservabilityMiddlewareMetricsTests::RunAllTests();
 
+    // Streaming request body — ChunkQueueBodyStream unit tests, watermark
+    // callbacks, RetryPolicy idempotency gate, and integration tests
+    // exercising Streaming-mode route handlers with real HTTP/1.1 clients.
+    StreamingRequestTests::RunAllStreamingRequestTests();
+
+    // HTTP/2 trailer sanitizer — IsForbiddenH2TrailerName, per-field
+    // classification, outbound emit filtering, and integration tests
+    // verifying trailing HEADERS frames reach a real H2 client.
+    H2TrailerTests::RunAllH2TrailerTests();
+
     std::cout << "====================================\n" << std::endl;
 }
 
@@ -434,6 +446,14 @@ void PrintUsage(const char* program_name) {
     std::cout << "  obs_middleware_metrics  DNS resolves{outcome} closed-set enum, rate-limit" << std::endl;
     std::cout << "                          decisions{zone, decision} (admit/reject/dry_run_reject)," << std::endl;
     std::cout << "                          tokens histogram, null-manager safety guards" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  streaming_request      Streaming request body tests — ChunkQueueBodyStream" << std::endl;
+    std::cout << "                         unit tests (Push/Read, watermarks, WaitForData, Abort)," << std::endl;
+    std::cout << "                         RetryPolicy idempotency gate, and Streaming-mode" << std::endl;
+    std::cout << "                         route handler integration tests (H1 client)" << std::endl;
+    std::cout << "  h2_trailer             H2 trailer sanitizer tests — IsForbiddenH2TrailerName," << std::endl;
+    std::cout << "                         SanitizeHttp2TrailerField, outbound emit filtering," << std::endl;
+    std::cout << "                         and trailing HEADERS integration (real H2 client)" << std::endl;
     std::cout << std::endl;
     std::cout << "  dns,         -D    Run the full DNS / dual-stack feature family" << std::endl;
     std::cout << "                     (DnsResolver primitives + dual-stack integration)" << std::endl;
@@ -674,6 +694,12 @@ int main(int argc, char* argv[]) {
         // Middleware-layer emit: DNS resolves + rate-limit decisions/tokens.
         }else if(mode == "obs_middleware_metrics"){
             ObservabilityMiddlewareMetricsTests::RunAllTests();
+        // Streaming request body — ChunkQueueBodyStream unit tests + integration.
+        }else if(mode == "streaming_request"){
+            StreamingRequestTests::RunAllStreamingRequestTests();
+        // H2 trailer sanitizer — per-field classification + integration.
+        }else if(mode == "h2_trailer"){
+            H2TrailerTests::RunAllH2TrailerTests();
         // Show help
         }else if(mode == "help" || mode == "-h" || mode == "--help"){
             PrintUsage(argv[0]);

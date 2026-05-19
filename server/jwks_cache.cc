@@ -2,9 +2,9 @@
 #include "log/logger.h"
 
 // JWKS parsing (jwt::parse_jwks) lives in JwksFetcher, not here — that
-// keeps exception containment at the jwt-cpp boundary owned by one file
-// (design §9 item 16). The real parse path is invoked from JwksFetcher.
-// The jwks_cache unit tests in Phase I use `InstallKeys` directly.
+// keeps exception containment at the jwt-cpp boundary owned by one file.
+// The real parse path is invoked from JwksFetcher; unit tests for this
+// cache use `InstallKeys` directly.
 
 namespace AUTH_NAMESPACE {
 

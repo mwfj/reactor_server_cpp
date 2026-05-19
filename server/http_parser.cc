@@ -213,13 +213,42 @@ static int on_headers_complete(llhttp_t* parser) {
     // key-value pair into the headers map.
     self->parsing_header_value_ = false;
     self->in_header_field_ = false;
+
+    // Notify the connection handler that headers are complete. This fires
+    // synchronously before on_body so the handler can install a streaming
+    // body_stream into streaming_body_stream_ before any body chunks arrive.
+    if (self->headers_complete_callback_) {
+        self->headers_complete_callback_();
+    }
     return 0;
 }
 
 static int on_body(llhttp_t* parser, const char* at, size_t length) {
     auto* self = static_cast<HttpParser*>(parser->data);
 
-    // Enforce body size limit DURING parsing, not after.
+    if (self->streaming_body_stream_) {
+        // Streaming path: enforce cumulative max_body_size BEFORE push.
+        // Without this gate chunked / no-CL uploads stream indefinitely
+        // and bypass the DoS-cap that buffered routes honor — Push
+        // accepts every chunk because backpressure throttles inbound
+        // but does not bound total ingestion.
+        if (self->max_body_size_ > 0) {
+            const size_t pushed = self->request_.pushed_body_bytes;
+            if (pushed >= self->max_body_size_ ||
+                length > self->max_body_size_ - pushed) {
+                self->streaming_body_stream_->Abort("body_size_limit_exceeded");
+                self->has_error_ = true;
+                self->error_message_ = "Body size exceeds maximum (streaming)";
+                self->error_type_ = HttpParser::ParseError::BODY_TOO_LARGE;
+                return HPE_USER;
+            }
+        }
+        self->streaming_body_stream_->Push(std::string(at, length));
+        self->request_.pushed_body_bytes += length;
+        return 0;
+    }
+
+    // Buffered path: enforce body size limit DURING parsing, not after.
     // Guard against unsigned underflow: check body.size() >= max first.
     if (self->max_body_size_ > 0 &&
         (self->request_.body.size() >= self->max_body_size_ ||
@@ -244,6 +273,14 @@ static int on_message_complete(llhttp_t* parser) {
     if (self->parsing_header_value_ && !self->current_header_field_.empty()) {
         self->current_header_field_.clear();
         self->current_header_value_.clear();
+    }
+
+    // Close the streaming body stream if one is installed (streaming route).
+    if (self->streaming_body_stream_) {
+        self->streaming_body_stream_->CloseEmpty();
+        if (self->streaming_body_complete_callback_) {
+            self->streaming_body_complete_callback_();
+        }
     }
 
     self->request_.complete = true;
@@ -316,6 +353,7 @@ void HttpParser::Reset() {
     parsing_header_value_ = false;
     in_header_field_ = false;
     header_bytes_ = 0;
+    streaming_body_stream_ = nullptr;
     llhttp_init(&impl_->parser, HTTP_REQUEST, &impl_->settings);
     impl_->parser.data = this;
 }

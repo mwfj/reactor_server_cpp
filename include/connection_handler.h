@@ -37,7 +37,7 @@ private:
     TimeStamp ts_; // Each connection owns a timestamp to manage
     bool has_deadline_ = false;
     std::chrono::steady_clock::time_point deadline_;
-    std::function<bool()> deadline_timeout_cb_;
+    CALLBACKS_NAMESPACE::ConnDeadlineTimeoutCallback deadline_timeout_cb_;
     // Generation counter for deadline callback. Incremented by
     // SetDeadlineTimeoutCb(). Used by CallDeadlineTimeoutCb() to detect
     // whether the callback explicitly re-installed or cleared itself
@@ -54,13 +54,16 @@ private:
     // Outbound connect support (for upstream/proxy connections)
     enum class ConnectState { NONE, CONNECTING, CONNECTED };
     ConnectState connect_state_ = ConnectState::NONE;
-    using ConnectCompleteCallback = std::function<void(std::shared_ptr<ConnectionHandler>)>;
+    // Re-exported from CALLBACKS_NAMESPACE so callers keep using the short
+    // class-scope name while the canonical alias lives with the rest of the
+    // reactor-core callbacks (CODE_CONVENTIONS.md §Callbacks).
+    using ConnectCompleteCallback = CALLBACKS_NAMESPACE::ConnConnectCompleteCallback;
     ConnectCompleteCallback connect_complete_callback_ = nullptr;
 
     // Fires once when TLS handshake transitions to READY (consume-on-fire).
     // Wired by the H2 upstream codec so it can inspect ALPN immediately on
     // completion. Cleared after invocation. See SetHandshakeCompleteCallback.
-    using HandshakeCompleteCallback = std::function<void()>;
+    using HandshakeCompleteCallback = CALLBACKS_NAMESPACE::ConnHandshakeCompleteCallback;
     HandshakeCompleteCallback handshake_complete_callback_ = nullptr;
 
     // TLS support
@@ -105,6 +108,14 @@ private:
     // borrower). That prevents stale reads from crossing request boundaries.
     std::atomic<uint64_t> on_message_cb_epoch_{0};
     std::atomic<bool> has_on_message_callback_{false};
+
+    // Counted read-pump pause. Cooperates with the existing binary
+    // `read_pump_paused_` atomic: read pump is paused if EITHER the binary
+    // flag is true OR this counter is non-zero. Used by inbound H1
+    // streaming to backpressure the socket while body_stream is above its
+    // high-water mark. Inc/Dec are dispatcher-thread-only; the load by
+    // PauseReadPump/ResumeReadPump uses acquire ordering.
+    std::atomic<int> read_disable_count_{0};
 
     // Observability — transport + protocol gauges. Wired by the
     // accept-time call to AttachTransportObservability; the
@@ -191,6 +202,7 @@ public:
     size_t InputBufferSize() const { return input_bf_.Size(); }
     size_t OutputBufferSize() const { return output_bf_.Size(); }
     Dispatcher* GetDispatcher() const { return event_dispatcher_.get(); }
+    std::shared_ptr<Dispatcher> dispatcher_ptr() const { return event_dispatcher_; }
 
     void EnableReadMode();
     void DisableReadMode();
@@ -199,6 +211,17 @@ public:
     void ResumeReadPump();
     bool IsReadPumpPaused() const {
         return read_pump_paused_.load(std::memory_order_acquire);
+    }
+
+    // Counted backpressure pause/resume. Inc/Dec must be balanced; a
+    // non-zero count keeps the read pump paused even if the binary
+    // `read_pump_paused_` flag is cleared by ResumeReadPump. Used by
+    // inbound H1 streaming to throttle the socket while body_stream is
+    // above its high-water mark. Dispatcher-thread-only.
+    void IncReadDisable();
+    void DecReadDisable();
+    int ReadDisableCount() const {
+        return read_disable_count_.load(std::memory_order_acquire);
     }
 
     // Returns true if this connection has TLS (any state: handshake or ready).
@@ -246,7 +269,8 @@ public:
     // Deadline timeout callback. Returns true if the timeout was handled
     // (e.g., HTTP/2 RST'd expired streams and re-armed) — connection stays alive.
     // Returns false to proceed with the default close behavior.
-    using DeadlineTimeoutCb = std::function<bool()>;
+    // Re-exported from CALLBACKS_NAMESPACE per CODE_CONVENTIONS.md §Callbacks.
+    using DeadlineTimeoutCb = CALLBACKS_NAMESPACE::ConnDeadlineTimeoutCallback;
     void SetDeadlineTimeoutCb(DeadlineTimeoutCb cb);
     bool CallDeadlineTimeoutCb();  // returns true if handled (keep alive)
 

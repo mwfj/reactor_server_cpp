@@ -2,7 +2,8 @@
 
 #include "http/http_request.h"
 #include "http/http_response.h"
-// <string>, <cstdint>, <memory> provided by common.h (via http_request.h)
+#include "http/route_options.h"
+// <string>, <cstdint>, <memory>, <vector> provided by common.h (via http_request.h)
 
 class ResponseDataSource {
 public:
@@ -57,6 +58,7 @@ public:
 
     // Mark stream as END_STREAM received from client
     void MarkEndStream();
+    bool IsEndStreamReceived() const { return end_stream_received_; }
 
     // Check if request is ready for dispatch
     bool IsRequestComplete() const;
@@ -70,6 +72,50 @@ public:
     int32_t StreamId() const { return stream_id_; }
     HttpRequest& GetRequest() { return request_; }
     const HttpRequest& GetRequest() const { return request_; }
+    HttpRequest* GetRequestPtr() { return &request_; }
+    const HttpRequest* GetRequestPtr() const { return &request_; }
+
+    // Per-stream request mode resolved at HEADERS-complete.
+    http::RouteRequestMode route_mode() const { return route_mode_; }
+    void set_route_mode(http::RouteRequestMode m) { route_mode_ = m; }
+
+    // Pending request trailers accumulated during the trailer HEADERS block.
+    // At END_STREAM the session moves these into body_stream via
+    // PushTrailersAndClose; handlers read them through BodyStream::Trailers().
+    std::vector<std::pair<std::string, std::string>>& pending_trailers() {
+        return pending_trailers_;
+    }
+
+    // Sub-threshold WINDOW_UPDATE batching. Bytes consumed by the outbound
+    // Read() path accumulate here; when the threshold is reached (or at
+    // stream end), ConsumeStreamingRequestBytes / ForceFlushStreamConsume
+    // emits the WINDOW_UPDATE and resets the counter.
+    void AccumulateConsumedBytes(size_t n) {
+        consumed_since_last_window_update_ += n;
+    }
+    size_t consumed_since_last_window_update() const {
+        return consumed_since_last_window_update_;
+    }
+    void reset_consumed_since_last_window_update() {
+        consumed_since_last_window_update_ = 0;
+    }
+
+    // Bytes recv'd-and-queued minus bytes credited back to nghttp2.
+    // Residue is refunded to the connection window on abort/RST per
+    // RFC 9113 §6.9.1.
+    void AddRecvBytesUncredited(size_t n) { recv_bytes_uncredited_ += n; }
+    void SubRecvBytesUncredited(size_t n) {
+        recv_bytes_uncredited_ = (recv_bytes_uncredited_ > n)
+            ? (recv_bytes_uncredited_ - n) : 0;
+    }
+    size_t recv_bytes_uncredited() const { return recv_bytes_uncredited_; }
+    void reset_recv_bytes_uncredited() { recv_bytes_uncredited_ = 0; }
+
+    // Latched by the body_stream high-water callback; suppresses
+    // WINDOW_UPDATE emission until low-water clears it, so the peer's
+    // per-stream window drains.
+    void SetWindowUpdateSuspended(bool s) { window_update_suspended_ = s; }
+    bool IsWindowUpdateSuspended() const { return window_update_suspended_; }
 
     // Track response state
     bool IsResponseHeadersSent() const { return response_headers_sent_; }
@@ -85,6 +131,19 @@ public:
     // Dispatcher-thread-only — no synchronization needed.
     bool FinalResponseSubmitted() const { return final_response_submitted_; }
     void MarkFinalResponseSubmitted() { final_response_submitted_ = true; }
+
+    // Streaming-route body-size enforcement: set in OnDataChunkRecvCallback
+    // when the inbound body exceeds max_body_size. The handler will deliver
+    // a 413 response via the normal async path; SubmitResponse must then
+    // queue a RST_STREAM AFTER the response has been serialized so the
+    // peer can't keep streaming bytes into a half-closed stream slot. A
+    // direct RST_STREAM submission at chunk-recv time would transition the
+    // stream to CLOSING in nghttp2 (third_party/nghttp2/nghttp2_session.c:1164)
+    // and cancel the pending 413 — see the analogous fix at
+    // server/http2_session.cc::DispatchStreamRequestStreaming for the
+    // deferred-RST pattern. Dispatcher-thread-only.
+    bool RstPendingAfterResponse() const { return rst_pending_after_response_; }
+    void MarkRstPendingAfterResponse() { rst_pending_after_response_ = true; }
 
     // Body size tracking for limit enforcement
     size_t AccumulatedBodySize() const { return accumulated_body_size_; }
@@ -150,6 +209,7 @@ private:
     bool response_headers_sent_ = false;
     bool response_complete_ = false;
     bool final_response_submitted_ = false;
+    bool rst_pending_after_response_ = false;
     size_t accumulated_body_size_ = 0;
     size_t accumulated_header_size_ = 0;
     bool rejected_ = false;
@@ -169,4 +229,28 @@ private:
     // counted against the handler's response budget.
     std::chrono::steady_clock::time_point dispatched_at_ =
         std::chrono::steady_clock::time_point::max();
+
+    // Streaming-route request mode (resolved at HEADERS-complete via
+    // resolve_route_options_callback). Defaults to Buffered so the
+    // existing code paths are unaffected when streaming is not configured.
+    http::RouteRequestMode route_mode_ = http::RouteRequestMode::Buffered;
+
+    // Accumulates trailer name/value pairs from the per-header callback.
+    // At END_STREAM these are moved into the body_stream via
+    // PushTrailersAndClose; handlers access them through
+    // BodyStream::Trailers() once END_OF_STREAM is observed.
+    std::vector<std::pair<std::string, std::string>> pending_trailers_;
+
+    // Bytes consumed by the consumer since the last WINDOW_UPDATE emission.
+    // Threshold-batched to avoid per-chunk WINDOW_UPDATE floods.
+    size_t consumed_since_last_window_update_ = 0;
+
+    // Bytes recv'd on streaming DATA that have not yet been credited back to
+    // nghttp2 via consume_stream/consume_connection. See AddRecvBytesUncredited.
+    size_t recv_bytes_uncredited_ = 0;
+
+    // Latched true when body_stream crosses the high-water mark; suppresses
+    // WINDOW_UPDATE emission via ConsumeStreamingRequestBytes so the peer's
+    // per-stream window drains and back-pressure flows upstream.
+    bool window_update_suspended_ = false;
 };

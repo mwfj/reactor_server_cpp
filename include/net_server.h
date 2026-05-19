@@ -75,7 +75,7 @@ public:
     // the timeout-trigger callback. Does NOT construct Acceptor, does
     // NOT build or start socket dispatchers, does NOT start the worker
     // pool. `conn_dispatcher_` MUST be Init()-complete here because
-    // `Acceptor::Acceptor()` (called in Phase 2) synchronously invokes
+    // `Acceptor::Acceptor()` synchronously invokes
     // `event_dispatcher_->UpdateChannelInLoop()` to register the listen
     // channel; without an initialised dispatcher that call would fail.
     //
@@ -225,6 +225,7 @@ public:
 
     // True once `StartListening()` has opened the listen socket.
     // False in the ctor-only partial state. Used by Stop() and by
-    // `HttpServer::Start()` to gate Phase C on Phase B.
+    // `HttpServer::Start()` to gate the request-handler enablement step
+    // on the listen-socket-bind step.
     bool IsListening() const { return acceptor_ != nullptr; }
 };

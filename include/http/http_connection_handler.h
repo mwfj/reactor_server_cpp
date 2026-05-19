@@ -23,6 +23,7 @@ public:
     void SetRequestCallback(RequestCallback callback);
     void SetRouteCheckCallback(RouteCheckCallback callback);
     void SetMiddlewareCallback(MiddlewareCallback callback);
+    void SetResolveRouteOptionsCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnResolveRouteOptionsCallback callback);
     // Install the async middleware callback for WS upgrades. Optional;
     // when not installed the WS upgrade path skips the async phase and
     // runs the sync path only.
@@ -31,6 +32,13 @@ public:
     void SetUpgradeCallback(UpgradeCallback callback);
     void SetRequestCountCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnRequestCountCallback callback);
     void SetShutdownCheckCallback(HTTP_CALLBACKS_NAMESPACE::HttpConnShutdownCheckCallback callback);
+
+    // Configure inbound streaming-request body watermarks. Read at
+    // headers-complete time by the HeadersCompleteCallback when constructing
+    // ChunkQueueBodyStream. Live-reloadable — must be set before the next
+    // streaming request arrives. high > low > 0 (validated upstream).
+    void SetStreamingWatermarks(size_t high_water_bytes,
+                                size_t low_water_bytes);
 
     // Send an HTTP response
     void SendResponse(const HttpResponse& response);
@@ -225,6 +233,13 @@ public:
     // without recursion surprises.
     void StashDeferredBytes(const std::string& data);
 
+    // Clear the streaming-upload-in-flight flag. Called from the async-resume
+    // aborted-body guard when it fires on the dispatcher thread. Mirrors the
+    // flag clear at the other terminal sites enumerated at the field
+    // declaration. H2's no-op counterpart on Http2ConnectionHandler keeps the
+    // generic MakeAsyncResumeCallback template clean.
+    void ClearStreamingUploadInFlight() { streaming_upload_in_flight_ = false; }
+
     // True if an async response is currently pending delivery.
     bool IsAsyncResponsePending() const { return deferred_response_pending_; }
 
@@ -273,6 +288,29 @@ private:
     // Reset when the parser is reset for the next pipelined request.
     bool sent_100_continue_ = false;
 
+    // Set true by the headers_complete_callback streaming dispatch path
+    // immediately before DispatchStreamingRoute; cleared at FIVE terminal
+    // sites so the OnRawData stash gate correctly bypasses buffering for
+    // mid-request body chunks on a streaming upload:
+    //   (a) on_message_complete via SetStreamingBodyCompleteCallback (happy path)
+    //   (b) HandleParseError at function entry
+    //   (c) CloseConnection at function entry
+    //   (d) parser_.Reset() site (symmetric with sent_100_continue_)
+    //   (e) async-resume aborted-body guard
+    bool streaming_upload_in_flight_ = false;
+
+    // Watermark-callback gate: a pause without a live consumer would deadlock
+    // multi-packet streaming uploads (nobody to call DecReadDisable).
+    // _pump_paused_ pairs IncReadDisable / DecReadDisable so a low-water fire
+    // never runs without a matching prior pause.
+    bool streaming_dispatched_ = false;
+    bool h1_streaming_pump_paused_ = false;
+
+    // One-shot trigger set inside SetHeadersCompleteCallback (which runs
+    // synchronously from llhttp); consumed by OnRawData after Parse() returns
+    // so the dispatch runs OUTSIDE the parser callback chain.
+    bool streaming_dispatch_pending_ = false;
+
     // Close the underlying connection (send response then close)
     void CloseConnection();
 
@@ -282,6 +320,21 @@ private:
     // Returns true to continue pipelining loop, false to stop processing
     bool HandleCompleteRequest(const char*& buf, size_t& remaining, size_t consumed);
     void HandleIncompleteRequest();
+
+    // Dispatch the streaming-route handler at headers-complete (before the
+    // body finishes arriving) so the handler can consume body_stream as the
+    // bytes arrive. Returns true if the caller should continue the OnRawData
+    // parsing loop; false if the connection has been closed or the deferred
+    // response is now in flight.
+    bool DispatchStreamingRouteFromHeaders();
+
+    // Arm the deferred-response heartbeat deadline with the configured cap
+    // safety net. Reused by the buffered-route deferred branch in
+    // HandleCompleteRequest and the streaming-route early-dispatch site —
+    // any divergence between the two re-introduces missing observability
+    // finalization or abort-hook bookkeeping on the cap-exceeded path.
+    // Sets `deferred_start_` and installs the deadline + timeout callback.
+    void ArmAsyncDeferredDeadline(int heartbeat_sec, int cap_sec);
 
     // Continue the WS upgrade handshake after any middleware has
     // resolved with PASS. Owns RFC 6455 handshake validation, 101 send,
@@ -337,6 +390,15 @@ private:
     // headers. The request must still block pipelined parsing until End/Abort,
     // but the generic async safety cap no longer applies after commitment.
     bool deferred_response_committed_ = false;
+
+    // Inbound streaming-request body watermarks. Snapshotted by
+    // HttpServer at construction time and refreshed via
+    // SetStreamingWatermarks on live reload. Read at headers-complete
+    // time by the streaming HeadersCompleteCallback to populate the
+    // ChunkQueueBodyStream config. 0 sentinels keep the legacy default
+    // (1 MB / 512 KB) for pre-config call paths (tests, direct ctor use).
+    size_t streaming_high_water_bytes_ = 0;  // 0 = use class default
+    size_t streaming_low_water_bytes_  = 0;  // 0 = use class default
     bool deferred_was_head_ = false;
     bool deferred_keep_alive_ = true;
     std::string deferred_pending_buf_;

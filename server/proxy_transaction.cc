@@ -13,6 +13,7 @@
 #include "http/http_request.h"
 #include "http/http_status.h"
 #include "http/trailer_policy.h"
+#include "http/http2_trailer_sanitizer.h"
 #include "log/logger.h"
 #include "observability/observability_snapshot.h"
 #include "observability/observability_manager.h"
@@ -200,6 +201,13 @@ Retryable5xxBodySnapshot SnapshotRetryable5xxBody(
     return snapshot;
 }
 
+// Convert chunk size to hex string for chunked transfer framing.
+std::string HexSize_(size_t n) {
+    char buf[32];
+    int len = std::snprintf(buf, sizeof(buf), "%zx", n);
+    return std::string(buf, static_cast<size_t>(len > 0 ? len : 0));
+}
+
 }  // namespace
 
 // Public + static so test code can verify the contract. See header
@@ -310,6 +318,14 @@ ProxyTransaction::ProxyTransaction(
         client_te_trailers_ = ProxyTransaction::ContainsTeTrailersToken(te_it->second);
     }
 
+    // Capture streaming body source before the request is invalidated.
+    // is_streaming_request_ governs H1/H2 send-path branching; body_stream_
+    // holds the live producer for the send phase.
+    if (client_request.body_stream) {
+        is_streaming_request_ = true;
+        body_stream_ = client_request.body_stream;
+    }
+
     logging::Get()->debug("ProxyTransaction created client_fd={} service={} "
                           "{} {}", client_fd_, service_name_, method_, path_);
 }
@@ -398,6 +414,19 @@ const char* ErrorTypeForResult(int result_code) {
         case ProxyTransaction::RESULT_RESPONSE_TOO_LARGE:     return "response_too_large";
         case ProxyTransaction::RESULT_CIRCUIT_OPEN:           return "circuit_open";
         case ProxyTransaction::RESULT_RETRY_BUDGET_EXHAUSTED: return "retry_budget_exhausted";
+        case ProxyTransaction::RESULT_TRUNCATED_RESPONSE:     return "upstream_truncated";
+        case ProxyTransaction::RESULT_GOAWAY_UNPROCESSED:     return "goaway_unprocessed";
+        case ProxyTransaction::RESULT_GOAWAY_MAYBE_PROCESSED: return "goaway_maybe_processed";
+        case ProxyTransaction::RESULT_H2_METHOD_NOT_SUPPORTED:return "h2_method_not_supported";
+        case ProxyTransaction::RESULT_H2_ALPN_NOT_NEGOTIATED: return "h2_alpn_not_negotiated";
+        case ProxyTransaction::RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED:
+            return "retry_denied_streaming_source_consumed";
+        case ProxyTransaction::RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE:
+            return "retry_denied_streaming_body_on_wire";
+        case ProxyTransaction::RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED:
+            return "retry_denied_non_idempotent_headers_queued";
+        case ProxyTransaction::RESULT_REQUEST_BODY_LIMIT_EXCEEDED:
+            return "request_body_limit_exceeded";
         default:                                              return "upstream_error";
     }
 }
@@ -1128,6 +1157,277 @@ void ProxyTransaction::OnCheckoutReady(UpstreamLease lease) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Outbound H1 streaming
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::string ProxyTransaction::BuildH1StreamingRequestHead_() const {
+    std::string head;
+    head.reserve(256);
+    head += method_;
+    head += ' ';
+    head += upstream_path_;
+    if (!query_.empty()) { head += '?'; head += query_; }
+    head += " HTTP/1.1\r\n";
+    for (const auto& [k, v] : rewritten_headers_) {
+        head += k; head += ": "; head += v; head += "\r\n";
+    }
+    head += "\r\n";
+    return head;
+}
+
+void ProxyTransaction::SendH1StreamingRequest_(
+    std::shared_ptr<http::BodyStream> body_stream) {
+    body_stream_ = std::move(body_stream);
+
+    // Wire the consumer dispatcher BEFORE the first Read or WaitForData.
+    if (auto* uc = lease_.Get()) {
+        if (auto t = uc->GetTransport()) {
+            body_stream_->SetConsumerDispatcher(
+                t->GetDispatcher()->weak_from_this());
+        }
+    }
+
+    // Single atomic snapshot for the three-shape decision.
+    const auto snap = body_stream_->SnapshotForSubmit();
+    const bool pure_bodyless       = snap.eos && !snap.has_trailers && snap.bytes_queued == 0;
+    const bool empty_with_trailers = snap.eos &&  snap.has_trailers && snap.bytes_queued == 0;
+
+    // Mutate rewritten_headers_ for framing (already populated by the existing
+    // dispatch path via HeaderRewriter::RewriteRequest).
+    rewritten_headers_.erase("content-length");
+    rewritten_headers_.erase("transfer-encoding");
+    rewritten_headers_.erase("trailer");
+    if (pure_bodyless) {
+        rewritten_headers_["content-length"] = "0";
+    } else {
+        rewritten_headers_["transfer-encoding"] = "chunked";
+    }
+    if (pure_bodyless && rewritten_headers_.count("transfer-encoding")) {
+        logging::Get()->error("BUG: streaming H1 PureBodyless has transfer-encoding");
+    }
+    if (!pure_bodyless && rewritten_headers_.count("content-length")) {
+        logging::Get()->error("BUG: streaming H1 Bodied/EmptyWithTrailers has content-length");
+    }
+
+    std::string head = BuildH1StreamingRequestHead_();
+    auto* uc = lease_.Get();
+    if (!uc) {
+        OnError(RESULT_CHECKOUT_FAILED, "h1 streaming: no upstream connection");
+        return;
+    }
+    auto transport = uc->GetTransport();
+    if (!transport) {
+        OnError(RESULT_CHECKOUT_FAILED,
+                "h1 streaming: upstream transport unavailable");
+        return;
+    }
+
+    // Arm the send-phase stall deadline AND install the write-progress
+    // refresh, matching the buffered H1 path at SendH1Request_ (~L1813).
+    // Without these, a wedged upstream that stops reading our chunked-body
+    // writes would pin both the client and the pool connection indefinitely
+    // — OnUpstreamWriteComplete only fires under back-pressure when the
+    // socket actually drains, and the pool's far-future checkout deadline
+    // never trips. SetWriteProgressCb also resumes the pump when the
+    // transport buffer drains below low-water (see PumpH1StreamingBody_).
+    h1_stall_budget_ms_ = ComputeH2StallBudgetMs(config_.response_timeout_ms);
+    ArmResponseTimeout(h1_stall_budget_ms_);
+    {
+        std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+        transport->SetWriteProgressCb(
+            [weak_self](std::shared_ptr<ConnectionHandler>, size_t) {
+                auto self = weak_self.lock();
+                if (!self) return;
+                // Refresh the send-stall deadline while still writing.
+                if (self->state_ == State::SENDING_REQUEST) {
+                    self->ArmResponseTimeout(self->h1_stall_budget_ms_);
+                }
+                // Resume the body pump if it was paused for transport drain.
+                // Re-entry guard inside PumpH1StreamingBody_ handles the
+                // synchronous-direct-write case where SendRaw fires this
+                // callback from inside the pump itself.
+                if (self->h1_pump_paused_for_drain_ &&
+                    !self->cancelled_ &&
+                    !self->IsKilledForShutdown()) {
+                    self->h1_pump_paused_for_drain_ = false;
+                    self->PumpH1StreamingBody_();
+                }
+            });
+    }
+
+    // For pure_bodyless: set completion-gate flags BEFORE SendRaw. The head
+    // write is the entire request (CL:0); SendRaw's fast-path direct-write can
+    // fire OnUpstreamWriteComplete synchronously inside this call. The guard at
+    // the top of OnUpstreamWriteComplete must permit the transition.
+    if (pure_bodyless) {
+        h1_streaming_send_complete_ = true;
+        h1_request_fully_sent_ = true;
+    }
+    transport->SendRaw(head.data(), head.size());
+
+    // Fire OnRequestHeadersSubmitted immediately — H1 has no async
+    // serialization queue equivalent to nghttp2.
+    OnRequestHeadersSubmitted();
+
+    if (pure_bodyless) {
+        return;
+    }
+    if (empty_with_trailers) {
+        EmitH1ChunkedTrailers_(snap.trailers_copy, /*omit_last_chunk_marker=*/false);
+        return;
+    }
+
+    // Bodied: install resume callback with weak_from_this capture.
+    std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+    body_stream_->WaitForData([weak_self]() {
+        auto self = weak_self.lock();
+        if (!self) return;
+        if (self->cancelled_ || self->IsKilledForShutdown()) return;
+        self->PumpH1StreamingBody_();
+    });
+}
+
+void ProxyTransaction::PumpH1StreamingBody_() {
+    static constexpr size_t MAX_CHUNK_BYTES = 16 * 1024;
+    // Hysteresis on transport output buffer: pause the pump when the
+    // outbound buffer climbs above HIGH_WATER, resume from
+    // SetWriteProgressCb when it drains below LOW_WATER. Without this,
+    // body_stream_->Read() releases inbound producer backpressure
+    // (on_bytes_consumed → inbound DecReadDisable / WINDOW_UPDATE),
+    // but SendRaw may only append to output_bf_ on EAGAIN — a slow
+    // upstream lets the gateway move the entire body from inbound queue
+    // to outbound buffer, defeating the streaming memory bound.
+    static constexpr size_t TRANSPORT_HIGH_WATER = 262144;  // 256 KB
+
+    // Re-entry guard: SendRaw fires SetWriteProgressCb synchronously when a
+    // direct-write succeeds. That callback may call PumpH1StreamingBody_
+    // again (when paused-for-drain). The outer pump's loop picks up the
+    // extra progress on its next iteration — recursion would just stack.
+    if (h1_pump_active_) {
+        return;
+    }
+    h1_pump_active_ = true;
+    struct ActiveGuard {
+        ProxyTransaction& self;
+        ~ActiveGuard() { self.h1_pump_active_ = false; }
+    };
+    ActiveGuard guard{*this};
+
+    // body_stream_ can be reset by Cleanup() (terminal teardown after
+    // response-timeout, retry path, or shutdown) between a WOULD_BLOCK
+    // return and the deferred WaitForData fire. cancelled_ /
+    // IsKilledForShutdown() don't cover the natural Cleanup() path on a
+    // failed transaction. Null-check defensively.
+    if (!body_stream_) {
+        return;
+    }
+    auto* uc = lease_.Get();
+    if (!uc) {
+        return;
+    }
+    auto transport = uc->GetTransport();
+    if (!transport) {
+        // Transport torn down (pool teardown / lease released). Treat as
+        // benign — Cleanup or the caller's terminal-error path owns the
+        // disposition; nothing for us to do.
+        return;
+    }
+    char buf[MAX_CHUNK_BYTES];
+    while (true) {
+        // Pause on transport backpressure BEFORE pulling more from the
+        // body_stream — the Read() call would release inbound producer
+        // backpressure, causing the inbound queue to grow even though
+        // we can't push to upstream yet.
+        if (transport->OutputBufferSize() >= TRANSPORT_HIGH_WATER) {
+            h1_pump_paused_for_drain_ = true;
+            return;
+        }
+        size_t bytes_read = 0;
+        auto rc = body_stream_->Read(buf, MAX_CHUNK_BYTES, &bytes_read);
+        switch (rc) {
+            case http::BodyStreamResult::OK: {
+                OnRequestBodySourceConsumed(bytes_read);
+                std::string chunk_hdr = HexSize_(bytes_read) + "\r\n";
+                transport->SendRaw(chunk_hdr.data(), chunk_hdr.size());
+                transport->SendRaw(buf, bytes_read);
+                transport->SendRaw("\r\n", 2);
+                OnRequestBodyProgress(bytes_read);
+                break;
+            }
+            case http::BodyStreamResult::WOULD_BLOCK: {
+                std::weak_ptr<ProxyTransaction> weak_self = weak_from_this();
+                body_stream_->WaitForData([weak_self]() {
+                    auto self = weak_self.lock();
+                    if (!self) return;
+                    if (self->cancelled_ || self->IsKilledForShutdown()) return;
+                    self->PumpH1StreamingBody_();
+                });
+                return;
+            }
+            case http::BodyStreamResult::END_OF_STREAM: {
+                const auto& trailers = body_stream_->Trailers();
+                EmitH1ChunkedTrailers_(trailers, /*omit_last_chunk_marker=*/false);
+                return;
+            }
+            case http::BodyStreamResult::ABORTED: {
+                const std::string& reason = body_stream_->AbortReason();
+                const int result_code =
+                    (reason == "body_size_limit_exceeded" ||
+                     reason == "content_length_overrun"  ||
+                     reason == "content_length_underrun")
+                        ? RESULT_REQUEST_BODY_LIMIT_EXCEEDED
+                        : RESULT_SEND_FAILED;
+                logging::Get()->warn(
+                    "H1 upstream streaming body_stream aborted: reason={} code={}",
+                    reason, result_code);
+                if (uc) uc->MarkClosing();
+                DeliverTerminalError(result_code,
+                                      "streaming body aborted: " + reason);
+                return;
+            }
+        }
+    }
+}
+
+void ProxyTransaction::EmitH1ChunkedTrailers_(
+    const std::vector<std::pair<std::string, std::string>>& trailers,
+    bool omit_last_chunk_marker) {
+    auto* uc = lease_.Get();
+    if (!uc) return;
+    auto transport = uc->GetTransport();
+    if (!transport) return;
+
+    // H1 upstreams silently discard inbound request trailers per the
+    // streaming contract (docs/streaming_request.md §H2 request trailers,
+    // "H1 upstreams do not receive trailers"). Many H1 origin servers
+    // mishandle chunked trailers, and the existing rewritten-headers pass
+    // already strips the inbound `Trailer` header so the upstream is not
+    // told to expect any. Emitting fields here would silently violate the
+    // contract clients negotiated. Single atomic terminator avoids the
+    // synchronous-OnUpstreamWriteComplete race that splitting SendRaw
+    // calls would expose.
+    if (!trailers.empty()) {
+        logging::Get()->debug(
+            "H1 upstream streaming: discarding {} request trailer field(s) per contract",
+            trailers.size());
+    }
+    std::string terminator;
+    if (!omit_last_chunk_marker) {
+        terminator.append("0\r\n");
+    }
+    terminator.append("\r\n");
+
+    // Set the completion gate AFTER assembling but BEFORE the single
+    // SendRaw — the sole post-final-write OnUpstreamWriteComplete (which
+    // may fire synchronously on direct-write) needs the gate open to take
+    // the normal AWAITING_RESPONSE transition path.
+    h1_streaming_send_complete_ = true;
+    h1_request_fully_sent_ = true;
+
+    transport->SendRaw(terminator.data(), terminator.size());
+}
+
 void ProxyTransaction::DispatchH1() {
     // If the previous attempt used H2, codec_ is UpstreamH2Codec.
     // ResetForRetryAttempt() only Reset()s the existing codec — it
@@ -1200,6 +1500,11 @@ void ProxyTransaction::DispatchH1() {
             txn->OnUpstreamWriteComplete(conn);
         }
     );
+
+    if (is_streaming_request_) {
+        SendH1StreamingRequest_(body_stream_);
+        return;
+    }
 
     SendUpstreamRequest();
 }
@@ -1341,13 +1646,37 @@ void ProxyTransaction::DispatchH2() {
     h2_last_progress_at_ = std::chrono::steady_clock::now();
     ArmH2SendStallDeadline(h2_stall_budget_ms_);
 
-    // Fast-path direct-write (DoSendRaw) may run inline here, firing
-    // the transport's complete_callback → OnTransportWriteComplete →
-    // sink->OnRequestSubmitted → bumps h2_send_stall_generation_,
-    // killing the closure above.
-    int32_t stream_id = h2->SubmitRequest(
-        method_, scheme, authority, path_with_query,
-        rewritten_headers_, request_body_, this, client_te_trailers_);
+    int32_t stream_id = -1;
+
+    if (is_streaming_request_) {
+        // Wire consumer dispatcher BEFORE SubmitStreamingRequest's first
+        // WaitForData/Read — body_stream_ was constructed on the inbound
+        // dispatcher; the real consumer is the outbound dispatcher that owns
+        // this lease.
+        if (auto* uc_raw = h2->transport()) {
+            if (auto t = uc_raw->GetTransport()) {
+                body_stream_->SetConsumerDispatcher(
+                    t->GetDispatcher()->weak_from_this());
+            }
+        }
+        // Fast-path direct-write (DoSendRaw) may run inline inside
+        // SubmitStreamingRequest → FlushSend, firing drain callbacks and
+        // sink virtuals synchronously. All H2 state flags are already set
+        // above so the virtuals arrive in a consistent state.
+        stream_id = h2->SubmitStreamingRequest(
+            this, method_, scheme, authority, path_with_query,
+            rewritten_headers_, client_te_trailers_, body_stream_);
+    } else {
+        // Buffered (non-streaming) path: body bytes are in request_body_.
+        // Fast-path direct-write (DoSendRaw) may run inline here, firing
+        // the transport's complete_callback → OnTransportWriteComplete →
+        // sink->OnRequestSubmitted → bumps h2_send_stall_generation_,
+        // killing the closure above.
+        stream_id = h2->SubmitRequest(
+            method_, scheme, authority, path_with_query,
+            rewritten_headers_, request_body_, this, client_te_trailers_);
+    }
+
     if (stream_id < 0) {
         // Submit failed. Roll back H2 bookkeeping; state_ stays
         // untouched — AttemptCheckout (called by MaybeRetry's
@@ -1749,9 +2078,20 @@ bool ProxyTransaction::OnHeaders(
             // Invalidate the send-stall closure. Otherwise it fires
             // after the budget elapses with state in AWAITING_RESPONSE /
             // RECEIVING_BODY and spuriously surfaces RESPONSE_TIMEOUT
-            // against a stream whose headers are already in hand.
+            // against a stream whose headers are already in hand. The
+            // generation bump alone suffices: the closure consults
+            // h2_send_stall_generation_ on fire and no-ops on mismatch.
+            //
+            // Do NOT flip h2_request_fully_sent_ here — the inbound H2
+            // body producer may still be alive (peer responded BEFORE
+            // client END_STREAM). Cleanup's body_stream-abort gate
+            // (request_fully_sent_at_cleanup) reads this flag to decide
+            // whether to abort the inbound BodyStream; setting true here
+            // would let an early 413/404 leak the producer with no
+            // consumer → wedged inbound dispatcher. The true setter is
+            // OnRequestSubmitted, fired only when we actually emit
+            // END_STREAM on the outbound stream.
             ++h2_send_stall_generation_;
-            h2_request_fully_sent_ = true;
         }
         // Header phase done; body phase is governed by stream timers.
         ClearResponseTimeout();
@@ -1867,7 +2207,14 @@ bool ProxyTransaction::OnBodyChunk(const char* data, size_t len) {
 void ProxyTransaction::OnTrailers(
     const std::vector<std::pair<std::string, std::string>>& trailers) {
     if (cancelled_ || IsKilledForShutdown()) return;
-    if (config_.forward_trailers) {
+    if (!config_.forward_trailers) return;
+    if (client_http_major_ == 2) {
+        // H2 downstream: sanitize pseudo-headers, hop-by-hop, and framing
+        // headers; no Trailer declaration enforcement (H2 doesn't use it).
+        response_trailers_ = http::SanitizeHttp2TrailerFieldsForOutboundEmit(trailers);
+    } else {
+        // H1 downstream: only forward trailers the upstream declared in the
+        // Trailer header; undefined trailers are dropped per RFC 7230.
         auto allowed = CollectDeclaredTrailerNames(response_head_.headers);
         response_trailers_.clear();
         if (allowed.empty()) {
@@ -1902,11 +2249,29 @@ void ProxyTransaction::OnComplete() {
 void ProxyTransaction::OnUpstreamWriteComplete(
     std::shared_ptr<ConnectionHandler> conn) {
     if (cancelled_ || IsKilledForShutdown()) return;
+
+    // Streaming H1: intermediate chunk drains (between the first headers
+    // SendRaw and the final EmitH1ChunkedTrailers_ SendRaw) must NOT
+    // transition state to AWAITING_RESPONSE. EmitH1ChunkedTrailers_ sets
+    // h1_streaming_send_complete_ = true BEFORE its final SendRaw so the
+    // sole post-final-write fire takes the normal transition path below.
+    //
+    // CRITICAL: do NOT clear SetWriteProgressCb on this intermediate path.
+    // The streaming pump's transport-drain backpressure relies on the
+    // callback to resume after the output buffer drops below high-water.
+    // Clearing the callback here on a sync write completion (header /
+    // early-chunk) would leave the pump permanently paused on a slow-but-
+    // draining upstream — false-stall + body queue grows. The clear
+    // happens on the post-final-write path below + in Cleanup.
+    if (is_streaming_request_ && !h1_streaming_send_complete_) {
+        return;
+    }
+
     // Clear the send-phase write-progress callback installed in
-    // SendUpstreamRequest. The response-wait phase uses a hard
-    // (unrefreshed) deadline. Done regardless of state so an early
-    // response path that already transitioned past SENDING_REQUEST
-    // also stops refreshing.
+    // SendUpstreamRequest / SendH1StreamingRequest_. The response-wait
+    // phase uses a hard (unrefreshed) deadline. Done regardless of state
+    // so an early response path that already transitioned past
+    // SENDING_REQUEST also stops refreshing.
     if (auto* upstream_conn = lease_.Get()) {
         if (auto transport = upstream_conn->GetTransport()) {
             transport->SetWriteProgressCb(nullptr);
@@ -2067,8 +2432,9 @@ void ProxyTransaction::OnRequestSubmitted() {
     }
 }
 
-void ProxyTransaction::OnRequestBodyProgress() {
+void ProxyTransaction::OnRequestBodyProgress(size_t bytes_drained) {
     if (cancelled_ || IsKilledForShutdown()) return;
+    body_bytes_written_to_upstream_ += bytes_drained;
     if (!h2_path_) return;
     if (h2_request_fully_sent_) return;
     // Pure-timestamp refresh: the in-flight send-stall closure
@@ -2076,6 +2442,35 @@ void ProxyTransaction::OnRequestBodyProgress() {
     // observed. No EnQueueDelayed call here — the heap stays at
     // one closure per request regardless of upload size.
     h2_last_progress_at_ = std::chrono::steady_clock::now();
+}
+
+void ProxyTransaction::OnRequestHeadersSubmitted() {
+    if (cancelled_ || IsKilledForShutdown()) return;
+    request_headers_submitted_ = true;
+}
+
+void ProxyTransaction::OnRequestBodySourceConsumed(size_t bytes) {
+    if (cancelled_ || IsKilledForShutdown()) return;
+    body_bytes_read_from_source_ += bytes;
+    // Latch on first non-zero observation. The retry-denial gate at the
+    // top of MaybeRetry short-circuits via this flag without re-reading
+    // body_bytes_read_from_source_ — once the consumer has pulled any
+    // bytes from the source, the source's contents may have advanced
+    // past the point where a replay would resend identical bytes.
+    if (bytes > 0) source_consumed_ = true;
+}
+
+UPSTREAM_CALLBACKS_NAMESPACE::H2StreamingAbortCallback
+ProxyTransaction::MakeDeferredErrorCallback() {
+    // INVARIANT: invoked via virtual dispatch on `sink` from inside
+    // SubmitStreamingRequest, which runs on the OnCheckoutReady strong-self
+    // capture's call stack. shared_from_this() cannot throw here.
+    auto self = shared_from_this();
+    return [self](int code, const std::string& msg) {
+        // OnError's `cancelled_ || IsKilledForShutdown` guard makes a
+        // client-abort-after-EnQueue harmless.
+        self->OnError(code, msg);
+    };
 }
 
 void ProxyTransaction::ArmH2SendStallDeadline(int budget_ms) {
@@ -2199,7 +2594,62 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
     // Short-circuit on cancellation — no point retrying against a
     // disconnected client.
     if (cancelled_) return;
+
+    // Streaming-only intent: fire TombstonePreBodyHeadersForRetry_() only
+    // if both (a) the streaming preconditions hold AND (b) ShouldRetry
+    // approves the retry. Computed in the streaming block, consumed in
+    // the ShouldRetry-true branch below.
+    bool streaming_tombstone_pending = false;
+
+    if (is_streaming_request_) {
+        // Streaming retries are gated on whether body bytes reached the
+        // upstream. The three cases produce distinct result codes so
+        // operators can distinguish the failure reason from logs/metrics.
+        const bool replay_safe = retry_policy_.IsMethodRetryableForReplay(method_);
+        const bool headers_queued = request_headers_submitted_;
+
+        if (source_consumed_) {
+            logging::Get()->debug(
+                "streaming retry blocked: source consumed drained={}",
+                body_bytes_written_to_upstream_);
+            // Connection hygiene: H1 Cleanup only poisons on
+            // poison_connection_; without it the half-sent chunked
+            // request returns to the idle pool and corrupts reuse.
+            // H2 ignores the flag (Cleanup unconditionally RST_STREAMs).
+            poison_connection_ = true;
+            DeliverTerminalError(RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED,
+                                 "streaming source consumed before failure");
+            return;
+        }
+        if (body_bytes_written_to_upstream_ > 0) {
+            logging::Get()->debug(
+                "streaming retry blocked: body bytes on wire count={}",
+                body_bytes_written_to_upstream_);
+            poison_connection_ = true;
+            DeliverTerminalError(RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE,
+                                 "streaming body bytes already on wire");
+            return;
+        }
+        if (headers_queued && !replay_safe) {
+            logging::Get()->debug(
+                "streaming retry blocked: non-idempotent with HEADERS queued method={}",
+                method_);
+            poison_connection_ = true;
+            DeliverTerminalError(RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED,
+                                 "non-idempotent method with HEADERS already queued");
+            return;
+        }
+        // Defer the tombstone (RST_STREAM on H2 / MarkClosing on H1) until
+        // we know a retry is actually going to follow. ShouldRetry may
+        // refuse (budget exhausted, condition disallowed); poisoning the
+        // connection BEFORE that check needlessly burns a pool slot.
+        streaming_tombstone_pending = headers_queued && replay_safe;
+    }
+
     if (retry_policy_.ShouldRetry(attempt_, method_, condition, response_committed_)) {
+        if (streaming_tombstone_pending) {
+            TombstonePreBodyHeadersForRetry_();
+        }
         if (condition == RetryPolicy::RetryCondition::RESPONSE_5XX) {
             auto snapshot = SnapshotRetryable5xxBody(
                 response_head_, response_body_, paused_parse_bytes_);
@@ -2393,6 +2843,18 @@ void ProxyTransaction::MaybeRetry(RetryPolicy::RetryCondition condition) {
             }
         }
         return;
+    }
+
+    // Streaming request reached this point with HEADERS already on the wire
+    // but ShouldRetry refused the retry (budget exhausted, non-retryable
+    // condition). H1 Cleanup only poisons the connection when
+    // poison_connection_=true; without it, the half-sent chunked request
+    // returns to the idle pool and corrupts the next reuse. H2 Cleanup
+    // already issues RST_STREAM unconditionally, so poison_connection_ is
+    // a no-op there but harmless. The streaming_tombstone_pending check
+    // (computed in the streaming block above) captures exactly this case.
+    if (streaming_tombstone_pending) {
+        poison_connection_ = true;
     }
 
     // Retry not allowed -- map condition to appropriate error response
@@ -2617,6 +3079,20 @@ void ProxyTransaction::Cancel() {
             HTTP_CALLBACKS_NAMESPACE::StreamingResponseSender::AbortReason::
                 CLIENT_DISCONNECT);
     }
+    // Abort the request body_stream BEFORE Cleanup. Cleanup's body_stream
+    // abort gate fires only when state_ ∈ {FAILED, COMPLETE} — Cancel()
+    // does NOT transition state, so on a mid-flight cancel (SENDING_REQUEST
+    // / AWAITING_RESPONSE / RECEIVING_BODY) Cleanup's gate skips the abort.
+    // The inbound HTTP/1.1 keep-alive connection may still hold a reference
+    // to body_stream (so ~ChunkQueueBodyStream doesn't run on lease.reset);
+    // the inbound producer keeps pushing chunks into a queue with no
+    // consumer, and the producer-side IncReadDisable stays applied —
+    // wedging the read pump on that connection. Explicit abort here is
+    // independent of Cleanup's state-keyed gate.
+    if (body_stream_) {
+        body_stream_->Abort("proxy_transaction_cancel");
+        body_stream_.reset();
+    }
     // Release the upstream lease back to the pool (or destroy it if
     // poisoned) and clear transport callbacks so any in-flight upstream
     // bytes land harmlessly.
@@ -2667,6 +3143,16 @@ void ProxyTransaction::Cleanup() {
     // exactly during retry storms. Move-assign from a default
     // (empty) guard decrements the old counter immediately.
     inflight_guard_ = CIRCUIT_BREAKER_NAMESPACE::RetryBudget::InFlightGuard{};
+
+    // Capture the protocol-specific "request fully sent" state BEFORE the
+    // H2 cleanup block mutates h2_path_ / h2_request_fully_sent_. The
+    // body_stream cleanup at the end of this function reads these to decide
+    // whether to abort the body stream; reading h2_path_ post-mutation
+    // would silently fall through to h1_request_fully_sent_ on H2 streams,
+    // spuriously aborting body streams whose request was already fully on
+    // the wire.
+    const bool request_fully_sent_at_cleanup =
+        h2_path_ ? h2_request_fully_sent_ : h1_request_fully_sent_;
 
     // H2 path: two leases are in flight.
     //   (1) Transport lease — donated to the UpstreamH2Connection for its
@@ -2756,6 +3242,65 @@ void ProxyTransaction::Cleanup() {
     // called by MaybeRetry() between retry attempts, and the callback must
     // survive across retries so DeliverResponse() can eventually invoke it.
     // DeliverResponse() itself moves + nulls complete_cb_ after invocation.
+
+    if (body_stream_ &&
+        (state_ == State::FAILED || state_ == State::COMPLETE)) {
+        // Abort if the REQUEST side hasn't reached terminal sent state.
+        // Only fires on terminal Cleanup (FAILED/COMPLETE), not on mid-
+        // retry Cleanup where body_stream_ must survive for the next
+        // attempt. Uses the pre-mutation snapshot — the H2 reset block
+        // above already cleared h2_path_ / h2_request_fully_sent_, so
+        // reading them here would always fall through to the H1 flag.
+        if (!request_fully_sent_at_cleanup) {
+            body_stream_->Abort("proxy_transaction_cleanup");
+        }
+        body_stream_.reset();
+    }
+}
+
+void ProxyTransaction::TombstonePreBodyHeadersForRetry_() {
+    if (h2_path_ && h2_stream_id_ > 0) {
+        if (auto* h2 = h2_lease_.GetH2Connection()) {
+            h2->ResetStream(h2_stream_id_);
+            // ResetStream calls DropDrainEntriesForStream and marks
+            // pending_erase_, but it does NOT invoke RunDeferredEraseWalk.
+            // The walker only fires from HandleBytes tails and from submit-
+            // failure cleanup. Without an explicit walker enqueue, the
+            // pending_erase entry sits in pending_erase_streams_ and
+            // active_streams_ stays elevated until the next inbound-bytes
+            // arrival. Under pool.max_connections=1 with tight stream caps
+            // that delay wedges the next dispatch. Enqueue a walker run so
+            // the slot frees promptly.
+            //
+            // Single conn_alive_ token is correct: the queued work only
+            // touches h2->RunDeferredEraseWalk(), which dereferences ONLY
+            // the H2 connection — not the partition. Asymmetric with the
+            // lease-construction site that captures BOTH partition_alive
+            // AND conn_alive because the lease-release path traverses
+            // partition_. Intentional asymmetry, not a bug.
+            if (auto* uc = h2->transport()) {
+                if (auto t = uc->GetTransport()) {
+                    if (auto* d = t->GetDispatcher()) {
+                        auto alive = h2->alive_token();
+                        d->EnQueue([h2, alive]() {
+                            if (!alive ||
+                                !alive->load(std::memory_order_acquire))
+                                return;
+                            h2->RunDeferredEraseWalk();
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        // H1: poison the upstream connection so the pool cannot reuse a
+        // half-sent request. lease_ is value-typed UpstreamLease
+        // (include/upstream/proxy_transaction.h), so .Get() not ->Get().
+        // MarkClosing() lives on UpstreamConnection, not ConnectionHandler.
+        if (auto* uc = lease_.Get()) {
+            uc->MarkClosing();
+        }
+    }
 }
 
 void ProxyTransaction::ReleaseAttemptAccounting() {
@@ -2811,6 +3356,15 @@ void ProxyTransaction::ResetForRetryAttempt() {
     paused_parse_bytes_.clear();
     InvalidateStreamTimers();
     sse_stream_ = false;
+    // Per-attempt request-send progress flags. Without resetting, the
+    // retry's first OnUpstreamWriteComplete (headers ack) sees a stale
+    // h1_streaming_send_complete_=true and transitions to
+    // AWAITING_RESPONSE before the body has been sent — arming the
+    // response timeout prematurely. The H2 parallel flag is reset in
+    // DispatchH2 / Cleanup; H1 needs explicit reset here.
+    h1_streaming_send_complete_ = false;
+    h1_request_fully_sent_ = false;
+    request_headers_submitted_ = false;
 }
 
 void ProxyTransaction::ClearPendingRetryable5xxResponse() {
@@ -3478,6 +4032,32 @@ HttpResponse ProxyTransaction::MakeErrorResponse(int result_code) {
         result_code == RESULT_GOAWAY_MAYBE_PROCESSED) {
         return HttpResponse::BadGateway();
     }
+    // Streaming-retry-denial codes: per-request semantics that prevented
+    // replay (source consumed, body-on-wire, queued-non-idempotent).
+    // All three map to 502 with `X-Proxy-Retry-Denied: <reason>`.
+    if (result_code == RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED) {
+        HttpResponse resp = HttpResponse::BadGateway();
+        resp.Header("X-Proxy-Retry-Denied", "streaming-source-consumed");
+        return resp;
+    }
+    if (result_code == RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE) {
+        HttpResponse resp = HttpResponse::BadGateway();
+        resp.Header("X-Proxy-Retry-Denied", "streaming-body-on-wire");
+        return resp;
+    }
+    if (result_code == RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED) {
+        HttpResponse resp = HttpResponse::BadGateway();
+        resp.Header("X-Proxy-Retry-Denied", "non-idempotent-headers-queued");
+        return resp;
+    }
+    // Proxy-side body-size enforcement (producer aborted the body_stream
+    // with reason "body_size_limit_exceeded" mid-forward). Maps to 413
+    // + `X-Request-Body-Limit-Exceeded: true`.
+    if (result_code == RESULT_REQUEST_BODY_LIMIT_EXCEEDED) {
+        HttpResponse resp = HttpResponse::PayloadTooLarge();
+        resp.Header("X-Request-Body-Limit-Exceeded", "true");
+        return resp;
+    }
     return HttpResponse::InternalError();
 }
 
@@ -3803,6 +4383,24 @@ void ProxyTransaction::ReportBreakerOutcome(int result_code) {
             // clear admission_generation_ before delivering), but the
             // defensive branch keeps the class-wide invariant: these
             // outcomes are invisible to the breaker.
+            return;
+
+        case RESULT_RETRY_DENIED_STREAMING_SOURCE_CONSUMED:
+        case RESULT_RETRY_DENIED_STREAMING_BODY_ON_WIRE:
+        case RESULT_RETRY_DENIED_NON_IDEMPOTENT_HEADERS_QUEUED:
+            // Retry-denial outcomes are local policy decisions — the
+            // underlying transport failure (CONNECT_FAILURE /
+            // UPSTREAM_DISCONNECT / RESPONSE_TIMEOUT) was already reported
+            // through the prior attempt's ReportBreakerOutcome call. The
+            // denial itself is breaker-neutral so we don't double-count
+            // the same failure when MaybeRetry surfaces it as terminal.
+            slice_->ReportNeutral(probe, gen);
+            return;
+
+        case RESULT_REQUEST_BODY_LIMIT_EXCEEDED:
+            // Producer-side limit (inbound body cap exceeded) — not an
+            // upstream health signal. Operator policy decision.
+            slice_->ReportNeutral(probe, gen);
             return;
 
         default:

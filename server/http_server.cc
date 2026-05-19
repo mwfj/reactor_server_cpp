@@ -268,6 +268,42 @@ MakeAsyncResumeCallback(
              pre_dispatch, tweak_response, submit]() mutable {
             if (state->cancelled()) { do_bookkeeping(); return; }
             if (!pre_dispatch(*handle)) { do_bookkeeping(); return; }
+            // Aborted-body guard: if the inbound body-stream was aborted
+            // during the async-middleware suspend window (body-size
+            // enforcement fired, client disconnected mid-upload, or parser
+            // error mid-body), the request body is invalid and we MUST NOT
+            // forward it to the route handler. Map the abort reason to the
+            // appropriate HTTP status: body-size-limit overflow → 413
+            // PayloadTooLarge; any other abort → 400 BadRequest.
+            // tweak_response(err, threw=true) adds Connection: close on H1
+            // (H2's tweak_response is a no-op). ClearStreamingUploadInFlight
+            // is real on H1, a no-op on H2.
+            if (req->body_stream && req->body_stream->Aborted()) {
+                const std::string& reason = req->body_stream->AbortReason();
+                HttpResponse err;
+                const char* outcome_tag;
+                if (reason == "body_size_limit_exceeded") {
+                    err = HttpResponse::PayloadTooLarge();
+                    outcome_tag = "streaming_body_size_limit_during_async";
+                } else {
+                    err = HttpResponse::BadRequest();
+                    outcome_tag = "streaming_body_aborted_during_async";
+                }
+                const int err_status = err.GetStatusCode();
+                tweak_response(err, /*threw=*/true);
+                err.ClearDeferred();
+                handle->ClearStreamingUploadInFlight();
+                try {
+                    submit(*handle, *req, err, std::string{outcome_tag});
+                } catch (const std::exception& e) {
+                    logging::Get()->error(
+                        "Failed to send {} after body-abort-during-async: {}",
+                        err_status, e.what());
+                    HttpServer::FinalizeIfSnapshot(*req, err, "submit_failed");
+                }
+                do_bookkeeping();
+                return;
+            }
             // Mirror the sync-path catch in HttpConnectionHandler: on
             // user-handler / finalizer throw, replace the in-flight
             // response with a generic 500 so the client always gets a
@@ -1766,6 +1802,19 @@ HttpServer::HttpServer(ServerConfig config)
     h2_settings_.max_header_list_size   = config.http2.max_header_list_size;
     h2_settings_.enable_push            = config.http2.enable_push;
 
+    // Snapshot streaming watermarks from config. Live-reload via Reload()
+    // updates these atomics and walks live handlers to push the new values.
+    h1_streaming_high_water_.store(
+        config.http1.streaming.high_water_bytes, std::memory_order_relaxed);
+    h1_streaming_low_water_.store(
+        config.http1.streaming.low_water_bytes, std::memory_order_relaxed);
+    h2_streaming_high_water_.store(
+        config.http2.streaming.high_water_bytes, std::memory_order_relaxed);
+    h2_streaming_low_water_.store(
+        config.http2.streaming.low_water_bytes, std::memory_order_relaxed);
+    h2_streaming_window_update_.store(
+        config.http2.streaming.window_update_bytes, std::memory_order_relaxed);
+
     // Store upstream configurations for pool creation in Start()
     upstream_configs_ = config.upstreams;
 
@@ -1851,6 +1900,7 @@ void HttpServer::PostAsync(const std::string& path, HttpRouter::AsyncHandler han
 void HttpServer::PutAsync(const std::string& path, HttpRouter::AsyncHandler handler)    { if (RejectIfServerLive("PutAsync", path)) return; router_.RouteAsync("PUT",    path, std::move(handler)); }
 void HttpServer::DeleteAsync(const std::string& path, HttpRouter::AsyncHandler handler) { if (RejectIfServerLive("DeleteAsync", path)) return; router_.RouteAsync("DELETE", path, std::move(handler)); }
 void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler) { if (RejectIfServerLive("RouteAsync", path)) return; router_.RouteAsync(method, path, std::move(handler)); }
+void HttpServer::RouteAsync(const std::string& method, const std::string& path, HttpRouter::AsyncHandler handler, http::RouteOptions options) { if (RejectIfServerLive("RouteAsync", path)) return; router_.RouteAsync(method, path, std::move(handler), std::move(options)); }
 
 void HttpServer::Proxy(const std::string& route_pattern,
                        const std::string& upstream_service_name) {
@@ -2218,6 +2268,11 @@ void HttpServer::Proxy(const std::string& route_pattern,
             // don't destroy this handler while this route is still live.
             // RouteProxyAsync (NOT RouteAsync) so ResolveRouteMatch can
             // demux this entry as RouteKind::Proxy at step (2).
+            // Pass explicit RouteOptions so the inbound dispatcher
+            // activates the streaming body-source path when the upstream
+            // config requests it. Mirrors the config-auto-register branch
+            // — both manual Proxy() and config_loader-driven proxy routes
+            // must honor UpstreamConfig::request_mode identically.
             router_.RouteProxyAsync(mr.method, pattern,
                 [handler](HttpRequest& request,
                           HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
@@ -2226,7 +2281,8 @@ void HttpServer::Proxy(const std::string& route_pattern,
                           HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                     handler->Handle(request, std::move(stream_sender),
                                     std::move(complete));
-                });
+                },
+                http::RouteOptions{found->request_mode});
             // Mark the derived bare-prefix companion only for the
             // methods this proxy actually registers on it. A method
             // not in the proxy's method list should NOT yield — a
@@ -2629,6 +2685,9 @@ void HttpServer::RegisterProxyRoutes() {
                 // ownership and survives any later overwrite.
                 // RouteProxyAsync (NOT RouteAsync) so ResolveRouteMatch
                 // can demux this entry as RouteKind::Proxy at step (2).
+                // Pass explicit RouteOptions so the inbound dispatcher
+                // activates the streaming body-source path when the
+                // upstream config requests it.
                 router_.RouteProxyAsync(mr.method, pattern,
                     [handler](HttpRequest& request,
                               HTTP_CALLBACKS_NAMESPACE::InterimResponseSender /*send_interim*/,
@@ -2637,7 +2696,8 @@ void HttpServer::RegisterProxyRoutes() {
                               HTTP_CALLBACKS_NAMESPACE::AsyncCompletionCallback complete) {
                         handler->Handle(request, std::move(stream_sender),
                                         std::move(complete));
-                    });
+                    },
+                    http::RouteOptions{upstream.request_mode});
                 if (!derived_companion.empty() && pattern == derived_companion) {
                     router_.MarkProxyCompanion(mr.method, pattern);
                 }
@@ -3670,6 +3730,12 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
     http_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
     http_conn->SetMaxAsyncDeferredSec(
         max_async_deferred_sec_.load(std::memory_order_relaxed));
+    // Inbound H1 streaming-request watermarks. Live-reloadable via the
+    // Reload() handler-walk; setter applies to subsequent streaming
+    // requests on this connection.
+    http_conn->SetStreamingWatermarks(
+        h1_streaming_high_water_.load(std::memory_order_relaxed),
+        h1_streaming_low_water_.load(std::memory_order_relaxed));
 
     // Count every completed HTTP parse — dispatched, rejected (400/413/etc), or
     // upgraded. Fires from HandleCompleteRequest before dispatch or rejection.
@@ -4382,6 +4448,12 @@ void HttpServer::SetupHandlers(std::shared_ptr<HttpConnectionHandler> http_conn)
             }
         }
     );
+
+    http_conn->SetResolveRouteOptionsCallback(
+        [this](const std::string& method, const std::string& path) {
+            return router_.ResolveOptionsAtHeaders(method, path);
+        }
+    );
 }
 
 void HttpServer::SafeNotifyWsClose(const std::shared_ptr<HttpConnectionHandler>& http_conn) {
@@ -4915,6 +4987,13 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
     h2_conn->SetRequestTimeout(request_timeout_sec_.load(std::memory_order_relaxed));
     h2_conn->SetMaxAsyncDeferredSec(
         max_async_deferred_sec_.load(std::memory_order_relaxed));
+    // Inbound H2 streaming-request watermarks come from Http2Config::streaming.
+    // Snapshotted at construction time; reload propagation runs through the
+    // same setter via HttpServer::Reload's H2 handler-walk path.
+    h2_conn->SetStreamingWatermarks(
+        h2_streaming_high_water_.load(std::memory_order_relaxed),
+        h2_streaming_low_water_.load(std::memory_order_relaxed),
+        h2_streaming_window_update_.load(std::memory_order_relaxed));
 
     // Set request callback: dispatch through HttpRouter (same as HTTP/1.x).
     // total_requests_ is counted in stream_open_callback (below), which fires
@@ -5550,6 +5629,12 @@ void HttpServer::SetupH2Handlers(std::shared_ptr<Http2ConnectionHandler> h2_conn
             self->FireAndEraseStreamAbortHook(stream_id);
         }
     );
+
+    h2_conn->SetResolveRouteOptionsCallback(
+        [this](const std::string& method, const std::string& path) {
+            return router_.ResolveOptionsAtHeaders(method, path);
+        }
+    );
 }
 
 HttpServer::ConnectionSnapshot HttpServer::SnapshotConnections() {
@@ -6144,6 +6229,48 @@ bool HttpServer::Reload(ServerConfig new_config) {
         live_config_.max_connections      = new_config.max_connections;
     }
 
+    // Streaming-request watermarks: live-reloadable. Update atomics first so
+    // newly-accepted connections see the new values, then walk live H1/H2
+    // handlers via their per-dispatcher RunOnDispatcher hop.
+    {
+        h1_streaming_high_water_.store(
+            new_config.http1.streaming.high_water_bytes,
+            std::memory_order_relaxed);
+        h1_streaming_low_water_.store(
+            new_config.http1.streaming.low_water_bytes,
+            std::memory_order_relaxed);
+        h2_streaming_high_water_.store(
+            new_config.http2.streaming.high_water_bytes,
+            std::memory_order_relaxed);
+        h2_streaming_low_water_.store(
+            new_config.http2.streaming.low_water_bytes,
+            std::memory_order_relaxed);
+        h2_streaming_window_update_.store(
+            new_config.http2.streaming.window_update_bytes,
+            std::memory_order_relaxed);
+
+        auto snap = SnapshotConnections();
+        const size_t h1_high = new_config.http1.streaming.high_water_bytes;
+        const size_t h1_low  = new_config.http1.streaming.low_water_bytes;
+        const size_t h2_high = new_config.http2.streaming.high_water_bytes;
+        const size_t h2_low  = new_config.http2.streaming.low_water_bytes;
+        const size_t h2_win  = new_config.http2.streaming.window_update_bytes;
+        for (auto& hconn : snap.h1) {
+            auto conn = hconn->GetConnection();
+            if (!conn) continue;
+            conn->RunOnDispatcher([hconn, h1_high, h1_low]() {
+                hconn->SetStreamingWatermarks(h1_high, h1_low);
+            });
+        }
+        for (auto& h2conn : snap.h2) {
+            auto conn = h2conn->GetConnection();
+            if (!conn) continue;
+            conn->RunOnDispatcher([h2conn, h2_high, h2_low, h2_win]() {
+                h2conn->SetStreamingWatermarks(h2_high, h2_low, h2_win);
+            });
+        }
+    }
+
     // Update the remaining reload-safe fields
     request_timeout_sec_.store(new_config.request_timeout_sec, std::memory_order_relaxed);
     shutdown_drain_timeout_sec_.store(new_config.shutdown_drain_timeout_sec,
@@ -6255,6 +6382,11 @@ bool HttpServer::Reload(ServerConfig new_config) {
         // Persist so GetLiveConfigSnapshot() returns the applied settings.
         live_config_.http2 = new_config.http2;
     }
+    // Persist http1 streaming sub-fields only. Narrow scope so a future
+    // restart-only Http1Config field doesn't silently drift into the live
+    // snapshot through this reload-safe path. Mirror the same field-by-
+    // field discipline used for size limits above.
+    live_config_.http1.streaming = new_config.http1.streaming;
 
     // Rate limit reload — always safe because manager is always created
     if (rate_limit_manager_) {

@@ -8,6 +8,7 @@
 #include <limits>
 
 #include "auth/auth_config.h"
+#include "http/route_options.h"
 #include "net/dns_resolver.h"
 #include "observability/observability_config.h"
 
@@ -38,6 +39,24 @@ struct Http2Config {
     // in its preface; when true the entry is OMITTED so nghttp2's local
     // default of 1 applies internally for our PUSH_PROMISE emission.
     bool enable_push = false;
+
+    // Inbound H2 streaming-request body watermarks + WINDOW_UPDATE
+    // replenishment threshold. Live-reloadable.
+    struct StreamingConfig {
+        size_t high_water_bytes = 262144;       // 256 KB
+        size_t low_water_bytes  = 65536;        // 64 KB
+        size_t window_update_bytes = 32768;     // 32 KB
+    };
+    StreamingConfig streaming;
+};
+
+// Inbound HTTP/1.1 streaming-request body watermarks. Live-reloadable.
+struct Http1Config {
+    struct StreamingConfig {
+        size_t high_water_bytes = 262144;       // 256 KB
+        size_t low_water_bytes  = 65536;        // 64 KB
+    };
+    StreamingConfig streaming;
 };
 
 // Per-upstream HTTP/2 client configuration. Distinct from `Http2Config`
@@ -69,6 +88,14 @@ struct Http2UpstreamConfig {
     // silent-no-op shape) AND preconnect_watermark_pct < saturation_open_pct
     // (the prediction must fire BEFORE saturation actually trips).
     int preconnect_watermark_pct = 0;
+
+    // (Per-upstream outbound streaming watermarks intentionally absent:
+    // the proxy reuses the inbound ChunkQueueBodyStream end-to-end, so
+    // a separate per-upstream watermark has no runtime consumer. Top-
+    // level http2.streaming.* governs producer-side backpressure. If a
+    // future protocol-translation path introduces a separate outbound
+    // body buffer, re-add the sub-struct + loader + runtime wiring
+    // together — never as schema-without-runtime.)
 
     // Full equality: every field. Used by tests + serialization round-trips.
     bool operator==(const Http2UpstreamConfig& o) const {
@@ -320,6 +347,10 @@ struct UpstreamConfig {
     ProxyConfig proxy;
     CircuitBreakerConfig circuit_breaker;
     Http2UpstreamConfig http2;
+    // Per-upstream request-handling mode. Defaults to Streaming for proxy
+    // routes (HttpServer::RegisterProxyRoutes auto-override); operators
+    // may pin to Buffered via config. Restart-only — see operator==.
+    http::RouteRequestMode request_mode = http::RouteRequestMode::Streaming;
 
     // Excludes `circuit_breaker` — breaker fields are live-reloadable via
     // `CircuitBreakerManager::Reload`, which `HttpServer::Reload` invokes on
@@ -332,10 +363,15 @@ struct UpstreamConfig {
     // LiveEqual compares only the restart-only H2 fields (enabled, prefer),
     // so a SIGHUP that changes only ping_idle_sec no longer fires a
     // spurious "restart required" warning.
+    //
+    // `request_mode` is restart-only — buffered ↔ streaming flip requires
+    // re-registering the route with new RouteOptions, which only happens
+    // at startup via RegisterProxyRoutes.
     bool operator==(const UpstreamConfig& o) const {
         return name == o.name && host == o.host && port == o.port &&
                tls == o.tls && pool == o.pool && proxy == o.proxy &&
-               http2.LiveEqual(o.http2);
+               http2.LiveEqual(o.http2) &&
+               request_mode == o.request_mode;
     }
     bool operator!=(const UpstreamConfig& o) const { return !(*this == o); }
 };
@@ -411,6 +447,7 @@ struct ServerConfig {
     // 0 = immediate (skip waits, force-close); negative rejected by Validate.
     int shutdown_drain_timeout_sec = 30;
     Http2Config http2;
+    Http1Config http1;
     std::vector<UpstreamConfig> upstreams;
     RateLimitConfig rate_limit;
     AUTH_NAMESPACE::AuthConfig auth;
