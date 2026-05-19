@@ -3,7 +3,7 @@
 ## Running Tests
 
 ```bash
-make test               # Build and run all suites (1491 tests across 41+ suites at HEAD)
+make test               # Build and run all suites (1641 tests across 42+ suites at HEAD)
 ./test_runner                   # Run all tests directly (after building)
 ./test_runner help              # Print every supported flag
 
@@ -87,7 +87,7 @@ make test_auth_race
 make test_auth_observability
 ```
 
-At current head, `./test_runner` reports **1379 / 1379 passing** (100 %).
+At current head, `./test_runner` reports **1641 / 1641 passing** (100 %).
 
 ## Test Suites
 
